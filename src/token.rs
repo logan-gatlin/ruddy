@@ -40,7 +40,7 @@ pub enum Kind {
     /// may sit anywhere an expression may, so there is no one position that
     /// could read it and leave the word a name everywhere else.
     Raise,
-    /// Boolean operators. Unlike the `where` clause's contextual words, these
+    /// Bool operators. Unlike the `where` clause's contextual words, these
     /// are reserved because they may appear wherever an expression does.
     And,
     Or,
@@ -169,7 +169,7 @@ pub enum Kind {
     /// every later phase compares values rather than source spellings.
     String(String),
     /// One of the two boolean values.
-    Boolean(bool),
+    Bool(bool),
     /// `-- text` — a line comment, carrying the text after its `--` up to
     /// but not including the newline that ends it. A token rather than
     /// whitespace because the formatter needs to know where every comment
@@ -543,8 +543,8 @@ pub fn lex(input: &str, file_id: FileID) -> Output {
                     "mut" => Kind::Mut,
                     "module" => Kind::Module,
                     "using" => Kind::Using,
-                    "true" => Kind::Boolean(true),
-                    "false" => Kind::Boolean(false),
+                    "true" => Kind::Bool(true),
+                    "false" => Kind::Bool(false),
                     // `return` is deliberately absent: it heads a handler arm
                     // and is an ordinary name everywhere else, so the parser
                     // recognizes it by spelling at the one position that reads

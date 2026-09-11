@@ -193,7 +193,7 @@ pub fn rep(rep: Rep) -> &'static str {
         Rep::Fixed(kind) => kind.suffix(),
         Rep::Real => "real64",
         Rep::String => "string",
-        Rep::Boolean => "boolean",
+        Rep::Bool => "boolean",
         Rep::TypeDescriptor => "type_descriptor",
         Rep::NativePlan => "native_plan",
         Rep::BoxedAny => "boxed_any",
@@ -334,7 +334,7 @@ fn literal(value: &Literal) -> String {
         Literal::Fixed(value) => format!("{value}"),
         Literal::Real(value) => value.to_string(),
         Literal::String(value) => crate::print::string(value),
-        Literal::Boolean(value) => value.to_string(),
+        Literal::Bool(value) => value.to_string(),
     }
 }
 

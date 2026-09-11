@@ -38,7 +38,7 @@ fn printed(source: &str) -> (String, String) {
 }
 
 /// The surface printer keeps conditionals recognizable while the IR printer
-/// honestly shows the ordinary Boolean match they become. A chain remains a
+/// honestly shows the ordinary Bool match they become. A chain remains a
 /// single-final-`end` chain in the surface tree and nests in the false branch
 /// after lowering.
 #[test]

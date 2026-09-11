@@ -70,6 +70,14 @@ vscode:
     npm --prefix "{{justfile_directory()}}/editors/vscode" ci
     npm --prefix "{{justfile_directory()}}/editors/vscode" run package -- --out ruddy.vsix
 
+# Log in to the Marketplace and publish a freshly built VS Code extension.
+vscode-publish: vscode
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cd "{{justfile_directory()}}/editors/vscode"
+    npx --no-install vsce login lgatlin
+    npx --no-install vsce publish --packagePath ruddy.vsix
+
 # Rebuild the grammar and install the highlighting/LSP extension into VS Code.
 vscode-install editor="code": grammar vscode
     "{{editor}}" --install-extension "{{justfile_directory()}}/editors/vscode/ruddy.vsix" --force
@@ -133,6 +141,15 @@ helix:
     indent = { tab-width = 2, unit = "  " }
     grammar = "ruddy"
 
+    # Ruddy uses ' as its ML-style type-parameter prefix, not as a delimiter.
+    [language.auto-pairs]
+    '(' = ')'
+    '{' = '}'
+    '[' = ']'
+    '"' = '"'
+    '`' = '`'
+    '<' = '>'
+
     [[grammar]]
     name = "ruddy"
     source = { path = "$grammar" }
@@ -163,7 +180,7 @@ deploy:
 
 # Build and install the CLI, including the language server.
 install:
-    cargo install --locked --path "{{justfile_directory()}}/cli"
+    cargo install --locked --force --path "{{justfile_directory()}}/cli"
 
 # Line and branch coverage for the compiler library. Branch coverage is a
 # nightly-only rustc feature, hence `+nightly`.

@@ -16,8 +16,8 @@ let from_pair = { 1: "second", ..pair }
 @private let update_a = fn v => { a: 7n, ..v }
 let added = update_a { b: 1n }
 let overwritten = update_a { a: "old", b: 2n }
-let read_back: { a: Nat, b: String, c: Boolean } -> (Nat, String, Boolean) = fn v => (v.a, v.b, v.c)
+let read_back: { a: Nat, b: String, c: Bool } -> (Nat, String, Bool) = fn v => (v.a, v.b, v.c)
 let read_added: { d: Nat, e: Nat } -> (Nat, Nat) = fn v => (v.d, v.e)
 let traced = fn v => { a: mark 10n, c: mark 30n, ..mark_base v }
 
-let set_a: { a: Nat, b: String, c: Boolean } -> { a: Nat, b: String, c: Boolean } = update_a
+let set_a: { a: Nat, b: String, c: Bool } -> { a: Nat, b: String, c: Bool } = update_a

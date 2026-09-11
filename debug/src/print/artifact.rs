@@ -57,7 +57,7 @@ impl fmt::Display for Shown<'_> {
             Data::Fixed(value) => write!(f, "{value}"),
             Data::Real(value) => write!(f, "{value}"),
             Data::String(value) => f.write_str(&string(value)),
-            Data::Boolean(value) => write!(f, "{value}"),
+            Data::Bool(value) => write!(f, "{value}"),
             Data::Array(items) => {
                 f.write_str("[")?;
                 for (index, item) in items.iter().enumerate() {

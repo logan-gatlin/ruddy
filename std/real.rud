@@ -9,12 +9,12 @@ extern abs: fn(Real) -> Real = "Math.abs"
 extern sqrt: fn(Real) -> Real = "Math.sqrt"
 extern power: fn(Real, Real) -> Real = "Math.pow"
 
-extern equal: fn(Real, Real) -> Boolean = "Object.is"
-extern not_equal: fn(Real, Real) -> Boolean = "(left, right) => !Object.is(left, right)"
-extern less_than: fn(Real, Real) -> Boolean = "(left, right) => left < right"
-extern less_than_or_equal: fn(Real, Real) -> Boolean = "(left, right) => left <= right"
-extern greater_than: fn(Real, Real) -> Boolean = "(left, right) => left > right"
-extern greater_than_or_equal: fn(Real, Real) -> Boolean = "(left, right) => left >= right"
+@private
+extern ordering_equal: fn(Real, Real) -> Bool = "Object.is"
+@private
+extern ordering_less_than: fn(Real, Real) -> Bool = "(left, right) => left < right"
+@private
+extern ordering_greater_than: fn(Real, Real) -> Bool = "(left, right) => left > right"
 
 extern min: fn(Real, Real) -> Real = "Math.min"
 extern max: fn(Real, Real) -> Real = "Math.max"
@@ -24,9 +24,9 @@ extern floor: fn(Real) -> Int = "Math.floor"
 extern ceil: fn(Real) -> Int = "Math.ceil"
 extern round: fn(Real) -> Int = "Math.round"
 extern truncate: fn(Real) -> Int = "Math.trunc"
-extern is_nan: fn(Real) -> Boolean = "Number.isNaN"
-extern is_finite: fn(Real) -> Boolean = "Number.isFinite"
-extern is_integer: fn(Real) -> Boolean = "Number.isInteger"
+extern is_nan: fn(Real) -> Bool = "Number.isNaN"
+extern is_finite: fn(Real) -> Bool = "Number.isFinite"
+extern is_integer: fn(Real) -> Bool = "Number.isInteger"
 
 extern from_nat: fn(Nat) -> Real = "value => value"
 extern from_int: fn(Int) -> Real = "value => value"
@@ -66,12 +66,21 @@ let tau: Real = 2 * pi
 let degrees_to_radians: Real -> Real = fn degrees => degrees * (pi / 180)
 let radians_to_degrees: Real -> Real = fn radians => radians * (180 / pi)
 
-let compare: Real -> Real -> Ordering = fn left right =>
-  if equal left right then #Equal
+let compare: order::Ordering Real = fn left right =>
+  if ordering_equal left right then #Equal
   else if is_nan left then #Greater
   else if is_nan right then #Less
-  else if less_than left right then #Less
-  else if greater_than left right then #Greater
-  else if less_than (divide 1 left) (divide 1 right) then #Less
+  else if ordering_less_than left right then #Less
+  else if ordering_greater_than left right then #Greater
+  else if ordering_less_than (divide 1 left) (divide 1 right) then #Less
   else #Greater
   end
+
+let {
+  equal,
+  not_equal,
+  less_than,
+  less_than_or_equal,
+  greater_than,
+  greater_than_or_equal,
+} = order::derive compare

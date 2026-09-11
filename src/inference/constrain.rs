@@ -340,7 +340,7 @@ impl Constrain<'_> {
             TermKind::Integer(_) => Arc::new(Ty::plain(Ty::Int)),
             TermKind::Real(_) => Arc::new(Ty::plain(Ty::Real)),
             TermKind::String(_) => Arc::new(Ty::plain(Ty::String)),
-            TermKind::Boolean(_) => Arc::new(Ty::plain(Ty::Boolean)),
+            TermKind::Bool(_) => Arc::new(Ty::plain(Ty::Bool)),
             TermKind::Unary {
                 op: crate::ir::UnaryOp::Allocate,
                 value,
@@ -390,7 +390,7 @@ impl Constrain<'_> {
                     real
                 }
                 crate::ir::UnaryOp::Not => {
-                    let boolean = Arc::new(Ty::plain(Ty::Boolean));
+                    let boolean = Arc::new(Ty::plain(Ty::Bool));
                     self.check_term(value, &boolean, Subject::Context, None);
                     boolean
                 }
@@ -404,7 +404,7 @@ impl Constrain<'_> {
                     | crate::ir::BinaryOp::Div => Ty::Real,
                     crate::ir::BinaryOp::And
                     | crate::ir::BinaryOp::Or
-                    | crate::ir::BinaryOp::Xor => Ty::Boolean,
+                    | crate::ir::BinaryOp::Xor => Ty::Bool,
                 };
                 let ty = Arc::new(Ty::plain(core));
                 self.check_term(left, &ty, Subject::Context, None);
@@ -1288,7 +1288,7 @@ impl Constrain<'_> {
                     ir::PatternKind::Integer(_) => primitives.push(Ty::Int),
                     ir::PatternKind::Real(_) => primitives.push(Ty::Real),
                     ir::PatternKind::String(_) => primitives.push(Ty::String),
-                    ir::PatternKind::Boolean(_) => primitives.push(Ty::Boolean),
+                    ir::PatternKind::Bool(_) => primitives.push(Ty::Bool),
                     ir::PatternKind::Tag { name, payload } => {
                         let payload = payload.as_deref().map(Col::Pattern).unwrap_or(Col::Unit);
                         tags.entry(name.anchored.as_str())
@@ -1753,9 +1753,9 @@ impl Constrain<'_> {
 
     /// One fresh argument per parameter the effect declares, of the sort the
     /// parameter stands for: a type variable for a type, and for a row a fresh
-    /// row wrapped as the type a row argument is written as — a struct for
-    /// fields, a sum for cases and effects — forbidden the labels the
-    /// declaration names beside it.
+    /// row wrapped as a type argument. Structs carry shared rows; effect
+    /// arguments retain their dedicated wrapper. The declaration's exclusions
+    /// apply to the underlying row regardless of its eventual constructor.
     fn fresh_effect_arguments(&mut self, effect: Symbol) -> Vec<Assigned> {
         let kinds = self.effect_params.get(&effect).cloned().unwrap_or_default();
         kinds
@@ -1765,14 +1765,19 @@ impl Constrain<'_> {
                     Assigned::Ty(self.table.fresh_region())
                 }
                 None => Assigned::Ty(self.table.fresh_type_for(Subject::Instance)),
-                Some((shape, lacks)) => {
+                Some((sense, lacks)) => {
                     let rest = self.table.fresh_row_for(Subject::Instance);
                     let row = Row::of(rest);
+                    let shape = if sense == crate::types::Sense::Effects {
+                        Shape::Effect
+                    } else {
+                        Shape::Struct
+                    };
                     self.table.forbid(&row, shape, lacks);
-                    Assigned::Ty(Arc::new(match shape {
-                        Shape::Struct => Ty::Struct(row),
-                        Shape::Sum => Ty::Sum(row),
-                        Shape::Effect => Ty::effects_argument(row),
+                    Assigned::Ty(Arc::new(if shape == Shape::Effect {
+                        Ty::effects_argument(row)
+                    } else {
+                        Ty::Struct(row)
                     }))
                 }
             })

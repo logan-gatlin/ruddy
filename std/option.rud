@@ -1,3 +1,6 @@
+type Option 't = #Some 't | #None
+type Maybe 't = #Nil | ..'t
+
 let map: ('a -> 'b + ..'effects) -> Option 'a -> Option 'b + ..'effects =
   fn function option => match option with
   | #Some value => #Some (function value)
@@ -21,7 +24,7 @@ let or_else: (() -> Option 'a + ..'effects) -> Option 'a -> Option 'a + ..'effec
   | #None => fallback ()
   end
 
-let filter: ('a -> Boolean + ..'effects) -> Option 'a -> Option 'a + ..'effects =
+let filter: ('a -> Bool + ..'effects) -> Option 'a -> Option 'a + ..'effects =
   fn predicate option => match option with
   | #Some value => if predicate value then option else #None end
   | #None => #None
@@ -32,12 +35,12 @@ let flatten: Option (Option 'a) -> Option 'a = fn option => match option with
 | #None => #None
 end
 
-let is_some: Option 'a -> Boolean = fn option => match option with
+let is_some: Option 'a -> Bool = fn option => match option with
 | #Some _ => true
 | #None => false
 end
 
-let is_none: Option 'a -> Boolean = fn option => match option with
+let is_none: Option 'a -> Bool = fn option => match option with
 | #Some _ => false
 | #None => true
 end
@@ -47,7 +50,7 @@ let some_or: 'a -> (#Some 'a | ..'rest) -> 'a = fn fallback value => match value
 | _ => fallback
 end
 
-let is_some_case: (#Some 'a | ..'rest) -> Boolean = fn value => match value with
+let is_some_case: (#Some 'a | ..'rest) -> Bool = fn value => match value with
 | #Some _ => true
 | _ => false
 end

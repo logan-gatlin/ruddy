@@ -235,7 +235,7 @@ pub fn expr_prec(kind: &parse::ExprKind) -> Prec {
         | ExprKind::Fixed(_)
         | ExprKind::Real(_)
         | ExprKind::String(_)
-        | ExprKind::Boolean(_)
+        | ExprKind::Bool(_)
         | ExprKind::Unit => Prec::Atom,
     }
 }
@@ -283,7 +283,7 @@ pub fn pattern_prec(kind: &parse::PatternKind) -> Prec {
         | PatternKind::Fixed(_)
         | PatternKind::Real(_)
         | PatternKind::String(_)
-        | PatternKind::Boolean(_)
+        | PatternKind::Bool(_)
         | PatternKind::Unit
         | PatternKind::Struct { .. }
         | PatternKind::Tuple(_)
@@ -742,7 +742,7 @@ impl fmt::Display for Kind {
             Kind::NumericField(value) => write!(f, "{value}"),
             Kind::Real(value) => write!(f, "{value}"),
             Kind::String(value) => write_string(f, value),
-            Kind::Boolean(value) => write!(f, "{value}"),
+            Kind::Bool(value) => write!(f, "{value}"),
             // The delimiters are written back on, as a string's quotes are:
             // the text alone would re-lex as code.
             Kind::LineComment(text) => write!(f, "--{text}"),
@@ -1044,7 +1044,7 @@ impl Grouped for parse::PatternKind {
             | parse::PatternKind::Integer(_)
             | parse::PatternKind::Real(_)
             | parse::PatternKind::String(_)
-            | parse::PatternKind::Boolean(_)
+            | parse::PatternKind::Bool(_)
             | parse::PatternKind::Unit
             | parse::PatternKind::Struct { .. }
             | parse::PatternKind::Tuple(_)
@@ -1067,7 +1067,7 @@ impl fmt::Display for parse::PatternKind {
             parse::PatternKind::Integer(value) => write!(f, "{value}i"),
             parse::PatternKind::Real(value) => write!(f, "{value}"),
             parse::PatternKind::String(value) => write_string(f, value),
-            parse::PatternKind::Boolean(value) => write!(f, "{value}"),
+            parse::PatternKind::Bool(value) => write!(f, "{value}"),
             parse::PatternKind::Unit => f.write_str("()"),
             parse::PatternKind::Tuple(elements) => {
                 write_tuple(f, elements.iter().map(|element| &element.tracked))
@@ -1175,7 +1175,7 @@ impl fmt::Display for ir::Witness {
                 ir::Literal::Integer(value) => write!(f, "{value}i"),
                 ir::Literal::Real(value) => write!(f, "{value}"),
                 ir::Literal::String(value) => write_string(f, value),
-                ir::Literal::Boolean(value) => write!(f, "{value}"),
+                ir::Literal::Bool(value) => write!(f, "{value}"),
             },
             ir::Witness::Tag { name, payload } => write_tag(f, name, None, payload.as_deref()),
             // A field held to be present with any value at all prints
@@ -1932,7 +1932,7 @@ impl fmt::Display for SourceLiteral<'_> {
             ir::Literal::Integer(value) => write!(f, "{value}i"),
             ir::Literal::Real(value) => write!(f, "{value:?}"),
             ir::Literal::String(value) => write_string(f, value),
-            ir::Literal::Boolean(value) => write!(f, "{value}"),
+            ir::Literal::Bool(value) => write!(f, "{value}"),
         }
     }
 }
@@ -2106,15 +2106,11 @@ impl fmt::Display for Shape {
 /// [`ir::ErrorKind::MixedParameter`] and [`ir::ErrorKind::MixedTail`] each say
 /// twice and [`ir::ErrorKind::NotARow`] once.
 ///
-/// The rest of a struct is a whole type, so it has no phrase of its own: `..'r`
-/// in a struct puts whatever is written for `'r` in the struct-row tail, and there is
-/// nothing narrower to call that.
 impl fmt::Display for Sense {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
             Sense::Type => "a whole type",
-            Sense::Fields => "the rest of a struct's fields",
-            Sense::Cases => "the rest of a sum's cases",
+            Sense::Row => "a row of fields or cases",
             Sense::Effects => "the rest of an arrow's effects",
             // What a `when` puts on a label, said as the reader's own word for
             // it rather than as "a presence variable": they wrote `when a`, and
@@ -2323,7 +2319,7 @@ fn format_semantic(f: &mut fmt::Formatter<'_>, root: SemanticRoot<'_>) -> fmt::R
                     Ty::Fixed(kind) => f.write_str(kind.name())?,
                     Ty::Real => f.write_str(Prim::Real.name())?,
                     Ty::String => f.write_str(Prim::String.name())?,
-                    Ty::Boolean => f.write_str(Prim::Boolean.name())?,
+                    Ty::Bool => f.write_str(Prim::Bool.name())?,
                     Ty::Any => f.write_str(Prim::Any.name())?,
                     Ty::ForeignValue => f.write_str(Prim::ForeignValue.name())?,
                     Ty::Arrow(from, to, effects) => {
@@ -3118,7 +3114,7 @@ fn type_description(description: inference::TypeDescription) -> &'static str {
         T::Integer => "an integer",
         T::RealNumber => "a real number",
         T::Text => "text",
-        T::Boolean => "a boolean",
+        T::Bool => "a boolean",
         T::Function => "a function",
         T::Struct => "a struct",
         T::TaggedValue => "a tagged value",
@@ -3646,11 +3642,8 @@ impl inference::Error {
                     Sense::Type => diagnostic
                         .help("return or pass through the annotated value instead of replacing its type")
                         .help("or change the annotation to name the concrete type the body uses"),
-                    Sense::Fields => diagnostic
-                        .help("preserve the caller-chosen struct remainder instead of closing it")
-                        .help("or remove the open remainder from the annotation"),
-                    Sense::Cases => diagnostic
-                        .help("preserve the caller-chosen remaining cases instead of closing them")
+                    Sense::Row => diagnostic
+                        .help("preserve the caller-chosen row remainder instead of closing it")
                         .help("or remove the open remainder from the annotation"),
                     Sense::Effects if effect_row_has_specific_operation(found) => diagnostic
                         .help("handle the performed effect inside the body")
@@ -3956,20 +3949,11 @@ impl fmt::Display for inference::ErrorKind {
             inference::ErrorKind::RigidBroken {
                 found,
                 name,
-                sense: Sense::Fields,
+                sense: Sense::Row,
                 ..
             } => write!(
                 f,
-                "this is `{found}`, but `'{name}` stands for whatever the caller picks for the rest of a struct's fields",
-            ),
-            inference::ErrorKind::RigidBroken {
-                found,
-                name,
-                sense: Sense::Cases,
-                ..
-            } => write!(
-                f,
-                "this is `{found}`, but `'{name}` stands for whatever the caller picks for the remaining cases",
+                "this is `{found}`, but `'{name}` stands for whatever row of fields or cases the caller picks",
             ),
             inference::ErrorKind::RigidBroken { found, name, .. } => write!(
                 f,

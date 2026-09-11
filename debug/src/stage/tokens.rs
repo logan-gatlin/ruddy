@@ -130,7 +130,7 @@ pub fn label(kind: &Kind) -> &'static str {
         Kind::NumericField(_) => "NumericField",
         Kind::Real(_) => "Real",
         Kind::String(_) => "String",
-        Kind::Boolean(_) => "Boolean",
+        Kind::Bool(_) => "Bool",
         Kind::LineComment(_) => "LineComment",
         Kind::BlockComment(_) => "BlockComment",
         Kind::Invalid => "Invalid",
@@ -157,7 +157,7 @@ pub fn class(kind: &Kind) -> &'static str {
         | Kind::NumericField(_)
         | Kind::Real(_) => "number",
         Kind::String(_) => "string",
-        Kind::Boolean(_) => "boolean",
+        Kind::Bool(_) => "boolean",
         Kind::Tag(_) => "tag",
         Kind::EffectLabel(_) => "effect",
         Kind::Variable(_) => "variable",

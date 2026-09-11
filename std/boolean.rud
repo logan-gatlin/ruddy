@@ -1,14 +1,21 @@
-let logical_not: Boolean -> Boolean = fn value => not value
-let logical_and: Boolean -> Boolean -> Boolean = fn left => fn right => left and right
-let logical_or: Boolean -> Boolean -> Boolean = fn left => fn right => left or right
-let logical_xor: Boolean -> Boolean -> Boolean = fn left => fn right => left xor right
-let equal: Boolean -> Boolean -> Boolean = fn left => fn right => not (left xor right)
-let not_equal: Boolean -> Boolean -> Boolean = fn left => fn right => left xor right
-let implies: Boolean -> Boolean -> Boolean = fn premise => fn conclusion =>
+let logical_not: Bool -> Bool = fn value => not value
+let logical_and: Bool -> Bool -> Bool = fn left => fn right => left and right
+let logical_or: Bool -> Bool -> Bool = fn left => fn right => left or right
+let logical_xor: Bool -> Bool -> Bool = fn left => fn right => left xor right
+let implies: Bool -> Bool -> Bool = fn premise => fn conclusion =>
   not premise or conclusion
 
-let compare: Boolean -> Boolean -> Ordering = fn left right =>
-  if equal left right then #Equal
-  else if left then #Greater
-  else #Less
-  end
+let compare: order::Ordering Bool = fn left right => match (left, right) with
+| (false, true) => #Less
+| (true, false) => #Greater
+| _ => #Equal
+end
+
+let {
+  equal,
+  not_equal,
+  less_than,
+  less_than_or_equal,
+  greater_than,
+  greater_than_or_equal,
+} = order::derive compare

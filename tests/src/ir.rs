@@ -20,7 +20,7 @@ use ruddy_debug::print;
 /// A parameter standing for a whole type that may not name any of `labels` —
 /// which is what a struct's `..'r` is, since the rest of a struct is its core.
 fn row(labels: &[&str]) -> ParamKind {
-    ParamKind::Fields {
+    ParamKind::Row {
         lacks: labels.iter().map(|label| label.to_string()).collect(),
     }
 }
@@ -34,7 +34,7 @@ fn whole() -> ParamKind {
 /// A parameter standing for the rest of a sum's cases, which may not name any
 /// of `labels`.
 fn cases(labels: &[&str]) -> ParamKind {
-    ParamKind::Cases {
+    ParamKind::Row {
         lacks: labels.iter().map(|label| label.to_string()).collect(),
     }
 }
@@ -148,12 +148,12 @@ fn if_expressions_lower_to_boolean_matches() {
     let TermKind::Match { scrutinee, arms } = term_value(&mint, &out, "choose") else {
         panic!("an if lowers to a match");
     };
-    assert!(matches!(scrutinee.kind, TermKind::Boolean(true)));
+    assert!(matches!(scrutinee.kind, TermKind::Bool(true)));
     assert_eq!(arms.len(), 2);
-    assert!(matches!(arms[0].0.anchored, PatternKind::Boolean(true)));
+    assert!(matches!(arms[0].0.anchored, PatternKind::Bool(true)));
     assert_eq!(arms[0].0.at, scrutinee.at);
     assert!(matches!(arms[0].1.kind, TermKind::Natural(1)));
-    assert!(matches!(arms[1].0.anchored, PatternKind::Boolean(false)));
+    assert!(matches!(arms[1].0.anchored, PatternKind::Bool(false)));
     assert_eq!(arms[1].0.at, scrutinee.at);
     assert!(matches!(arms[1].1.kind, TermKind::Natural(2)));
 
@@ -168,10 +168,10 @@ fn if_expressions_lower_to_boolean_matches() {
     else {
         panic!("the else-if lowers in the false branch");
     };
-    assert!(matches!(scrutinee.kind, TermKind::Boolean(false)));
+    assert!(matches!(scrutinee.kind, TermKind::Bool(false)));
     assert_eq!(nested.len(), 2);
-    assert!(matches!(nested[0].0.anchored, PatternKind::Boolean(true)));
-    assert!(matches!(nested[1].0.anchored, PatternKind::Boolean(false)));
+    assert!(matches!(nested[0].0.anchored, PatternKind::Bool(true)));
+    assert!(matches!(nested[1].0.anchored, PatternKind::Bool(false)));
 }
 
 #[test]
@@ -1535,7 +1535,7 @@ fn a_parameter_may_not_stand_for_both() {
         [ruddy::ir::Error {
             kind: ErrorKind::MixedParameter {
                 first: Sense::Type,
-                second: Sense::Fields,
+                second: Sense::Row,
             },
             ..
         }]
@@ -1654,7 +1654,6 @@ fn only_a_row_may_be_written_where_a_row_goes() {
     for src in [
         "type Or 'r = #A | ..'r  let f : Or Nat -> Nat = fn p => 1n",
         "type Or 'r = #A | ..'r  let f : Or (Nat -> Nat) -> Nat = fn p => 1n",
-        "type Or 'r = #A | ..'r  let f : Or { y: Nat } -> Nat = fn p => 1n",
         "type Or 'r = #A | ..'r  type Bad = Or Nat",
     ] {
         let (_, out) = build_src(src);
@@ -1669,6 +1668,7 @@ fn only_a_row_may_be_written_where_a_row_goes() {
 
     // A sum is one, and so is another sum's row parameter handed straight on.
     for src in [
+        "type Or 'r = #A | ..'r  let f : Or { y: Nat } -> Nat = fn p => 1n",
         "type Or 'r = #A | ..'r  let f : Or (#B Nat) -> Nat = fn p => 1n",
         "type Or 'r = #A | ..'r  let f : Or (|) -> Nat = fn p => 1n",
         "type Or 'r = #A | ..'r  type Pass 's = Or 's",
@@ -1992,38 +1992,60 @@ fn a_declared_sum_must_list_its_cases() {
     assert_eq!(decl.params[0].kind, cases(&["Err"]));
 }
 
-/// A sum's tail stands for cases, so a struct written at one is refused — while
-/// a struct's tail is the type's core and takes anything, including a sum.
+/// Both constructors consume the same row, including through forwarding.
 #[test]
-fn a_row_parameter_knows_which_shape_it_is() {
-    let (_, out) = build_src("type Cases 'r = #A Nat | ..'r  type Bad = Cases { y: Nat }");
-    assert_eq!(out.errors.len(), 1, "{:#?}", out.errors);
-    assert!(matches!(out.errors[0].kind, ErrorKind::NotARow { .. }));
-
-    let (_, out) = build_src("type WithX 'r = { x: Nat, ..'r }  type Bad = WithX (#A Nat)");
-    assert!(matches!(
-        out.errors.as_slice(),
-        [ruddy::ir::Error {
-            kind: ErrorKind::NotARow {
-                sense: Sense::Fields
-            },
-            ..
-        }]
-    ));
-
-    // And a parameter handed to both is a parameter that has to say which it
-    // meant: a whole type in one place, the rest of a sum in the other.
-    let (_, out) = build_src(
-        "type WithX 'r = { x: Nat, ..'r }  type Cases 's = #A Nat | ..'s  \
-         type Bad 't = { it: WithX 't, also: Cases 't }",
-    );
-    assert!(
-        out.errors
+fn shared_rows_combine_exclusions_across_every_use() {
+    let source = "type WithX 'r = { x: Nat, ..'r }\n\
+                  type Cases 'r = #Y | ..'r\n\
+                  type Both 'r = { product: WithX 'r, choice: Cases 'r }\n\
+                  type Forward 'r = Both 'r\n";
+    let (mint, out) = built(&format!("{source}type Good = Forward {{ z: Nat }}"));
+    let both = &out.program.types[&type_symbol(&mint, &out, "Both")];
+    assert_eq!(both.params[0].kind.sense(), Sense::Row);
+    assert_eq!(
+        both.params[0]
+            .kind
+            .lacks()
             .iter()
-            .any(|error| matches!(error.kind, ErrorKind::MixedParameter { .. })),
-        "{:#?}",
-        out.errors
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        ["x", "Y"]
     );
+    for argument in ["{ x: Nat }", "(#x Nat)", "{ Y: () }", "(#Y)"] {
+        let (_, out) = build_src(&format!("{source}type Bad = Forward {argument}"));
+        assert!(
+            matches!(out.errors.as_slice(), [error] if matches!(error.kind, ErrorKind::RepeatedRowField { .. })),
+            "{argument}: {:#?}",
+            out.errors
+        );
+    }
+    built("type Cases 'r = #A Nat | ..'r type Good = Cases { y: Nat }");
+    built("type WithX 'r = { x: Nat, ..'r } type Good = WithX (#A Nat)");
+}
+
+#[test]
+fn shared_rows_effect_alias_templates_keep_exclusions() {
+    for argument in [
+        "(#X Boolean)",
+        "{ X: Boolean }",
+        "Cases",
+        "(Generic Boolean)",
+    ] {
+        let (_, out) = build_src(&format!(
+            "effect Choose 'r = {{ choose: {{ ..'r }} -> (| ..'r) }}
+             effect Via 'r = !Choose {{ X: Nat, ..'r }}
+             type Cases = #X Boolean
+             type Generic 'a = #X 'a
+             let bad : () -> () + !Via {argument} = fn _ => ()"
+        ));
+        assert!(
+            out.errors.iter().any(|error| matches!(
+                &error.kind, ErrorKind::RepeatedRowField { field, .. } if field == "X"
+            )),
+            "{argument}: {:#?}",
+            out.errors
+        );
+    }
 }
 
 /// A row handed to a sum's tail may not name a case the declaration already
@@ -2046,7 +2068,7 @@ fn operation_signatures_validate_every_row_argument_sense() {
                 _ => None,
             })
             .collect::<Vec<_>>(),
-        [Sense::Fields, Sense::Cases, Sense::Effects]
+        [Sense::Row, Sense::Row, Sense::Effects]
     );
 }
 
@@ -2113,62 +2135,11 @@ fn a_sum_makes_a_type_recursive_rather_than_circular() {
     );
 }
 
-/// Naming a tail is for saying that two `..`s stand for one rest, and one rest
-/// is one shape. A name given both is refused at the second use — the one that
-/// brought the two together — and the row it was written in absorbs.
-///
-/// Left standing, the two tails really would share a variable, and a field
-/// pushed into one would come back out of the other as a case, with nothing
-/// anywhere 'telling the reader why.
+/// A named row may occur in either constructor within the same annotation.
 #[test]
-fn one_tail_name_is_one_shape_of_rest() {
-    let src = "let f : { x: Nat, ..'r } -> (#A Nat | ..'r) -> Nat = fn a => fn b => 1n";
-    let (_, out) = build_src(src);
-    assert_eq!(out.errors.len(), 1, "{:#?}", out.errors);
-    assert!(
-        matches!(
-            out.errors[0].kind,
-            ErrorKind::MixedTail {
-                first: Sense::Fields,
-                second: Sense::Cases,
-                ..
-            }
-        ),
-        "{:#?}",
-        out.errors
-    );
-    // At the second use's *name*, which is the one thing the writer can change
-    // — and pointing back at the first, which is the other half of what went
-    // wrong and is somewhere else on the page.
-    assert_eq!(
-        out.source.span(out.errors[0].at).start,
-        src.rfind("..'r").expect("the tail") + 2
-    );
-    let ErrorKind::MixedTail { previous, .. } = out.errors[0].kind else {
-        panic!("the clash was just matched");
-    };
-    assert_eq!(
-        out.source.span(previous).start,
-        src.find("..'r").expect("the first tail") + 2
-    );
-
-    // Either order: the row that absorbs is the second one written, whichever
-    // shape that is.
-    let (_, out) =
-        build_src("let f : (#A Nat | ..'r) -> { x: Nat, ..'r } -> Nat = fn a => fn b => 1n");
-    assert_eq!(out.errors.len(), 1, "{:#?}", out.errors);
-    assert!(
-        matches!(
-            out.errors[0].kind,
-            ErrorKind::MixedTail {
-                first: Sense::Cases,
-                second: Sense::Fields,
-                ..
-            }
-        ),
-        "{:#?}",
-        out.errors
-    );
+fn shared_rows_allow_one_tail_name_in_both_shapes() {
+    built("let f : { x: Nat, ..'r } -> (#A Nat | ..'r) -> Nat = fn a => fn b => 1n");
+    built("let f : (#A Nat | ..'r) -> { x: Nat, ..'r } -> Nat = fn a => fn b => 1n");
 
     // Two tails of one shape are what naming one is *for*, and stay one rest.
     let (_, out) = build_src("let f : { x: Nat, ..'r } -> { ..'r } -> Nat = fn a => fn b => 1n");
@@ -3354,7 +3325,7 @@ fn references_of(term: &Term, out: &mut Vec<Symbol>) {
         | TermKind::Fixed(_)
         | TermKind::Real(_)
         | TermKind::String(_)
-        | TermKind::Boolean(_)
+        | TermKind::Bool(_)
         | TermKind::Error => {}
     }
 }
@@ -4235,13 +4206,13 @@ fn an_effect_parameter_stands_for_what_its_operations_use_it_as() {
     assert_eq!(kind("Ask"), ParamKind::Type { lacks: [].into() });
     assert_eq!(
         kind("State"),
-        ParamKind::Fields {
+        ParamKind::Row {
             lacks: ["x".to_string()].into()
         }
     );
     assert_eq!(
         kind("Choose"),
-        ParamKind::Cases {
+        ParamKind::Row {
             lacks: ["A".to_string()].into()
         }
     );
@@ -4283,7 +4254,7 @@ fn an_effect_parameter_stands_for_what_its_operations_use_it_as() {
         error.kind,
         ErrorKind::MixedParameter {
             first: Sense::Type,
-            second: Sense::Cases
+            second: Sense::Row
         }
     ));
 
@@ -4328,8 +4299,8 @@ fn an_effect_argument_is_held_to_its_parameters_reading() {
                 effect Choose 'c = { pick: (#A | ..'c) -> () }\n";
     for (row, sense) in [
         ("!Run Nat", Sense::Effects),
-        ("!State Nat", Sense::Fields),
-        ("!Choose Nat", Sense::Cases),
+        ("!State Nat", Sense::Row),
+        ("!Choose Nat", Sense::Row),
     ] {
         let (_, out) = build_src(&format!("{base}let f : () -> Nat + {row} = fn _ => 0n"));
         assert!(
@@ -5756,11 +5727,8 @@ fn an_undeclared_name_is_undefined_wherever_it_is_used() {
 fn a_declared_variable_takes_its_sort_from_its_uses() {
     for (src, sense) in [
         ("let f : 'a -> 'a = fn x => x", Sense::Type),
-        (
-            "let f : { x: Nat, ..'a } -> Nat = fn p => p.x",
-            Sense::Fields,
-        ),
-        ("let f : (#A Nat | ..'a) -> Nat = fn p => 0n", Sense::Cases),
+        ("let f : { x: Nat, ..'a } -> Nat = fn p => p.x", Sense::Row),
+        ("let f : (#A Nat | ..'a) -> Nat = fn p => 0n", Sense::Row),
         (
             "let f : { x when 'a: Nat } -> Nat = fn p => 0n",
             Sense::Presence,
@@ -5794,7 +5762,7 @@ fn a_declared_variable_takes_its_sort_from_its_uses() {
         [
             ("a", Sense::Presence),
             ("c", Sense::Type),
-            ("b", Sense::Fields)
+            ("b", Sense::Row)
         ]
     );
     let ids: Vec<u32> = annotation.variables.iter().map(|v| v.id).collect();
@@ -5822,14 +5790,14 @@ fn a_declared_variable_takes_its_sort_from_its_uses() {
 fn a_declared_variable_used_at_two_sorts_is_refused() {
     for (src, first, second) in [
         (
-            "let f : { x: Nat, ..'a } -> (#A Nat | ..'a) -> Nat = fn p => fn q => 0n",
-            Sense::Fields,
-            Sense::Cases,
+            "let f : { x: Nat, ..'a } -> 'a = fn p => p",
+            Sense::Row,
+            Sense::Type,
         ),
         (
-            "let f : (#A Nat | ..'a) -> { x: Nat, ..'a } -> Nat = fn p => fn q => 0n",
-            Sense::Cases,
-            Sense::Fields,
+            "let f : 'a -> { x: Nat, ..'a } = fn p => p",
+            Sense::Type,
+            Sense::Row,
         ),
         (
             "let f : { x when 'a: Nat } -> 'a = fn r => r",
@@ -5843,13 +5811,13 @@ fn a_declared_variable_used_at_two_sorts_is_refused() {
         ),
         (
             "let f : (#A Nat | ..'a) -> { x when 'a: Nat } = fn r => r",
-            Sense::Cases,
+            Sense::Row,
             Sense::Presence,
         ),
         (
             "let f : { x when 'a: Nat } -> (#A Nat | ..'a) = fn r => r",
             Sense::Presence,
-            Sense::Cases,
+            Sense::Row,
         ),
     ] {
         let (_, out) = build_src(src);
@@ -5955,7 +5923,7 @@ fn presence_ownership_is_inferred_from_polarity_and_result_boundaries() {
         }
     }
 
-    let source = "let choose : Nat -> Boolean -> { x when 'p: Nat } = fn n => fn b => { x: n }";
+    let source = "let choose : Nat -> Bool -> { x when 'p: Nat } = fn n => fn b => { x: n }";
     let (mint, out) = built(source);
     let annotation = annotation_of(&mint, &out, "choose");
     let PresenceOwnership::Existential { boundary } = annotation.variables[0].ownership else {
@@ -6326,6 +6294,37 @@ fn an_unqualified_name_walks_outward_and_the_inner_one_wins() {
     assert_eq!(names("w"), term_symbol(&mint, &out, "x"));
 }
 
+/// A path beginning with `::` starts at the bundle root instead of walking out
+/// from its lexical scope. The unprefixed spelling keeps the ordinary walk.
+#[test]
+fn an_absolute_path_resolves_from_the_bundle_root() {
+    let src = "module std =\n  module console =\n    let println = 1n\n  end\nend\n\
+               module nested =\n  module std =\n    module console =\n      let println = 2n\n    end\n  end\n\
+  let absolute = ::std::console::println\n\
+  let relative = std::console::println\nend";
+    let (mint, out) = built(src);
+    let named = |path: &str| {
+        out.program
+            .terms
+            .keys()
+            .copied()
+            .find(|symbol| mint.path(*symbol).to_string() == path)
+            .unwrap_or_else(|| panic!("no term at {path}"))
+    };
+    let resolved = |name: &str| {
+        let TermKind::Ident(symbol) = term_value(&mint, &out, name) else {
+            panic!("{name} is not given as a name");
+        };
+        *symbol
+    };
+
+    assert_eq!(resolved("absolute"), named("test::std::console::println"));
+    assert_eq!(
+        resolved("relative"),
+        named("test::nested::std::console::println")
+    );
+}
+
 /// A sibling module's names are not in scope: reaching one unqualified is the
 /// undefined term it is, because the walk goes outward and never sideways.
 #[test]
@@ -6407,9 +6406,9 @@ fn a_repeated_module_is_a_duplicate() {
     assert!(out.errors.is_empty(), "{:#?}", out.errors);
 }
 
-/// A path's first segment resolves by R9's walk, so a segment naming no module
-/// anywhere out to the root is reported as the undefined module it is — at the
-/// segment, not at the name after it.
+/// A relative path's first segment resolves by R9's walk, so a segment naming
+/// no module anywhere out to the root is reported as the undefined module it
+/// is — at the segment, not at the name after it.
 #[test]
 fn an_undefined_first_segment_is_reported_at_the_segment() {
     let src = "let a = Nope::x";
@@ -7853,7 +7852,7 @@ fn recovery_signatures_keep_every_normalized_source_form_structural() {
                effect Alias = !IO\n\
                effect Probe = {\n\
                  record: Record { extra: String } -> (),\n\
-                 choice: Choice (#Other Boolean) -> (),\n\
+                 choice: Choice (#Other Bool) -> (),\n\
                  runner: Runner (!IO) -> (),\n\
                  anonymous: (() -> () + !IO (when _)) -> (),\n\
                  named: (() -> () + !IO (when 'p)) -> (),\n\
@@ -8447,6 +8446,55 @@ fn recovery_row_tails_remain_unknown_in_every_canonical_shape() {
 }
 
 #[test]
+fn shared_rows_keep_structural_effect_identities_equal_to_expanded_types() {
+    let (mint, out) = built(
+        "type Sum 'r = | ..'r\n\
+         type Struct 'r = { ..'r }\n\
+         module Converted =\n\
+           effect Probe = { op: Struct (#A Nat) -> Sum { B: Nat } }\n\
+           effect Empty = { op: Struct (|) -> Sum {} }\n\
+         end\n\
+         module Expanded =\n\
+           effect Probe = { op: { A: Nat } -> (#B Nat) }\n\
+           effect Empty = { op: () -> (|) }\n\
+         end",
+    );
+    for name in ["Probe", "Empty"] {
+        let ids: Vec<_> = out
+            .program
+            .effect_ids
+            .iter()
+            .filter(|(symbol, _)| mint.name(**symbol) == name)
+            .map(|(_, identity)| identity)
+            .collect();
+        assert_eq!(ids.len(), 2);
+        assert_eq!(ids[0], ids[1], "{name} did not extract the row");
+    }
+}
+
+#[test]
+fn shared_rows_normalize_nested_effect_arguments_in_structural_identities() {
+    let (mint, out) = built(
+        "effect Choose 'r = { choose: { ..'r } -> (| ..'r) }\n\
+         module Record =\n\
+           effect Probe = { run: (() -> () + !Choose { X: Nat }) -> () }\n\
+         end\n\
+         module Sum =\n\
+           effect Probe = { run: (() -> () + !Choose (#X Nat)) -> () }\n\
+         end",
+    );
+    let ids: Vec<_> = out
+        .program
+        .effect_ids
+        .iter()
+        .filter(|(symbol, _)| mint.name(**symbol) == "Probe")
+        .map(|(_, identity)| identity)
+        .collect();
+    assert_eq!(ids.len(), 2);
+    assert_eq!(ids[0], ids[1]);
+}
+
+#[test]
 fn canonicalization_substitutes_struct_sum_and_effect_row_tails() {
     let src = "type Record 'r = { x: Nat, ..'r }\n\
                type Cases 'r = #X | ..'r\n\
@@ -8571,7 +8619,7 @@ fn imported_structural_identity_respects_effect_and_case_parameter_senses() {
         ),
         declared(
             "Cases",
-            vec![parameter(a::Sense::Cases)],
+            vec![parameter(a::Sense::Row)],
             1,
             a::Type::Sum(a::Row {
                 labels: Vec::new(),
@@ -8774,7 +8822,7 @@ fn structural_rows_mask_inner_duplicates_and_preserve_ordinary_separator_labels(
                 declared(
                     "Mask",
                     vec![a::Parameter {
-                        sense: a::Sense::Cases,
+                        sense: a::Sense::Row,
                         lacks: vec!["X".into()],
                         relevant: true,
                     }],
@@ -9298,7 +9346,7 @@ fn imported_declared_types_exercise_every_semantic_identity_form() {
     let mut types = vec![
         declared("Int", artifact_type(a::Type::Int)),
         declared("Real", artifact_type(a::Type::Real)),
-        declared("Boolean", artifact_type(a::Type::Boolean)),
+        declared("Bool", artifact_type(a::Type::Bool)),
         declared("Var", artifact_type(a::Type::Var(7))),
         declared(
             "Rigid",
@@ -9313,7 +9361,7 @@ fn imported_declared_types_exercise_every_semantic_identity_form() {
             "Arrow",
             artifact_type(a::Type::Arrow(
                 Box::new(artifact_type(a::Type::Int)),
-                Box::new(artifact_type(a::Type::Boolean)),
+                Box::new(artifact_type(a::Type::Bool)),
                 a::Row {
                     labels: vec![(
                         "IO\u{1f}run:{}->{}".into(),
@@ -9400,7 +9448,7 @@ fn imported_declared_types_exercise_every_semantic_identity_form() {
         },
     };
     let src = "effect Probe = { inspect: {\n\
-                 int: dep::Int, real: dep::Real, boolean: dep::Boolean,\n\
+                 int: dep::Int, real: dep::Real, boolean: dep::Bool,\n\
                  variable: dep::Var, rigid: dep::Rigid, unknown: dep::Undecided,\n\
                  bound: dep::Bound, arrow: dep::Arrow,\n\
                  fields: dep::Fields, presences: dep::RowPresences,\n\
@@ -9648,7 +9696,7 @@ fn dependency_interfaces_import_every_semantic_form() {
         ("int", a::Type::Int),
         ("real", a::Type::Real),
         ("string", a::Type::String),
-        ("boolean", a::Type::Boolean),
+        ("boolean", a::Type::Bool),
         ("var", a::Type::Var(0)),
         ("bound", a::Type::Bound(0)),
         ("undecided", a::Type::Undecided),
@@ -9769,7 +9817,7 @@ fn dependency_interfaces_import_every_semantic_form() {
                             relevant: true,
                         },
                         a::Parameter {
-                            sense: a::Sense::Cases,
+                            sense: a::Sense::Row,
                             lacks: Vec::new(),
                             relevant: false,
                         },
@@ -9852,7 +9900,7 @@ fn dependency_interfaces_import_every_semantic_form() {
                     metadata: Default::default(),
                     name: "dep@1.0.0::StructBound".into(),
                     params: vec![a::Parameter {
-                        sense: a::Sense::Fields,
+                        sense: a::Sense::Row,
                         lacks: Vec::new(),
                         relevant: true,
                     }],
@@ -9912,7 +9960,7 @@ fn dependency_interfaces_import_every_semantic_form() {
                     metadata: Default::default(),
                     name: "dep@1.0.0::RowLoop".into(),
                     params: vec![a::Parameter {
-                        sense: a::Sense::Fields,
+                        sense: a::Sense::Row,
                         lacks: Vec::new(),
                         relevant: true,
                     }],
@@ -9951,7 +9999,7 @@ fn dependency_interfaces_import_every_semantic_form() {
                     // One fields parameter, which the `bound` operation's row
                     // ends in.
                     params: vec![a::Parameter {
-                        sense: a::Sense::Fields,
+                        sense: a::Sense::Row,
                         lacks: Vec::new(),
                         relevant: true,
                     }],
@@ -10217,7 +10265,7 @@ fn extern_boundary_metadata_keeps_source_anchors_after_resolution() {
 fn extern_abi_retains_resolved_arity_callback_nesting_and_effects() {
     let (_, output) = build_src(
         "effect Log = { write: () -> () }\n\
-         extern schedule : fn((fn(Nat, String) -> Boolean + !Log), Nat) -> (fn() -> String) + !Log = \"host.schedule\"",
+         extern schedule : fn((fn(Nat, String) -> Bool + !Log), Nat) -> (fn() -> String) + !Log = \"host.schedule\"",
     );
     assert!(output.errors.is_empty(), "{:#?}", output.errors);
     let external = &output.program.externs.first().unwrap().1.value;
@@ -10301,7 +10349,7 @@ fn externs_accept_every_annotation_type() {
 }
 
 #[test]
-fn struct_tails_are_field_rows_and_only_accept_struct_rows() {
+fn struct_tails_accept_rows_and_reject_whole_types() {
     let (mint, out) = built(
         "type WithX 'r = { x: Nat, ..'r }\n\
          type Plain = { y: Nat }\n\
@@ -10321,10 +10369,10 @@ fn struct_tails_are_field_rows_and_only_accept_struct_rows() {
     let with_x = type_symbol(&mint, &out, "WithX");
     assert!(matches!(
         out.program.types[&with_x].params[0].kind,
-        ParamKind::Fields { .. }
+        ParamKind::Row { .. }
     ));
 
-    for argument in ["Nat", "(Nat -> Nat)", "(#A | #B)"] {
+    for argument in ["Nat", "(Nat -> Nat)"] {
         let (_, out) = build_src(&format!(
             "type WithX 'r = {{ x: Nat, ..'r }}\ntype Bad = WithX {argument}"
         ));
@@ -10333,9 +10381,7 @@ fn struct_tails_are_field_rows_and_only_accept_struct_rows() {
         };
         assert!(matches!(
             error.kind,
-            ErrorKind::NotARow {
-                sense: Sense::Fields
-            }
+            ErrorKind::NotARow { sense: Sense::Row }
         ));
     }
 
@@ -10355,7 +10401,7 @@ fn struct_tails_are_field_rows_and_only_accept_struct_rows() {
         error.kind,
         ErrorKind::MixedParameter {
             first: Sense::Type,
-            second: Sense::Fields
+            second: Sense::Row
         }
     ));
 }
@@ -10418,7 +10464,7 @@ fn forwarding_rows_artifact(include_cycle: bool) -> a::UncheckedArtifact {
             metadata: Default::default(),
             name: "dep@1.0.0::Id".into(),
             params: vec![a::Parameter {
-                sense: a::Sense::Fields,
+                sense: a::Sense::Row,
                 lacks: Vec::new(),
                 relevant: true,
             }],
@@ -10495,7 +10541,7 @@ fn forwarding_rows_artifact(include_cycle: bool) -> a::UncheckedArtifact {
             metadata: Default::default(),
             name: "dep@1.0.0::GenericUnknown".into(),
             params: vec![a::Parameter {
-                sense: a::Sense::Fields,
+                sense: a::Sense::Row,
                 lacks: Vec::new(),
                 relevant: false,
             }],
@@ -10514,7 +10560,7 @@ fn forwarding_rows_artifact(include_cycle: bool) -> a::UncheckedArtifact {
             metadata: Default::default(),
             name: "dep@1.0.0::Twice".into(),
             params: vec![a::Parameter {
-                sense: a::Sense::Fields,
+                sense: a::Sense::Row,
                 lacks: Vec::new(),
                 relevant: true,
             }],
@@ -10539,7 +10585,7 @@ fn forwarding_rows_artifact(include_cycle: bool) -> a::UncheckedArtifact {
             metadata: Default::default(),
             name: "dep@1.0.0::Chain".into(),
             params: vec![a::Parameter {
-                sense: a::Sense::Fields,
+                sense: a::Sense::Row,
                 lacks: Vec::new(),
                 relevant: true,
             }],
@@ -10567,7 +10613,7 @@ fn forwarding_rows_artifact(include_cycle: bool) -> a::UncheckedArtifact {
                     relevant: false,
                 },
                 a::Parameter {
-                    sense: a::Sense::Fields,
+                    sense: a::Sense::Row,
                     lacks: Vec::new(),
                     relevant: true,
                 },
@@ -10590,7 +10636,7 @@ fn forwarding_rows_artifact(include_cycle: bool) -> a::UncheckedArtifact {
             metadata: Default::default(),
             name: "dep@1.0.0::WithX".into(),
             params: vec![a::Parameter {
-                sense: a::Sense::Fields,
+                sense: a::Sense::Row,
                 lacks: vec!["x".into()],
                 relevant: true,
             }],
@@ -10618,7 +10664,7 @@ fn forwarding_rows_artifact(include_cycle: bool) -> a::UncheckedArtifact {
             metadata: Default::default(),
             name: "dep@1.0.0::MaybeX".into(),
             params: vec![a::Parameter {
-                sense: a::Sense::Fields,
+                sense: a::Sense::Row,
                 lacks: vec!["x".into()],
                 relevant: true,
             }],
@@ -10646,7 +10692,7 @@ fn forwarding_rows_artifact(include_cycle: bool) -> a::UncheckedArtifact {
             metadata: Default::default(),
             name: "dep@1.0.0::AbsentX".into(),
             params: vec![a::Parameter {
-                sense: a::Sense::Fields,
+                sense: a::Sense::Row,
                 lacks: vec!["x".into()],
                 relevant: true,
             }],
@@ -10687,7 +10733,7 @@ fn forwarding_rows_artifact(include_cycle: bool) -> a::UncheckedArtifact {
                 metadata: Default::default(),
                 name: "dep@1.0.0::BrokenSlot".into(),
                 params: vec![a::Parameter {
-                    sense: a::Sense::Fields,
+                    sense: a::Sense::Row,
                     lacks: Vec::new(),
                     relevant: true,
                 }],
@@ -10748,7 +10794,7 @@ fn case_rows_artifact() -> a::UncheckedArtifact {
             metadata: Default::default(),
             name: "dep@1.0.0::AddB".into(),
             params: vec![a::Parameter {
-                sense: a::Sense::Cases,
+                sense: a::Sense::Row,
                 lacks: vec!["B".into()],
                 relevant: true,
             }],
@@ -10782,7 +10828,7 @@ fn case_rows_artifact() -> a::UncheckedArtifact {
                     relevant: false,
                 },
                 a::Parameter {
-                    sense: a::Sense::Cases,
+                    sense: a::Sense::Row,
                     lacks: vec!["B".into()],
                     relevant: true,
                 },
@@ -11351,7 +11397,7 @@ fn a_finite_imported_rotation_longer_than_256_states_remains_exact() {
     };
     dependency.header.types = std::iter::once(rotate)
         .chain(ring("StringRing", a::Type::String))
-        .chain(ring("BooleanRing", a::Type::Boolean))
+        .chain(ring("BooleanRing", a::Type::Bool))
         .chain([
             alias("Strings", "StringRing"),
             alias("Booleans", "BooleanRing"),
@@ -11782,7 +11828,7 @@ fn forwarded_field_addition_respects_outer_absent_shadowing() {
         metadata: Default::default(),
         name: "dep@1.0.0::Shadow".into(),
         params: vec![a::Parameter {
-            sense: a::Sense::Fields,
+            sense: a::Sense::Row,
             lacks: Vec::new(),
             relevant: true,
         }],
@@ -11870,7 +11916,7 @@ fn deep_field_summary_artifact(depth: usize, cycle: bool) -> a::UncheckedArtifac
                 Vec::new()
             } else {
                 vec![a::Parameter {
-                    sense: a::Sense::Fields,
+                    sense: a::Sense::Row,
                     lacks: vec!["z".into()],
                     relevant: true,
                 }]
@@ -13163,12 +13209,9 @@ fn deep_imported_field_summaries_are_stack_safe_when_unused_and_used() {
             let mut mint = dummy_mint();
             let used = build_with_dependencies(&mut mint, parsed.stmts, &[checked(dependency)]);
             assert!(
-                used.errors.iter().any(|error| matches!(
-                    error.kind,
-                    ErrorKind::NotARow {
-                        sense: Sense::Fields
-                    }
-                )),
+                used.errors
+                    .iter()
+                    .any(|error| matches!(error.kind, ErrorKind::NotARow { sense: Sense::Row })),
                 "{:#?}",
                 used.errors
             );
@@ -13233,7 +13276,7 @@ fn malformed_imported_alias_cycles_are_absorbed_without_recursing() {
                         if matches!(
                             cycle.kind,
                             ErrorKind::NotARow {
-                                sense: Sense::Fields
+                                sense: Sense::Row
                             }
                         ) && matches!(
                             &missing.kind,
@@ -13271,7 +13314,7 @@ fn imported_struct_aliases_are_valid_field_row_arguments() {
             metadata: Default::default(),
             name: "dep@1.0.0::Fields".into(),
             params: vec![a::Parameter {
-                sense: a::Sense::Fields,
+                sense: a::Sense::Row,
                 lacks: Vec::new(),
                 relevant: true,
             }],
@@ -13293,7 +13336,7 @@ fn imported_struct_aliases_are_valid_field_row_arguments() {
             metadata: Default::default(),
             name: "dep@1.0.0::IdentityRow".into(),
             params: vec![a::Parameter {
-                sense: a::Sense::Fields,
+                sense: a::Sense::Row,
                 lacks: Vec::new(),
                 relevant: true,
             }],
@@ -13312,7 +13355,7 @@ fn imported_struct_aliases_are_valid_field_row_arguments() {
             metadata: Default::default(),
             name: "dep@1.0.0::ForwardRow".into(),
             params: vec![a::Parameter {
-                sense: a::Sense::Fields,
+                sense: a::Sense::Row,
                 lacks: Vec::new(),
                 relevant: true,
             }],
@@ -13397,7 +13440,7 @@ fn imported_struct_aliases_are_valid_field_row_arguments() {
             metadata: Default::default(),
             name: "dep@1.0.0::Pass".into(),
             params: vec![a::Parameter {
-                sense: a::Sense::Fields,
+                sense: a::Sense::Row,
                 lacks: Vec::new(),
                 relevant: true,
             }],
@@ -13505,7 +13548,7 @@ fn imported_struct_aliases_are_valid_field_row_arguments() {
     let out = build_with_dependencies(&mut mint, parsed.stmts, &[checked(dependency.clone())]);
     assert!(out.errors.is_empty(), "{:#?}", out.errors);
 
-    for argument in ["dep::Cases", "dep::Cycle", "dep::Nat"] {
+    for argument in ["dep::Cycle", "dep::Nat"] {
         let parsed = parse::parse(
             lex(
                 &format!("type WithX 'r = {{ x: Nat, ..'r }}\ntype Bad = WithX {argument}"),
@@ -13518,7 +13561,7 @@ fn imported_struct_aliases_are_valid_field_row_arguments() {
         assert!(
             matches!(
                 out.errors.as_slice(),
-                [error] if matches!(error.kind, ErrorKind::NotARow { sense: Sense::Fields })
+                [error] if matches!(error.kind, ErrorKind::NotARow { sense: Sense::Row })
             ),
             "{argument}: {:#?}",
             out.errors

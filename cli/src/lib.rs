@@ -34,7 +34,7 @@ mod git;
 pub use git::{LOCKFILE, LockedGit, LockedSelector, Lockfile, ruddy_home};
 
 const MANIFEST: &str = "Ruddy.toml";
-const ROOT: &str = "main.rud";
+const ROOT: &str = "src/main.rud";
 pub const DEFAULT_STD_GIT: &str = "https://github.com/logan-gatlin/ruddy.git";
 
 const GITIGNORE: &str = ".gitignore";
@@ -435,10 +435,17 @@ pub fn new_project(path: impl AsRef<Path>) -> Result<(), CliError> {
 
     let manifest = path.join(MANIFEST);
     let root = path.join(ROOT);
+    let source_directory = root.parent().expect("the root has a parent");
+    fs::create_dir(source_directory).map_err(|error| {
+        CliError::one(format!(
+            "could not create source directory {}: {error}",
+            source_directory.display()
+        ))
+    })?;
     write_new_file(
         &manifest,
         &format!(
-            "name = {name:?}\nversion = {INITIAL_VERSION:?}\nkind = \"executable\"\nroot = \"main.rud\"\ntarget = \"js\"\n\n[dependencies]\n"
+            "name = {name:?}\nversion = {INITIAL_VERSION:?}\nkind = \"executable\"\nroot = {ROOT:?}\ntarget = \"js\"\n\n[dependencies]\n"
         ),
     )?;
     write_new_file(&root, "let main = fn _ => ()\n")?;

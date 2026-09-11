@@ -661,7 +661,7 @@ impl Solve<'_> {
             | Ty::Fixed(_)
             | Ty::Real
             | Ty::String
-            | Ty::Boolean
+            | Ty::Bool
             | Ty::Any
             | Ty::ForeignValue
             | Ty::Arrow(..)
@@ -735,7 +735,7 @@ impl Solve<'_> {
             | Ty::Fixed(_)
             | Ty::Real
             | Ty::String
-            | Ty::Boolean
+            | Ty::Bool
             | Ty::Any
             | Ty::ForeignValue
             | Ty::Arrow(..)
@@ -1016,7 +1016,7 @@ impl Solve<'_> {
                                 Ty::Fixed(kind) => values.push(tagged(30, [*kind as u64])),
                                 Ty::Real => values.push(tagged(2, [])),
                                 Ty::String => values.push(tagged(3, [])),
-                                Ty::Boolean => values.push(tagged(4, [])),
+                                Ty::Bool => values.push(tagged(4, [])),
                                 Ty::Any => values.push(tagged(50, [])),
                                 Ty::ForeignValue => values.push(tagged(51, [])),
                                 Ty::Var(var) | Ty::Bound(var) => {
@@ -1732,6 +1732,21 @@ impl Solve<'_> {
         for (position, (left, right)) in positions.into_iter().enumerate() {
             let before = self.errors.len();
             let first_reason = self.table.next_reason();
+            let shared_row = self
+                .table
+                .signatures
+                .effect_kinds
+                .get(label)
+                .and_then(|kinds| kinds.get(position))
+                .is_some_and(|kind| kind.sense() == Sense::Row);
+            let (left, right) = if shared_row {
+                (
+                    self.row_argument(span, &left),
+                    self.row_argument(span, &right),
+                )
+            } else {
+                (left, right)
+            };
             self.unify(span, &left, &right);
             // Every reason minted making this position agree is one a later
             // failure may descend from; see [`Table::effect_argument_reasons`].
@@ -1748,6 +1763,24 @@ impl Solve<'_> {
                 error
                     .kind
                     .as_effect_argument(effect.clone(), position as u32);
+            }
+        }
+    }
+
+    /// Compare shared-row arguments through a common struct wrapper. This is
+    /// only used at a declared row position; ordinary sum and struct values
+    /// still enter type unification with their own constructors.
+    fn row_argument(&mut self, span: Anchor, argument: &Arc<Ty>) -> Arc<Ty> {
+        let mut argument = self.table.resolve(argument);
+        loop {
+            let exposed = super::unfold(self.aliases, &argument);
+            if !Arc::ptr_eq(&argument, &exposed) {
+                self.table.note_lacks(&exposed);
+            }
+            match &*exposed {
+                Ty::Package(_) => argument = self.table.open_package(span, &exposed),
+                Ty::Sum(row) => return Arc::new(Ty::Struct(row.clone())),
+                _ => return exposed,
             }
         }
     }
@@ -2058,7 +2091,7 @@ impl Solve<'_> {
                         | (Ty::Int, Ty::Int)
                         | (Ty::Real, Ty::Real)
                         | (Ty::String, Ty::String)
-                        | (Ty::Boolean, Ty::Boolean)
+                        | (Ty::Bool, Ty::Bool)
                         | (Ty::Any, Ty::Any)
                         | (Ty::ForeignValue, Ty::ForeignValue) => {
                             self.step(span, Rule::Prim, goal, Effect::None);
@@ -2414,7 +2447,7 @@ impl Solve<'_> {
                         | Ty::Fixed(_)
                         | Ty::Real
                         | Ty::String
-                        | Ty::Boolean
+                        | Ty::Bool
                         | Ty::Any
                         | Ty::ForeignValue
                         | Ty::Var(_)
@@ -3674,7 +3707,7 @@ impl Solve<'_> {
                     | Ty::Fixed(_)
                     | Ty::Real
                     | Ty::String
-                    | Ty::Boolean
+                    | Ty::Bool
                     | Ty::Any
                     | Ty::ForeignValue
                     | Ty::Bound(_)
@@ -3898,8 +3931,8 @@ impl Solve<'_> {
 /// sense rides along so the wording can follow it.
 fn rest_found(row: &Row, shape: Shape) -> (Sense, Arc<Ty>) {
     match shape {
-        Shape::Struct => (Sense::Fields, Arc::new(Ty::plain(Ty::Struct(row.clone())))),
-        Shape::Sum => (Sense::Cases, Arc::new(Ty::plain(Ty::Sum(row.clone())))),
+        Shape::Struct => (Sense::Row, Arc::new(Ty::plain(Ty::Struct(row.clone())))),
+        Shape::Sum => (Sense::Row, Arc::new(Ty::plain(Ty::Sum(row.clone())))),
         Shape::Effect => (Sense::Effects, row_ty(row)),
     }
 }

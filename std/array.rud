@@ -6,3 +6,185 @@ extern concat: ['a] -> ['a] -> ['a] = "$arrayConcat"
 extern slice: ['a] -> Nat -> Nat -> Option ['a] = "$arraySlice"
 extern prepend: ['a] -> 'a -> ['a] = "$arrayPrepend"
 extern pop: ['a] -> Option ('a, ['a]) = "$arrayPop"
+
+let map: ('a -> 'b + ..'effects) -> ['a] -> ['b] + ..'effects =
+  fn function values => match values with
+  | [] => []
+  | [head, ..tail] => [function head, ..map function tail]
+  end
+
+let fold:
+  ('state -> 'a -> 'state + ..'effects) -> 'state -> ['a] -> 'state + ..'effects =
+  fn step state values => match values with
+  | [] => state
+  | [head, ..tail] => fold step (step state head) tail
+  end
+
+let fold_right:
+  ('a -> 'state -> 'state + ..'effects) -> 'state -> ['a] -> 'state + ..'effects =
+  fn step state values => match values with
+  | [] => state
+  | [head, ..tail] => step head (fold_right step state tail)
+  end
+
+let filter: ('a -> Bool + ..'effects) -> ['a] -> ['a] + ..'effects =
+  fn predicate values => match values with
+  | [] => []
+  | [head, ..tail] =>
+    if predicate head then [head, ..filter predicate tail] else filter predicate tail end
+  end
+
+let filter_map: ('a -> Option 'b + ..'effects) -> ['a] -> ['b] + ..'effects =
+  fn function values => match values with
+  | [] => []
+  | [head, ..tail] =>
+    match function head with
+    | #Some value => [value, ..filter_map function tail]
+    | #None => filter_map function tail
+    end
+  end
+
+let flat_map: ('a -> ['b] + ..'effects) -> ['a] -> ['b] + ..'effects =
+  fn function values => match values with
+  | [] => []
+  | [head, ..tail] => [..function head, ..flat_map function tail]
+  end
+
+let find: ('a -> Bool + ..'effects) -> ['a] -> Option 'a + ..'effects =
+  fn predicate values => match values with
+  | [] => #None
+  | [head, ..tail] => if predicate head then #Some head else find predicate tail end
+  end
+
+@private
+let find_index_from:
+  ('a -> Bool + ..'effects) -> Nat -> ['a] -> Option Nat + ..'effects =
+  fn predicate index values => match values with
+  | [] => #None
+  | [head, ..tail] =>
+    if predicate head then #Some index
+    else find_index_from predicate (nat::add index 1n) tail
+    end
+  end
+
+let find_index: ('a -> Bool + ..'effects) -> ['a] -> Option Nat + ..'effects =
+  fn predicate values => find_index_from predicate 0n values
+
+let any: ('a -> Bool + ..'effects) -> ['a] -> Bool + ..'effects =
+  fn predicate values => match values with
+  | [] => false
+  | [head, ..tail] => predicate head or any predicate tail
+  end
+
+let all: ('a -> Bool + ..'effects) -> ['a] -> Bool + ..'effects =
+  fn predicate values => match values with
+  | [] => true
+  | [head, ..tail] => predicate head and all predicate tail
+  end
+
+let reverse: ['a] -> ['a] = fn values =>
+  fold (fn reversed value => prepend reversed value) [] values
+
+let zip: ['a] -> ['b] -> [('a, 'b)] = fn left right => match (left, right) with
+| ([left_head, ..left_tail], [right_head, ..right_tail]) =>
+  [(left_head, right_head), ..zip left_tail right_tail]
+| _ => []
+end
+
+@private
+let enumerate_from: Nat -> ['a] -> [(Nat, 'a)] = fn index values => match values with
+| [] => []
+| [head, ..tail] => [(index, head), ..enumerate_from (nat::add index 1n) tail]
+end
+
+let enumerate: ['a] -> [(Nat, 'a)] = fn values => enumerate_from 0n values
+
+@private
+let partition_onto:
+  ('a -> Bool + ..'effects)
+  -> ['a]
+  -> ['a]
+  -> ['a]
+  -> (['a], ['a]) + ..'effects =
+  fn predicate selected rejected values => match values with
+  | [] => (reverse selected, reverse rejected)
+  | [head, ..tail] =>
+    if predicate head then partition_onto predicate (prepend selected head) rejected tail
+    else partition_onto predicate selected (prepend rejected head) tail
+    end
+  end
+
+let partition: ('a -> Bool + ..'effects) -> ['a] -> (['a], ['a]) + ..'effects =
+  fn predicate values => partition_onto predicate [] [] values
+
+let reduce: ('a -> 'a -> 'a + ..'effects) -> ['a] -> Option 'a + ..'effects =
+  fn step values => match values with
+  | [] => #None
+  | [head, ..tail] => #Some (fold step head tail)
+  end
+
+let traverse_option:
+  ('a -> Option 'b + ..'effects) -> ['a] -> Option ['b] + ..'effects =
+  fn function values => match values with
+  | [] => #Some []
+  | [head, ..tail] =>
+    match function head with
+    | #Some value =>
+      match traverse_option function tail with
+      | #Some rest => #Some [value, ..rest]
+      | #None => #None
+      end
+    | #None => #None
+    end
+  end
+
+let traverse_result:
+  ('a -> Result 'b 'failure + ..'effects)
+  -> ['a]
+  -> Result ['b] 'failure + ..'effects =
+  fn function values => match values with
+  | [] => #Some []
+  | [head, ..tail] =>
+    match function head with
+    | #Some value =>
+      match traverse_result function tail with
+      | #Some rest => #Some [value, ..rest]
+      | #Error failure => #Error failure
+      end
+    | #Error failure => #Error failure
+    end
+  end
+
+let try_fold_option:
+  ('state -> 'a -> Option 'state + ..'effects)
+  -> 'state
+  -> ['a]
+  -> Option 'state + ..'effects =
+  fn step state values => match values with
+  | [] => #Some state
+  | [head, ..tail] =>
+    match step state head with
+    | #Some next => try_fold_option step next tail
+    | #None => #None
+    end
+  end
+
+let try_fold_result:
+  ('state -> 'a -> Result 'state 'failure + ..'effects)
+  -> 'state
+  -> ['a]
+  -> Result 'state 'failure + ..'effects =
+  fn step state values => match values with
+  | [] => #Some state
+  | [head, ..tail] =>
+    match step state head with
+    | #Some next => try_fold_result step next tail
+    | #Error failure => #Error failure
+    end
+  end
+
+let sequence_option: [Option 'a] -> Option ['a] =
+  fn values => traverse_option (fn value => value) values
+
+let sequence_result: [Result 'a 'failure] -> Result ['a] 'failure =
+  fn values => traverse_result (fn value => value) values

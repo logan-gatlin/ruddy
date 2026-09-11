@@ -53,6 +53,15 @@ args = ["lsp"]
 name = "ruddy"
 roots = ["Ruddy.toml"]
 language-servers = ["ruddy"]
+
+# Ruddy uses ' as its ML-style type-parameter prefix, not as a delimiter.
+[language.auto-pairs]
+'(' = ')'
+'{' = '}'
+'[' = ']'
+'"' = '"'
+'`' = '`'
+'<' = '>'
 ```
 
 The server analyzes the current buffer with recovery, prioritizes active-file
@@ -86,7 +95,7 @@ kind must have no escaping effects.
 name = "hello"
 version = "0.1.0"
 kind = "executable"
-root = "main.rud"
+root = "src/main.rud"
 target = "js"
 
 [dependencies]
@@ -94,7 +103,7 @@ target = "js"
 
 ```text
 let main = fn _ => do
-  _ = std::console::print "Hello!"
+  _ = std::io::print "Hello!"
   return ()
 end
 ```
@@ -109,15 +118,17 @@ Generated executable JS calls `main` once under the Node runtime handlers.
 Run it with `ruddy run` or directly with Node. `run` requires an executable
 targeting JS; `[run].js` can configure the launch command.
 
-The runtime handles `std::Console.write` and `write_error` (`String -> ()`),
-which write to stdout and stderr without adding a newline, and
-`std::Process.exit` (`Nat -> Never`). The corresponding `console::print` and
-`print_error` helpers append a newline. `process::exit` saturates its code to
+The runtime handles `std::io::IO.write` and `write_error` (`String -> ()`),
+also available through the prelude alias `IO`. They write to stdout and
+stderr without adding a newline, and `std::Process.exit` (`Nat -> Never`). The
+corresponding `io::println` and `eprintln` helpers append a newline.
+`process::exit` saturates its code to
 255, never resumes, and drains pending console output before termination.
 Normal return exits successfully.
 
-The Node runtime also handles `std::FileSystem`, exposed through `std::fs`.
-It provides whole-file UTF-8 and binary reads, writes and appends, existence checks,
+The Node runtime also handles `std::fs::FileSystem`, also available through the
+prelude alias `FileSystem`. The `std::fs` module provides whole-file UTF-8 and binary
+reads, writes and appends, existence checks,
 directory listings and creation, metadata, file and empty-directory removal,
 rename, and copy. Operations may suspend and return `Result` values; callers
 need no `await`. See [the filesystem module](docs/fs.md) for its signatures
@@ -129,8 +140,8 @@ they were declared. Std can still be overridden or disabled with `std = false`;
 a pure executable needs no std dependency.
 
 When a JavaScript root bundle is built, its public values receive host-callable
-adapters. On Node, exported functions run under the Console, Process, and
-FileSystem handlers, including aliases imported from std. Both `check` and
+adapters. On Node, exported functions run under the IO, Process, and FileSystem
+handlers, including aliases imported from std. Both `check` and
 `build` reject exports whose effects cannot be handled. Dependency artifacts,
 private definitions, and internal Ruddy calls retain their effect interfaces;
 local handlers can still intercept them. See [host exports](docs/cps.md#library-exports-and-initialization).

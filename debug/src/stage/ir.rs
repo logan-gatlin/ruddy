@@ -266,8 +266,8 @@ fn term_node(ids: &mut Ids, cx: &Cx, mint: &Mint, term: &Term, trace: &mut Trace
             label: "String".into(),
             ..node
         },
-        TermKind::Boolean(_) => Node {
-            label: "Boolean".into(),
+        TermKind::Bool(_) => Node {
+            label: "Bool".into(),
             ..node
         },
         TermKind::Array(items) => Node {
@@ -650,8 +650,8 @@ fn pattern_node(ids: &mut Ids, cx: &Cx, mint: &Mint, pattern: &Pattern) -> Node 
             label: "String".into(),
             ..node
         },
-        PatternKind::Boolean(_) => Node {
-            label: "Boolean".into(),
+        PatternKind::Bool(_) => Node {
+            label: "Bool".into(),
             ..node
         },
         PatternKind::Unit => Node {
@@ -785,7 +785,7 @@ fn annotation_node(ids: &mut Ids, cx: &Cx, mint: &Mint, annotation: &Annotation)
 fn stands_for_variable(variable: &Variable) -> String {
     let written = match variable.sense {
         Sense::Type | Sense::Region => format!("'{}", variable.name),
-        Sense::Fields | Sense::Cases | Sense::Effects => format!("..'{}", variable.name),
+        Sense::Row | Sense::Effects => format!("..'{}", variable.name),
         Sense::Presence => format!("when '{}", variable.name),
     };
     format!("{written} ({})", variable.sense)

@@ -1,0 +1,94 @@
+type Order = #Less | #Equal | #Greater
+type Ordering 't = 't -> 't -> Order
+
+type Comparisons 't = {
+  equal: 't -> 't -> Bool,
+  not_equal: 't -> 't -> Bool,
+  less_than: 't -> 't -> Bool,
+  less_than_or_equal: 't -> 't -> Bool,
+  greater_than: 't -> 't -> Bool,
+  greater_than_or_equal: 't -> 't -> Bool,
+}
+
+let derive: Ordering 't -> Comparisons 't = fn ordering => {
+  equal: fn left right => match ordering left right with
+  | #Equal => true
+  | _ => false
+  end,
+  not_equal: fn left right => match ordering left right with
+  | #Equal => false
+  | _ => true
+  end,
+  less_than: fn left right => match ordering left right with
+  | #Less => true
+  | _ => false
+  end,
+  less_than_or_equal: fn left right => match ordering left right with
+  | #Greater => false
+  | _ => true
+  end,
+  greater_than: fn left right => match ordering left right with
+  | #Greater => true
+  | _ => false
+  end,
+  greater_than_or_equal: fn left right => match ordering left right with
+  | #Less => false
+  | _ => true
+  end,
+}
+
+let reverse: Order -> Order = fn value => match value with
+| #Less => #Greater
+| #Equal => #Equal
+| #Greater => #Less
+end
+
+let is_less: Order -> Bool = fn value => match value with
+| #Less => true
+| _ => false
+end
+
+let is_equal: Order -> Bool = fn value => match value with
+| #Equal => true
+| _ => false
+end
+
+let is_greater: Order -> Bool = fn value => match value with
+| #Greater => true
+| _ => false
+end
+
+let compare_by:
+  ('b -> 'b -> Order + ..'effects)
+  -> ('a -> 'b + ..'effects)
+  -> 'a
+  -> 'a
+  -> Order + ..'effects =
+  fn comparator project left right => comparator (project left) (project right)
+
+let reverse_compare: ('a -> 'a -> Order + ..'effects) -> 'a -> 'a -> Order + ..'effects =
+  fn comparator left right => reverse (comparator left right)
+
+let then_compare:
+  ('a -> 'a -> Order + ..'effects)
+  -> ('a -> 'a -> Order + ..'effects)
+  -> 'a
+  -> 'a
+  -> Order + ..'effects =
+  fn first second left right => match first left right with
+  | #Less => #Less
+  | #Equal => second left right
+  | #Greater => #Greater
+  end
+
+let min_by: ('a -> 'a -> Order + ..'effects) -> 'a -> 'a -> 'a + ..'effects =
+  fn comparator left right => match comparator left right with
+  | #Greater => right
+  | _ => left
+  end
+
+let max_by: ('a -> 'a -> Order + ..'effects) -> 'a -> 'a -> 'a + ..'effects =
+  fn comparator left right => match comparator left right with
+  | #Less => right
+  | _ => left
+  end

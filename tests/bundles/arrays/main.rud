@@ -14,7 +14,7 @@ let slice_or: [ForeignValue] -> Nat -> Nat -> [ForeignValue] = fn arr from to =>
   | #Some part => part
   | #None => []
 end
-let slice_ok: [ForeignValue] -> Nat -> Nat -> Boolean = fn arr from to => match std::array::slice arr from to with
+let slice_ok: [ForeignValue] -> Nat -> Nat -> Bool = fn arr from to => match std::array::slice arr from to with
   | #Some _ => true
   | #None => false
 end
@@ -26,7 +26,7 @@ let pop_rest: [ForeignValue] -> [ForeignValue] = fn arr => match std::array::pop
   | #Some (_, rest) => rest
   | #None => arr
 end
-let pop_ok: [ForeignValue] -> Boolean = fn arr => match std::array::pop arr with
+let pop_ok: [ForeignValue] -> Bool = fn arr => match std::array::pop arr with
   | #Some _ => true
   | #None => false
 end

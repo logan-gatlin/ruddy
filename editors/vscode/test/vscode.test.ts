@@ -33,7 +33,7 @@ export async function run(): Promise<void> {
   assert.equal(vscode.workspace.isTrusted, true);
   for (const [index, document] of documents.entries()) {
     const hovers = await eventually(() => hover(document.uri), value => value.length > 0);
-    assert.match(hovers.flatMap(h => h.contents.map(content => typeof content === 'string' ? content : content.value)).join('\n'), new RegExp(['Nat', 'Boolean', 'String'][index]!));
+    assert.match(hovers.flatMap(h => h.contents.map(content => typeof content === 'string' ? content : content.value)).join('\n'), new RegExp(['Nat', 'Bool', 'String'][index]!));
     assert.equal(hovers.length, 1, 'nested project requests are not duplicated to the parent');
     const definitions = await vscode.commands.executeCommand<Array<vscode.Location | vscode.LocationLink>>('vscode.executeDefinitionProvider', document.uri, new vscode.Position(1, 15));
     assert.ok(definitions?.length);

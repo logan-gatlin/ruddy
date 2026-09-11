@@ -18,3 +18,9 @@ let curry: (('a, 'b) -> 'c + ..'effects) -> 'a -> 'b -> 'c + ..'effects =
 
 let uncurry: ('a -> 'b -> 'c + ..'effects) -> ('a, 'b) -> 'c + ..'effects =
   fn function values => function values.0 values.1
+
+let make_consumer: ('t -> 'r + ..'effects) -> types::Consumer 't (..'effects) =
+  fn function input => do
+    _ = function input
+    return make_consumer function
+  end

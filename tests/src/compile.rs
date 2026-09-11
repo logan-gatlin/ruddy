@@ -1017,7 +1017,7 @@ fn mutation_isolation_respects_pure_annotations_and_other_effects() {
         let uses = fn _ => do let a = factory 1n let b = factory true return (~a, ~b) end");
     assert_eq!(scheme(&program, "local"), "() -> Nat");
     assert_eq!(scheme(&program, "logged"), "() -> Nat + !Log");
-    assert_eq!(scheme(&program, "uses"), "'a -> (Nat, Boolean)");
+    assert_eq!(scheme(&program, "uses"), "'a -> (Nat, Bool)");
 }
 
 #[test]
@@ -1031,7 +1031,7 @@ fn mutation_value_restriction_preserves_pure_factories_and_shared_unknowns() {
         return (pure (~number), pure (~truth))
       end",
     );
-    assert_eq!(scheme(&program, "run"), "'a -> (Nat, Boolean)");
+    assert_eq!(scheme(&program, "run"), "'a -> (Nat, Bool)");
     for source in [
         "let bad = fn _ => do let box = { cell: mut (fn x => x) } let { cell: alias } = box let _ = (~box.cell) 1n return (~alias) true end",
         "let bad = fn _ => do let cell = mut (fn x => x) let use = fn x => (~cell) x let _ = use 1n return use true end",
@@ -1569,6 +1569,33 @@ fn reification_shared_generic_aliases_do_not_expand_unused_callable_fields() {
 }
 
 #[test]
+fn using_aliases_do_not_redirect_absolute_paths() {
+    let program = accepted(
+        "let value = 42n
+         type T = Nat
+         effect Ask = { get: () -> Nat }
+         module Source = let value = 1n end
+         module Other = let value = true type T = Bool end
+         module Nested =
+           using Other::{self as Source, value, T}
+           let relative: T = Source::value
+           let absolute: ::T = ::Source::value
+           let root = do using Other::value return ::value end
+           let query: () -> ::T + ::!Ask = fn _ => ::!Ask.get ()
+         end",
+    );
+    assert_eq!(scheme(&program, "relative"), "T");
+    assert_eq!(scheme(&program, "absolute"), "T");
+    assert_eq!(scheme(&program, "root"), "Nat");
+    for source in [
+        "module Source = let value = 1n end using Source as alias let x = ::alias::value",
+        "module Source = let value = 1n end using Source::value as alias let x = ::alias",
+    ] {
+        assert!(!rejected(source).ir.errors.is_empty(), "{source}");
+    }
+}
+
+#[test]
 fn using_module_aliases_are_hoisted_and_do_not_add_exports() {
     let program = accepted(
         "let answer = short::value\nusing Source as short\nmodule Source = let value = 42n end",
@@ -1634,7 +1661,7 @@ fn using_groups_import_all_namespaces_and_preserve_public_signatures() {
 #[test]
 fn using_local_imports_are_sequential_nested_and_do_not_escape() {
     let program = accepted(
-        "module Source = let value = true type T = Boolean end
+        "module Source = let value = true type T = Bool end
          let value = 1n
          let result = do
            let before = value
@@ -1668,7 +1695,7 @@ fn using_alias_dependencies_resolve_forward_and_cycles_are_rejected() {
          module Child = let inherited = answer end
          let result = Child::inherited",
     );
-    assert_eq!(scheme(&program, "result"), "Boolean");
+    assert_eq!(scheme(&program, "result"), "Bool");
     for source in [
         "using a as b using b as a",
         "module Seed = module x = module y = module y = module y = let v = 3n end let v = 2n end let v = 1n end end end using Seed::* using x::y as x let got = x::v",
@@ -1816,7 +1843,7 @@ fn using_explicit_imports_win_over_globs_in_either_order() {
         let program = accepted(&format!(
             "module A = let x = 1n end module B = let x = true end {imports} let result = x"
         ));
-        assert_eq!(scheme(&program, "result"), "Boolean");
+        assert_eq!(scheme(&program, "result"), "Bool");
     }
     accepted("module Source = module A = end end using Source::* using A using A::{}");
     let empty = accepted("module M = end using M::{} using {}");

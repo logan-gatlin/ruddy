@@ -91,7 +91,7 @@ fn executable_artifacts_cannot_be_imported_or_linked_as_dependencies() {
 #[test]
 fn node_filesystem_support_requires_the_complete_structural_interface() {
     let library = compiled(
-        "effect FileSystem = { exists: String -> Boolean }\n\
+        "effect FileSystem = { exists: String -> Bool }\n\
          let main = fn _ => do let _ = !FileSystem.exists \"file\" return () end",
     );
     let executable = entry::executable(&library, &[]).unwrap();

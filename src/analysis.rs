@@ -927,7 +927,7 @@ impl Analysis {
         if type_context && qualified.is_none() {
             candidates.extend(
                 [
-                    "Nat", "Int", "Real", "String", "Boolean", "Nat8", "Nat16", "Nat32", "Nat64",
+                    "Nat", "Int", "Real", "String", "Bool", "Nat8", "Nat16", "Nat32", "Nat64",
                     "Int8", "Int16", "Int32", "Int64",
                 ]
                 .into_iter()

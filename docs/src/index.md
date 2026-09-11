@@ -54,17 +54,17 @@ This allows code to request operations such as console output while a handler de
 For example, `main` prints a greeting through the standard library's console effect:
 
 ```ruddy
-let main = fn _ => std::console::print "Hello!"
+let main = fn _ => println "Hello!"
 ```
 
 An executable starts by calling `main` with `()`, the [unit](dictionary.md#unit) value.
-Here, `std::console::print` writes the text followed by a newline and returns `()`.
+Here, `println` writes the text followed by a newline and returns `()`.
 The runtime supplies the console effect handler; a program can also supply its own handlers.
 
 ## Getting started
 
-The [download page](download.md) covers installation and running a first project.
+The [download page](download.md) covers installation and editor setup.
 
 The following reading order builds on this introduction:
 
-1. [Grammar](grammar.md) introduces Ruddy's syntax, from names and literals to functions, types, and effects.
+1. [Hello, World!](hello-world.md)

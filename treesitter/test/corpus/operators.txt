@@ -20,7 +20,7 @@ let value = -1 + 2 * 3 - 4 / 5
         (natural)))))
 
 ================================================================================
-Boolean operators respect precedence
+Bool operators respect precedence
 ================================================================================
 
 let value = not true and false xor true or false

@@ -48,6 +48,85 @@ fn built(source: &str) -> Artifact {
 }
 
 #[test]
+fn shared_rows_round_trip_and_import_with_their_exclusions() {
+    let dependency = built(
+        "type Sum 'r = | ..'r\n\
+         type Struct 'r = { ..'r }\n\
+         type Both 'r = { product: { x: Nat, ..'r }, choice: #Y | ..'r }\n\
+         type Fields 'a = { A: 'a }\n\
+         type Cases 'a = #A 'a\n\
+         effect Choose 'r = { choose: { ..'r } -> (| ..'r) }\n\
+         effect ViaStruct 'r = !Choose { ..'r }\n\
+         effect ViaSum 'r = !Choose (| ..'r)",
+    );
+    let both = dependency
+        .header()
+        .types
+        .iter()
+        .find(|t| t.name.ends_with("::Both"))
+        .unwrap();
+    assert_eq!(both.params[0].sense, artifact::Sense::Row);
+    assert_eq!(both.params[0].lacks, ["x", "Y"]);
+    let printed = assert_round_trip(&dependency);
+    assert!(printed.contains("param row"));
+    let dependency = Artifact::parse(&printed).validate().unwrap();
+    let source = "let sum : tests::Sum (tests::Fields Nat) = #A 1n\n\
+                  let record : tests::Struct (tests::Cases Nat) = { A: 2n }\n\
+                  let direct : () -> (#A Nat) + tests::!Choose (tests::Cases Nat) = fn _ => tests::!Choose.choose { A: 1n }\n\
+                  let via_struct : () -> (#A Nat) + tests::!ViaStruct (tests::Cases Nat) = direct\n\
+                  let via_sum : () -> (#A Nat) + tests::!ViaSum (tests::Fields Nat) = direct\n\
+                  let both : tests::Both (#A Nat) = { product: { x: 1n, A: 2n }, choice: #Y }";
+    let mut files = FileManager::new();
+    let file = files.register_new_file("consumer.rud".into(), source.into());
+    let parsed = parse::parse(token::lex(source, file).tokens);
+    assert!(parsed.errors.is_empty(), "{:#?}", parsed.errors);
+    let mut mint = Mint::new(Bundle::new("consumer", Version::new(0, 1, 0)).unwrap());
+    let out =
+        ir::build_with_dependencies(&mut mint, parsed.stmts, std::slice::from_ref(&dependency));
+    assert!(out.errors.is_empty(), "{:#?}", out.errors);
+    let inferred = inference::infer(&mint, &out.program, inference::Trace::Off);
+    assert!(inferred.errors().is_empty(), "{:#?}", inferred.errors());
+
+    let bad = "type Bad = tests::Both (#x Nat)";
+    let file = files.register_new_file("bad.rud".into(), bad.into());
+    let parsed = parse::parse(token::lex(bad, file).tokens);
+    let mut mint = Mint::new(Bundle::new("consumer", Version::new(0, 1, 0)).unwrap());
+    let out = ir::build_with_dependencies(&mut mint, parsed.stmts, &[dependency]);
+    assert!(
+        matches!(out.errors.as_slice(), [error] if matches!(&error.kind, ir::ErrorKind::RepeatedRowField { field, .. } if field == "x")),
+        "{:#?}",
+        out.errors
+    );
+}
+
+#[test]
+fn shared_rows_reify_with_the_enclosing_constructor() {
+    let artifact = built(
+        "extern box : 'a -> Any = \"$anyUpcast\"\n\
+         type Sum 'r = | ..'r\n\
+         type Struct 'r = { ..'r }\n\
+         let choice : Sum { A: Nat } = #A 1n\n\
+         let product : Struct (#A Nat) = { A: 2n }\n\
+         let boxed_choice = box choice\n\
+         let boxed_product = box product",
+    );
+    assert_round_trip(&artifact);
+    let descriptors: Vec<_> = artifact
+        .lir()
+        .functions
+        .iter()
+        .flat_map(|function| &function.blocks)
+        .flat_map(|block| &block.instrs)
+        .filter_map(|instruction| match &instruction.op {
+            Op::TypeDescriptor { template, .. } => Some(template),
+            _ => None,
+        })
+        .collect();
+    assert!(descriptors.iter().any(|descriptor| matches!(&descriptor.nodes[0], ruddy::reification::Node::Sum(fields) if fields.len() == 1 && fields[0].0 == "A")), "{descriptors:#?}");
+    assert!(descriptors.iter().any(|descriptor| matches!(&descriptor.nodes[0], ruddy::reification::Node::Struct(fields) if fields.len() == 1 && fields[0].0 == "A")), "{descriptors:#?}");
+}
+
+#[test]
 fn reification_artifacts_validate_descriptor_graphs_and_evidence_layouts() {
     let artifact = built(
         "extern box: 'a -> Any = \"$anyUpcast\"\nlet wrapped = box 1n\nlet identity = fn x => x",
@@ -104,11 +183,6 @@ fn reification_artifacts_validate_descriptor_graphs_and_evidence_layouts() {
         vec![
             ruddy::reification::Node::Extend([1, 2]),
             ruddy::reification::Node::Nat,
-            ruddy::reification::Node::Struct(vec![]),
-        ],
-        vec![
-            ruddy::reification::Node::Extend([1, 2]),
-            ruddy::reification::Node::Sum(vec![]),
             ruddy::reification::Node::Struct(vec![]),
         ],
         vec![
@@ -193,7 +267,7 @@ fn rich(ty: Type) -> Type {
 
 fn row(rest: Rest) -> Row {
     Row {
-        labels: vec![("label".to_string(), field(Presence::Present, Type::Boolean))],
+        labels: vec![("label".to_string(), field(Presence::Present, Type::Bool))],
         rest,
     }
 }
@@ -287,7 +361,7 @@ fn model_artifact() -> Artifact {
         rich(Type::Int),
         rich(Type::Real),
         rich(Type::String),
-        rich(Type::Boolean),
+        rich(Type::Bool),
         rich(Type::Arrow(
             Box::new(plain(Type::Var(7))),
             Box::new(plain(Type::Bound(8))),
@@ -334,7 +408,7 @@ fn model_artifact() -> Artifact {
         Op::Const(Literal::Integer(i64::MIN)),
         Op::Const(Literal::Real(f64::NAN.to_bits())),
         Op::Const(Literal::String("quote \" and newline\n".to_string())),
-        Op::Const(Literal::Boolean(true)),
+        Op::Const(Literal::Bool(true)),
         Op::Neg(1),
         Op::Not(2),
         Op::And { left: 1, right: 2 },
@@ -378,7 +452,7 @@ fn model_artifact() -> Artifact {
         Rep::Int,
         Rep::Real,
         Rep::String,
-        Rep::Boolean,
+        Rep::Bool,
         Rep::Unit,
         Rep::Struct,
         Rep::Sum,
@@ -433,7 +507,7 @@ fn model_artifact() -> Artifact {
                     metadata: Default::default(),
                     name: "bundle@1.0.0::Fields".to_string(),
                     params: vec![artifact::Parameter {
-                        sense: artifact::Sense::Fields,
+                        sense: artifact::Sense::Row,
                         lacks: vec!["field".to_string()],
                         relevant: true,
                     }],
@@ -452,7 +526,7 @@ fn model_artifact() -> Artifact {
                     metadata: Default::default(),
                     name: "bundle@1.0.0::Cases".to_string(),
                     params: vec![artifact::Parameter {
-                        sense: artifact::Sense::Cases,
+                        sense: artifact::Sense::Row,
                         lacks: vec!["Case".to_string()],
                         relevant: false,
                     }],
@@ -1200,7 +1274,7 @@ fn building_translates_every_compiler_semantic_variant() {
     );
     fields.insert(
         "boolean".to_string(),
-        compiler_field(types::Presence::Absent, types::Ty::Boolean),
+        compiler_field(types::Presence::Absent, types::Ty::Bool),
     );
     fields.insert(
         "var".to_string(),
@@ -1612,7 +1686,7 @@ fn deep_semantic_artifact_building_is_stack_safe_in_every_position() {
                     ),
                     (
                         "boolean".into(),
-                        types::RowField::present(Arc::new(types::Ty::Boolean)),
+                        types::RowField::present(Arc::new(types::Ty::Bool)),
                     ),
                 ]
                 .into_iter()
@@ -2198,7 +2272,7 @@ fn parameterized_effects_and_generic_aliases_round_trip() {
     };
     assert!(matches!(operations[0].to, Type::Bound(0)));
     let state = effect("State");
-    assert_eq!(state.params[0].sense, artifact::Sense::Fields);
+    assert_eq!(state.params[0].sense, artifact::Sense::Row);
     assert_eq!(state.params[0].lacks, ["x"]);
     let both = effect("Both");
     assert_eq!(
@@ -2568,10 +2642,10 @@ fn metadata_data_compares_by_representation() {
         }
     );
     assert_ne!(
-        Data::Array(vec![Data::Boolean(true)]),
-        Data::Array(vec![Data::Boolean(false)])
+        Data::Array(vec![Data::Bool(true)]),
+        Data::Array(vec![Data::Bool(false)])
     );
-    assert_ne!(Data::String("a".into()), Data::Boolean(true));
+    assert_ne!(Data::String("a".into()), Data::Bool(true));
 }
 
 #[test]

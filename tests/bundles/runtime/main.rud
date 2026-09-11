@@ -52,7 +52,7 @@ let read_tag: (#Ready Nat | #Other) -> Nat = fn value => match value with
   | #Ready payload => payload
   | _ => 0n
 end
-let classify_record: { answer when 'present: Nat, ready: Boolean } -> Nat = fn value => match value with
+let classify_record: { answer when 'present: Nat, ready: Bool } -> Nat = fn value => match value with
   | { answer, ready } => answer
   | _ => 0n
 end

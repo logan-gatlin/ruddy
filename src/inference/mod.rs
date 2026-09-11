@@ -2471,7 +2471,7 @@ pub enum TypeDescription {
     Integer,
     RealNumber,
     Text,
-    Boolean,
+    Bool,
     Any,
     ForeignValue,
     Function,
@@ -4083,7 +4083,7 @@ fn describe_type(ty: &Arc<Ty>) -> TypeDescription {
         }
         Ty::Real => TypeDescription::RealNumber,
         Ty::String => TypeDescription::Text,
-        Ty::Boolean => TypeDescription::Boolean,
+        Ty::Bool => TypeDescription::Bool,
         Ty::Any => TypeDescription::Any,
         Ty::ForeignValue => TypeDescription::ForeignValue,
         Ty::Arrow(..) => TypeDescription::Function,
@@ -4195,7 +4195,7 @@ impl MismatchFingerprints {
                         Ty::Fixed(kind) => values.push(tagged(30, [*kind as u64])),
                         Ty::Real => values.push(tagged(2, [])),
                         Ty::String => values.push(tagged(3, [])),
-                        Ty::Boolean => values.push(tagged(4, [])),
+                        Ty::Bool => values.push(tagged(4, [])),
                         Ty::Any => values.push(tagged(50, [])),
                         Ty::ForeignValue => values.push(tagged(51, [])),
                         Ty::Var(id) => values.push(tagged(5, [u64::from(*id)])),
@@ -4643,7 +4643,7 @@ fn smallest_incompatible_counted_with_mask(
             | (Ty::Int, Ty::Int)
             | (Ty::Real, Ty::Real)
             | (Ty::String, Ty::String)
-            | (Ty::Boolean, Ty::Boolean)
+            | (Ty::Bool, Ty::Bool)
             | (Ty::Any, Ty::Any)
             | (Ty::ForeignValue, Ty::ForeignValue)
             | (Ty::Bound(_), Ty::Bound(_))
@@ -6084,7 +6084,7 @@ impl Fingerprint {
                     }
                     Ty::Real => self.word(0x03),
                     Ty::String => self.word(0x04),
-                    Ty::Boolean => self.word(0x05),
+                    Ty::Bool => self.word(0x05),
                     Ty::Any => self.word(0x30),
                     Ty::ForeignValue => self.word(0x31),
                     Ty::Arrow(from, to, effects) => {
@@ -8179,7 +8179,7 @@ impl Table {
                         | (Ty::Int, Ty::Int)
                         | (Ty::Real, Ty::Real)
                         | (Ty::String, Ty::String)
-                        | (Ty::Boolean, Ty::Boolean)
+                        | (Ty::Bool, Ty::Bool)
                         | (Ty::Any, Ty::Any)
                         | (Ty::ForeignValue, Ty::ForeignValue)
                         | (Ty::Undecided, Ty::Undecided) => {}
@@ -8421,7 +8421,7 @@ impl Table {
                             | Ty::Fixed(_)
                             | Ty::Real
                             | Ty::String
-                            | Ty::Boolean
+                            | Ty::Bool
                             | Ty::Any
                             | Ty::ForeignValue
                             | Ty::Bound(_)
@@ -8627,7 +8627,7 @@ impl Table {
                         | Ty::Fixed(_)
                         | Ty::Real
                         | Ty::String
-                        | Ty::Boolean
+                        | Ty::Bool
                         | Ty::Any
                         | Ty::ForeignValue
                         | Ty::Bound(_)
@@ -8735,15 +8735,17 @@ impl Table {
                                                 .map(|(shape, labels)| (shape, labels.clone()))
                                         })
                                     });
-                                if let Some((shape, labels)) = demand {
-                                    // Fields are carried only by structs. Using
-                                    // `cases` here erased precisely the row a
-                                    // Fields parameter's declaration forbade.
+                                if let Some((sense, labels)) = demand {
                                     let resolved = self.resolve(arg);
-                                    let row = match (shape, &*resolved) {
-                                        (Shape::Struct, Ty::Struct(row))
-                                        | (Shape::Sum | Shape::Effect, Ty::Sum(row)) => row.clone(),
-                                        _ => Row::of(Rest::Undecided),
+                                    let (row, shape) = match (sense, &*resolved) {
+                                        (Sense::Row, Ty::Struct(row)) => {
+                                            (row.clone(), Shape::Struct)
+                                        }
+                                        (Sense::Row, Ty::Sum(row)) => (row.clone(), Shape::Sum),
+                                        (Sense::Effects, Ty::Sum(row)) => {
+                                            (row.clone(), Shape::Effect)
+                                        }
+                                        _ => (Row::of(Rest::Undecided), Shape::Struct),
                                     };
                                     self.forbid(&row, shape, &labels);
                                 }
@@ -8755,7 +8757,7 @@ impl Table {
                         | Ty::Fixed(_)
                         | Ty::Real
                         | Ty::String
-                        | Ty::Boolean
+                        | Ty::Bool
                         | Ty::Any
                         | Ty::ForeignValue
                         | Ty::Var(_)
@@ -9427,7 +9429,7 @@ impl Table {
                         | Ty::Fixed(_)
                         | Ty::Real
                         | Ty::String
-                        | Ty::Boolean
+                        | Ty::Bool
                         | Ty::Any
                         | Ty::ForeignValue
                         | Ty::Var(_)
@@ -10213,6 +10215,13 @@ impl Table {
         destination_span: Anchor,
         errors: &mut Vec<Error>,
     ) {
+        // Lowering represents `_ = value` as a synthetic let so that `value`
+        // is still checked and sequenced. Nothing can refer to that let, so it
+        // publishes no type for a caller-owned choice to escape through.
+        if &*destination_name == "%discard" {
+            return;
+        }
+
         let mut found = IndexMap::new();
         self.rigids_in(ty, &mut found);
         for (id, name) in found {
@@ -11647,7 +11656,7 @@ impl Table {
             | TermKind::Integer(_)
             | TermKind::Real(_)
             | TermKind::String(_)
-            | TermKind::Boolean(_)
+            | TermKind::Bool(_)
             | TermKind::Error => {}
         }
     }
@@ -12649,7 +12658,7 @@ fn extern_annotation_sources(
                     sources.insert(identity, variable.at, name);
                 }
             }
-            Sense::Fields | Sense::Cases | Sense::Effects => {
+            Sense::Row | Sense::Effects => {
                 if let Some(rest) = tails.rows.get(&variable.name)
                     && let Some(identity) = row_variable_identity(rest)
                 {
@@ -12836,7 +12845,7 @@ fn lower_annotation(mint: &Mint, table: &mut Table, annotation: &Annotation) -> 
             // Every row sort has an explicit rest.
             // from the same map: which row a use splices into was fixed where
             // the variable's sense was, so the two senses lower the same way.
-            Sense::Fields | Sense::Cases | Sense::Effects => {
+            Sense::Row | Sense::Effects => {
                 at.insert(variable.id, at.len() as u32);
                 rigids.push(variable.id);
                 let rest = Rest::Rigid {
@@ -12940,7 +12949,7 @@ fn lower_annotation(mint: &Mint, table: &mut Table, annotation: &Annotation) -> 
                 let sort = match variable.sense {
                     Sense::Type => VarSort::Type,
                     Sense::Region => VarSort::Region,
-                    Sense::Fields | Sense::Cases | Sense::Effects => VarSort::Row,
+                    Sense::Row | Sense::Effects => VarSort::Row,
                     Sense::Presence => return None,
                 };
                 Some((variable.id, sort))
@@ -13894,8 +13903,8 @@ mod existential_regressions {
             })
         };
         assert_eq!(
-            smallest_incompatible(&aliases, &named(Ty::Nat), &named(Ty::Boolean)),
-            (TypeDescription::NaturalNumber, TypeDescription::Boolean)
+            smallest_incompatible(&aliases, &named(Ty::Nat), &named(Ty::Bool)),
+            (TypeDescription::NaturalNumber, TypeDescription::Bool)
         );
 
         let missing_left = mint.global(None, Namespace::Types, "MissingLeft").unwrap();
@@ -13920,11 +13929,7 @@ mod existential_regressions {
             smallest_incompatible(
                 &aliases,
                 &missing(missing_left, "MissingLeft", Arc::from([Arc::new(Ty::Nat)])),
-                &missing(
-                    missing_left,
-                    "MissingLeft",
-                    Arc::from([Arc::new(Ty::Boolean)]),
-                ),
+                &missing(missing_left, "MissingLeft", Arc::from([Arc::new(Ty::Bool)]),),
             ),
             (TypeDescription::DeclaredType, TypeDescription::DeclaredType),
             "arguments of the same unavailable alias have no honest semantics"
@@ -13933,9 +13938,9 @@ mod existential_regressions {
             smallest_incompatible(
                 &aliases,
                 &missing(missing_left, "MissingLeft", Arc::from([Arc::new(Ty::Nat)])),
-                &Arc::new(Ty::Boolean),
+                &Arc::new(Ty::Bool),
             ),
-            (TypeDescription::DeclaredType, TypeDescription::Boolean),
+            (TypeDescription::DeclaredType, TypeDescription::Bool),
             "one unavailable alias must remain declared without hiding the other side"
         );
     }
@@ -14020,7 +14025,7 @@ mod existential_regressions {
                 struct_right,
                 Scheme::new(
                     0,
-                    Arc::new(Ty::Struct(hidden_row(Presence::Absent, Ty::Boolean))),
+                    Arc::new(Ty::Struct(hidden_row(Presence::Absent, Ty::Bool))),
                 ),
             ),
             (
@@ -14039,7 +14044,7 @@ mod existential_regressions {
                     0,
                     Arc::new(Ty::Package(Arc::new(Ty::Sum(hidden_row(
                         Presence::Recovered(1),
-                        Ty::Boolean,
+                        Ty::Bool,
                     ))))),
                 ),
             ),
@@ -14096,13 +14101,13 @@ mod existential_regressions {
             .into_iter()
             .collect(),
             rest: Rest::More(Arc::new(Row {
-                labels: [("tail".into(), field(Ty::Boolean))].into_iter().collect(),
+                labels: [("tail".into(), field(Ty::Bool))].into_iter().collect(),
                 rest: Rest::Closed,
             })),
         }));
         assert_eq!(
             smallest_incompatible(&IndexMap::new(), &left, &right),
-            (TypeDescription::NaturalNumber, TypeDescription::Boolean),
+            (TypeDescription::NaturalNumber, TypeDescription::Bool),
             "reordered map keys must not hide a mismatch in a composed tail"
         );
     }
@@ -14119,7 +14124,7 @@ mod existential_regressions {
         }));
         let right = Arc::new(Ty::Struct(Row {
             labels: [
-                ("leaf".into(), field(Ty::Boolean)),
+                ("leaf".into(), field(Ty::Bool)),
                 ("outer".into(), field(Ty::unit())),
             ]
             .into_iter()
@@ -14128,7 +14133,7 @@ mod existential_regressions {
         }));
         assert_eq!(
             smallest_incompatible(&IndexMap::new(), &left, &right),
-            (TypeDescription::NaturalNumber, TypeDescription::Boolean)
+            (TypeDescription::NaturalNumber, TypeDescription::Bool)
         );
     }
 
@@ -14153,9 +14158,9 @@ mod existential_regressions {
             smallest_incompatible(
                 &IndexMap::new(),
                 &segmented(Ty::unit(), Ty::Nat, Ty::Nat),
-                &segmented(Ty::unit(), Ty::Boolean, Ty::Boolean),
+                &segmented(Ty::unit(), Ty::Bool, Ty::Bool),
             ),
-            (TypeDescription::NaturalNumber, TypeDescription::Boolean),
+            (TypeDescription::NaturalNumber, TypeDescription::Bool),
             "the hidden duplicate payload must not become the first mismatch"
         );
     }
@@ -14181,7 +14186,7 @@ mod existential_regressions {
         };
         for presence in [Presence::Absent, Presence::Recovered(7)] {
             let left = unavailable(presence.clone(), Ty::Nat);
-            let right = unavailable(presence, Ty::Boolean);
+            let right = unavailable(presence, Ty::Bool);
             let mut compare_budget = 128;
             assert_eq!(
                 same_finite_syntax_metered(&left, &right, &mut compare_budget),
@@ -14240,7 +14245,7 @@ mod existential_regressions {
                 smallest_incompatible(
                     &IndexMap::new(),
                     &row(left_presence, Ty::Nat),
-                    &row(right_presence, Ty::Boolean),
+                    &row(right_presence, Ty::Bool),
                 ),
                 (TypeDescription::Struct, TypeDescription::Struct),
                 "absent, recovery, and incompatible presences require the honest row fallback"
@@ -14281,11 +14286,11 @@ mod existential_regressions {
             })
         };
         let left = named(Arc::new(Ty::Nat));
-        let right = named(Arc::new(Ty::Boolean));
+        let right = named(Arc::new(Ty::Bool));
         for _ in 0..32 {
             assert_eq!(
                 smallest_incompatible(&aliases, &left, &right),
-                (TypeDescription::NaturalNumber, TypeDescription::Boolean),
+                (TypeDescription::NaturalNumber, TypeDescription::Bool),
                 "the recursive walk must be deterministic"
             );
         }
@@ -14349,12 +14354,12 @@ mod existential_regressions {
         );
         let right = row(
             named(growth[0], "Growth0".into(), Arc::new(Ty::Nat)),
-            named(wrapper, "Wrapper".into(), Arc::new(Ty::Boolean)),
+            named(wrapper, "Wrapper".into(), Arc::new(Ty::Bool)),
         );
 
         assert_eq!(
             smallest_incompatible(&aliases, &left, &right),
-            (TypeDescription::NaturalNumber, TypeDescription::Boolean),
+            (TypeDescription::NaturalNumber, TypeDescription::Bool),
             "a growing first branch must not spend its sibling's alias depth"
         );
     }
@@ -14511,9 +14516,9 @@ mod existential_regressions {
             smallest_incompatible(
                 &aliases,
                 &named(Arc::new(Ty::Nat)),
-                &named(Arc::new(Ty::Boolean)),
+                &named(Arc::new(Ty::Bool)),
             ),
-            (TypeDescription::NaturalNumber, TypeDescription::Boolean)
+            (TypeDescription::NaturalNumber, TypeDescription::Bool)
         );
         let cyclic = Arc::new(Ty::Named {
             symbol: forward,
@@ -14592,9 +14597,9 @@ mod existential_regressions {
                     smallest_incompatible(
                         &aliases,
                         &named(Arc::new(Ty::Nat)),
-                        &named(Arc::new(Ty::Boolean)),
+                        &named(Arc::new(Ty::Bool)),
                     ),
-                    (TypeDescription::NaturalNumber, TypeDescription::Boolean)
+                    (TypeDescription::NaturalNumber, TypeDescription::Bool)
                 );
             })
             .unwrap()
@@ -14657,7 +14662,7 @@ mod existential_regressions {
                 let aliases: IndexMap<_, _> =
                     [(stream, Scheme::new(1, body))].into_iter().collect();
                 let mut left_argument = Arc::new(Ty::Nat);
-                let mut right_argument = Arc::new(Ty::Boolean);
+                let mut right_argument = Arc::new(Ty::Bool);
                 for _ in 0..30_000 {
                     left_argument = Arc::new(Ty::Struct(Row {
                         labels: [("x".into(), RowField::present(left_argument))]
@@ -14683,7 +14688,7 @@ mod existential_regressions {
                 let right = named(right_argument);
                 assert_eq!(
                     smallest_incompatible(&aliases, &left, &right),
-                    (TypeDescription::NaturalNumber, TypeDescription::Boolean)
+                    (TypeDescription::NaturalNumber, TypeDescription::Bool)
                 );
                 std::mem::forget(left);
                 std::mem::forget(right);
@@ -14700,7 +14705,7 @@ mod existential_regressions {
             .stack_size(512 * 1024)
             .spawn(|| {
                 let mut left = Arc::new(Ty::Nat);
-                let mut right = Arc::new(Ty::Boolean);
+                let mut right = Arc::new(Ty::Bool);
                 for _ in 0..30_000 {
                     left = Arc::new(Ty::Struct(Row {
                         labels: [("x".into(), RowField::present(left))]
@@ -14717,7 +14722,7 @@ mod existential_regressions {
                 }
                 assert_eq!(
                     smallest_incompatible(&IndexMap::new(), &left, &right),
-                    (TypeDescription::NaturalNumber, TypeDescription::Boolean)
+                    (TypeDescription::NaturalNumber, TypeDescription::Bool)
                 );
                 // Deep Arc destruction is unrelated to the iterative reader.
                 std::mem::forget(left);
@@ -15091,7 +15096,7 @@ mod identity_tests {
         let table = Table::default();
         let absent_payload = Arc::new(Ty::Arrow(
             Arc::new(Ty::Nat),
-            Arc::new(Ty::Boolean),
+            Arc::new(Ty::Bool),
             Row::closed(),
         ));
         let mut labels = IndexMap::new();

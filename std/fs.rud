@@ -17,6 +17,25 @@ type FileKind = #File | #Directory | #Symlink | #Other
 type Metadata = { kind: FileKind, size: Nat }
 type DirEntry = { name: String, kind: FileKind }
 
+effect FileSystem = {
+  read_bytes: String -> Result [Nat8] Error,
+  write_bytes: { path: String, bytes: [Nat8] } -> Result () Error,
+  append_bytes: { path: String, bytes: [Nat8] } -> Result () Error,
+  read_text: String -> Result String Error,
+  write_text: { path: String, text: String } -> Result () Error,
+  append_text: { path: String, text: String } -> Result () Error,
+  exists: String -> Result Bool Error,
+  read_dir: String -> Result [DirEntry] Error,
+  metadata: String -> Result Metadata Error,
+  symlink_metadata: String -> Result Metadata Error,
+  create_dir: String -> Result () Error,
+  create_dir_all: String -> Result () Error,
+  remove_file: String -> Result () Error,
+  remove_dir: String -> Result () Error,
+  rename: { source: String, destination: String } -> Result () Error,
+  copy_file: { source: String, destination: String } -> Result () Error,
+}
+
 let read_bytes = !FileSystem.read_bytes
 
 let write_bytes = fn path bytes =>

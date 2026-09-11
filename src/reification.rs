@@ -585,7 +585,7 @@ pub enum Node {
     Fixed(FixedInt),
     Real,
     String,
-    Boolean,
+    Bool,
     Any,
     ForeignValue,
     Array(u32),
@@ -687,7 +687,7 @@ impl Descriptor {
                 "Int" => Node::Int,
                 "Real" => Node::Real,
                 "String" => Node::String,
-                "Boolean" => Node::Boolean,
+                "Bool" => Node::Bool,
                 "Any" => Node::Any,
                 "ForeignValue" => Node::ForeignValue,
                 "Unit" => Node::Struct(Vec::new()),
@@ -860,7 +860,7 @@ impl Descriptor {
                                 | (Head::Parameter, Head::Row(kind, fields)) => {
                                     Head::Row(*kind, fields.clone())
                                 }
-                                (Head::Row(a, xs), Head::Row(b, ys)) if a == b => {
+                                (Head::Row(a, xs), Head::Row(_, ys)) => {
                                     if !xs.is_disjoint(ys) {
                                         return Err("duplicate runtime row field");
                                     }

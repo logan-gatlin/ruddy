@@ -467,7 +467,7 @@ fn rep(r: lower::Rep) -> Rep {
         lower::Rep::Fixed(kind) => Rep::Fixed(kind),
         lower::Rep::Real => Rep::Real,
         lower::Rep::String => Rep::String,
-        lower::Rep::Boolean => Rep::Boolean,
+        lower::Rep::Bool => Rep::Bool,
         lower::Rep::TypeDescriptor => Rep::TypeDescriptor,
         lower::Rep::NativePlan => Rep::NativePlan,
         lower::Rep::BoxedAny => Rep::BoxedAny,

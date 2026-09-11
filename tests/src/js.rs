@@ -221,7 +221,7 @@ fn reification_generalized_initializers_preserve_eager_allocation_identity() {
     execute_reification(
         r#"
 @private extern box: 'a -> Any = "$anyUpcast"
-@private extern same: Any -> Any -> Boolean = "a => b => a === b"
+@private extern same: Any -> Any -> Bool = "a => b => a === b"
 @private let make: 'a -> { boxed: Any, token: Any } = do
   let token = box 1n
   return fn x => { boxed: box x, token: token }
@@ -239,7 +239,7 @@ fn reification_generalized_partial_application_evaluates_its_argument_once() {
     execute_reification(
         r#"
 @private extern box: 'a -> Any = "$anyUpcast"
-@private extern same: Any -> Any -> Boolean = "a => b => a === b"
+@private extern same: Any -> Any -> Bool = "a => b => a === b"
 @private let pair = fn token => fn x => { boxed: box x, token: token }
 @private let partial = pair (box 1n)
 @private let first = partial 2n
@@ -247,6 +247,27 @@ fn reification_generalized_partial_application_evaluates_its_argument_once() {
 let shared = same first.token second.token
 "#,
         "assert.equal(app.shared, true);",
+    );
+}
+
+#[test]
+fn shared_rows_generic_descriptors_keep_structs_and_sums_distinct() {
+    execute_reification(
+        r#"
+type Option 'a = #Some 'a | #None
+type Both 'r = { product: { ..'r }, choice: | ..'r }
+@private extern box: 'a -> Any = "$anyUpcast"
+@private extern unbox: Any -> Option 'a = "$anyDowncast"
+@private let pack: Both { ..'r } -> { product: Any, choice: Any } = fn p => { product: box p.product, choice: box p.choice }
+@private let packed = pack { product: { A: 7n }, choice: #A 8n }
+@private let product: Option { A: Nat } = unbox packed.product
+@private let choice: Option (#A Nat) = unbox packed.choice
+@private let wrong: Option { A: Nat } = unbox packed.choice
+let field = match product with | #Some p => p.A | #None => 0n end
+let payload = match choice with | #Some (#A n) => n | #None => 0n end
+let distinct = match wrong with | #Some _ => false | #None => true end
+"#,
+        "assert.equal(app.field, 7); assert.equal(app.payload, 8); assert.equal(app.distinct, true);",
     );
 }
 

@@ -43,10 +43,10 @@ let exists = std::fs::exists
 let read_or_empty = fn path => std::result::unwrap_or "" (read_file path)
 let reader: () -> _ = fn _ => read_file
 module files = let read = read_or_empty end
-let print = std::console::print
+let print = std::io::println
 let capture_print = fn text => handle print text with
-  | std::!Console.write output => raise output
-  | std::!Console.write_error _ => ()
+  | std::io::!IO.write output => raise output
+  | std::io::!IO.write_error _ => ()
   | return _ => ""
   end
 "#,
@@ -151,12 +151,111 @@ fn host_exports_use_the_selected_platform() {
 }
 
 #[test]
+fn root_effect_contract_rejects_unhandled_standard_effects_and_wrong_exit_shapes() {
+    for source in [
+        "let main = fn unit => do let _: () = unit return std::effects::!Halt \"stopped\" end",
+        "let main = fn unit => do let _: () = unit return do let _: String = std::effects::!Ask () return () end end",
+        "let main = fn unit => do let _: () = unit return std::effects::!Advise \"notice\" end",
+        "effect Immediate = () -> ()\nlet main = fn unit => do let _: () = unit return !Immediate () end",
+        "effect Exit = String -> |\nlet main = fn unit => do let _: () = unit return !Exit \"wrong argument\" end",
+        "effect Exit = { exit: Nat -> | }\nlet main = fn unit => do let _: () = unit return !Exit.exit 1n end",
+    ] {
+        for kind in ["library", "executable"] {
+            let project = project(source, "node");
+            let manifest = project.path().join("Ruddy.toml");
+            fs::write(
+                &manifest,
+                fs::read_to_string(&manifest)
+                    .unwrap()
+                    .replace("kind = \"library\"", &format!("kind = {kind:?}")),
+            )
+            .unwrap();
+            let error = ruddy_cli::check_project(project.path())
+                .unwrap_err()
+                .to_string();
+            let diagnostic = if kind == "executable" {
+                "unsupported-entry-effects"
+            } else {
+                "unsupported-export-effects"
+            };
+            assert!(error.contains(diagnostic), "{kind}: {source}\n{error}");
+        }
+    }
+}
+
+#[test]
+fn immediate_effects_run_at_root_calls_but_not_during_initialization() {
+    let foreign = r#"@private extern foreign: String -> String + std::ffi::!Immediate = "text => { console.log(text); return text; }""#;
+    for platform in ["node", "web"] {
+        let library = project(
+            &format!(
+                "{foreign}\nlet call = foreign\nlet calls = [foreign]\nlet record = {{ call: foreign }}\nlet curried = fn prefix => fn text => foreign (std::str::concat prefix text)\ntype Loop = String -> Loop + std::ffi::!Immediate\nlet loop: Loop = fn text => do _ = foreign text return loop end"
+            ),
+            platform,
+        );
+        let output = run(
+            library.path(),
+            "assert.equal(await app.call('direct'), 'direct'); assert.equal(await app.calls[0]('array'), 'array'); assert.equal(await app.record.call('record'), 'record'); const call = await app.curried('curried'); assert.equal(await call(' call'), 'curried call'); const loop = await app.loop('first'); await loop('second');",
+        );
+        success(&output);
+        assert_eq!(
+            output.stdout,
+            b"direct\narray\nrecord\ncurried call\nfirst\nsecond\n"
+        );
+
+        let invalid = project(
+            &format!("{foreign}\nlet value = foreign \"initializing\""),
+            platform,
+        );
+        let error = ruddy_cli::check_project(invalid.path())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("unhandled-effect"), "{error}");
+        assert!(!invalid.path().join("build").exists());
+    }
+
+    for initialize in [false, true] {
+        let source = if initialize {
+            format!("{foreign}\nlet value = foreign \"initializing\"\nlet main = fn _ => ()")
+        } else {
+            format!(
+                "{foreign}\nlet main = fn _ => do _ = foreign \"main\" return std::io::println \"handled\" end"
+            )
+        };
+        let executable = project(&source, "node");
+        let manifest = executable.path().join("Ruddy.toml");
+        fs::write(
+            &manifest,
+            fs::read_to_string(&manifest)
+                .unwrap()
+                .replace("kind = \"library\"", "kind = \"executable\""),
+        )
+        .unwrap();
+        if initialize {
+            let error = ruddy_cli::check_project(executable.path())
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("unhandled-effect"), "{error}");
+        } else {
+            ruddy_cli::check_project(executable.path()).unwrap();
+            let artifact = ruddy_cli::build_project(executable.path()).unwrap();
+            let output = Command::new("node")
+                .arg(artifact.with_extension("js"))
+                .output()
+                .unwrap();
+            success(&output);
+            assert_eq!(output.stdout, b"main\nhandled\n");
+        }
+    }
+}
+
+#[test]
 fn host_exports_exit_drains_output_and_saturates_the_exit_code() {
     let project = project(
         r#"
 let stop = fn code => do
-  let _ = std::console::write "before exit"
-  return std::process::exit code
+  let _ = std::io::print "before exit"
+  return std::process::!Exit code
 end
 "#,
         "node",
@@ -179,11 +278,11 @@ fn host_exports_handle_callable_fields_and_reject_hidden_unsupported_effects() {
     let good = project(
         r#"
 let files = { read: std::fs::read_text, label: "files" }
-let factory: () -> _ = fn _ => { print: std::console::print }
-let tagged: #Printer (String -> () + std::!Console) = #Printer std::console::print
-let printers = [std::console::print]
-let optional: Boolean -> (#Printer (String -> () + std::!Console) | #Empty) = fn enable => if enable then #Printer std::console::print else #Empty end
-let pair = (std::console::print, 42n)
+let factory: () -> _ = fn _ => { print: std::io::println }
+let tagged: #Printer (String -> () + !IO) = #Printer std::io::println
+let printers = [std::io::println]
+let optional: Bool -> (#Printer (String -> () + std::io::!IO) | #Empty) = fn enable => if enable then #Printer std::io::println else #Empty end
+let pair = (std::io::println, 42n)
 "#,
         "node",
     );
@@ -223,15 +322,15 @@ await app.pair[0]('tuple');
 fn host_exports_adapt_recursive_callables_and_preserve_returned_captures() {
     let project = project(
         r#"
-@private type Printer = String -> Printer + std::!Console
+@private type Printer = String -> Printer + std::io::!IO
 @private let make : Nat -> Printer = fn count => fn text => do
-  let _ = std::console::print (std::str::concat (std::str::from_nat count) text)
+  let _ = std::io::println (std::str::concat (std::str::from_nat count) text)
   return make (std::nat::add count 1n)
 end
 let printer = make 0n
 let capture: () -> _ = fn _ => handle printer "local" with
-  | std::!Console.write text => raise text
-  | std::!Console.write_error _ => ()
+  | std::io::!IO.write text => raise text
+  | std::io::!IO.write_error _ => ()
   | return _ => ""
 end
 "#,
@@ -255,24 +354,24 @@ await first('d');
 fn host_exports_adapt_mutual_recursion_and_rotating_type_arguments() {
     let project = project(
         r#"
-type Left = String -> Right + std::!Console
-type Right = Nat -> Left + std::!Console
+type Left = String -> Right + std::io::!IO
+type Right = Nat -> Left + std::io::!IO
 let left : Left = fn text => do
-  let _ = std::console::print text
+  let _ = std::io::println text
   return right
 end
 @private let right : Right = fn n => do
-  let _ = std::console::print (std::str::from_nat n)
+  let _ = std::io::println (std::str::from_nat n)
   return left
 end
 type Id 'a = 'a
-type Rotate 'a 'b = 'a -> Rotate 'b 'a + std::!Console
+type Rotate 'a 'b = 'a -> Rotate 'b 'a + std::io::!IO
 let rotate : Rotate (Id String) Nat = fn text => do
-  let _ = std::console::print text
+  let _ = std::io::println text
   return number
 end
 @private let number : Rotate Nat String = fn n => do
-  let _ = std::console::print (std::str::from_nat n)
+  let _ = std::io::println (std::str::from_nat n)
   return rotate
 end
 "#,
@@ -293,9 +392,9 @@ await (await (await app.rotate('rotate'))(8))('rotated');
 fn host_exports_adapt_recursive_containers_and_async_invocations() {
     let project = project(
         r#"
-type Tree = #Leaf | #Branch { print: String -> () + std::!Console, children: [Tree] }
-let tree : Tree = #Branch { print: std::console::print, children: [#Leaf, #Branch { print: std::console::print, children: [] }] }
-type Reader = String -> { text: String, next: Reader } + std::!FileSystem
+type Tree = #Leaf | #Branch { print: String -> () + std::io::!IO, children: [Tree] }
+let tree : Tree = #Branch { print: std::io::println, children: [#Leaf, #Branch { print: std::io::println, children: [] }] }
+type Reader = String -> { text: String, next: Reader } + !FileSystem
 let reader : Reader = fn path => do
   let text = std::result::unwrap_or "missing" (std::fs::read_text path)
   return { text: text, next: reader }
@@ -358,10 +457,10 @@ let printer = dep::printer
 type Fields 'r = { ..'r }
 type Cases 'r = #Empty | ..'r
 type Loop 'e = String -> Loop 'e + ..'e
-let fields : Fields { print: String -> () + std::!Console } = { print: std::console::print }
-let tagged : Cases (#Printer (String -> () + std::!Console)) = #Printer std::console::print
-let loop : Loop (std::!Console) = fn text => do
-  let _ = std::console::print text
+let fields : Fields { print: String -> () + std::io::!IO } = { print: std::io::println }
+let tagged : Cases (#Printer (String -> () + std::io::!IO)) = #Printer std::io::println
+let loop : Loop (std::io::!IO) = fn text => do
+  let _ = std::io::println text
   return loop
 end
 "#,
@@ -371,7 +470,7 @@ end
     fs::create_dir(&dependency).unwrap();
     let standard = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
     fs::write(dependency.join("Ruddy.toml"), format!("name = \"dep\"\nversion = \"0.1.0\"\nkind = \"library\"\nroot = \"lib.rud\"\n[dependencies]\nstd = {standard:?}\n")).unwrap();
-    fs::write(dependency.join("lib.rud"), "@private type Printer = String -> Printer + std::!Console\nlet printer : Printer = fn text => do let _ = std::console::print text return printer end").unwrap();
+    fs::write(dependency.join("lib.rud"), "@private type Printer = String -> Printer + std::io::!IO\nlet printer : Printer = fn text => do let _ = std::io::println text return printer end").unwrap();
     let manifest = project.path().join("Ruddy.toml");
     fs::write(
         &manifest,
@@ -398,10 +497,10 @@ await (await app.loop('effects'))('repeat');
 fn host_exports_preserve_optional_fields_in_recursive_interfaces() {
     let project = project(
         r#"
-type Cursor 'r = () -> { next: Cursor 'r, ..'r } + std::!Console
+type Cursor 'r = () -> { next: Cursor 'r, ..'r } + std::io::!IO
 let optional : { label when 'p: String } -> Cursor { label when 'p: String } = fn fields => do
   let next : Cursor { .. } = fn _ => do
-    let _ = std::console::print "step"
+    let _ = std::io::println "step"
     return { next: next, ..fields }
   end
   return next

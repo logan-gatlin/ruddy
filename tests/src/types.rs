@@ -74,7 +74,7 @@ fn finite_semantic_syntax_equality_compares_every_identity_and_position() {
     let ty = |ty| Arc::new(ty);
     let same = |left, right| same_finite_syntax(&ty(left), &ty(right));
 
-    for primitive in [Ty::Nat, Ty::Int, Ty::Real, Ty::String, Ty::Boolean] {
+    for primitive in [Ty::Nat, Ty::Int, Ty::Real, Ty::String, Ty::Bool] {
         assert!(same(primitive.clone(), primitive));
     }
     assert!(same(Ty::Undecided, Ty::Undecided));
@@ -328,12 +328,12 @@ fn distinct_primitives_are_spelled_differently() {
     assert_eq!(Prim::Int.name(), "Int");
     assert_eq!(Prim::Real.name(), "Real");
     assert_eq!(Prim::String.name(), "String");
-    assert_eq!(Prim::Boolean.name(), "Boolean");
+    assert_eq!(Prim::Bool.name(), "Bool");
     assert!(matches!(Ty::from(Prim::Nat), Ty::Nat));
     assert!(matches!(Ty::from(Prim::Int), Ty::Int));
     assert!(matches!(Ty::from(Prim::Real), Ty::Real));
     assert!(matches!(Ty::from(Prim::String), Ty::String));
-    assert!(matches!(Ty::from(Prim::Boolean), Ty::Boolean));
+    assert!(matches!(Ty::from(Prim::Bool), Ty::Bool));
 }
 
 /// Unit is one type with one spelling. A second way to build it would be a
@@ -483,19 +483,19 @@ fn a_parameter_says_what_an_argument_has_to_be() {
     let lacks: indexmap::IndexSet<String> = ["x".to_string()].into_iter().collect();
     // A struct's `..'r` is a type parameter with fields it may not name, which is
     // why `WithX Nat` is well-formed and `WithX { x: Nat }` is not.
-    let fielded = ParamKind::Fields {
+    let fielded = ParamKind::Row {
         lacks: lacks.clone(),
     };
-    assert_eq!(fielded.sense(), Sense::Fields);
+    assert_eq!(fielded.sense(), Sense::Row);
     assert_eq!(fielded.lacks(), &lacks);
-    assert_eq!(fielded.row(), Some((Shape::Struct, &lacks)));
+    assert_eq!(fielded.row(), Some((Sense::Row, &lacks)));
 
-    let cases = ParamKind::Cases {
+    let cases = ParamKind::Row {
         lacks: lacks.clone(),
     };
-    assert_eq!(cases.sense(), Sense::Cases);
+    assert_eq!(cases.sense(), Sense::Row);
     assert_eq!(cases.lacks(), &lacks);
-    assert_eq!(cases.row(), Some((Shape::Sum, &lacks)));
+    assert_eq!(cases.row(), Some((Sense::Row, &lacks)));
 }
 
 /// A label written into a type is simply there. The constructor exists so that
@@ -898,7 +898,7 @@ fn a_parameter_may_stand_for_an_arrows_effects() {
     };
     assert_eq!(effects.sense(), Sense::Effects);
     assert_eq!(effects.lacks(), &lacks);
-    assert_eq!(effects.row(), Some((Shape::Effect, &lacks)));
+    assert_eq!(effects.row(), Some((Sense::Effects, &lacks)));
 }
 
 /// A scheme has one index space, not two. The presences take the low

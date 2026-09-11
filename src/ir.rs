@@ -265,7 +265,7 @@ pub enum DataKind {
     Fixed(crate::types::FixedLiteral),
     Real(f64),
     String(String),
-    Boolean(bool),
+    Bool(bool),
     Array(Vec<Data>),
     /// Fields by decoded label, in written order, each with where its label
     /// was written. Unit and tuples are here too: the empty struct, and the
@@ -554,7 +554,7 @@ pub enum TermKind {
     Fixed(crate::types::FixedLiteral),
     Real(f64),
     String(String),
-    Boolean(bool),
+    Bool(bool),
     /// A name that did not resolve. Lowering stays total so that one typo
     /// produces one error rather than a cascade from a dropped definition.
     Error,
@@ -641,7 +641,7 @@ pub enum Literal {
     Fixed(crate::types::FixedLiteral),
     Real(f64),
     String(String),
-    Boolean(bool),
+    Bool(bool),
 }
 
 impl PartialEq for Literal {
@@ -652,7 +652,7 @@ impl PartialEq for Literal {
             (Self::Integer(a), Self::Integer(b)) => a == b,
             (Self::Real(a), Self::Real(b)) => a.to_bits() == b.to_bits(),
             (Self::String(a), Self::String(b)) => a == b,
-            (Self::Boolean(a), Self::Boolean(b)) => a == b,
+            (Self::Bool(a), Self::Bool(b)) => a == b,
             _ => false,
         }
     }
@@ -670,7 +670,7 @@ impl Hash for Literal {
             // of zero, so hashing must do the same.
             Self::Real(value) => value.to_bits().hash(state),
             Self::String(value) => value.hash(state),
-            Self::Boolean(value) => value.hash(state),
+            Self::Bool(value) => value.hash(state),
         }
     }
 }
@@ -707,7 +707,7 @@ pub enum PatternKind {
     Fixed(crate::types::FixedLiteral),
     Real(f64),
     String(String),
-    Boolean(bool),
+    Bool(bool),
     Unit,
     /// `[a, ..rest, b]`: the elements before the rest counted from the front,
     /// the ones after it from the back, and the rest — when written — the
@@ -1238,7 +1238,7 @@ fn declaration_variances(
                             | Ty::Fixed(_)
                             | Ty::Real
                             | Ty::String
-                            | Ty::Boolean
+                            | Ty::Bool
                             | Ty::Any
                             | Ty::ForeignValue => {}
                         }
@@ -1740,25 +1740,10 @@ pub enum ErrorKind {
         first: Sense,
         second: Sense,
     },
-    /// Something that cannot stand for the rest of a sum's cases, written where
-    /// a sum's row parameter goes: `Or Nat` against
-    /// `type Or 'r = #A | ..'r`.
-    ///
-    /// A sum can stand for one, and so can another sum's row parameter. A struct
-    /// cannot, and neither can a declared name, though the latter looks as
-    /// though it should: a tail holding a name would have to be unfolded by the
-    /// walks that flatten rows, and neither does.
-    ///
-    /// Never about a struct: a struct's `..` is its row tail, and its tail accepts only a field row
-    /// type at all, so `WithX Nat` is well-formed. A sum's rest and an arrow's
-    /// effects are the two that are spliced into a row, so the reading is
-    /// field_summary to say which of them the reader was asked for. The name stays
-    /// because the code is stable and renaming it would churn a code and a test
-    /// file for no gain.
-    ///
-    /// The argument absorbs, so this is said once. Left standing it would be
-    /// substituted into the tail all the same, and the reader would be told a
-    /// second time in words about a row they never wrote.
+    /// An argument cannot supply the parameter's row kind (or region kind).
+    /// Shared rows accept structs, sums, and aliases resolving to either;
+    /// effect rows remain separate. Invalid arguments absorb so inference does
+    /// not repeat the diagnostic after attempting substitution.
     NotARow {
         sense: Sense,
     },
@@ -2161,6 +2146,10 @@ struct Builder<'a> {
     pending_aliases: HashMap<Symbol, PendingAlias>,
     /// Every alias body lowered so far, local or imported.
     alias_bodies: HashMap<Symbol, AliasBody>,
+    // Imported bodies arrive cached but still need their row templates lifted.
+    lifted_aliases: HashSet<Symbol>,
+    // Private type declarations installed before kind inference.
+    row_templates: IndexMap<Symbol, Decl<Type>>,
     /// The aliases being expanded, innermost last: an alias met again while it
     /// is on this stack is a cycle.
     expanding: Vec<Symbol>,
@@ -2579,7 +2568,7 @@ pub(crate) enum Step {
 /// universes the matrix checks draw values from — usefulness in the sense of
 /// Maranget (JFP 2007), with each tag position's universe being its listed
 /// cases when no arm is irrefutable there, its listed cases plus "anything
-/// else" when one is, Boolean's universe being `false` and `true`, and every
+/// else" when one is, Bool's universe being `false` and `true`, and every
 /// other primitive's universe being infinite.
 ///
 /// Syntactic throughout: built from the normalized patterns and consulting no
@@ -2905,6 +2894,8 @@ pub fn build_with_interfaces(
         arities: HashMap::new(),
         pending_aliases: HashMap::new(),
         alias_bodies: HashMap::new(),
+        lifted_aliases: HashSet::new(),
+        row_templates: IndexMap::new(),
         expanding: Vec::new(),
         cyclic: HashSet::new(),
         imported_aliases: HashSet::new(),
@@ -3129,6 +3120,10 @@ pub fn build_with_interfaces(
             );
         }
     }
+    for symbol in b.alias_bodies.keys().copied().collect::<Vec<_>>() {
+        b.alias_body(symbol);
+    }
+    program.types.extend(std::mem::take(&mut b.row_templates));
     // A loop of bare names is the one recursion that cannot be allowed, and it
     // is what mutual visibility just made writable. See [`ErrorKind::Circular`]
     // for why it means nothing, and [`Solve::unify`](crate::inference) for what
@@ -3792,7 +3787,7 @@ fn imported_syntax(
         artifact::Type::Fixed(kind) => TypeKind::Prim(Prim::Fixed(*kind)),
         artifact::Type::Real => TypeKind::Prim(Prim::Real),
         artifact::Type::String => TypeKind::Prim(Prim::String),
-        artifact::Type::Boolean => TypeKind::Prim(Prim::Boolean),
+        artifact::Type::Bool => TypeKind::Prim(Prim::Bool),
         artifact::Type::Any => TypeKind::Prim(Prim::Any),
         artifact::Type::ForeignValue => TypeKind::Prim(Prim::ForeignValue),
         artifact::Type::Bound(index) => match params.get(*index as usize) {
@@ -4085,7 +4080,7 @@ fn clamp_bounds(ty: Arc<Ty>, count: usize, presences: usize) -> Arc<Ty> {
                 Ty::Fixed(kind) => types.push(Arc::new(Ty::Fixed(*kind))),
                 Ty::Real => types.push(Arc::new(Ty::Real)),
                 Ty::String => types.push(Arc::new(Ty::String)),
-                Ty::Boolean => types.push(Arc::new(Ty::Boolean)),
+                Ty::Bool => types.push(Arc::new(Ty::Bool)),
                 Ty::Any => types.push(Arc::new(Ty::Any)),
                 Ty::ForeignValue => types.push(Arc::new(Ty::ForeignValue)),
                 Ty::Bound(index) if (*index as usize) < count && (*index as usize) >= presences => {
@@ -4283,7 +4278,7 @@ fn drop_type_iterative(root: Arc<Ty>) {
                     | Ty::Fixed(_)
                     | Ty::Real
                     | Ty::String
-                    | Ty::Boolean
+                    | Ty::Bool
                     | Ty::Any
                     | Ty::ForeignValue
                     | Ty::Var(_)
@@ -4455,7 +4450,7 @@ fn import_type(
                 artifact::Type::Fixed(kind) => types.push(Arc::new(Ty::Fixed(*kind))),
                 artifact::Type::Real => types.push(Arc::new(Ty::Real)),
                 artifact::Type::String => types.push(Arc::new(Ty::String)),
-                artifact::Type::Boolean => types.push(Arc::new(Ty::Boolean)),
+                artifact::Type::Bool => types.push(Arc::new(Ty::Bool)),
                 artifact::Type::Any => types.push(Arc::new(Ty::Any)),
                 artifact::Type::ForeignValue => types.push(Arc::new(Ty::ForeignValue)),
                 artifact::Type::Bound(index) => types.push(Arc::new(Ty::Bound(*index))),
@@ -5161,7 +5156,9 @@ impl RegularType<'_> {
     }
 
     fn with_fields(&mut self, core: usize, fields: Vec<(String, String, usize)>) -> usize {
-        if fields.is_empty() {
+        if fields.is_empty()
+            && self.arena.nodes[core].label == RegularLabel::Ordinary("Unit".into())
+        {
             return core;
         }
         let mut edges = Vec::with_capacity(fields.len() + 1);
@@ -5172,6 +5169,36 @@ impl RegularType<'_> {
                 .map(|(name, presence, ty)| (format!("field:{name}:{presence}"), ty)),
         );
         self.node("fields", edges)
+    }
+
+    /// Effect interfaces publish parameter kinds in the same graph. Canonical
+    /// identity compares shared-row arguments through one enclosing shape, so
+    /// their original struct/sum spelling cannot distinguish equal effects.
+    fn effect_case(
+        &mut self,
+        presence: &str,
+        identity: usize,
+        payload: usize,
+        args: Vec<usize>,
+    ) -> usize {
+        let interface = self.arena.nodes[identity]
+            .edges
+            .iter()
+            .find_map(|(label, child)| (label == "interface").then_some(*child));
+        let mut edges = vec![("identity".into(), identity), ("payload".into(), payload)];
+        for (at, argument) in args.into_iter().enumerate() {
+            let parameter = format!("param:{at}");
+            let row = interface.and_then(|interface| self.arena.nodes[interface].edges.iter()
+                .find_map(|(label, child)| (label == &parameter).then_some(*child)))
+                .is_some_and(|kind| matches!(&self.arena.nodes[kind].label, RegularLabel::Ordinary(label) if label == "Row" || label == "Fields" || label == "Cases"));
+            let argument = if row {
+                self.with_fields(argument, Vec::new())
+            } else {
+                argument
+            };
+            edges.push((format!("arg:{at}"), argument));
+        }
+        self.node(format!("effect-case:{presence}"), edges)
     }
 
     /// Build source syntax, local named declarations, and effect rows with one
@@ -5210,15 +5237,7 @@ impl RegularType<'_> {
                     let args = values.split_off(start);
                     let payload = values.pop().expect("an effect case has a payload");
                     let identity = values.pop().expect("an effect case has an identity");
-                    let edges = [("identity".into(), identity), ("payload".into(), payload)]
-                        .into_iter()
-                        .chain(
-                            args.into_iter()
-                                .enumerate()
-                                .map(|(at, arg)| (format!("arg:{at}"), arg)),
-                        )
-                        .collect();
-                    values.push(self.node(format!("effect-case:{presence}"), edges));
+                    values.push(self.effect_case(&presence, identity, payload, args));
                 }
                 Work::Make(label, edge_labels) => {
                     let start = values.len() - edge_labels.len();
@@ -5509,15 +5528,7 @@ impl RegularType<'_> {
                     let args = values.split_off(start);
                     let payload = values.pop().expect("an effect case has a payload");
                     let identity = values.pop().expect("an effect case has an identity");
-                    let edges = [("identity".into(), identity), ("payload".into(), payload)]
-                        .into_iter()
-                        .chain(
-                            args.into_iter()
-                                .enumerate()
-                                .map(|(at, arg)| (format!("arg:{at}"), arg)),
-                        )
-                        .collect();
-                    values.push(self.node(format!("effect-case:{presence}"), edges));
+                    values.push(self.effect_case(&presence, identity, payload, args));
                 }
                 Work::Make(label, edge_labels) => {
                     let mut children = Vec::with_capacity(edge_labels.len());
@@ -5533,7 +5544,7 @@ impl RegularType<'_> {
                     Ty::Fixed(kind) => values.push(self.atom(kind.name())),
                     Ty::Real => values.push(self.atom("Real")),
                     Ty::String => values.push(self.atom("String")),
-                    Ty::Boolean => values.push(self.atom("Boolean")),
+                    Ty::Bool => values.push(self.atom("Bool")),
                     Ty::Any => values.push(self.atom("Any")),
                     Ty::ForeignValue => values.push(self.atom("ForeignValue")),
                     Ty::Bound(index) if instantiation == usize::MAX => {
@@ -5807,6 +5818,8 @@ impl RegularType<'_> {
     /// depend on declaration order. Epsilon closure also makes recursive row
     /// graphs finite: each row node contributes its labels at most once.
     fn flatten_rows(&mut self) {
+        let unit = self.atom("Unit");
+        let closed = self.atom("closed");
         let original = self.arena.nodes.clone();
         let mut effect_keys = HashMap::new();
         for root in self.created.iter().copied() {
@@ -5824,14 +5837,45 @@ impl RegularType<'_> {
                 if !seen.insert(node) {
                     continue;
                 }
+                let node_join = if original[node].label == RegularLabel::Ordinary("fields".into()) {
+                    "core"
+                } else {
+                    "tail"
+                };
                 for (label, child) in &original[node].edges {
-                    if label == join
-                        && original[*child].label == RegularLabel::Ordinary(kind.into())
-                    {
-                        pending.push(*child);
-                    } else if label == join {
-                        edges.push((label.clone(), *child));
+                    if label == node_join {
+                        let compatible = match &original[*child].label {
+                            RegularLabel::Ordinary(label) if kind == "effects" => {
+                                label == "effects"
+                            }
+                            RegularLabel::Ordinary(label) => label == "fields" || label == "sum",
+                            _ => false,
+                        };
+                        if compatible {
+                            pending.push(*child);
+                        } else {
+                            let child = if kind != "effects"
+                                && matches!(&original[*child].label, RegularLabel::Ordinary(label) if label == "Unit" || label == "closed")
+                            {
+                                if kind == "fields" { unit } else { closed }
+                            } else {
+                                *child
+                            };
+                            edges.push((join.into(), child));
+                        }
                     } else {
+                        // A row argument contributes labels, not its outer
+                        // constructor. Re-spell each edge in the root's shape.
+                        let label = if kind == "effects" {
+                            label.clone()
+                        } else {
+                            let (_, label) =
+                                label.split_once(':').expect("a row label has a prefix");
+                            format!(
+                                "{}:{label}",
+                                if kind == "fields" { "field" } else { "label" }
+                            )
+                        };
                         // Presence is the final colon-delimited component.
                         // Claiming the semantic label before inspecting it is
                         // the row rule: an outer absent edge masks an inner
@@ -5863,7 +5907,13 @@ impl RegularType<'_> {
             // Graph encoding is order independent, but stable storage keeps
             // duplicate labels and multiple distinct exits deterministic too.
             edges.sort();
-            self.arena.nodes[root].edges = edges;
+            edges.dedup();
+            if kind == "fields" && edges.as_slice() == [("core".into(), unit)] {
+                self.arena.nodes[root].label = RegularLabel::Ordinary("Unit".into());
+                self.arena.nodes[root].edges.clear();
+            } else {
+                self.arena.nodes[root].edges = edges;
+            }
         }
     }
 
@@ -6639,7 +6689,7 @@ fn rekey_term(
         | TermKind::Integer(_)
         | TermKind::Real(_)
         | TermKind::String(_)
-        | TermKind::Boolean(_)
+        | TermKind::Bool(_)
         | TermKind::Error => {}
     }
 }
@@ -6931,7 +6981,7 @@ impl<'a> Follow<'a> {
                     | Ty::Fixed(_)
                     | Ty::Real
                     | Ty::String
-                    | Ty::Boolean
+                    | Ty::Bool
                     | Ty::Any
                     | Ty::ForeignValue
                     | Ty::Arrow(..)
@@ -7113,7 +7163,7 @@ fn erase_circular(term: &mut Term, looping: &IndexSet<Symbol>, out: &mut Vec<Anc
         | TermKind::Integer(_)
         | TermKind::Real(_)
         | TermKind::String(_)
-        | TermKind::Boolean(_)
+        | TermKind::Bool(_)
         | TermKind::Error => {}
     }
 }
@@ -7186,7 +7236,7 @@ fn nested<'a>(term: &'a Term, out: &mut HashMap<Symbol, &'a Term>) {
         | TermKind::Integer(_)
         | TermKind::Real(_)
         | TermKind::String(_)
-        | TermKind::Boolean(_)
+        | TermKind::Bool(_)
         | TermKind::Error => {}
     }
 }
@@ -7252,7 +7302,7 @@ impl Chain<'_> {
             | TermKind::Raise(_)
             | TermKind::Operation { .. }
             | TermKind::Fixed(_)
-            | TermKind::Natural(_) | TermKind::Integer(_) | TermKind::Real(_) | TermKind::String(_) | TermKind::Boolean(_)
+            | TermKind::Natural(_) | TermKind::Integer(_) | TermKind::Real(_) | TermKind::String(_) | TermKind::Bool(_)
             | TermKind::Error => Stands::Shape,
         }
     }
@@ -7275,7 +7325,7 @@ fn refuter(pattern: &Pattern) -> Option<(Anchor, Refuter)> {
         PatternKind::Integer(value) => literal(Literal::Integer(*value)),
         PatternKind::Real(value) => literal(Literal::Real(*value)),
         PatternKind::String(value) => literal(Literal::String(value.clone())),
-        PatternKind::Boolean(value) => literal(Literal::Boolean(*value)),
+        PatternKind::Bool(value) => literal(Literal::Bool(*value)),
         // Length is no part of an array's type, so naming any element is a
         // test a value can fail; the lone rest names none and cannot.
         PatternKind::Array {
@@ -7329,7 +7379,7 @@ fn calm(pattern: &Pattern) -> Option<Calm> {
         | PatternKind::Integer(_)
         | PatternKind::Real(_)
         | PatternKind::String(_)
-        | PatternKind::Boolean(_) => None,
+        | PatternKind::Bool(_) => None,
     }
 }
 
@@ -7346,7 +7396,7 @@ fn pattern_binders(pattern: &Pattern, out: &mut Vec<Anchored<Symbol>>) {
         | PatternKind::Integer(_)
         | PatternKind::Real(_)
         | PatternKind::String(_)
-        | PatternKind::Boolean(_) => {}
+        | PatternKind::Bool(_) => {}
         PatternKind::Tag { payload, .. } => {
             if let Some(payload) = payload {
                 pattern_binders(payload, out);
@@ -7467,7 +7517,7 @@ fn mat(pattern: &Pattern) -> Mat {
         PatternKind::Integer(value) => Mat::Literal(Literal::Integer(*value)),
         PatternKind::Real(value) => Mat::Literal(Literal::Real(*value)),
         PatternKind::String(value) => Mat::Literal(Literal::String(value.clone())),
-        PatternKind::Boolean(value) => Mat::Literal(Literal::Boolean(*value)),
+        PatternKind::Bool(value) => Mat::Literal(Literal::Bool(*value)),
         PatternKind::Array {
             before,
             rest,
@@ -7536,7 +7586,7 @@ impl Matrix {
             PatternKind::String(value) => {
                 self.collect_literal(path, Literal::String(value.clone()))
             }
-            PatternKind::Boolean(value) => self.collect_literal(path, Literal::Boolean(*value)),
+            PatternKind::Bool(value) => self.collect_literal(path, Literal::Bool(*value)),
             // Every element, from either end, is the one element position;
             // see [`Step::Element`]. The rest binds the array between the
             // elements rather than any element, so it opens nothing here.
@@ -7682,15 +7732,15 @@ impl Matrix {
                     if tests
                         .literals
                         .iter()
-                        .all(|literal| matches!(literal, Literal::Boolean(_)))
+                        .all(|literal| matches!(literal, Literal::Bool(_)))
                     {
-                        // Boolean is the one finite scalar universe. Asking
+                        // Bool is the one finite scalar universe. Asking
                         // both values — not merely the values written in an
                         // arm — is what makes `false | true` total and a
                         // single boolean literal partial.
                         [false, true].into_iter().any(|value| {
                             self.useful(
-                                &specialize_literal(rows, &Literal::Boolean(value)),
+                                &specialize_literal(rows, &Literal::Bool(value)),
                                 later,
                                 &q[1..],
                             )
@@ -7790,7 +7840,7 @@ fn pattern_names(pattern: &parse::Pattern, out: &mut Vec<TrackedString>) {
         | parse::PatternKind::Integer(_)
         | parse::PatternKind::Real(_)
         | parse::PatternKind::String(_)
-        | parse::PatternKind::Boolean(_)
+        | parse::PatternKind::Bool(_)
         | parse::PatternKind::Unit => {}
         parse::PatternKind::Tag { payload, .. } => {
             if let Some(payload) = payload {
@@ -8023,7 +8073,7 @@ impl Term {
                 | TermKind::Integer(_)
                 | TermKind::Real(_)
                 | TermKind::String(_)
-                | TermKind::Boolean(_)
+                | TermKind::Bool(_)
                 | TermKind::Error => {}
             }
             Some(term)
@@ -8095,11 +8145,10 @@ fn kinds(
             })
         })
         .collect();
-    let summaries: HashMap<Shape, HashMap<Symbol, RowSummary>> =
-        [Shape::Struct, Shape::Sum, Shape::Effect]
-            .into_iter()
-            .map(|shape| (shape, row_summaries(types, external, shape)))
-            .collect();
+    let summaries: HashMap<Sense, HashMap<Symbol, RowSummary>> = [Sense::Row, Sense::Effects]
+        .into_iter()
+        .map(|shape| (shape, row_summaries(types, external, shape)))
+        .collect();
     // Every body that binds parameters, with the types it reads them in: a
     // type declaration's one body, and an effect's operation signatures. An
     // effect is a declaration with parameters like any other, and its
@@ -8199,20 +8248,11 @@ fn kinds(
                     });
                 }
             }
-            // A parameter read more than one way is still taken as the sum's
-            // rest among them, so that the debugger and the Types tab show what
-            // the body actually said of it. Nothing is enforced against it —
-            // the declaration is a write-off and `mixed` says so — but calling
-            // it a type would be this pass reporting one thing and displaying
-            // another.
-            // A parameter read more than one way is shown as the row reading
-            // among them, for the reason below — and a sum's rest wins over an
-            // arrow's effects only because one of the two has to, the
-            // declaration being a write-off either way.
-            kinds.push(if read_as.contains(&Sense::Fields) {
-                ParamKind::Fields { lacks }
-            } else if read_as.contains(&Sense::Cases) {
-                ParamKind::Cases { lacks }
+            // Recovery retains a row reading when a parameter has conflicting
+            // uses. The declaration absorbs, so this choice affects only how
+            // its invalid parameter is displayed.
+            kinds.push(if read_as.contains(&Sense::Row) {
+                ParamKind::Row { lacks }
             } else if read_as.contains(&Sense::Effects) {
                 ParamKind::Effects { lacks }
             } else if read_as.contains(&Sense::Region) {
@@ -8237,7 +8277,7 @@ fn kinds(
 /// argument may be — and what each says of its tail is the same sentence.
 fn says_effects(
     effects: &EffectRow,
-    summaries: &HashMap<Shape, HashMap<Symbol, RowSummary>>,
+    summaries: &HashMap<Sense, HashMap<Symbol, RowSummary>>,
     out: &mut impl FnMut(Fact),
 ) {
     if let Some(Tail {
@@ -8261,7 +8301,7 @@ fn says_effects(
 fn arguments(
     head: Symbol,
     args: &[Type],
-    summaries: &HashMap<Shape, HashMap<Symbol, RowSummary>>,
+    summaries: &HashMap<Sense, HashMap<Symbol, RowSummary>>,
     out: &mut impl FnMut(Fact),
 ) {
     for (at, arg) in args.iter().enumerate() {
@@ -8293,12 +8333,9 @@ fn arguments(
             // reading, which is why it is a [`Fact::Tails`] rather than
             // a second [`Fact::Hands`].
             _ => {
-                // Every parameter whose row reaches this argument's
-                // outer row lands where the callee's tail sat. Keep the
-                // three senses separate: a struct alias carries only
-                // field obligations, a sum alias only case obligations,
-                // and an effects row only effect obligations.
-                for shape in [Shape::Struct, Shape::Sum, Shape::Effect] {
+                // A row forwarded through either constructor inherits the
+                // callee's exclusions. Effect rows carry their own exclusions.
+                for shape in [Sense::Row, Sense::Effects] {
                     let declarations = summaries
                         .get(&shape)
                         .expect("every row sense has summaries");
@@ -8346,7 +8383,7 @@ fn senses(
 /// apiece.
 fn constrain(
     ty: &Type,
-    summaries: &HashMap<Shape, HashMap<Symbol, RowSummary>>,
+    summaries: &HashMap<Sense, HashMap<Symbol, RowSummary>>,
     out: &mut impl FnMut(Fact),
 ) {
     match &ty.anchored {
@@ -8381,19 +8418,10 @@ fn constrain(
                 ..
             }) = tail
             {
-                // A struct's `..` is the struct-row tail, so the parameter stands
-                // for a whole type — the same reading a parameter written
-                // anywhere else has, which is why `type W 'r = { f: 'r, ..'r }` is
-                // well-formed.
-                //
-                // The fields written in it are exactly what it may not
-                // name: they are already named here, and a `..` covers what is
-                // not. An absent label is named as surely as a written one —
-                // `\y` says the tail has no `y`, which is the same sentence a
-                // field named `y` makes it say — and sits in the same map, so
-                // the keys are the whole set.
+                // Every named label, including an explicit absence, excludes
+                // that label from the shared tail.
                 let lacks = fields.keys().cloned().collect();
-                out(Fact::Says(*index, ParamKind::Fields { lacks }));
+                out(Fact::Says(*index, ParamKind::Row { lacks }));
             }
         }
         // The struct arm again, about cases: a payload is a type position, and
@@ -8411,7 +8439,7 @@ fn constrain(
             }) = tail
             {
                 let lacks = cases.keys().cloned().collect();
-                out(Fact::Says(*index, ParamKind::Cases { lacks }));
+                out(Fact::Says(*index, ParamKind::Row { lacks }));
             }
         }
         // The sum's arm a third time, about effects: an arrow's two sides are
@@ -8439,7 +8467,7 @@ fn constrain(
 /// it stood.
 ///
 /// Two ways to fail, and which of them a parameter can be failed by is what
-/// [`ParamKind`] says. A [`ParamKind::Cases`] parameter has both: a sum's rest is
+/// [`ParamKind`] says. A [`ParamKind::Row`] parameter has both: a sum's rest is
 /// spliced into a row, so the argument has to be something a row can hold —
 /// [`row_shaped`] — and it has to name none of the cases the declaration already
 /// names, since a `..` covers only what its row leaves out. A
@@ -8468,7 +8496,7 @@ fn row_arguments(program: &mut Program, kinds: &HashMap<Symbol, Vec<ParamKind>>)
     fn walk(
         ty: &mut Type,
         kinds: &HashMap<Symbol, Vec<ParamKind>>,
-        carries: &HashMap<Shape, HashMap<Symbol, RowSummary>>,
+        carries: &HashMap<Sense, HashMap<Symbol, RowSummary>>,
         rows: &HashMap<Symbol, Sense>,
         out: &mut Vec<Error>,
     ) {
@@ -8530,7 +8558,7 @@ fn row_arguments(program: &mut Program, kinds: &HashMap<Symbol, Vec<ParamKind>>)
         head: Symbol,
         args: &mut [Type],
         kinds: &HashMap<Symbol, Vec<ParamKind>>,
-        carries: &HashMap<Shape, HashMap<Symbol, RowSummary>>,
+        carries: &HashMap<Sense, HashMap<Symbol, RowSummary>>,
         rows: &HashMap<Symbol, Sense>,
         out: &mut Vec<Error>,
     ) {
@@ -8541,7 +8569,7 @@ fn row_arguments(program: &mut Program, kinds: &HashMap<Symbol, Vec<ParamKind>>)
             // Where a row of effects is asked for, that is the row of
             // effects with none — which is what a printed pure
             // effects argument reads back as.
-            if matches!(kind, Some(kind) if kind.row().is_some_and(|(shape, _)| shape == Shape::Effect))
+            if matches!(kind, Some(kind) if kind.row().is_some_and(|(shape, _)| shape == Sense::Effects))
                 && matches!(&arg.anchored, TypeKind::Sum { cases, tail: None } if cases.is_empty())
             {
                 let span = arg.at;
@@ -8575,11 +8603,17 @@ fn row_arguments(program: &mut Program, kinds: &HashMap<Symbol, Vec<ParamKind>>)
                         false => Some(ErrorKind::NotARow {
                             sense: kind.sense(),
                         }),
-                        true => row_summary(arg, summaries, shape)
-                            .labels
-                            .into_iter()
-                            .find(|name| lacks.contains(name))
-                            .map(|field| ErrorKind::RepeatedRowField { shape, field }),
+                        true => {
+                            let summary = row_summary(arg, summaries, shape);
+                            summary
+                                .labels
+                                .into_iter()
+                                .find(|name| lacks.contains(name))
+                                .map(|field| ErrorKind::RepeatedRowField {
+                                    shape: summary.shape.unwrap_or(Shape::Effect),
+                                    field,
+                                })
+                        }
                     }
                 }
                 _ => None,
@@ -8600,16 +8634,15 @@ fn row_arguments(program: &mut Program, kinds: &HashMap<Symbol, Vec<ParamKind>>)
     // before anything is walked: an argument written at a struct's `..` carries
     // whatever the declaration it names carries, which is what the repeated
     // field check is asked against. See [`row_summaries`].
-    let carries: HashMap<Shape, HashMap<Symbol, RowSummary>> =
-        [Shape::Struct, Shape::Sum, Shape::Effect]
-            .into_iter()
-            .map(|shape| {
-                (
-                    shape,
-                    row_summaries(&program.types, &program.external_types, shape),
-                )
-            })
-            .collect();
+    let carries: HashMap<Sense, HashMap<Symbol, RowSummary>> = [Sense::Row, Sense::Effects]
+        .into_iter()
+        .map(|shape| {
+            (
+                shape,
+                row_summaries(&program.types, &program.external_types, shape),
+            )
+        })
+        .collect();
     let mut out = Vec::new();
     for decl in program.types.values_mut() {
         // Which of this declaration's own parameters are a sum's rest, so one
@@ -8745,7 +8778,7 @@ fn annotations(term: &mut Term, out: &mut impl FnMut(&mut Type)) {
         | TermKind::Integer(_)
         | TermKind::Real(_)
         | TermKind::String(_)
-        | TermKind::Boolean(_)
+        | TermKind::Bool(_)
         | TermKind::Error => {}
     }
 }
@@ -8758,21 +8791,21 @@ fn annotations(term: &mut Term, out: &mut impl FnMut(&mut Type)) {
 fn row_shaped(
     ty: &Type,
     rows: &HashMap<Symbol, Sense>,
-    shape: Shape,
+    shape: Sense,
     summaries: &HashMap<Symbol, RowSummary>,
 ) -> bool {
     fn outer(
         ty: &Type,
         rows: &HashMap<Symbol, Sense>,
-        shape: Shape,
+        shape: Sense,
         summaries: &HashMap<Symbol, RowSummary>,
     ) -> bool {
         match &ty.anchored {
             TypeKind::Error => true,
-            TypeKind::Struct { .. } => shape == Shape::Struct,
-            TypeKind::Sum { .. } => shape == Shape::Sum,
-            TypeKind::Effects(_) => shape == Shape::Effect,
-            TypeKind::Param { symbol, .. } => rows.get(symbol).copied() == Some(sense(shape)),
+            TypeKind::Struct { .. } => shape == Sense::Row,
+            TypeKind::Sum { .. } => shape == Sense::Row,
+            TypeKind::Effects(_) => shape == Sense::Effects,
+            TypeKind::Param { symbol, .. } => rows.get(symbol).copied() == Some(shape),
             TypeKind::Ident(symbol) => {
                 let summary = summaries.get(symbol).cloned().unwrap_or_default();
                 summary.shaped
@@ -8802,14 +8835,14 @@ fn row_shaped(
     outer(ty, rows, shape, summaries)
 }
 
-/// A written type's normalized outer row for one sense: whether it reaches a
-/// concrete row, the labels it names, and the parameters it forwards there.
-/// A separate summary is built for fields, cases, and effects.
+/// A type's outer row for a requested kind. The source shape is retained only
+/// for diagnostics; fields and cases contribute to the same summary table.
 #[derive(Debug, Clone, Default)]
 struct RowSummary {
     /// Whether normalization reaches a concrete row of this sense. A pure
     /// forwarding parameter has slots but no shape until its argument is read.
     shaped: bool,
+    shape: Option<Shape>,
     /// Insertion-ordered, so a complaint about an argument breaking the rule
     /// twice always names the same label first — the one a reader would reach
     /// first reading the argument left to right, which is the rule
@@ -8840,7 +8873,7 @@ struct RowSummary {
 fn row_summaries(
     types: &IndexMap<Symbol, Decl<Type>>,
     external: &IndexMap<Symbol, ExternalType>,
-    shape: Shape,
+    shape: Sense,
 ) -> HashMap<Symbol, RowSummary> {
     enum Work<'a> {
         Named(Symbol),
@@ -8851,6 +8884,7 @@ fn row_summaries(
         ArtifactApply(&'a [Type]),
         FinishApply {
             shaped: bool,
+            shape: Option<Shape>,
             labels: IndexSet<String>,
             arguments: usize,
             crossed_cycle: bool,
@@ -8858,9 +8892,10 @@ fn row_summaries(
         Value(RowSummary),
     }
 
-    fn semantic_row(mut row: &crate::types::Row) -> RowSummary {
+    fn semantic_row(mut row: &crate::types::Row, shape: Shape) -> RowSummary {
         let mut out = RowSummary {
             shaped: true,
+            shape: Some(shape),
             ..RowSummary::default()
         };
         loop {
@@ -8881,6 +8916,7 @@ fn row_summaries(
     fn written_row_summary(
         labels: impl IntoIterator<Item = String>,
         tail: &Option<Tail>,
+        shape: Shape,
     ) -> RowSummary {
         let mut slots = IndexSet::new();
         if let Some(Tail {
@@ -8892,6 +8928,7 @@ fn row_summaries(
         }
         RowSummary {
             shaped: true,
+            shape: Some(shape),
             labels: labels.into_iter().collect(),
             slots,
         }
@@ -8901,7 +8938,7 @@ fn row_summaries(
         root: Symbol,
         types: &'a IndexMap<Symbol, Decl<Type>>,
         external: &'a IndexMap<Symbol, ExternalType>,
-        shape: Shape,
+        shape: Sense,
         done: &mut HashMap<Symbol, RowSummary>,
     ) {
         let mut active = HashSet::new();
@@ -8959,14 +8996,15 @@ fn row_summaries(
                     Ty::Package(body) => work.push(Work::Semantic(body)),
                     Ty::Bound(index) => work.push(Work::Value(RowSummary {
                         shaped: false,
+                        shape: None,
                         labels: IndexSet::new(),
                         slots: std::iter::once(*index).collect(),
                     })),
-                    Ty::Struct(row) if shape == Shape::Struct => {
-                        work.push(Work::Value(semantic_row(row)))
+                    Ty::Struct(row) if shape == Sense::Row => {
+                        work.push(Work::Value(semantic_row(row, Shape::Struct)))
                     }
-                    Ty::Sum(row) if shape == Shape::Sum => {
-                        work.push(Work::Value(semantic_row(row)))
+                    Ty::Sum(row) if shape == Sense::Row => {
+                        work.push(Work::Value(semantic_row(row, Shape::Sum)))
                     }
                     Ty::Named {
                         symbol,
@@ -8981,7 +9019,7 @@ fn row_summaries(
                     | Ty::Fixed(_)
                     | Ty::Real
                     | Ty::String
-                    | Ty::Boolean
+                    | Ty::Bool
                     | Ty::Any
                     | Ty::ForeignValue
                     | Ty::Arrow(..)
@@ -8997,20 +9035,23 @@ fn row_summaries(
                     })),
                 },
                 Work::Artifact(ty) => match &ty.anchored {
-                    TypeKind::Struct { fields, tail } if shape == Shape::Struct => {
+                    TypeKind::Struct { fields, tail } if shape == Sense::Row => {
                         work.push(Work::Value(written_row_summary(
                             fields.keys().cloned(),
                             tail,
+                            Shape::Struct,
                         )));
                     }
-                    TypeKind::Sum { cases, tail } if shape == Shape::Sum => {
+                    TypeKind::Sum { cases, tail } if shape == Sense::Row => {
                         work.push(Work::Value(written_row_summary(
                             cases.keys().cloned(),
                             tail,
+                            Shape::Sum,
                         )));
                     }
                     TypeKind::Param { index, .. } => work.push(Work::Value(RowSummary {
                         shaped: false,
+                        shape: None,
                         labels: IndexSet::new(),
                         slots: std::iter::once(*index).collect(),
                     })),
@@ -9045,6 +9086,7 @@ fn row_summaries(
                         .collect();
                     work.push(Work::FinishApply {
                         shaped: head.shaped,
+                        shape: head.shape,
                         labels: head.labels,
                         arguments: arguments.len(),
                         crossed_cycle,
@@ -9064,6 +9106,7 @@ fn row_summaries(
                         .collect();
                     work.push(Work::FinishApply {
                         shaped: head.shaped,
+                        shape: head.shape,
                         labels: head.labels,
                         arguments: arguments.len(),
                         crossed_cycle,
@@ -9074,6 +9117,7 @@ fn row_summaries(
                 }
                 Work::FinishApply {
                     shaped,
+                    shape: outer_shape,
                     labels,
                     arguments,
                     mut crossed_cycle,
@@ -9084,11 +9128,13 @@ fn row_summaries(
                         .expect("every selected argument leaves one summary");
                     let mut out = RowSummary {
                         shaped,
+                        shape: outer_shape,
                         labels,
                         slots: IndexSet::new(),
                     };
                     for (argument, cycle) in values.drain(at..) {
                         out.shaped |= argument.shaped;
+                        out.shape = out.shape.or(argument.shape);
                         out.labels.extend(argument.labels);
                         out.slots.extend(argument.slots);
                         crossed_cycle |= cycle;
@@ -9119,7 +9165,11 @@ fn row_summaries(
 /// One written type's row summary for a requested sense, composing declaration
 /// summaries with whichever arguments their forwarding slots select.
 /// Concrete rows of another sense contribute nothing.
-fn written_summary(labels: impl IntoIterator<Item = String>, tail: &Option<Tail>) -> RowSummary {
+fn written_summary(
+    labels: impl IntoIterator<Item = String>,
+    tail: &Option<Tail>,
+    shape: Shape,
+) -> RowSummary {
     let mut slots = IndexSet::new();
     if let Some(Tail {
         of: Row::Param { index, .. },
@@ -9130,28 +9180,31 @@ fn written_summary(labels: impl IntoIterator<Item = String>, tail: &Option<Tail>
     }
     RowSummary {
         shaped: true,
+        shape: Some(shape),
         labels: labels.into_iter().collect(),
         slots,
     }
 }
 
-fn row_summary(ty: &Type, decls: &HashMap<Symbol, RowSummary>, shape: Shape) -> RowSummary {
+fn row_summary(ty: &Type, decls: &HashMap<Symbol, RowSummary>, shape: Sense) -> RowSummary {
     match &ty.anchored {
-        TypeKind::Struct { fields, tail } if shape == Shape::Struct => {
-            written_summary(fields.keys().cloned(), tail)
+        TypeKind::Struct { fields, tail } if shape == Sense::Row => {
+            written_summary(fields.keys().cloned(), tail, Shape::Struct)
         }
-        TypeKind::Sum { cases, tail } if shape == Shape::Sum => {
-            written_summary(cases.keys().cloned(), tail)
+        TypeKind::Sum { cases, tail } if shape == Sense::Row => {
+            written_summary(cases.keys().cloned(), tail, Shape::Sum)
         }
-        TypeKind::Effects(effects) if shape == Shape::Effect => written_summary(
+        TypeKind::Effects(effects) if shape == Sense::Effects => written_summary(
             effects.effects.keys().map(EffectId::label_key),
             &effects.tail,
+            Shape::Effect,
         ),
         // The body is the parameter, as in `type Id 'a = 'a`: whatever is written
         // there is the whole of what the declaration stands for, fields
         // included.
         TypeKind::Param { index, .. } => RowSummary {
             shaped: false,
+            shape: None,
             labels: IndexSet::new(),
             slots: std::iter::once(*index).collect(),
         },
@@ -9162,6 +9215,7 @@ fn row_summary(ty: &Type, decls: &HashMap<Symbol, RowSummary>, shape: Shape) -> 
             let head = decls.get(head).cloned().unwrap_or_default();
             let mut out = RowSummary {
                 shaped: head.shaped,
+                shape: head.shape,
                 labels: head.labels,
                 slots: IndexSet::new(),
             };
@@ -9180,6 +9234,7 @@ fn row_summary(ty: &Type, decls: &HashMap<Symbol, RowSummary>, shape: Shape) -> 
                     .map(|arg| row_summary(arg, decls, shape))
                     .unwrap_or_default();
                 out.shaped |= inner.shaped;
+                out.shape = out.shape.or(inner.shape);
                 out.labels.extend(inner.labels);
                 out.slots.extend(inner.slots);
             }
@@ -9786,7 +9841,7 @@ impl Builder<'_> {
             parse::DataKind::Integer(value) => DataKind::Integer(value),
             parse::DataKind::Real(value) => DataKind::Real(value),
             parse::DataKind::String(value) => DataKind::String(value),
-            parse::DataKind::Boolean(value) => DataKind::Boolean(value),
+            parse::DataKind::Bool(value) => DataKind::Bool(value),
             parse::DataKind::Unit => DataKind::Struct(IndexMap::new()),
             parse::DataKind::Tuple(elements) => DataKind::Struct(
                 elements
@@ -10115,14 +10170,12 @@ impl Builder<'_> {
                                 .collect(),
                             artifact::Sense::Region
                             | artifact::Sense::Type
-                            | artifact::Sense::Fields
-                            | artifact::Sense::Cases => param.lacks.iter().cloned().collect(),
+                            | artifact::Sense::Row => param.lacks.iter().cloned().collect(),
                         };
                         match param.sense {
                             artifact::Sense::Region => ParamKind::Region { lacks },
                             artifact::Sense::Type => ParamKind::Type { lacks },
-                            artifact::Sense::Fields => ParamKind::Fields { lacks },
-                            artifact::Sense::Cases => ParamKind::Cases { lacks },
+                            artifact::Sense::Row => ParamKind::Row { lacks },
                             artifact::Sense::Effects => ParamKind::Effects { lacks },
                         }
                     })
@@ -10181,8 +10234,7 @@ impl Builder<'_> {
                         match param.sense {
                             artifact::Sense::Region => ParamKind::Region { lacks },
                             artifact::Sense::Type => ParamKind::Type { lacks },
-                            artifact::Sense::Fields => ParamKind::Fields { lacks },
-                            artifact::Sense::Cases => ParamKind::Cases { lacks },
+                            artifact::Sense::Row => ParamKind::Row { lacks },
                             artifact::Sense::Effects => ParamKind::Effects { lacks },
                         }
                     })
@@ -10441,12 +10493,23 @@ impl Builder<'_> {
     /// Which module a path's segments name: `Some(None)` for a bare name, whose
     /// segments are none at all.
     ///
-    /// R10 in one loop. The first segment resolves by the R9 walk; every later
-    /// one strictly inside the module the previous one named, with no outward
-    /// step, because a path says where to look and a walk would let it mean
-    /// somewhere else.
+    /// R10 in one loop. A relative first segment resolves by the R9 walk; an
+    /// absolute one resolves at the bundle root. Every later segment resolves
+    /// strictly inside the module the previous one named, with no outward step,
+    /// because a path says where to look and a walk would let it mean somewhere
+    /// else.
     fn segments(&mut self, path: &parse::Path) -> Option<Option<Module>> {
-        match self.import_modules(&path.modules) {
+        let module = if path.absolute.is_some() {
+            path.modules.iter().try_fold(None, |at, segment| {
+                self.modules
+                    .get(&(at, segment.tracked.clone()))
+                    .map(|&(module, _)| Some(module))
+                    .ok_or_else(|| using::PathError::Missing(segment.clone()))
+            })
+        } else {
+            self.import_modules(&path.modules)
+        };
+        match module {
             Ok(module) => Some(module),
             Err(using::PathError::Missing(name)) => {
                 self.error(
@@ -10466,7 +10529,7 @@ impl Builder<'_> {
     }
 
     fn find(&mut self, path: &parse::Path, namespace: Namespace) -> Result<Symbol, Missing> {
-        let found = if path.modules.is_empty() {
+        let found = if path.absolute.is_none() && path.modules.is_empty() {
             self.lookup_import_name(namespace, &path.name.tracked, true)
         } else {
             let Some(module) = self.segments(path) else {
@@ -10665,8 +10728,12 @@ impl Builder<'_> {
     /// naming itself through an argument's row — is the empty one: the cycle
     /// is [`expand_alias`](Self::expand_alias)'s to report.
     fn alias_body(&mut self, symbol: Symbol) -> AliasBody {
-        if let Some(body) = self.alias_bodies.get(&symbol) {
-            return body.clone();
+        if let Some(mut body) = self.alias_bodies.get(&symbol).cloned() {
+            if self.lifted_aliases.insert(symbol) {
+                self.lift_row_templates(&mut body);
+                self.alias_bodies.insert(symbol, body.clone());
+            }
+            return body;
         }
         let Some(pending) = self.pending_aliases.remove(&symbol) else {
             return AliasBody::default();
@@ -10675,12 +10742,139 @@ impl Builder<'_> {
         let params = std::mem::take(&mut self.params);
         let vars = std::mem::take(&mut self.vars);
         self.scope_params(&pending.params);
-        let body = self.within(symbol, |this| this.alias_row(pending.row));
+        let mut body = self.within(symbol, |this| this.alias_row(pending.row));
+        self.lift_row_templates(&mut body);
+        self.lifted_aliases.insert(symbol);
         self.module = module;
         self.params = params;
         self.vars = vars;
         self.alias_bodies.insert(symbol, body.clone());
         body
+    }
+
+    /// Keep structural row templates as type applications until aliases can
+    /// be unfolded by the normal row machinery. Eager syntax substitution
+    /// cannot extract a named row and would lose duplicate-label exclusions.
+    fn lift_row_templates(&mut self, body: &mut AliasBody) {
+        for case in &mut body.cases {
+            for arg in &mut case.args {
+                self.lift_row_template(arg);
+            }
+        }
+    }
+
+    fn lift_row_template(&mut self, ty: &mut Type) {
+        if let TypeKind::Effects(row) = &mut ty.anchored {
+            for label in row.effects.values_mut() {
+                for arg in label.args_mut() {
+                    self.lift_row_template(arg);
+                }
+            }
+            return;
+        }
+        let mut pending = vec![&*ty];
+        let mut captured = std::collections::BTreeMap::new();
+        let mut structural_tail = false;
+        while let Some(node) = pending.pop() {
+            let mut tail = None;
+            match &node.anchored {
+                TypeKind::Param { symbol, index } => {
+                    captured.insert(*index, (*symbol, node.at));
+                }
+                TypeKind::Struct { fields, tail: rest } => {
+                    pending.extend(fields.values().filter_map(TypeField::value));
+                    tail = rest.as_ref();
+                    structural_tail |= matches!(
+                        tail,
+                        Some(Tail {
+                            of: Row::Param { .. },
+                            ..
+                        })
+                    );
+                }
+                TypeKind::Sum { cases, tail: rest } => {
+                    pending.extend(cases.values().filter_map(SumCase::payload));
+                    tail = rest.as_ref();
+                    structural_tail |= matches!(
+                        tail,
+                        Some(Tail {
+                            of: Row::Param { .. },
+                            ..
+                        })
+                    );
+                }
+                TypeKind::Arrow { from, to, effects } => {
+                    pending.extend([from.as_ref(), to.as_ref()]);
+                    pending.extend(effects.effects.values().flat_map(EffectLabel::args));
+                    tail = effects.tail.as_ref();
+                }
+                TypeKind::Effects(row) => {
+                    pending.extend(row.effects.values().flat_map(EffectLabel::args));
+                    tail = row.tail.as_ref();
+                }
+                TypeKind::Apply { args, .. } => pending.extend(args),
+                TypeKind::Array(element) => pending.push(element),
+                TypeKind::Mut(region, element) => {
+                    pending.extend([region.as_ref(), element.as_ref()])
+                }
+                _ => {}
+            }
+            if let Some(Tail {
+                at,
+                of: Row::Param { symbol, index },
+            }) = tail
+            {
+                captured.insert(*index, (*symbol, *at));
+            }
+        }
+        if !structural_tail {
+            return;
+        }
+        let head = self.mint.local(None, Namespace::Types, "row template");
+        let mut params = Vec::new();
+        let mut args = Vec::new();
+        let count = *captured.last_key_value().unwrap().0 as usize + 1;
+        let mut replacements = vec![ty.at.anchor(TypeKind::Error); count];
+        for (original, (symbol, at)) in captured {
+            let fresh = self.mint.local_in(
+                head,
+                Namespace::Types,
+                self.mint.name(symbol).to_owned().as_str(),
+            );
+            replacements[original as usize] = at.anchor(TypeKind::Param {
+                symbol: fresh,
+                index: params.len() as u32,
+            });
+            params.push(Param {
+                at,
+                symbol: fresh,
+                kind: ParamKind::Type {
+                    lacks: IndexSet::new(),
+                },
+                relevant: false,
+            });
+            args.push(at.anchor(TypeKind::Param {
+                symbol,
+                index: original,
+            }));
+        }
+        let value = self.substituted(ty, &replacements);
+        self.arities.insert(head, params.len());
+        self.row_templates.insert(
+            head,
+            Decl {
+                name_at: ty.at,
+                annotation: None,
+                params,
+                metadata: Metadata::new(),
+                value,
+            },
+        );
+        ty.anchored = TypeKind::Apply {
+            head,
+            head_at: ty.at,
+            args,
+        };
     }
 
     /// Lower the row an alias declaration wrote: each application resolved,
@@ -11045,9 +11239,7 @@ impl Builder<'_> {
                         Some(_) => {
                             self.error_at(
                                 args[*index as usize].at,
-                                ErrorKind::NotARow {
-                                    sense: Sense::Fields,
-                                },
+                                ErrorKind::NotARow { sense: Sense::Row },
                             );
                             tail = None;
                         }
@@ -11105,9 +11297,7 @@ impl Builder<'_> {
                         Some(_) => {
                             self.error_at(
                                 args[*index as usize].at,
-                                ErrorKind::NotARow {
-                                    sense: Sense::Cases,
-                                },
+                                ErrorKind::NotARow { sense: Sense::Row },
                             );
                             tail = None;
                         }
@@ -11822,7 +12012,7 @@ impl Builder<'_> {
             ExprKind::Integer(value) => TermKind::Integer(value).at(self.anchor(span)),
             ExprKind::Real(value) => TermKind::Real(value).at(self.anchor(span)),
             ExprKind::String(value) => TermKind::String(value).at(self.anchor(span)),
-            ExprKind::Boolean(value) => TermKind::Boolean(value).at(self.anchor(span)),
+            ExprKind::Bool(value) => TermKind::Bool(value).at(self.anchor(span)),
             ExprKind::Unary { op, value } => TermKind::Unary {
                 op: match op {
                     parse::UnaryOp::Neg => UnaryOp::Neg,
@@ -11948,7 +12138,7 @@ impl Builder<'_> {
             }
             ExprKind::Match { scrutinee, arms } => self.match_term(span, *scrutinee, arms),
             // A conditional is surface syntax for the ordinary exhaustive
-            // Boolean match. Keeping the desugaring here means inference,
+            // Bool match. Keeping the desugaring here means inference,
             // coverage checking, pattern compilation, and LIR all use their
             // existing match paths; no conditional reaches the IR.
             ExprKind::If {
@@ -11959,11 +12149,11 @@ impl Builder<'_> {
                 let pattern_span = predicate.span;
                 let arms = vec![
                     parse::Arm {
-                        pattern: pattern_span.track(parse::PatternKind::Boolean(true)),
+                        pattern: pattern_span.track(parse::PatternKind::Bool(true)),
                         body: *consequent,
                     },
                     parse::Arm {
-                        pattern: pattern_span.track(parse::PatternKind::Boolean(false)),
+                        pattern: pattern_span.track(parse::PatternKind::Bool(false)),
                         body: *alternative,
                     },
                 ];
@@ -13022,7 +13212,7 @@ impl Builder<'_> {
             parse::PatternKind::Integer(value) => here.anchor(PatternKind::Integer(value)),
             parse::PatternKind::Real(value) => here.anchor(PatternKind::Real(value)),
             parse::PatternKind::String(value) => here.anchor(PatternKind::String(value)),
-            parse::PatternKind::Boolean(value) => here.anchor(PatternKind::Boolean(value)),
+            parse::PatternKind::Bool(value) => here.anchor(PatternKind::Bool(value)),
             parse::PatternKind::Unit => here.anchor(PatternKind::Unit),
             // A bare tag keeps its `None`: what it constrains the payload to —
             // unit — is said where the type is built rather than written into
@@ -13526,14 +13716,12 @@ impl Builder<'_> {
     }
 }
 
-/// What a `..` written on a row of this shape stands for: a struct's is the
-/// whole type its fields sit on, and a sum's is the cases it does not write out.
-/// The one place the two shapes still have different answers, and the reason
-/// [`Sense`] has two variants rather than one. See [`ErrorKind::MixedTail`].
+/// A constructor determines how its row is interpreted. Structs and sums
+/// share one parameter kind, while effects use a separate row kind.
 fn sense(shape: Shape) -> Sense {
     match shape {
-        Shape::Struct => Sense::Fields,
-        Shape::Sum => Sense::Cases,
+        Shape::Struct => Sense::Row,
+        Shape::Sum => Sense::Row,
         Shape::Effect => Sense::Effects,
     }
 }

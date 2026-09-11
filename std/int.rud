@@ -6,27 +6,33 @@ extern remainder: fn(Int, Int) -> Int = "(left, right) => left % right"
 extern negate: fn(Int) -> Int = "value => -value"
 extern abs: fn(Int) -> Int = "Math.abs"
 
-extern equal: fn(Int, Int) -> Boolean = "(left, right) => left === right"
-extern not_equal: fn(Int, Int) -> Boolean = "(left, right) => left !== right"
-extern less_than: fn(Int, Int) -> Boolean = "(left, right) => left < right"
-extern less_than_or_equal: fn(Int, Int) -> Boolean = "(left, right) => left <= right"
-extern greater_than: fn(Int, Int) -> Boolean = "(left, right) => left > right"
-extern greater_than_or_equal: fn(Int, Int) -> Boolean = "(left, right) => left >= right"
+@private
+extern ordering_less_than: fn(Int, Int) -> Bool = "(left, right) => left < right"
+@private
+extern ordering_greater_than: fn(Int, Int) -> Bool = "(left, right) => left > right"
 
 extern min: fn(Int, Int) -> Int = "Math.min"
 extern max: fn(Int, Int) -> Int = "Math.max"
 extern clamp: fn(Int, Int, Int) -> Int =
   "(value, minimum, maximum) => Math.min(Math.max(value, minimum), maximum)"
-let is_zero: Int -> Boolean = fn value => match value with | 0i => true | _ => false end
+let is_zero: Int -> Bool = fn value => match value with | 0i => true | _ => false end
 
 extern from_nat: fn(Nat) -> Int = "value => value"
 extern from_real: fn(Real) -> Int = "Math.trunc"
 
-let compare: Int -> Int -> Ordering = fn left right =>
-  if less_than left right then #Less
-  else if greater_than left right then #Greater
+let compare: order::Ordering Int = fn left right =>
+  if ordering_less_than left right then #Less
+  else if ordering_greater_than left right then #Greater
   else #Equal
   end
+let {
+  equal,
+  not_equal,
+  less_than,
+  less_than_or_equal,
+  greater_than,
+  greater_than_or_equal,
+} = order::derive compare
 
 -- Int8: arithmetic wraps modulo 2^8; division truncates toward zero.
 let min_value8: Int8 = -128i8
@@ -40,17 +46,15 @@ extern remainder8: fn(Int8, Int8) -> Int8 =
   "(left, right) => { if (right === 0) throw new RangeError(\"division by zero\"); return ((left % right) << 24 >> 24); }"
 extern negate8: fn(Int8) -> Int8 = "value => ((-value) << 24 >> 24)"
 extern abs8: fn(Int8) -> Int8 = "value => value < 0 ? ((-value) << 24 >> 24) : value"
-extern equal8: fn(Int8, Int8) -> Boolean = "(left, right) => left === right"
-extern not_equal8: fn(Int8, Int8) -> Boolean = "(left, right) => left !== right"
-extern less_than8: fn(Int8, Int8) -> Boolean = "(left, right) => left < right"
-extern less_than_or_equal8: fn(Int8, Int8) -> Boolean = "(left, right) => left <= right"
-extern greater_than8: fn(Int8, Int8) -> Boolean = "(left, right) => left > right"
-extern greater_than_or_equal8: fn(Int8, Int8) -> Boolean = "(left, right) => left >= right"
+@private
+extern ordering_less_than8: fn(Int8, Int8) -> Bool = "(left, right) => left < right"
+@private
+extern ordering_greater_than8: fn(Int8, Int8) -> Bool = "(left, right) => left > right"
 extern min8: fn(Int8, Int8) -> Int8 = "(left, right) => left < right ? left : right"
 extern max8: fn(Int8, Int8) -> Int8 = "(left, right) => left > right ? left : right"
 extern clamp8: fn(Int8, Int8, Int8) -> Int8 =
   "(value, minimum, maximum) => value < minimum ? minimum : value > maximum ? maximum : value"
-extern is_zero8: fn(Int8) -> Boolean = "value => value === 0"
+extern is_zero8: fn(Int8) -> Bool = "value => value === 0"
 extern from_nat8: fn(Nat) -> Int8 =
   "value => { if (!Number.isSafeInteger(value)) throw new RangeError(\"expected a safe integer\"); return ((value) << 24 >> 24); }"
 extern from_int8: fn(Int) -> Int8 =
@@ -58,11 +62,19 @@ extern from_int8: fn(Int) -> Int8 =
 extern to_string8: fn(Int8) -> String = "value => String(value)"
 extern to_int8: fn(Int8) -> Int =
   "value => { const result = value; if (!Number.isSafeInteger(result)) throw new RangeError(\"integer out of range\"); return result; }"
-let compare8: Int8 -> Int8 -> Ordering = fn left right =>
-  if less_than8 left right then #Less
-  else if greater_than8 left right then #Greater
+let compare8: order::Ordering Int8 = fn left right =>
+  if ordering_less_than8 left right then #Less
+  else if ordering_greater_than8 left right then #Greater
   else #Equal
   end
+let {
+  equal: equal8,
+  not_equal: not_equal8,
+  less_than: less_than8,
+  less_than_or_equal: less_than_or_equal8,
+  greater_than: greater_than8,
+  greater_than_or_equal: greater_than_or_equal8,
+} = order::derive compare8
 
 -- Int16: arithmetic wraps modulo 2^16; division truncates toward zero.
 let min_value16: Int16 = -32768i16
@@ -76,17 +88,15 @@ extern remainder16: fn(Int16, Int16) -> Int16 =
   "(left, right) => { if (right === 0) throw new RangeError(\"division by zero\"); return ((left % right) << 16 >> 16); }"
 extern negate16: fn(Int16) -> Int16 = "value => ((-value) << 16 >> 16)"
 extern abs16: fn(Int16) -> Int16 = "value => value < 0 ? ((-value) << 16 >> 16) : value"
-extern equal16: fn(Int16, Int16) -> Boolean = "(left, right) => left === right"
-extern not_equal16: fn(Int16, Int16) -> Boolean = "(left, right) => left !== right"
-extern less_than16: fn(Int16, Int16) -> Boolean = "(left, right) => left < right"
-extern less_than_or_equal16: fn(Int16, Int16) -> Boolean = "(left, right) => left <= right"
-extern greater_than16: fn(Int16, Int16) -> Boolean = "(left, right) => left > right"
-extern greater_than_or_equal16: fn(Int16, Int16) -> Boolean = "(left, right) => left >= right"
+@private
+extern ordering_less_than16: fn(Int16, Int16) -> Bool = "(left, right) => left < right"
+@private
+extern ordering_greater_than16: fn(Int16, Int16) -> Bool = "(left, right) => left > right"
 extern min16: fn(Int16, Int16) -> Int16 = "(left, right) => left < right ? left : right"
 extern max16: fn(Int16, Int16) -> Int16 = "(left, right) => left > right ? left : right"
 extern clamp16: fn(Int16, Int16, Int16) -> Int16 =
   "(value, minimum, maximum) => value < minimum ? minimum : value > maximum ? maximum : value"
-extern is_zero16: fn(Int16) -> Boolean = "value => value === 0"
+extern is_zero16: fn(Int16) -> Bool = "value => value === 0"
 extern from_nat16: fn(Nat) -> Int16 =
   "value => { if (!Number.isSafeInteger(value)) throw new RangeError(\"expected a safe integer\"); return ((value) << 16 >> 16); }"
 extern from_int16: fn(Int) -> Int16 =
@@ -94,11 +104,19 @@ extern from_int16: fn(Int) -> Int16 =
 extern to_string16: fn(Int16) -> String = "value => String(value)"
 extern to_int16: fn(Int16) -> Int =
   "value => { const result = value; if (!Number.isSafeInteger(result)) throw new RangeError(\"integer out of range\"); return result; }"
-let compare16: Int16 -> Int16 -> Ordering = fn left right =>
-  if less_than16 left right then #Less
-  else if greater_than16 left right then #Greater
+let compare16: order::Ordering Int16 = fn left right =>
+  if ordering_less_than16 left right then #Less
+  else if ordering_greater_than16 left right then #Greater
   else #Equal
   end
+let {
+  equal: equal16,
+  not_equal: not_equal16,
+  less_than: less_than16,
+  less_than_or_equal: less_than_or_equal16,
+  greater_than: greater_than16,
+  greater_than_or_equal: greater_than_or_equal16,
+} = order::derive compare16
 
 -- Int32: arithmetic wraps modulo 2^32; division truncates toward zero.
 let min_value32: Int32 = -2147483648i32
@@ -112,17 +130,15 @@ extern remainder32: fn(Int32, Int32) -> Int32 =
   "(left, right) => { if (right === 0) throw new RangeError(\"division by zero\"); return ((left % right) | 0); }"
 extern negate32: fn(Int32) -> Int32 = "value => ((-value) | 0)"
 extern abs32: fn(Int32) -> Int32 = "value => value < 0 ? ((-value) | 0) : value"
-extern equal32: fn(Int32, Int32) -> Boolean = "(left, right) => left === right"
-extern not_equal32: fn(Int32, Int32) -> Boolean = "(left, right) => left !== right"
-extern less_than32: fn(Int32, Int32) -> Boolean = "(left, right) => left < right"
-extern less_than_or_equal32: fn(Int32, Int32) -> Boolean = "(left, right) => left <= right"
-extern greater_than32: fn(Int32, Int32) -> Boolean = "(left, right) => left > right"
-extern greater_than_or_equal32: fn(Int32, Int32) -> Boolean = "(left, right) => left >= right"
+@private
+extern ordering_less_than32: fn(Int32, Int32) -> Bool = "(left, right) => left < right"
+@private
+extern ordering_greater_than32: fn(Int32, Int32) -> Bool = "(left, right) => left > right"
 extern min32: fn(Int32, Int32) -> Int32 = "(left, right) => left < right ? left : right"
 extern max32: fn(Int32, Int32) -> Int32 = "(left, right) => left > right ? left : right"
 extern clamp32: fn(Int32, Int32, Int32) -> Int32 =
   "(value, minimum, maximum) => value < minimum ? minimum : value > maximum ? maximum : value"
-extern is_zero32: fn(Int32) -> Boolean = "value => value === 0"
+extern is_zero32: fn(Int32) -> Bool = "value => value === 0"
 extern from_nat32: fn(Nat) -> Int32 =
   "value => { if (!Number.isSafeInteger(value)) throw new RangeError(\"expected a safe integer\"); return ((value) | 0); }"
 extern from_int32: fn(Int) -> Int32 =
@@ -130,11 +146,19 @@ extern from_int32: fn(Int) -> Int32 =
 extern to_string32: fn(Int32) -> String = "value => String(value)"
 extern to_int32: fn(Int32) -> Int =
   "value => { const result = value; if (!Number.isSafeInteger(result)) throw new RangeError(\"integer out of range\"); return result; }"
-let compare32: Int32 -> Int32 -> Ordering = fn left right =>
-  if less_than32 left right then #Less
-  else if greater_than32 left right then #Greater
+let compare32: order::Ordering Int32 = fn left right =>
+  if ordering_less_than32 left right then #Less
+  else if ordering_greater_than32 left right then #Greater
   else #Equal
   end
+let {
+  equal: equal32,
+  not_equal: not_equal32,
+  less_than: less_than32,
+  less_than_or_equal: less_than_or_equal32,
+  greater_than: greater_than32,
+  greater_than_or_equal: greater_than_or_equal32,
+} = order::derive compare32
 
 -- Int64: arithmetic wraps modulo 2^64; division truncates toward zero.
 let min_value64: Int64 = -9223372036854775808i64
@@ -146,17 +170,15 @@ extern divide64: fn(Int64, Int64) -> Int64 = "(left, right) => BigInt.asIntN(64,
 extern remainder64: fn(Int64, Int64) -> Int64 = "(left, right) => BigInt.asIntN(64, left % right)"
 extern negate64: fn(Int64) -> Int64 = "value => BigInt.asIntN(64, -value)"
 extern abs64: fn(Int64) -> Int64 = "value => value < 0n ? BigInt.asIntN(64, -value) : value"
-extern equal64: fn(Int64, Int64) -> Boolean = "(left, right) => left === right"
-extern not_equal64: fn(Int64, Int64) -> Boolean = "(left, right) => left !== right"
-extern less_than64: fn(Int64, Int64) -> Boolean = "(left, right) => left < right"
-extern less_than_or_equal64: fn(Int64, Int64) -> Boolean = "(left, right) => left <= right"
-extern greater_than64: fn(Int64, Int64) -> Boolean = "(left, right) => left > right"
-extern greater_than_or_equal64: fn(Int64, Int64) -> Boolean = "(left, right) => left >= right"
+@private
+extern ordering_less_than64: fn(Int64, Int64) -> Bool = "(left, right) => left < right"
+@private
+extern ordering_greater_than64: fn(Int64, Int64) -> Bool = "(left, right) => left > right"
 extern min64: fn(Int64, Int64) -> Int64 = "(left, right) => left < right ? left : right"
 extern max64: fn(Int64, Int64) -> Int64 = "(left, right) => left > right ? left : right"
 extern clamp64: fn(Int64, Int64, Int64) -> Int64 =
   "(value, minimum, maximum) => value < minimum ? minimum : value > maximum ? maximum : value"
-extern is_zero64: fn(Int64) -> Boolean = "value => value === 0n"
+extern is_zero64: fn(Int64) -> Bool = "value => value === 0n"
 extern from_nat64: fn(Nat) -> Int64 =
   "value => { if (!Number.isSafeInteger(value)) throw new RangeError(\"expected a safe integer\"); return BigInt.asIntN(64, BigInt(value)); }"
 extern from_int64: fn(Int) -> Int64 =
@@ -164,8 +186,16 @@ extern from_int64: fn(Int) -> Int64 =
 extern to_string64: fn(Int64) -> String = "value => String(value)"
 extern to_int64: fn(Int64) -> Int =
   "value => { const result = Number(value); if (!Number.isSafeInteger(result)) throw new RangeError(\"integer out of range\"); return result; }"
-let compare64: Int64 -> Int64 -> Ordering = fn left right =>
-  if less_than64 left right then #Less
-  else if greater_than64 left right then #Greater
+let compare64: order::Ordering Int64 = fn left right =>
+  if ordering_less_than64 left right then #Less
+  else if ordering_greater_than64 left right then #Greater
   else #Equal
   end
+let {
+  equal: equal64,
+  not_equal: not_equal64,
+  less_than: less_than64,
+  less_than_or_equal: less_than_or_equal64,
+  greater_than: greater_than64,
+  greater_than_or_equal: greater_than_or_equal64,
+} = order::derive compare64

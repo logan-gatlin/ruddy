@@ -1,22 +1,20 @@
 extern concat: fn(String, String) -> String = "(left, right) => left + right"
 extern len: fn(String) -> Nat = "value => value.length"
-let is_empty: String -> Boolean = fn value => match value with | "" => true | _ => false end
+let is_empty: String -> Bool = fn value => match value with | "" => true | _ => false end
 
 extern from_nat: fn(Nat) -> String = "value => String(value)"
 extern from_int: fn(Int) -> String = "value => String(value)"
 extern from_real: fn(Real) -> String = "value => String(value)"
-let from_boolean: Boolean -> String = fn b => match b with | true => "true" | false => "false" end
+let from_boolean: Bool -> String = fn b => match b with | true => "true" | false => "false" end
 
-extern equal: fn(String, String) -> Boolean = "(left, right) => left === right"
-extern not_equal: fn(String, String) -> Boolean = "(left, right) => left !== right"
-extern less_than: fn(String, String) -> Boolean = "(left, right) => left < right"
-extern less_than_or_equal: fn(String, String) -> Boolean = "(left, right) => left <= right"
-extern greater_than: fn(String, String) -> Boolean = "(left, right) => left > right"
-extern greater_than_or_equal: fn(String, String) -> Boolean = "(left, right) => left >= right"
+@private
+extern ordering_less_than: fn(String, String) -> Bool = "(left, right) => left < right"
+@private
+extern ordering_greater_than: fn(String, String) -> Bool = "(left, right) => left > right"
 
-extern contains: fn(String, String) -> Boolean = "(value, search) => value.includes(search)"
-extern starts_with: fn(String, String) -> Boolean = "(value, prefix) => value.startsWith(prefix)"
-extern ends_with: fn(String, String) -> Boolean = "(value, suffix) => value.endsWith(suffix)"
+extern contains: fn(String, String) -> Bool = "(value, search) => value.includes(search)"
+extern starts_with: fn(String, String) -> Bool = "(value, prefix) => value.startsWith(prefix)"
+extern ends_with: fn(String, String) -> Bool = "(value, suffix) => value.endsWith(suffix)"
 extern char_at: fn(String, Nat) -> String = "(value, index) => value.charAt(index)"
 extern index_of: fn(String, String) -> Int = "(value, search) => value.indexOf(search)"
 
@@ -38,13 +36,22 @@ extern pad_end: fn(String, Nat, String) -> String =
   "(value, length, fill) => value.padEnd(length, fill)"
 extern reverse: fn(String) -> String = "value => value.split('').reverse().join('')"
 
-let compare: String -> String -> Ordering = fn left right =>
-  if less_than left right then #Less
-  else if greater_than left right then #Greater
+let compare: order::Ordering String = fn left right =>
+  if ordering_less_than left right then #Less
+  else if ordering_greater_than left right then #Greater
   else #Equal
   end
 
-let is_blank: String -> Boolean = fn value => is_empty (trim value)
+let {
+  equal,
+  not_equal,
+  less_than,
+  less_than_or_equal,
+  greater_than,
+  greater_than_or_equal,
+} = order::derive compare
+
+let is_blank: String -> Bool = fn value => is_empty (trim value)
 
 let char_at_option: String -> Nat -> Option String = fn value index =>
   if nat::less_than index (len value) then #Some (char_at value index) else #None end
@@ -71,28 +78,23 @@ let split_once: String -> String -> Option (String, String) = fn value separator
   | #None => #None
   end
 
-let chars: String -> List String = fn value =>
-  if is_empty value then #None
-  else #Cons (char_at value 0n, chars (drop value 1n))
-  end
+let chars: String -> [String] = fn value =>
+  if is_empty value then [] else [char_at value 0n, ..chars (drop value 1n)] end
 
-let split: String -> String -> List String = fn value separator =>
+let split: String -> String -> [String] = fn value separator =>
   if is_empty separator then chars value
   else
     match index_of_option value separator with
     | #Some index =>
-      #Cons (take value index, split (drop value (nat::add index (len separator))) separator)
-    | #None => #Cons (value, #None)
+      [take value index, ..split (drop value (nat::add index (len separator))) separator]
+    | #None => [value]
     end
   end
 
-let join: String -> List String -> String = fn separator values => match values with
-| #Cons (head, tail) =>
-  match tail with
-  | #Cons _ => concat head (concat separator (join separator tail))
-  | #None => head
-  end
-| #None => ""
+let join: String -> [String] -> String = fn separator values => match values with
+| [] => ""
+| [head] => head
+| [head, ..tail] => concat head (concat separator (join separator tail))
 end
 
 let slice_with: String -> { start when 'start: Nat, stop when 'stop: Nat } -> String =

@@ -250,16 +250,16 @@ fn executable_main_waits_for_async_initialization_and_preserves_process_exit() {
     let project = tempfile::tempdir().unwrap();
     fs::write(project.path().join("Ruddy.toml"), "name = \"async-main\"\nversion = \"1.0.0\"\nkind = \"executable\"\nroot = \"main.rud\"\ntarget = \"js\"\n[dependencies]\nstd = false\n").unwrap();
     fs::write(project.path().join("main.rud"), r#"
-        effect Console = { write: String -> (), write_error: String -> () }
-        effect Process = { exit: Nat -> | }
+        effect IO = { write: String -> (), write_error: String -> () }
+        effect Exit = Nat -> |
         @async
         extern wait : String -> String = "value => new Promise(resolve => queueMicrotask(() => { console.log(value); resolve(value); }))"
         let initialized = wait "initialized"
         let main = fn _ => do
           let _ = wait "main"
-          let _ = !Console.write initialized
-          let _ = !Console.write_error "error"
-          return !Process.exit 23n
+          let _ = !IO.write initialized
+          let _ = !IO.write_error "error"
+          return !Exit 23n
         end
     "#).unwrap();
     let artifact = build_project(project.path()).unwrap();
