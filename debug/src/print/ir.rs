@@ -524,7 +524,7 @@ impl Grouped for Show<'_, TypeKind> {
             // A row of effects binds as a sum does: same labels, same tail,
             // same brackets around it.
             TypeKind::Sum { .. } | TypeKind::Effects(_) => Prec::Sum,
-            TypeKind::Apply { .. } | TypeKind::Mut(..) => Prec::Apply,
+            TypeKind::Apply { .. } | TypeKind::Mut(..) | TypeKind::Mirror(_) => Prec::Apply,
             // The body runs as far right as it can, as the written form's does.
             TypeKind::Hidden { .. } => Prec::Lambda,
             TypeKind::Struct { .. }
@@ -796,6 +796,9 @@ impl fmt::Display for Show<'_, TypeKind> {
                 self.show(&**element)
             ),
             TypeKind::Array(element) => write!(f, "[{}]", self.show(&**element)),
+            TypeKind::Mirror(element) => {
+                write_applied(f, "Mirror", std::iter::once(self.show(&**element)))
+            }
             TypeKind::Arrow { from, to, effects } => {
                 let row = self.effect_row(effects);
                 write_arrow(

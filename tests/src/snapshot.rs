@@ -3986,3 +3986,27 @@ fn hidden_types_are_shown_by_the_ir_and_constraints_tabs() {
         assert!(text.contains(rule), "the solve tab shows no {rule} step");
     }
 }
+
+#[test]
+fn pattern_bound_mirrors_are_shown_by_the_reification_tab() {
+    let snapshot = snapshot(
+        "@private extern type_of: 'a -> Mirror 'a = \"$typeOf\"\n\
+         type Dyn = hide 'a => { value: 'a, evidence: Mirror 'a }\n\
+         let echo: Dyn -> Dyn = fn item => match item with\n\
+         | hide 'x { value, evidence } => { value: value, evidence: type_of value }\n\
+         end\n",
+    );
+    assert!(
+        snapshot.diagnostics.is_empty(),
+        "{:#?}",
+        snapshot.diagnostics
+    );
+    let stage = stage_named(&snapshot, "reification");
+    assert!(
+        nodes(stage)
+            .iter()
+            .any(|node| node.label == "evidence" && node.text.contains("evidence for type")),
+        "{:#?}",
+        stage.nodes
+    );
+}

@@ -574,6 +574,11 @@ pub enum Ty {
     },
     /// An immutable homogeneous array.
     Array(Arc<Ty>),
+    /// `Mirror T` — authentic evidence of the type `T`: opaque, compiler-made,
+    /// and invariant in its type, so two mirrors are one type exactly when the
+    /// types they mirror are. Its values are the runtime type information the
+    /// compiler already passes as hidden evidence, made a first-class value.
+    Mirror(Arc<Ty>),
     /// A cell with a fixed region and invariant element type.
     Mut(Arc<Ty>, Arc<Ty>),
     /// A structural record and its true field-row tail.
@@ -952,7 +957,7 @@ fn take_ty_children(ty: &mut Ty, types: &mut Vec<Arc<Ty>>, rows: &mut Vec<Arc<Ro
             types.push(std::mem::replace(region, Arc::new(Ty::Undecided)));
             types.push(std::mem::replace(element, Arc::new(Ty::Undecided)));
         }
-        Ty::Array(element) => {
+        Ty::Array(element) | Ty::Mirror(element) => {
             types.push(std::mem::replace(element, Arc::new(Ty::Undecided)));
         }
         Ty::Struct(row) | Ty::Sum(row) => take_row_children(row, types, rows),
@@ -1172,7 +1177,9 @@ pub(crate) fn same_finite_syntax_metered(
                         pending.push(Pair::Ty(a, c, env.clone()));
                         pending.push(Pair::Ty(b, d, env));
                     }
-                    (Ty::Array(left), Ty::Array(right)) => pending.push(Pair::Ty(left, right, env)),
+                    (Ty::Array(left), Ty::Array(right)) | (Ty::Mirror(left), Ty::Mirror(right)) => {
+                        pending.push(Pair::Ty(left, right, env))
+                    }
                     (Ty::Struct(left), Ty::Struct(right)) | (Ty::Sum(left), Ty::Sum(right)) => {
                         pending.push(Pair::Row(left, right, env))
                     }
@@ -1269,6 +1276,7 @@ pub fn open_hidden(body: &Arc<Ty>, binder: u32, replacement: &Arc<Ty>) -> Arc<Ty
         Shadow,
         Unshadow,
         Array,
+        Mirror,
         Mut,
         Struct,
         Sum,
@@ -1318,6 +1326,10 @@ pub fn open_hidden(body: &Arc<Ty>, binder: u32, replacement: &Arc<Ty>) -> Arc<Ty
                 }
                 Ty::Array(element) => {
                     work.push(Work::Array);
+                    work.push(Work::Ty(element));
+                }
+                Ty::Mirror(element) => {
+                    work.push(Work::Mirror);
                     work.push(Work::Ty(element));
                 }
                 Ty::Mut(region, element) => {
@@ -1386,6 +1398,10 @@ pub fn open_hidden(body: &Arc<Ty>, binder: u32, replacement: &Arc<Ty>) -> Arc<Ty
             Work::Array => {
                 let element = types.pop().expect("array postorder");
                 types.push(Arc::new(Ty::Array(element)));
+            }
+            Work::Mirror => {
+                let element = types.pop().expect("mirror postorder");
+                types.push(Arc::new(Ty::Mirror(element)));
             }
             Work::Mut => {
                 let element = types.pop().expect("cell element");
@@ -1729,7 +1745,9 @@ fn existential_outside_package(body: &Arc<Ty>, existentials: &IndexSet<u32>) -> 
             Work::Ty(ty, packaged) => match &*ty {
                 Ty::Package(inner) => work.push(Work::Ty(inner.clone(), true)),
                 Ty::Hidden { body, .. } => work.push(Work::Ty(body.clone(), packaged)),
-                Ty::Array(element) => work.push(Work::Ty(element.clone(), packaged)),
+                Ty::Array(element) | Ty::Mirror(element) => {
+                    work.push(Work::Ty(element.clone(), packaged))
+                }
                 Ty::Mut(region, element) => {
                     work.push(Work::Ty(element.clone(), packaged));
                     work.push(Work::Ty(region.clone(), packaged));
@@ -1787,7 +1805,9 @@ fn partition_package_formula(
                     work.push(Work::Ty(inner.clone(), Some(here)));
                 }
                 Ty::Hidden { body, .. } => work.push(Work::Ty(body.clone(), owner)),
-                Ty::Array(element) => work.push(Work::Ty(element.clone(), owner)),
+                Ty::Array(element) | Ty::Mirror(element) => {
+                    work.push(Work::Ty(element.clone(), owner))
+                }
                 Ty::Mut(region, element) => {
                     work.push(Work::Ty(element.clone(), owner));
                     work.push(Work::Ty(region.clone(), owner));

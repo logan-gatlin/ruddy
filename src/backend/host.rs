@@ -106,6 +106,9 @@ pub(super) fn native_descriptor(
                 format!("{path} element"),
                 incoming,
             )),
+            Type::Mirror(inner) => {
+                Runtime::Mirror(child(view.child(inner), format!("{path} mirror"), incoming))
+            }
             Type::Named { name, args } => {
                 let declaration = declarations
                     .get(name.as_str())
@@ -386,11 +389,11 @@ fn key(
                     work.push(Work::Text(format!("{name:?}:{presence:?};")));
                 }
             }
-            Type::Array(inner) | Type::Package(inner) => {
-                out.push_str(if matches!(view.ty, Type::Array(_)) {
-                    "A("
-                } else {
-                    "P("
+            Type::Array(inner) | Type::Package(inner) | Type::Mirror(inner) => {
+                out.push_str(match view.ty {
+                    Type::Array(_) => "A(",
+                    Type::Mirror(_) => "M(",
+                    _ => "P(",
                 });
                 work.push(Work::Text(")".into()));
                 work.push(Work::Type(view.child(inner)));
@@ -510,6 +513,8 @@ impl Graph {
                     }
                 }
                 Type::Array(inner) => Plan::Array(child(view.child(inner))),
+                // A mirror crosses as the opaque value it is.
+                Type::Mirror(_) => Plan::Value,
                 Type::Struct(row) | Type::Sum(row) => {
                     let fields = fields(row, view.clone(), declarations);
                     let open = !matches!(fields.rest, Rest::Closed);

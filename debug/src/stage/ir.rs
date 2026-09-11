@@ -975,6 +975,11 @@ fn type_node(ids: &mut Ids, cx: &Cx, mint: &Mint, ty: &Type, scope: &[Variable])
             ..node
         }
         .child(type_node(ids, cx, mint, element, scope)),
+        TypeKind::Mirror(element) => Node {
+            label: "Mirror".into(),
+            ..node
+        }
+        .child(type_node(ids, cx, mint, element, scope)),
         // The struct's row again about cases; see the arm below for what the
         // `Rest` child is.
         TypeKind::Sum { cases, tail } => {

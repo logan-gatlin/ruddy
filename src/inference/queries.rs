@@ -323,7 +323,9 @@ fn written_names(root: &ir::Type, out: &mut HashSet<Symbol>) {
                 out.insert(*head);
                 work.extend(args);
             }
-            T::Array(element) | T::Hidden { body: element, .. } => work.push(element),
+            T::Array(element) | T::Mirror(element) | T::Hidden { body: element, .. } => {
+                work.push(element)
+            }
             T::Mut(region, element) => {
                 work.push(region);
                 work.push(element);
@@ -372,7 +374,10 @@ fn semantic_names(root: &Ty, out: &mut HashSet<Symbol>, effects: &mut HashSet<St
                 work.extend(args.iter().map(|ty| &**ty));
                 None
             }
-            Ty::Array(element) | Ty::Package(element) | Ty::Hidden { body: element, .. } => {
+            Ty::Array(element)
+            | Ty::Mirror(element)
+            | Ty::Package(element)
+            | Ty::Hidden { body: element, .. } => {
                 work.push(element);
                 None
             }
@@ -712,7 +717,10 @@ fn quantified_rows(root: &Ty) -> HashSet<u32> {
                 Some(row)
             }
             Ty::Struct(row) | Ty::Sum(row) => Some(row),
-            Ty::Array(inner) | Ty::Package(inner) | Ty::Hidden { body: inner, .. } => {
+            Ty::Array(inner)
+            | Ty::Mirror(inner)
+            | Ty::Package(inner)
+            | Ty::Hidden { body: inner, .. } => {
                 work.push(inner);
                 None
             }

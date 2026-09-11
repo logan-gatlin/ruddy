@@ -769,6 +769,7 @@ impl Solve<'_> {
             | Ty::ForeignValue
             | Ty::Arrow(..)
             | Ty::Array(_)
+            | Ty::Mirror(_)
             | Ty::Mut(..)
             | Ty::Sum(_) => {
                 self.not_a_struct(operand_span, exposed, super::StructDemand::Spread, result)
@@ -977,6 +978,7 @@ impl Solve<'_> {
             Package(*const Ty, Arc<Ty>),
             Hidden(*const Ty, Arc<Ty>),
             Array(*const Ty, Arc<Ty>),
+            Mirror(*const Ty, Arc<Ty>),
             Mut(*const Ty, Arc<Ty>),
             Struct(*const Ty, Arc<Ty>),
             Sum(*const Ty, Arc<Ty>),
@@ -1087,6 +1089,11 @@ impl Solve<'_> {
                                     work.push(FingerprintWork::Type(element.clone()));
                                     continue;
                                 }
+                                Ty::Mirror(inner) => {
+                                    work.push(FingerprintWork::Mirror(key, ty.clone()));
+                                    work.push(FingerprintWork::Type(inner.clone()));
+                                    continue;
+                                }
                                 Ty::Struct(row) => {
                                     work.push(FingerprintWork::Struct(key, ty.clone()));
                                     work.push(FingerprintWork::Row(row.clone()));
@@ -1130,6 +1137,12 @@ impl Solve<'_> {
                         FingerprintWork::Hidden(key, ty) => {
                             let body = values.pop().expect("family hidden fingerprint body");
                             let hash = tagged(52, [body]);
+                            self.types.insert(key, (ty, hash));
+                            values.push(hash);
+                        }
+                        FingerprintWork::Mirror(key, ty) => {
+                            let inner = values.pop().expect("family mirror fingerprint type");
+                            let hash = tagged(54, [inner]);
                             self.types.insert(key, (ty, hash));
                             values.push(hash);
                         }
@@ -2170,6 +2183,10 @@ impl Solve<'_> {
                             self.step(span, Rule::Array, goal, Effect::Decomposed);
                             work.push(SolveWork::Ty(element.clone(), other.clone(), depth + 1));
                         }
+                        (Ty::Mirror(inner), Ty::Mirror(other)) => {
+                            self.step(span, Rule::Mirror, goal, Effect::Decomposed);
+                            work.push(SolveWork::Ty(inner.clone(), other.clone(), depth + 1));
+                        }
                         (Ty::Struct(fields), Ty::Struct(others))
                             if fields.labels.is_empty()
                                 && others.labels.is_empty()
@@ -2466,7 +2483,9 @@ impl Solve<'_> {
                         Ty::Package(body) | Ty::Hidden { body, .. } => {
                             work.push(Work::Ty(body.clone()))
                         }
-                        Ty::Array(element) => work.push(Work::Ty(element.clone())),
+                        Ty::Array(element) | Ty::Mirror(element) => {
+                            work.push(Work::Ty(element.clone()))
+                        }
                         Ty::Mut(region, element) => {
                             work.push(Work::Ty(region.clone()));
                             work.push(Work::Ty(element.clone()));
@@ -3880,7 +3899,9 @@ impl Solve<'_> {
                     Ty::Package(body) | Ty::Hidden { body, .. } => {
                         work.push(Work::Type(body.clone()))
                     }
-                    Ty::Array(element) => work.push(Work::Type(element.clone())),
+                    Ty::Array(element) | Ty::Mirror(element) => {
+                        work.push(Work::Type(element.clone()))
+                    }
                     Ty::Mut(region, element) => {
                         work.push(Work::Type(region.clone()));
                         work.push(Work::Type(element.clone()));

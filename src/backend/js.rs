@@ -483,6 +483,10 @@ impl<'a> Generator<'a> {
                     crate::reification::Intrinsic::Upcast => "$anyUpcast(",
                     crate::reification::Intrinsic::Downcast => "$anyDowncast(",
                     crate::reification::Intrinsic::Decode => "$ffiDecode(",
+                    crate::reification::Intrinsic::Mirror => "$mirror(",
+                    crate::reification::Intrinsic::TypeOf => "$typeOf(",
+                    crate::reification::Intrinsic::Describe => "$describe(",
+                    crate::reification::Intrinsic::Same => "$sameMirror(",
                 });
                 out.push_str(&v(*descriptor));
                 out.push_str(", ");

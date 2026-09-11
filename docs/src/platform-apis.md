@@ -184,3 +184,35 @@ The host contracts follow the official
 [Node process](https://nodejs.org/api/process.html),
 [Fetch](https://developer.mozilla.org/en-US/docs/Web/API/Window/fetch), and
 [URL](https://developer.mozilla.org/en-US/docs/Web/API/URL) documentation.
+
+## Mirrors
+
+`std::reflect` works with `Mirror 'a`, a builtin type whose values are the
+compiler's own evidence for a type. `reflect::mirror : () -> Mirror 'a` makes
+one at whatever type the position is inferred at, and `reflect::type_of : 'a ->
+Mirror 'a` makes one for a value's static type without inspecting the value.
+A mirror cannot be built from data: foreign code cannot forge one, and
+`ffi::decode` accepts only a mirror the compiler made.
+
+`reflect::describe : Mirror 'a -> Description` renders a mirror as an ordinary
+finite graph of nodes, so a program can inspect a type's primitives, fields,
+tags, and function shapes. `reflect::same : Mirror 'a -> Mirror 'b -> Option {
+forward: 'a -> 'b, backward: 'b -> 'a }` decides whether two mirrors are exactly
+one type, and on success supplies the two identity functions that let a value
+cross between the names.
+
+Together with [hidden types](dictionary.md#hidden-type) this recovers a value's
+type at runtime without `Any`:
+
+```ruddy
+type Dynamic = hide 'a => { value: 'a, evidence: Mirror 'a }
+let as_nat: Dynamic -> Option Nat = fn item => match item with
+| hide 'x { value, evidence } => match std::reflect::same evidence (std::reflect::mirror ()) with
+  | #Some { forward, .. } => #Some (forward value)
+  | #None => #None
+  end
+end
+```
+
+Inside the arm, a mirror the pattern bound is evidence for the opened type, so
+`std::reflect::type_of value` and generic foreign calls on `value` work there.

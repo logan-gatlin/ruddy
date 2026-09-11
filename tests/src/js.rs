@@ -1646,3 +1646,82 @@ let third = match boxes with | [head, ..] => describe (repacked head) | [] => ""
         "assert.equal(app.first, '1'); assert.equal(app.second, 'yes'); assert.equal(app.third, '1');",
     );
 }
+
+#[test]
+fn mirrors_authenticate_types_and_open_hidden_values_in_generated_javascript() {
+    execute_reification(
+        r#"
+type Option 'a = #Some 'a | #None
+@private extern mirror: () -> Mirror 'a = "$mirror"
+@private extern type_of: 'a -> Mirror 'a = "$typeOf"
+@private extern same_pair: (Mirror 'a, Mirror 'b) -> Option { forward: 'a -> 'b, backward: 'b -> 'a } = "$sameMirror"
+type Dyn = hide 'a => { value: 'a, evidence: Mirror 'a }
+let items: [Dyn] = [{ value: 1n, evidence: mirror () }, { value: "two", evidence: mirror () }]
+let as_nat: Dyn -> Option Nat = fn item => match item with
+| hide 'x { value, evidence } => match same_pair (evidence, mirror ()) with
+  | #Some { forward, backward } => #Some (forward value)
+  | #None => #None
+  end
+end
+let echo: Dyn -> Dyn = fn item => match item with
+| hide 'x { value, evidence } => { value: value, evidence: type_of value }
+end
+let first = match items with | [head, ..] => as_nat head | [] => #None end
+let second = match items with | [_, next, ..] => as_nat next | _ => #None end
+let third = match items with | [head, ..] => as_nat (echo head) | [] => #None end
+let strings = same_pair (type_of "a", type_of "b")
+let round_trip = match strings with
+| #Some { forward, backward } => backward (forward "kept")
+| #None => "lost"
+end
+"#,
+        r#"
+assert.deepEqual(app.first, { tag: 'Some', value: 1 });
+assert.equal(app.second.tag, 'None');
+assert.deepEqual(app.third, { tag: 'Some', value: 1 });
+assert.equal(app.round_trip, 'kept');
+"#,
+    );
+}
+
+#[test]
+fn mirrors_and_hidden_types_have_exact_identities_through_any() {
+    execute_reification(
+        r#"
+type Option 'a = #Some 'a | #None
+@private extern box: 'a -> Any = "$anyUpcast"
+@private extern unbox: Any -> Option 'a = "$anyDowncast"
+@private extern type_of: 'a -> Mirror 'a = "$typeOf"
+type Shown = hide 'a => { value: 'a, show: 'a -> String }
+type Renamed = hide 'item => { value: 'item, show: 'item -> String }
+type Wider = hide 'a => { value: 'a, show: 'a -> String, extra: Nat }
+extern show_nat: fn(Nat) -> String = "n => String(n)"
+let boxed_mirror = box (type_of 1n)
+let mirror_of_nat: Option (Mirror Nat) = unbox boxed_mirror
+let mirror_of_string: Option (Mirror String) = unbox boxed_mirror
+let mirror_recovered = match mirror_of_nat with | #Some _ => true | #None => false end
+let mirror_rejected = match mirror_of_string with | #Some _ => false | #None => true end
+let shown: Shown = { value: 1n, show: show_nat }
+let boxed_shown = box shown
+let as_shown: Option Shown = unbox boxed_shown
+let as_renamed: Option Renamed = unbox boxed_shown
+let as_wider: Option Wider = unbox boxed_shown
+let shown_recovered = match as_shown with
+| #Some (hide 'a { value, show }) => show value
+| #None => "lost"
+end
+let renamed_recovered = match as_renamed with
+| #Some (hide 'a { value, show }) => show value
+| #None => "lost"
+end
+let wider_rejected = match as_wider with | #Some _ => false | #None => true end
+"#,
+        r#"
+assert.equal(app.mirror_recovered, true);
+assert.equal(app.mirror_rejected, true);
+assert.equal(app.shown_recovered, '1');
+assert.equal(app.renamed_recovered, '1');
+assert.equal(app.wider_rejected, true);
+"#,
+    );
+}

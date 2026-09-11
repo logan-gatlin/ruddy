@@ -769,6 +769,7 @@ fn wire_explanation(
             T::Array => "array",
             T::DeclaredType => "declared-type",
             T::Hidden => "hidden",
+            T::Mirror => "mirror",
             T::Any => "any",
             T::ForeignValue => "foreign-value",
             T::Undecided => "undecided",

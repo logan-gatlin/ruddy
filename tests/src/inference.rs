@@ -11474,3 +11474,94 @@ fn hide_patterns_open_nested_positions() {
     assert_eq!(scheme(&mint, &inferred, "unwrap"), "Wrapped -> String");
     assert_eq!(scheme(&mint, &inferred, "first"), "[Box] -> String");
 }
+
+#[test]
+fn mirror_intrinsics_are_reviewed_by_their_signatures() {
+    let description = "type Description = { root: Nat, nodes: [Node] }\ntype Node = #Nat | #Record [{ name: String, node: Nat }]\n";
+    let accepted = [
+        "extern mirror: () -> Mirror 'a = \"$mirror\"",
+        "extern type_of: 'a -> Mirror 'a = \"$typeOf\"",
+        "extern describe: Mirror 'a -> Description = \"$describe\"",
+        "extern same: (Mirror 'a, Mirror 'b) -> Option { forward: 'a -> 'b, backward: 'b -> 'a } = \"$sameMirror\"",
+    ];
+    for signature in accepted {
+        let (_, _, output) = infer_src(&format!(
+            "type Option 'a = #Some 'a | #None\n{description}{signature}"
+        ));
+        assert!(
+            output.errors().is_empty(),
+            "{signature}: {:#?}",
+            output.errors()
+        );
+    }
+    let refused = [
+        "extern mirror: Nat -> Mirror 'a = \"$mirror\"",
+        "extern mirror: () -> Mirror Nat = \"$mirror\"",
+        "extern mirror: () -> Nat = \"$mirror\"",
+        "extern type_of: 'a -> Mirror 'b = \"$typeOf\"",
+        "extern type_of: 'a -> Mirror Nat = \"$typeOf\"",
+        "extern type_of: Nat -> Mirror Nat = \"$typeOf\"",
+        "extern describe: Nat -> Description = \"$describe\"",
+        "extern describe: Mirror 'a -> Nat = \"$describe\"",
+        "extern describe: Mirror 'a -> { root: Nat } = \"$describe\"",
+        "extern describe: Mirror 'a -> { root: Nat, nodes: [Node], ..'r } = \"$describe\"",
+        "extern describe: Mirror 'a -> { root: Nat, tail: [Node] } = \"$describe\"",
+        "extern describe: Mirror 'a -> { root when 'p: Nat, nodes: [Node] } = \"$describe\"",
+        "extern same: Nat -> Option { forward: 'a -> 'b, backward: 'b -> 'a } = \"$sameMirror\"",
+        "extern same: (Nat, Mirror 'b) -> Option { forward: 'a -> 'b, backward: 'b -> 'a } = \"$sameMirror\"",
+        "extern same: (Mirror Nat, Mirror 'b) -> Option { forward: 'a -> 'b, backward: 'b -> 'a } = \"$sameMirror\"",
+        "extern same: (Mirror 'a, Mirror 'b, Nat) -> Option { forward: 'a -> 'b, backward: 'b -> 'a } = \"$sameMirror\"",
+        "extern same: { 0: Mirror 'a, 1: Mirror 'b, ..'r } -> Option { forward: 'a -> 'b, backward: 'b -> 'a } = \"$sameMirror\"",
+        "extern same: (Mirror 'a, Mirror 'b) -> Nat = \"$sameMirror\"",
+        "extern same: (Mirror 'a, Mirror 'b) -> #Some { forward: 'a -> 'b, backward: 'b -> 'a } = \"$sameMirror\"",
+        "extern same: (Mirror 'a, Mirror 'b) -> #None = \"$sameMirror\"",
+        "extern same: (Mirror 'a, Mirror 'b) -> Option Nat = \"$sameMirror\"",
+        "extern same: (Mirror 'a, Mirror 'b) -> #Some { forward: 'a -> 'b, backward: 'b -> 'a } | #None | #Other = \"$sameMirror\"",
+        "extern same: (Mirror 'a, Mirror 'b) -> #Some { forward: 'a -> 'b, backward: 'b -> 'a } | #None Nat = \"$sameMirror\"",
+        "extern same: (Mirror 'a, Mirror 'b) -> Option { forward: 'a -> 'b } = \"$sameMirror\"",
+        "extern same: (Mirror 'a, Mirror 'b) -> Option { forward: 'a -> 'b, backward: 'b -> 'a, ..'r } = \"$sameMirror\"",
+        "extern same: (Mirror 'a, Mirror 'b) -> Option { forward: 'b -> 'a, backward: 'b -> 'a } = \"$sameMirror\"",
+        "extern same: (Mirror 'a, Mirror 'b) -> Option { forward: 'a -> 'b, backward: 'a -> 'b } = \"$sameMirror\"",
+        "extern same: (Mirror 'a, Mirror 'b) -> Option { forward: 'a -> 'b, backward: 'b -> 'a -> 'a } = \"$sameMirror\"",
+        "extern same: (Mirror 'a, Mirror 'b) -> Option { forward: 'a -> 'b, sideways: 'b -> 'a } = \"$sameMirror\"",
+        "extern same: (Mirror 'a, Mirror 'b) -> Option { forward: 'a -> 'b, backward: Nat } = \"$sameMirror\"",
+        "effect Tick = () -> ()\nextern same: (Mirror 'a, Mirror 'b) -> Option { forward: 'a -> 'b + !Tick, backward: 'b -> 'a } = \"$sameMirror\"",
+        "extern same: (Mirror 'a, Mirror 'b) -> Option { forward: 'a -> 'b, backward: 'b -> 'a + ..'e } = \"$sameMirror\"",
+    ];
+    for signature in refused {
+        let (_, _, output) = infer_src(&format!(
+            "type Option 'a = #Some 'a | #None\n{description}{signature}"
+        ));
+        let kinds = output
+            .errors()
+            .iter()
+            .map(|error| error.kind.code())
+            .collect::<Vec<_>>();
+        assert!(
+            kinds.contains(&"runtime-type-information") || !kinds.is_empty(),
+            "{signature} was accepted"
+        );
+    }
+    // A mirror-consuming intrinsic needs no evidence of its own: a generic
+    // wrapper over it is a plain polymorphic function.
+    let (_, _, output) = infer_src(
+        "type Option 'a = #Some 'a | #None\n\
+         @private extern same_pair: (Mirror 'a, Mirror 'b) -> Option { forward: 'a -> 'b, backward: 'b -> 'a } = \"$sameMirror\"\n\
+         let same = fn left right => same_pair (left, right)\n\
+         let apply = fn call value => call value\n\
+         let forward = apply same",
+    );
+    assert!(output.errors().is_empty(), "{:#?}", output.errors());
+    // One that makes evidence does: a generalized value has nobody to supply it.
+    let (_, _, output) = infer_src(
+        "@private extern mirror: () -> Mirror 'a = \"$mirror\"\nlet unpinned = mirror ()",
+    );
+    assert_eq!(
+        output
+            .errors()
+            .iter()
+            .map(|error| error.kind.code())
+            .collect::<Vec<_>>(),
+        ["runtime-type-information"]
+    );
+}

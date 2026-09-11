@@ -931,6 +931,8 @@ pub enum Rule {
     Open,
     /// A term packaged under a hidden type, its witness decided.
     Witness,
+    /// Two mirrors, decomposed into the one type each mirrors.
+    Mirror,
     /// Both sides are already the same thing: the same variable, or the same
     /// declared type applied to nothing. Either way there is nothing to take
     /// apart.
@@ -2525,6 +2527,7 @@ pub enum TypeDescription {
     Mut,
     DeclaredType,
     Hidden,
+    Mirror,
     Undecided,
 }
 
@@ -3004,6 +3007,7 @@ enum ProvenanceTy {
     Arrow,
     Package,
     Hidden,
+    Mirror,
     Struct,
     Sum,
     Named(usize),
@@ -4171,6 +4175,7 @@ fn describe_type(ty: &Arc<Ty>) -> TypeDescription {
         Ty::Struct(..) => TypeDescription::Struct,
         Ty::Sum(..) => TypeDescription::TaggedValue,
         Ty::Array(..) => TypeDescription::Array,
+        Ty::Mirror(..) => TypeDescription::Mirror,
         Ty::Mut(..) => TypeDescription::Mut,
         Ty::Named { .. } => TypeDescription::DeclaredType,
         Ty::Hidden { .. } => TypeDescription::Hidden,
@@ -4345,6 +4350,17 @@ impl MismatchFingerprints {
                                 None,
                             ));
                             pending.push(MismatchFingerprintWork::Type(element.clone()));
+                            continue;
+                        }
+                        Ty::Mirror(inner) => {
+                            pending.push(MismatchFingerprintWork::Finish(
+                                key,
+                                ty.clone(),
+                                18,
+                                1,
+                                None,
+                            ));
+                            pending.push(MismatchFingerprintWork::Type(inner.clone()));
                             continue;
                         }
                         Ty::Struct(row) | Ty::Sum(row) => {
@@ -4695,13 +4711,14 @@ fn smallest_incompatible_counted_with_mask(
             return descriptions;
         }
         match (&*left, &*right) {
-            (Ty::Array(left), Ty::Array(right)) => work.push(MismatchWork {
-                left: left.clone(),
-                right: right.clone(),
-                alias_path,
-                alias_work,
-                root: false,
-            }),
+            (Ty::Array(left), Ty::Array(right)) | (Ty::Mirror(left), Ty::Mirror(right)) => work
+                .push(MismatchWork {
+                    left: left.clone(),
+                    right: right.clone(),
+                    alias_path,
+                    alias_work,
+                    root: false,
+                }),
             (Ty::Arrow(l_from, l_to, l_effects), Ty::Arrow(r_from, r_to, r_effects)) => {
                 // An incompatible effect row contributes no payload jobs. Keep
                 // walking parameter and result first; if neither has a leaf,
@@ -6217,6 +6234,10 @@ impl Fingerprint {
                     }
                     Ty::Array(inner) => {
                         self.word(0x08);
+                        work.push(inner);
+                    }
+                    Ty::Mirror(inner) => {
+                        self.word(0x13);
                         work.push(inner);
                     }
                     Ty::Struct(row) => {
@@ -8315,7 +8336,8 @@ impl Table {
                             work.push(Work::Ty(a.clone(), c.clone()));
                             work.push(Work::Ty(b.clone(), d.clone()));
                         }
-                        (Ty::Array(element), Ty::Array(other)) => {
+                        (Ty::Array(element), Ty::Array(other))
+                        | (Ty::Mirror(element), Ty::Mirror(other)) => {
                             work.push(Work::Ty(element.clone(), other.clone()));
                         }
                         (Ty::Struct(a), Ty::Struct(b)) | (Ty::Sum(a), Ty::Sum(b)) => {
@@ -8492,7 +8514,7 @@ impl Table {
                                     ));
                                 }
                             }
-                            Ty::Array(element) => work.push((
+                            Ty::Array(element) | Ty::Mirror(element) => work.push((
                                 Part::Ty(element.clone()),
                                 trace,
                                 Route {
@@ -8734,7 +8756,9 @@ impl Table {
                         Ty::Package(body) | Ty::Hidden { body, .. } => {
                             work.push(Work::Ty(body.clone()))
                         }
-                        Ty::Array(element) => work.push(Work::Ty(element.clone())),
+                        Ty::Array(element) | Ty::Mirror(element) => {
+                            work.push(Work::Ty(element.clone()))
+                        }
                         Ty::Mut(region, element) => {
                             work.push(Work::Ty(element.clone()));
                             work.push(Work::Ty(region.clone()));
@@ -8847,7 +8871,9 @@ impl Table {
                         Ty::Package(body) | Ty::Hidden { body, .. } => {
                             work.push(Work::Ty(body.clone()))
                         }
-                        Ty::Array(element) => work.push(Work::Ty(element.clone())),
+                        Ty::Array(element) | Ty::Mirror(element) => {
+                            work.push(Work::Ty(element.clone()))
+                        }
                         Ty::Mut(region, element) => {
                             work.push(Work::Ty(element.clone()));
                             work.push(Work::Ty(region.clone()));
@@ -9545,7 +9571,9 @@ impl Table {
                         Ty::Package(body) | Ty::Hidden { body, .. } => {
                             work.push(Work::Ty(body.clone()))
                         }
-                        Ty::Array(element) => work.push(Work::Ty(element.clone())),
+                        Ty::Array(element) | Ty::Mirror(element) => {
+                            work.push(Work::Ty(element.clone()))
+                        }
                         Ty::Mut(region, element) => {
                             work.push(Work::Ty(element.clone()));
                             work.push(Work::Ty(region.clone()));
@@ -9624,7 +9652,9 @@ impl Table {
                 Work::Ty(ty) => match &*ty {
                     Ty::Package(_) => {} // a nested owner
                     Ty::Hidden { body, .. } => work.push(Work::Ty(body.clone())),
-                    Ty::Array(element) => work.push(Work::Ty(element.clone())),
+                    Ty::Array(element) | Ty::Mirror(element) => {
+                        work.push(Work::Ty(element.clone()))
+                    }
                     Ty::Mut(region, element) => {
                         work.push(Work::Ty(element.clone()));
                         work.push(Work::Ty(region.clone()));
@@ -9729,6 +9759,7 @@ impl Table {
                         Ty::Package(..) => ProvenanceTy::Package,
                         Ty::Hidden { .. } => ProvenanceTy::Hidden,
                         Ty::Array(..) => ProvenanceTy::Array,
+                        Ty::Mirror(..) => ProvenanceTy::Mirror,
                         Ty::Mut(..) => ProvenanceTy::Mut,
                         Ty::Struct(..) => ProvenanceTy::Struct,
                         Ty::Sum(..) => ProvenanceTy::Sum,
@@ -9751,7 +9782,9 @@ impl Table {
                         Ty::Mut(region, element) => {
                             vec![Opened::Ty(region.clone()), Opened::Ty(element.clone())]
                         }
-                        Ty::Array(element) => vec![Opened::Ty(element.clone())],
+                        Ty::Array(element) | Ty::Mirror(element) => {
+                            vec![Opened::Ty(element.clone())]
+                        }
                         Ty::Struct(row) | Ty::Sum(row) => {
                             vec![Opened::Row(self.canon(row), ty.clone())]
                         }
@@ -9853,9 +9886,10 @@ impl Table {
                         work.push(Work::Region(region));
                         work.push(Work::Ty(element));
                     }
-                    Ty::Package(body) | Ty::Array(body) | Ty::Hidden { body, .. } => {
-                        work.push(Work::Ty(body))
-                    }
+                    Ty::Package(body)
+                    | Ty::Array(body)
+                    | Ty::Mirror(body)
+                    | Ty::Hidden { body, .. } => work.push(Work::Ty(body)),
                     Ty::Arrow(from, to, row) => {
                         work.push(Work::Ty(from));
                         work.push(Work::Ty(to));
@@ -10038,7 +10072,9 @@ impl Table {
                         work.push(Work::Ty(body.clone(), false));
                     }
                     Ty::Hidden { body, .. } => work.push(Work::Ty(body.clone(), false)),
-                    Ty::Array(element) => work.push(Work::Ty(element.clone(), false)),
+                    Ty::Array(element) | Ty::Mirror(element) => {
+                        work.push(Work::Ty(element.clone(), false))
+                    }
                     Ty::Mut(region, element) => {
                         work.push(Work::Ty(element.clone(), false));
                         work.push(Work::Ty(region.clone(), false));
@@ -10225,7 +10261,9 @@ impl Table {
                         Ty::Package(body) | Ty::Hidden { body, .. } => {
                             work.push(Work::Ty(body.clone()))
                         }
-                        Ty::Array(element) => work.push(Work::Ty(element.clone())),
+                        Ty::Array(element) | Ty::Mirror(element) => {
+                            work.push(Work::Ty(element.clone()))
+                        }
                         Ty::Mut(region, element) => {
                             work.push(Work::Ty(element.clone()));
                             work.push(Work::Ty(region.clone()));
@@ -10486,7 +10524,9 @@ impl Table {
                         Ty::Package(body) | Ty::Hidden { body, .. } => {
                             work.push(Work::Ty(body.clone()))
                         }
-                        Ty::Array(element) => work.push(Work::Ty(element.clone())),
+                        Ty::Array(element) | Ty::Mirror(element) => {
+                            work.push(Work::Ty(element.clone()))
+                        }
                         Ty::Mut(region, element) => {
                             work.push(Work::Ty(element.clone()));
                             work.push(Work::Ty(region.clone()));
@@ -10678,7 +10718,7 @@ impl Table {
                     Some(row)
                 }
                 Ty::Struct(row) | Ty::Sum(row) => Some(row),
-                Ty::Package(ty) | Ty::Array(ty) | Ty::Hidden { body: ty, .. } => {
+                Ty::Package(ty) | Ty::Array(ty) | Ty::Mirror(ty) | Ty::Hidden { body: ty, .. } => {
                     work.push(ty.clone());
                     None
                 }
@@ -10822,7 +10862,9 @@ impl Table {
                         Ty::Package(body) | Ty::Hidden { body, .. } => {
                             work.push(Work::Ty(body.clone()))
                         }
-                        Ty::Array(element) => work.push(Work::Ty(element.clone())),
+                        Ty::Array(element) | Ty::Mirror(element) => {
+                            work.push(Work::Ty(element.clone()))
+                        }
                         Ty::Mut(region, element) => {
                             work.push(Work::Ty(element.clone()));
                             work.push(Work::Ty(region.clone()));
@@ -10998,6 +11040,9 @@ impl Table {
                             Ty::Array(element) => {
                                 (ProvenanceTy::Array, vec![Work::Ty(element.clone(), None)])
                             }
+                            Ty::Mirror(inner) => {
+                                (ProvenanceTy::Mirror, vec![Work::Ty(inner.clone(), None)])
+                            }
                             Ty::Struct(row) => {
                                 (ProvenanceTy::Struct, vec![Work::Row(row.clone(), None)])
                             }
@@ -11130,6 +11175,10 @@ impl Table {
                         Ty::Array(element) => (
                             ProvenanceTy::Array,
                             vec![Published::Ty(element.clone(), None, None)],
+                        ),
+                        Ty::Mirror(inner) => (
+                            ProvenanceTy::Mirror,
+                            vec![Published::Ty(inner.clone(), None, None)],
                         ),
                         Ty::Struct(row) => (
                             ProvenanceTy::Struct,
@@ -11506,7 +11555,9 @@ impl Table {
                         Ty::Package(body) | Ty::Hidden { body, .. } => {
                             work.push(Work::Ty(body.clone()))
                         }
-                        Ty::Array(element) => work.push(Work::Ty(element.clone())),
+                        Ty::Array(element) | Ty::Mirror(element) => {
+                            work.push(Work::Ty(element.clone()))
+                        }
                         Ty::Mut(region, element) => {
                             work.push(Work::Ty(element.clone()));
                             work.push(Work::Ty(region.clone()));
@@ -11603,6 +11654,7 @@ impl Table {
             Package,
             Hidden(u32, Arc<str>),
             Array,
+            Mirror,
             Mut,
             Struct,
             Sum,
@@ -11658,6 +11710,10 @@ impl Table {
                         }
                         Ty::Array(element) => {
                             work.push(Work::Array);
+                            work.push(Work::Ty(element.clone()));
+                        }
+                        Ty::Mirror(element) => {
+                            work.push(Work::Mirror);
                             work.push(Work::Ty(element.clone()));
                         }
                         Ty::Mut(region, element) => {
@@ -11736,6 +11792,10 @@ impl Table {
                 Work::Array => {
                     let element = types.pop().expect("zonked array element");
                     types.push(Arc::new(Ty::Array(element)));
+                }
+                Work::Mirror => {
+                    let element = types.pop().expect("zonked mirror type");
+                    types.push(Arc::new(Ty::Mirror(element)));
                 }
                 Work::Mut => {
                     let element = types.pop().expect("cell element");
@@ -12094,7 +12154,7 @@ fn collect_owned_existentials(body: &Arc<Ty>, abstract_: &HashSet<TyVar>) -> Ind
             Work::Ty(ty) => match &*ty {
                 Ty::Package(_) => {} // belongs to the nested package
                 Ty::Hidden { body, .. } => work.push(Work::Ty(body.clone())),
-                Ty::Array(element) => work.push(Work::Ty(element.clone())),
+                Ty::Array(element) | Ty::Mirror(element) => work.push(Work::Ty(element.clone())),
                 Ty::Mut(region, element) => {
                     work.push(Work::Ty(element.clone()));
                     work.push(Work::Ty(region.clone()));
@@ -12136,6 +12196,7 @@ fn substitute_presence_vars(root: &Arc<Ty>, renames: &HashMap<TyVar, Presence>) 
         Package,
         Hidden(u32, Arc<str>),
         Array,
+        Mirror,
         Mut,
         Struct,
         Sum,
@@ -12164,6 +12225,10 @@ fn substitute_presence_vars(root: &Arc<Ty>, renames: &HashMap<TyVar, Presence>) 
                 }
                 Ty::Array(element) => {
                     work.push(Work::Array);
+                    work.push(Work::Ty(element.clone()));
+                }
+                Ty::Mirror(element) => {
+                    work.push(Work::Mirror);
                     work.push(Work::Ty(element.clone()));
                 }
                 Ty::Mut(region, element) => {
@@ -12228,6 +12293,10 @@ fn substitute_presence_vars(root: &Arc<Ty>, renames: &HashMap<TyVar, Presence>) 
             Work::Array => {
                 let element = types.pop().unwrap();
                 types.push(Arc::new(Ty::Array(element)));
+            }
+            Work::Mirror => {
+                let element = types.pop().unwrap();
+                types.push(Arc::new(Ty::Mirror(element)));
             }
             Work::Mut => {
                 let element = types.pop().expect("cell element");
@@ -12318,7 +12387,9 @@ fn semantic_variances(aliases: &IndexMap<Symbol, Scheme>) -> HashMap<(Symbol, u3
                             Ty::Package(body) | Ty::Hidden { body, .. } => {
                                 work.push(Work::Ty(body.clone(), positive))
                             }
-                            Ty::Array(element) => work.push(Work::Ty(element.clone(), positive)),
+                            Ty::Array(element) | Ty::Mirror(element) => {
+                                work.push(Work::Ty(element.clone(), positive))
+                            }
                             Ty::Mut(region, element) => {
                                 work.push(Work::Ty(element.clone(), positive));
                                 work.push(Work::Ty(region.clone(), positive));
@@ -12417,7 +12488,9 @@ fn package_positive_presences(
                     Ty::Package(inner) | Ty::Hidden { body: inner, .. } => {
                         work.push(Scan::Ty(inner.clone(), positive, owner))
                     }
-                    Ty::Array(element) => work.push(Scan::Ty(element.clone(), positive, owner)),
+                    Ty::Array(element) | Ty::Mirror(element) => {
+                        work.push(Scan::Ty(element.clone(), positive, owner))
+                    }
                     Ty::Mut(region, element) => {
                         work.push(Scan::Ty(element.clone(), positive, owner));
                         work.push(Scan::Ty(region.clone(), positive, owner));
@@ -12487,6 +12560,7 @@ fn package_positive_presences(
         Package(bool),
         Hidden(bool, u32, Arc<str>),
         Array(bool),
+        Mirror(bool),
         Mut(bool),
         Struct(bool),
         Sum(bool),
@@ -12524,6 +12598,10 @@ fn package_positive_presences(
                     Ty::Array(element) => {
                         work.push(Build::Array(wrap));
                         work.push(Build::Ty(element.clone()));
+                    }
+                    Ty::Mirror(inner) => {
+                        work.push(Build::Mirror(wrap));
+                        work.push(Build::Ty(inner.clone()));
                     }
                     Ty::Struct(row) => {
                         work.push(Build::Struct(wrap));
@@ -12628,6 +12706,14 @@ fn package_positive_presences(
                     value
                 });
             }
+            Build::Mirror(wrap) => {
+                let value = Arc::new(Ty::Mirror(types.pop().unwrap()));
+                types.push(if wrap {
+                    Arc::new(Ty::Package(value))
+                } else {
+                    value
+                });
+            }
             Build::Array(wrap) => {
                 let value = Arc::new(Ty::Array(types.pop().unwrap()));
                 types.push(if wrap {
@@ -12695,6 +12781,7 @@ fn shift(ty: &Arc<Ty>, by: u32) -> Arc<Ty> {
         Package,
         Hidden(u32, Arc<str>),
         Array,
+        Mirror,
         Mut,
         Struct,
         Sum,
@@ -12724,6 +12811,10 @@ fn shift(ty: &Arc<Ty>, by: u32) -> Arc<Ty> {
                 }
                 Ty::Array(element) => {
                     work.push(Work::Array);
+                    work.push(Work::Ty(element.clone()));
+                }
+                Ty::Mirror(element) => {
+                    work.push(Work::Mirror);
                     work.push(Work::Ty(element.clone()));
                 }
                 Ty::Mut(region, element) => {
@@ -12780,6 +12871,10 @@ fn shift(ty: &Arc<Ty>, by: u32) -> Arc<Ty> {
             Work::Array => {
                 let element = types.pop().expect("shifted array element");
                 types.push(Arc::new(Ty::Array(element)));
+            }
+            Work::Mirror => {
+                let element = types.pop().expect("shifted mirror type");
+                types.push(Arc::new(Ty::Mirror(element)));
             }
             Work::Mut => {
                 let element = types.pop().expect("cell element");
@@ -12981,7 +13076,8 @@ fn extern_annotation_sources(
                         .map(|(written, semantic)| (written, semantic.clone())),
                 );
             }
-            (ir::TypeKind::Array(element), Ty::Array(lowered)) => {
+            (ir::TypeKind::Array(element), Ty::Array(lowered))
+            | (ir::TypeKind::Mirror(element), Ty::Mirror(lowered)) => {
                 work.push((element, lowered.clone()));
             }
             (ir::TypeKind::Mut(region, element), Ty::Mut(lowered_region, lowered_element)) => {
@@ -13344,6 +13440,9 @@ fn lower_scoped(
         ),
         TypeKind::Array(element) => {
             Ty::Array(lower_scoped(mint, table, tails, element, boundaries))
+        }
+        TypeKind::Mirror(element) => {
+            Ty::Mirror(lower_scoped(mint, table, tails, element, boundaries))
         }
         // A row handed to a declaration as an argument, which is the one place
         // a row arrives without an arrow around it. It lowers to the row it is
@@ -13852,6 +13951,7 @@ fn substitute_type(
         Package,
         Hidden(u32, Arc<str>),
         Array,
+        Mirror,
         Mut,
         Struct,
         Sum,
@@ -13886,6 +13986,10 @@ fn substitute_type(
                 }
                 Ty::Array(element) => {
                     work.push(Work::Array);
+                    work.push(Work::Ty(element));
+                }
+                Ty::Mirror(element) => {
+                    work.push(Work::Mirror);
                     work.push(Work::Ty(element));
                 }
                 Ty::Mut(region, element) => {
@@ -13945,6 +14049,10 @@ fn substitute_type(
             Work::Array => {
                 let element = types.pop().expect("array substitution postorder");
                 types.push(Arc::new(Ty::Array(element)));
+            }
+            Work::Mirror => {
+                let element = types.pop().expect("mirror substitution postorder");
+                types.push(Arc::new(Ty::Mirror(element)));
             }
             Work::Mut => {
                 let element = types.pop().expect("cell element");

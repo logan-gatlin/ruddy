@@ -2976,3 +2976,77 @@ fn hidden_types_round_trip_through_artifact_text() {
     assert!(printed.contains("(hidden "), "{printed}");
     assert!(printed.contains("(hidden-var "), "{printed}");
 }
+
+#[test]
+fn reflection_artifacts_validate_mirror_intrinsics() {
+    let artifact = built(
+        r#"
+type Option 'a = #Some 'a | #None
+type Description = { root: Nat, nodes: [Node] }
+type Node = #Nat | #Record [{ name: String, node: Nat }]
+@private extern mirror: () -> Mirror 'a = "$mirror"
+@private extern type_of: 'a -> Mirror 'a = "$typeOf"
+@private extern describe: Mirror 'a -> Description = "$describe"
+@private extern same_pair: (Mirror 'a, Mirror 'b) -> Option { forward: 'a -> 'b, backward: 'b -> 'a } = "$sameMirror"
+let of_nat: Mirror Nat = mirror ()
+let of_value = type_of "text"
+let described = describe of_nat
+let compared = same_pair (of_nat, of_value)
+"#,
+    );
+    assert!(artifact::parse(&artifact.print()).validate().is_ok());
+    use ruddy::reification::Intrinsic;
+    for (kind, corruption) in [
+        (Intrinsic::Mirror, 0),
+        (Intrinsic::TypeOf, 0),
+        (Intrinsic::Describe, 0),
+        (Intrinsic::Describe, 1),
+        (Intrinsic::Same, 0),
+        (Intrinsic::Same, 1),
+        (Intrinsic::Same, 2),
+    ] {
+        let mut changed = artifact.clone().to_unchecked();
+        let block = changed
+            .lir
+            .functions
+            .iter_mut()
+            .flat_map(|function| &mut function.blocks)
+            .find(|block| {
+                block.instrs.iter().any(
+                    |instruction| matches!(&instruction.op, Op::Reflect { kind: k, .. } if *k == kind),
+                )
+            })
+            .expect("each mirror intrinsic reflects once");
+        let at = block
+            .instrs
+            .iter()
+            .position(|instruction| matches!(&instruction.op, Op::Reflect { .. }))
+            .unwrap();
+        // A number the intrinsic could be handed instead of what it takes.
+        block.instrs.insert(
+            0,
+            Instr {
+                temp: 999,
+                rep: Rep::Nat,
+                op: Op::Const(Literal::Natural(0)),
+            },
+        );
+        let instruction = &mut block.instrs[at + 1];
+        let Op::Reflect {
+            descriptor, value, ..
+        } = &mut instruction.op
+        else {
+            unreachable!()
+        };
+        match corruption {
+            0 => instruction.rep = Rep::Nat,
+            1 => *value = 999,
+            _ => *descriptor = *value,
+        }
+        let message = changed.validate().unwrap_err().to_string();
+        assert!(
+            message.contains("mirror") || message.contains("descriptor"),
+            "{kind:?} {corruption}: {message}"
+        );
+    }
+}

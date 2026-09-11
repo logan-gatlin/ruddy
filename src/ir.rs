@@ -735,6 +735,10 @@ pub type Type = Anchored<TypeKind>;
 pub enum TypeKind {
     /// The type of an immutable homogeneous array.
     Array(Box<Type>),
+    /// `Mirror T` — the builtin type constructor of authentic evidence for
+    /// `T`. Written as an application of the reserved bare name `Mirror`, which
+    /// no declaration shadows unless one is written; see [`Builder::apply`].
+    Mirror(Box<Type>),
     Mut(Box<Type>, Box<Type>),
     Struct {
         fields: IndexMap<String, TypeField>,
@@ -1041,7 +1045,9 @@ fn presence_polarities(
                         work.push(Work::Ty(to, positive, result_owner));
                         work.push(Work::Ty(from, !positive, owner));
                     }
-                    TypeKind::Array(element) => work.push(Work::Ty(element, positive, owner)),
+                    TypeKind::Array(element) | TypeKind::Mirror(element) => {
+                        work.push(Work::Ty(element, positive, owner))
+                    }
                     TypeKind::Hidden { body, .. } => work.push(Work::Ty(body, positive, owner)),
                     TypeKind::Mut(region, element) => {
                         for polarity in [positive, !positive] {
@@ -1146,7 +1152,9 @@ fn declaration_variances(
                             *out.entry((*owner, *index)).or_default() |= bit;
                         }
                     }
-                    TypeKind::Array(element) => work.push((element, positive)),
+                    TypeKind::Array(element) | TypeKind::Mirror(element) => {
+                        work.push((element, positive))
+                    }
                     TypeKind::Hidden { body, .. } => work.push((body, positive)),
                     TypeKind::Mut(region, element) => {
                         for polarity in [positive, !positive] {
@@ -1241,7 +1249,9 @@ fn declaration_variances(
                             Ty::Package(body) | Ty::Hidden { body, .. } => {
                                 work.push(Semantic::Ty(body, positive))
                             }
-                            Ty::Array(element) => work.push(Semantic::Ty(element, positive)),
+                            Ty::Array(element) | Ty::Mirror(element) => {
+                                work.push(Semantic::Ty(element, positive))
+                            }
                             Ty::Mut(region, element) => {
                                 work.push(Semantic::Ty(element, positive));
                                 work.push(Semantic::Ty(region, positive));
@@ -3638,7 +3648,7 @@ fn array_intrinsic_signature(
 
     fn array_variable(ty: &Type) -> Option<&str> {
         match &ty.anchored {
-            TypeKind::Array(element) => variable(element),
+            TypeKind::Array(element) | TypeKind::Mirror(element) => variable(element),
             _ => None,
         }
     }
@@ -3888,6 +3898,15 @@ fn imported_syntax(
                 depth + 1,
             )),
         ),
+        artifact::Type::Mirror(element) => TypeKind::Mirror(Box::new(imported_syntax(
+            mint,
+            element,
+            params,
+            symbols,
+            names,
+            effect_rows,
+            depth + 1,
+        ))),
         artifact::Type::Array(element) => TypeKind::Array(Box::new(imported_syntax(
             mint,
             element,
@@ -4123,6 +4142,7 @@ fn clamp_bounds(ty: Arc<Ty>, count: usize, presences: usize) -> Arc<Ty> {
         Package,
         Hidden(u32, Arc<str>),
         Array,
+        Mirror,
         Mut,
         Struct,
         Sum,
@@ -4175,6 +4195,10 @@ fn clamp_bounds(ty: Arc<Ty>, count: usize, presences: usize) -> Arc<Ty> {
                 }
                 Ty::Array(element) => {
                     work.push(Work::Array);
+                    work.push(Work::Ty(element));
+                }
+                Ty::Mirror(element) => {
+                    work.push(Work::Mirror);
                     work.push(Work::Ty(element));
                 }
                 Ty::Mut(region, element) => {
@@ -4249,6 +4273,10 @@ fn clamp_bounds(ty: Arc<Ty>, count: usize, presences: usize) -> Arc<Ty> {
             Work::Array => {
                 let element = types.pop().expect("array postorder stays balanced");
                 types.push(Arc::new(Ty::Array(element)));
+            }
+            Work::Mirror => {
+                let element = types.pop().expect("mirror postorder stays balanced");
+                types.push(Arc::new(Ty::Mirror(element)));
             }
             Work::Mut => {
                 let element = types.pop().expect("cell element");
@@ -4344,7 +4372,9 @@ fn drop_type_iterative(root: Arc<Ty>) {
                     Ty::Package(body) | Ty::Hidden { body, .. } => {
                         work.push(Work::Ty(body.clone()))
                     }
-                    Ty::Array(element) => work.push(Work::Ty(element.clone())),
+                    Ty::Array(element) | Ty::Mirror(element) => {
+                        work.push(Work::Ty(element.clone()))
+                    }
                     Ty::Mut(region, element) => {
                         work.push(Work::Ty(element.clone()));
                         work.push(Work::Ty(region.clone()));
@@ -4510,6 +4540,7 @@ fn import_type(
         Package,
         Hidden(u32, Arc<str>),
         Array,
+        Mirror,
         Mut,
         Struct,
         Sum,
@@ -4559,6 +4590,10 @@ fn import_type(
                 })),
                 artifact::Type::Array(element) => {
                     work.push(Work::Array);
+                    work.push(Work::Ty(element, false));
+                }
+                artifact::Type::Mirror(element) => {
+                    work.push(Work::Mirror);
                     work.push(Work::Ty(element, false));
                 }
                 artifact::Type::Mut(region, element) => {
@@ -4613,6 +4648,10 @@ fn import_type(
             Work::Array => {
                 let element = types.pop().expect("array postorder stays balanced");
                 types.push(Arc::new(Ty::Array(element)));
+            }
+            Work::Mirror => {
+                let element = types.pop().expect("mirror postorder stays balanced");
+                types.push(Arc::new(Ty::Mirror(element)));
             }
             Work::Mut => {
                 let element = types.pop().expect("cell element");
@@ -5338,6 +5377,10 @@ impl RegularType<'_> {
                         work.push(Work::Make("array".into(), vec!["element".into()]));
                         work.push(Work::Type(element, args));
                     }
+                    TypeKind::Mirror(element) => {
+                        work.push(Work::Make("mirror".into(), vec!["of".into()]));
+                        work.push(Work::Type(element, args));
+                    }
                     TypeKind::Struct { fields, tail } => {
                         let labels = fields
                             .iter()
@@ -5636,6 +5679,11 @@ impl RegularType<'_> {
                         values.push(self.atom(format!("param:{index}")))
                     }
                     Ty::Bound(index) => values.push(self.argument(&args, *index)),
+                    // A type a `hide` pattern opened is a slot the arm's
+                    // evidence fills, exactly as a quantified parameter is.
+                    Ty::Rigid { id, .. } if crate::reification::scoped_rigid(*id) => {
+                        values.push(self.atom(format!("param:{}", crate::reification::SCOPED | id)))
+                    }
                     Ty::Var(_) | Ty::Rigid { .. } | Ty::Undecided => values.push(self.atom("?")),
                     Ty::HiddenVar { binder, .. } => {
                         values.push(self.atom(format!("hidden-var:{binder}")))
@@ -5666,6 +5714,10 @@ impl RegularType<'_> {
                             supplied_as_effects,
                             instantiation,
                         ));
+                    }
+                    Ty::Mirror(inner) => {
+                        work.push(Work::Make("mirror".into(), vec!["of".into()]));
+                        work.push(Work::Type(inner, args, false, instantiation));
                     }
                     Ty::Arrow(from, to, effects) => {
                         work.push(Work::Make(
@@ -6207,7 +6259,7 @@ fn type_effect_dependencies<'a>(
     let mut dependencies = Vec::new();
     while let Some(ty) = pending.pop() {
         match &ty.anchored {
-            TypeKind::Array(element) => pending.push(element),
+            TypeKind::Array(element) | TypeKind::Mirror(element) => pending.push(element),
             TypeKind::Hidden { body, .. } => pending.push(body),
             TypeKind::Mut(region, element) => {
                 pending.push(region);
@@ -6607,7 +6659,7 @@ fn rekey_type(ty: &mut Type, ids: &IndexMap<Symbol, EffectId>, errors: &mut Vec<
                 rekey_type(arg, ids, errors);
             }
         }
-        TypeKind::Array(element) => rekey_type(element, ids, errors),
+        TypeKind::Array(element) | TypeKind::Mirror(element) => rekey_type(element, ids, errors),
         TypeKind::Hidden { body, .. } => rekey_type(body, ids, errors),
         TypeKind::Mut(region, element) => {
             rekey_type(region, ids, errors);
@@ -6966,6 +7018,7 @@ impl<'a> Follow<'a> {
                     TypeKind::Struct { .. }
                     | TypeKind::Mut(..)
                     | TypeKind::Array(_)
+                    | TypeKind::Mirror(_)
                     | TypeKind::Sum { .. }
                     | TypeKind::Arrow { .. }
                     | TypeKind::Effects(_)
@@ -7046,6 +7099,7 @@ impl<'a> Follow<'a> {
                     | Ty::Arrow(..)
                     | Ty::Mut(..)
                     | Ty::Array(_)
+                    | Ty::Mirror(_)
                     | Ty::Sum(_)
                     | Ty::Var(_)
                     | Ty::Rigid { .. }
@@ -7504,7 +7558,7 @@ fn calm(pattern: &Pattern) -> Option<Calm> {
 /// Every name a normalized pattern binds, in the order the pattern walk met
 /// them. What a refused binding still has to bind — to error values — so
 /// downstream uses resolve.
-fn pattern_binders(pattern: &Pattern, out: &mut Vec<Anchored<Symbol>>) {
+pub fn pattern_binders(pattern: &Pattern, out: &mut Vec<Anchored<Symbol>>) {
     match &pattern.anchored {
         PatternKind::Bind(name) => out.push(*name),
         PatternKind::Hidden { pattern, .. } => pattern_binders(pattern, out),
@@ -7950,6 +8004,11 @@ fn payload_cols(pos: &[Step], name: &str, later: &[Vec<Step>]) -> Vec<Vec<Step>>
         .chain(later.iter().cloned())
         .collect()
 }
+
+/// The bare name of the builtin type constructor of mirrors. Resolved after
+/// declarations, so a `type Mirror` of one's own shadows it as a `type Nat`
+/// shadows the primitive.
+pub const MIRROR: &str = "Mirror";
 
 /// Every name a surface pattern binds, in the order the lowering walk meets
 /// them — repeats included, so the declare pass and [`Builder::pattern`] agree
@@ -8534,7 +8593,7 @@ fn constrain(
                 lacks: IndexSet::new(),
             },
         )),
-        TypeKind::Array(element) => constrain(element, summaries, out),
+        TypeKind::Array(element) | TypeKind::Mirror(element) => constrain(element, summaries, out),
         TypeKind::Hidden { body, .. } => constrain(body, summaries, out),
         TypeKind::Mut(region, element) => {
             if let TypeKind::Param { index, .. } = &region.anchored {
@@ -8669,7 +8728,9 @@ fn row_arguments(program: &mut Program, kinds: &HashMap<Symbol, Vec<ParamKind>>)
                     applied(label.symbol(), label.args_mut(), kinds, carries, rows, out);
                 }
             }
-            TypeKind::Array(element) => walk(element, kinds, carries, rows, out),
+            TypeKind::Array(element) | TypeKind::Mirror(element) => {
+                walk(element, kinds, carries, rows, out)
+            }
             TypeKind::Hidden { body, .. } => walk(body, kinds, carries, rows, out),
             TypeKind::Mut(region, element) => {
                 walk(region, kinds, carries, rows, out);
@@ -8972,6 +9033,7 @@ fn row_shaped(
             }
             TypeKind::Mut(..)
             | TypeKind::Array(_)
+            | TypeKind::Mirror(_)
             | TypeKind::Arrow { .. }
             | TypeKind::Prim(_)
             | TypeKind::Var(_)
@@ -9169,6 +9231,7 @@ fn row_summaries(
                     | Ty::Arrow(..)
                     | Ty::Mut(..)
                     | Ty::Array(_)
+                    | Ty::Mirror(_)
                     | Ty::Struct(_)
                     | Ty::Sum(_)
                     | Ty::Var(_)
@@ -9210,6 +9273,7 @@ fn row_summaries(
                     TypeKind::Struct { .. }
                     | TypeKind::Mut(..)
                     | TypeKind::Array(_)
+                    | TypeKind::Mirror(_)
                     | TypeKind::Sum { .. }
                     | TypeKind::Arrow { .. }
                     | TypeKind::Effects(_)
@@ -9374,6 +9438,7 @@ fn row_summary(ty: &Type, decls: &HashMap<Symbol, RowSummary>, shape: Shape) -> 
         TypeKind::Struct { .. }
         | TypeKind::Mut(..)
         | TypeKind::Array(_)
+        | TypeKind::Mirror(_)
         | TypeKind::Sum { .. }
         | TypeKind::Arrow { .. }
         | TypeKind::Effects(_)
@@ -9507,7 +9572,9 @@ fn relevance(types: &IndexMap<Symbol, Decl<Type>>) -> HashSet<Slot> {
     fn occurrences(ty: &Type, under: &mut Vec<Slot>, out: &mut impl FnMut(u32, &[Slot])) {
         match &ty.anchored {
             TypeKind::Param { index, .. } => out(*index, under),
-            TypeKind::Array(element) => occurrences(element, under, out),
+            TypeKind::Array(element) | TypeKind::Mirror(element) => {
+                occurrences(element, under, out)
+            }
             TypeKind::Hidden { body, .. } => occurrences(body, under, out),
             TypeKind::Mut(region, element) => {
                 occurrences(region, under, out);
@@ -9621,7 +9688,7 @@ fn relevance(types: &IndexMap<Symbol, Decl<Type>>) -> HashSet<Slot> {
 fn mentioned(ty: &Type, out: &mut Vec<Symbol>) {
     match &ty.anchored {
         TypeKind::Ident(symbol) => out.push(*symbol),
-        TypeKind::Array(element) => mentioned(element, out),
+        TypeKind::Array(element) | TypeKind::Mirror(element) => mentioned(element, out),
         TypeKind::Hidden { body, .. } => mentioned(body, out),
         TypeKind::Mut(region, element) => {
             mentioned(region, out);
@@ -9691,7 +9758,7 @@ fn grows(ty: &Type, group: &[Symbol], report: &mut impl FnMut(Anchor)) {
         // something, the arity check has already spoken and this would be a
         // second complaint about one mistake.
         TypeKind::Ident(_) => {}
-        TypeKind::Array(element) => grows(element, group, report),
+        TypeKind::Array(element) | TypeKind::Mirror(element) => grows(element, group, report),
         TypeKind::Hidden { body, .. } => grows(body, group, report),
         TypeKind::Mut(region, element) => {
             grows(region, group, report);
@@ -9753,7 +9820,7 @@ fn grows(ty: &Type, group: &[Symbol], report: &mut impl FnMut(Anchor)) {
 fn mentions_a_parameter(ty: &Type) -> bool {
     match &ty.anchored {
         TypeKind::Param { .. } => true,
-        TypeKind::Array(element) => mentions_a_parameter(element),
+        TypeKind::Array(element) | TypeKind::Mirror(element) => mentions_a_parameter(element),
         TypeKind::Hidden { body, .. } => mentions_a_parameter(body),
         TypeKind::Mut(region, element) => {
             mentions_a_parameter(region) || mentions_a_parameter(element)
@@ -11390,6 +11457,9 @@ impl Builder<'_> {
                 Box::new(self.substituted(element, args)),
             ),
             TypeKind::Array(element) => TypeKind::Array(Box::new(self.substituted(element, args))),
+            TypeKind::Mirror(element) => {
+                TypeKind::Mirror(Box::new(self.substituted(element, args)))
+            }
             TypeKind::Hidden { id, name, body } => TypeKind::Hidden {
                 id: *id,
                 name: name.clone(),
@@ -12041,6 +12111,26 @@ impl Builder<'_> {
             // A segment named no module; the complaint is already at it.
             Err(Missing::Segment) => return self.anchored(span.track(TypeKind::Error)),
             Err(Missing::Name) => {
+                // `Mirror` is the one builtin constructor that takes an
+                // argument: a bare name no declaration shadows, applied to
+                // exactly one type.
+                if name.modules.is_empty() && name.name.tracked == MIRROR {
+                    let mut args = args;
+                    if args.len() == 1 {
+                        return self.anchored(span.track(TypeKind::Mirror(Box::new(
+                            args.pop().expect("one argument"),
+                        ))));
+                    }
+                    self.error(
+                        span,
+                        ErrorKind::Arity {
+                            name: name.name.tracked.clone(),
+                            expected: 1,
+                            found,
+                        },
+                    );
+                    return self.anchored(span.track(TypeKind::Error));
+                }
                 // A primitive takes nothing, so applying one is an arity
                 // complaint rather than a "not a constructor": the reader wrote
                 // a type that exists and gave it too much. Only a bare name can
@@ -12699,6 +12789,20 @@ impl Builder<'_> {
                         .flatten();
                     match prim {
                         Some(prim) => here.anchor(TypeKind::Prim(prim)),
+                        // `Mirror` written bare is the builtin constructor
+                        // given nothing: an arity complaint, as for a
+                        // declaration that takes something.
+                        None if name.modules.is_empty() && name.name.tracked == MIRROR => {
+                            self.error(
+                                name.span(),
+                                ErrorKind::Arity {
+                                    name: name.name.tracked.clone(),
+                                    expected: 1,
+                                    found: 0,
+                                },
+                            );
+                            here.anchor(TypeKind::Error)
+                        }
                         None => {
                             self.error(
                                 name.name.span,

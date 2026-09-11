@@ -325,3 +325,48 @@ end
         "assert.deepEqual(await app.args({}), ['web']);",
     );
 }
+
+#[test]
+fn reflect_mirrors_describe_and_compare_types() {
+    let project = project(
+        r#"
+type Dynamic = hide 'a => { value: 'a, evidence: Mirror 'a }
+type Named = { name: String, count: Nat }
+let described = std::reflect::describe (std::reflect::type_of { name: "a", count: 1n })
+let field_names: std::reflect::Description -> [String] = fn description =>
+  match std::array::get description.nodes description.root with
+  | #Some (#Record fields) => std::array::map (fn field => field.name) fields
+  | _ => []
+  end
+let names = field_names described
+let items: [Dynamic] = [{ value: 2n, evidence: std::reflect::mirror () }, { value: "two", evidence: std::reflect::mirror () }]
+let as_nat: Dynamic -> Option Nat = fn item => match item with
+| hide 'x { value, evidence } => match std::reflect::same evidence (std::reflect::mirror ()) with
+  | #Some { forward, backward } => #Some (forward value)
+  | #None => #None
+  end
+end
+let describe_later: Dynamic -> std::reflect::Description = fn item => match item with
+| hide 'x { value, evidence } => (fn _ => std::reflect::describe (std::reflect::type_of value)) ()
+end
+let numbers = std::array::map as_nat items
+let later = std::array::map describe_later items
+let decode_mirror: ForeignValue -> std::result::Result (Mirror Nat) std::ffi::DecodeError = std::ffi::decode
+let nat_mirror: Mirror Nat = std::reflect::mirror ()
+"#,
+        "node",
+        "library",
+    );
+    run(
+        project.path(),
+        r#"
+assert.deepEqual(app.names, ['count', 'name']);
+assert.deepEqual(app.numbers, [{ tag: 'Some', value: 2 }, { tag: 'None', value: undefined }]);
+assert.equal(app.later.length, 2);
+assert.equal(app.later[0].nodes[0].tag, 'Nat');
+assert.equal(app.later[1].nodes[0].tag, 'String');
+assert.equal((await app.decode_mirror(app.nat_mirror)).tag, 'Some');
+assert.equal((await app.decode_mirror({ nodes: ['Nat'] })).tag, 'Error');
+"#,
+    );
+}

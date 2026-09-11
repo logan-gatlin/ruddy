@@ -1304,13 +1304,13 @@ impl Lower<'_> {
     }
 
     fn representation(&mut self, ty: &Arc<Ty>, body: &mut Body) -> Temp {
-        if let Ty::Bound(parameter) = &**ty {
+        if let Some(parameter) = crate::reification::evidence_slot(ty) {
             let at = self
                 .frames
                 .iter()
-                .rposition(|frame| frame.representations.contains_key(parameter))
+                .rposition(|frame| frame.representations.contains_key(&parameter))
                 .expect("accepted reflection has evidence for each type parameter");
-            return self.thread(at, self.frames[at].representations[parameter]);
+            return self.thread(at, self.frames[at].representations[&parameter]);
         }
         let (template, parameters) =
             crate::reification::Descriptor::template(ty, self.inference.aliases())
@@ -1375,8 +1375,23 @@ impl Lower<'_> {
             rep: self.rep(&from),
         });
         let mut body = Body::default();
-        let descriptor =
-            self.representation(&kind.represented(ty, self.inference.aliases()), &mut body);
+        // The descriptor an intrinsic works with: evidence for the type it
+        // represents, or, for one handed a mirror, the mirror itself.
+        let descriptor = match kind.represented(ty, self.inference.aliases()) {
+            Some(represented) => self.representation(&represented, &mut body),
+            None => match kind {
+                crate::reification::Intrinsic::Same => self.emit(
+                    &mut body,
+                    Span::default(),
+                    Rep::TypeDescriptor,
+                    Op::Project {
+                        base: argument,
+                        field: FieldKey::named("0".to_owned()),
+                    },
+                ),
+                _ => argument,
+            },
+        };
         let value = self.emit(
             &mut body,
             Span::default(),
@@ -2264,6 +2279,7 @@ impl Lower<'_> {
             Ty::ForeignValue => Rep::HostValue,
             Ty::Arrow(..) => Rep::Fn,
             Ty::Array(_) => Rep::Array,
+            Ty::Mirror(_) => Rep::TypeDescriptor,
             Ty::Mut(..) => Rep::Any,
             Ty::Sum(_) => Rep::Sum,
             Ty::Struct(row) => {
@@ -4218,6 +4234,11 @@ impl Lower<'_> {
     fn leaf(&mut self, line: Line, assumed: Formula, tree: &Tree, body: &mut Body) -> Temp {
         for (symbol, temp) in &line.binds {
             self.top().locals.insert(*symbol, *temp);
+            // A mirror the pattern bound is the arm's evidence for the type
+            // it opened, installed before anything in the arm can need it.
+            if let Some(slot) = self.reification.callables.evidence.get(symbol).copied() {
+                self.top().representations.insert(slot, *temp);
+            }
         }
         // Every leaf yields to the one temp the whole match stands at, so a
         // function value is fitted from the shape it holds to the match's own

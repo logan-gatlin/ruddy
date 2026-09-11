@@ -121,6 +121,9 @@ A type written `hide 'a => T` whose variable stands for one particular type chos
 
 [Grammar](grammar.md#types)
 
+## Mirror
+A value of type `Mirror T` that is authentic evidence for the type `T`. Only the compiler makes one, at a position whose type it knows; the standard `reflect` module reads it as data and decides whether two mirrors are one type.
+
 ## Sum type
 A type describing alternative cases identified by tags, each of which can carry a value.
 

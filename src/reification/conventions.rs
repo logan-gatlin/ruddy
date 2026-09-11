@@ -261,6 +261,16 @@ impl Graph {
                 "array" => Shape::Array(child(self, edge("element").expect("array element"))),
                 "mut" if !native => Shape::Cell(self.shape(Shape::Sealed)),
                 "package" => Shape::Alias(child(self, edge("body").expect("package body"))),
+                // A value behind a hidden type is opened elsewhere, by code
+                // with its own evidence: every callable it carries takes the
+                // descriptor-free convention, decided where it was packaged.
+                name if name.starts_with("hidden:") => {
+                    if native {
+                        Shape::Alias(child(self, edge("body").expect("hidden body")))
+                    } else {
+                        Shape::Sealed
+                    }
+                }
                 "fields" | "sum" => {
                     let mut fields = BTreeMap::new();
                     for (label, node) in edges {
@@ -830,9 +840,25 @@ pub struct Plan {
     pub graph: Graph,
     pub bindings: IndexMap<Symbol, Binding>,
     pub occurrences: IndexMap<Anchor, Flow>,
+    /// The binders a `hide` pattern gave an authentic mirror of the type it
+    /// opened, by the slot that mirror is evidence for. Bound explicitly, by
+    /// the pattern itself: the arm's body has this evidence from the moment
+    /// the pattern matched, before any closure in it is built.
+    pub evidence: IndexMap<Symbol, u32>,
 }
 
 impl Plan {
+    /// The evidence slots an arm's pattern supplies through the mirrors it
+    /// binds. See [`Plan::evidence`].
+    pub fn arm_evidence(&self, pattern: &ir::Pattern) -> BTreeSet<u32> {
+        let mut binders = Vec::new();
+        ir::pattern_binders(pattern, &mut binders);
+        binders
+            .iter()
+            .filter_map(|binder| self.evidence.get(&binder.anchored).copied())
+            .collect()
+    }
+
     pub fn infer(program: &Program, semantics: &inference::Semantics) -> Self {
         let mut planner = Planner {
             plan: Self::default(),
@@ -879,7 +905,10 @@ impl Plan {
                 planner.seed(
                     *symbol,
                     ty,
-                    super::parameters(&intrinsic.represented(ty, planner.aliases)),
+                    intrinsic
+                        .represented(ty, planner.aliases)
+                        .map(|ty| super::parameters(&ty))
+                        .unwrap_or_default(),
                 );
                 let root = planner.plan.bindings[symbol].value;
                 if let Shape::Arrow {
@@ -887,7 +916,7 @@ impl Plan {
                 } = planner.plan.graph.exposed(root).clone()
                 {
                     match intrinsic {
-                        super::Intrinsic::Upcast => {
+                        super::Intrinsic::Upcast | super::Intrinsic::TypeOf => {
                             planner.plan.graph.shapes[argument as usize] = Shape::Sealed
                         }
                         super::Intrinsic::Downcast => {
@@ -1269,7 +1298,15 @@ impl Planner<'_> {
                     self.pattern(pattern, scrutinee.value, &scrutinee_type);
                     let body = self.term(body);
                     self.plan.graph.join(value, body.value);
-                    evaluations.push(body.evaluation);
+                    // What the pattern's mirrors are evidence for, the arm
+                    // supplies itself; only the rest is asked of the context.
+                    let supplied = self.plan.arm_evidence(pattern);
+                    if supplied.is_empty() {
+                        evaluations.push(body.evaluation);
+                    } else {
+                        let asked = self.universe.difference(&supplied).copied().collect();
+                        evaluations.push(self.plan.graph.select(body.evaluation, asked));
+                    }
                 }
                 Flow {
                     value,
@@ -1342,6 +1379,23 @@ impl Planner<'_> {
                 }
             }
         };
+        // A term at a hidden type is packaged: its callables are sealed here,
+        // where the evidence they need is at hand, since where it is opened
+        // has only the evidence its own patterns bind.
+        let flow = if matches!(
+            &*inference::unfold(self.aliases, &term.ty),
+            Ty::Hidden { .. }
+        ) {
+            let sealed = self.plan.graph.shape(Shape::Sealed);
+            let sealing = self.plan.graph.sealing(flow.value);
+            self.plan.graph.supply(sealed, flow.value);
+            Flow {
+                value: sealed,
+                evaluation: self.plan.graph.union([flow.evaluation, sealing]),
+            }
+        } else {
+            flow
+        };
         self.plan.graph.reveal(flow.value, &term.ty, self.aliases);
         self.plan.occurrences.insert(term.at, flow);
         flow
@@ -1372,9 +1426,20 @@ impl Planner<'_> {
                     ),
                     _ => Arc::new(Ty::Undecided),
                 };
-                self.pattern(payload, value, &opened);
+                let sealed = self.plan.graph.shape(Shape::Sealed);
+                self.plan.graph.supply(sealed, value);
+                self.pattern(payload, sealed, &opened);
             }
             ir::PatternKind::Bind(name) => {
+                // A mirror of an opened type, bound by name: evidence for
+                // that type within the arm. Only the mirror itself counts;
+                // a mirror of an array of it says nothing about the element.
+                if let Ty::Mirror(inner) = &*ty
+                    && let Some(slot) = super::evidence_slot(inner)
+                    && slot & super::SCOPED != 0
+                {
+                    self.plan.evidence.insert(name.anchored, slot);
+                }
                 self.plan.bindings.insert(
                     name.anchored,
                     Binding {
@@ -1386,14 +1451,16 @@ impl Planner<'_> {
                 );
             }
             ir::PatternKind::Struct { fields, .. } => {
-                if let Shape::Record(members) = self.plan.graph.exposed(value).clone() {
-                    for (name, field) in fields {
-                        if let Some(member) = members.get(name)
-                            && let Ty::Struct(row) = &*ty
-                            && let Some(field_ty) = super::flattened(row).labels.get(name)
-                        {
-                            self.pattern(&field.value, *member, &field_ty.ty);
-                        }
+                let members = match self.plan.graph.exposed(value).clone() {
+                    Shape::Record(members) => Some(members),
+                    _ => None,
+                };
+                for (name, field) in fields {
+                    if let Some(member) = self.member(value, members.as_ref(), name)
+                        && let Ty::Struct(row) = &*ty
+                        && let Some(field_ty) = super::flattened(row).labels.get(name)
+                    {
+                        self.pattern(&field.value, member, &field_ty.ty);
                     }
                 }
             }
@@ -1401,8 +1468,11 @@ impl Planner<'_> {
                 name,
                 payload: Some(payload),
             } => {
-                if let Shape::Sum(members) = self.plan.graph.exposed(value)
-                    && let Some(member) = members.get(&name.anchored).copied()
+                let members = match self.plan.graph.exposed(value).clone() {
+                    Shape::Sum(members) => Some(members),
+                    _ => None,
+                };
+                if let Some(member) = self.member(value, members.as_ref(), &name.anchored)
                     && let Ty::Sum(row) = &*ty
                     && let Some(field) = super::flattened(row).labels.get(&name.anchored)
                 {
@@ -1425,7 +1495,12 @@ impl Planner<'_> {
                         },
                     );
                 }
-                if let Shape::Array(element) = self.plan.graph.exposed(value).clone() {
+                let element = match self.plan.graph.exposed(value).clone() {
+                    Shape::Array(element) => Some(element),
+                    Shape::Value | Shape::Sealed => Some(value),
+                    _ => None,
+                };
+                if let Some(element) = element {
                     for pattern in before.iter().chain(after) {
                         if let Ty::Array(element_ty) = &*ty {
                             self.pattern(pattern, element, element_ty);
@@ -1434,6 +1509,22 @@ impl Planner<'_> {
                 }
             }
             _ => {}
+        }
+    }
+
+    /// The shape a pattern reads a member at. A value with no structure
+    /// exposed, opaque or sealed, has every member that same shape: its
+    /// bindings still need their types recorded, mirrors most of all.
+    fn member(
+        &self,
+        value: ShapeId,
+        members: Option<&BTreeMap<String, ShapeId>>,
+        name: &str,
+    ) -> Option<ShapeId> {
+        match members {
+            Some(members) => members.get(name).copied(),
+            None => matches!(self.plan.graph.exposed(value), Shape::Value | Shape::Sealed)
+                .then_some(value),
         }
     }
 }

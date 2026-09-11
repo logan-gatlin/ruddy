@@ -1,6 +1,6 @@
 # 03 Typed mirrors and the `reflect` module
 
-Status: open
+Status: resolved
 Type: task
 Blocked by: 02
 

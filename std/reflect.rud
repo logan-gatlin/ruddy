@@ -1,0 +1,43 @@
+@doc "A finite graph describing a type: ordinary readable data, never evidence. Node indices refer into `nodes`; a recursive type is a graph with a back edge."
+type Description = { root: Nat, nodes: [Node] }
+
+@doc "One node of a description. Numeric kinds keep their exact primitive; a function reports its argument and result; records and sums list their fields by name."
+type Node =
+  | #Nat
+  | #Int
+  | #Real
+  | #String
+  | #Bool
+  | #Any
+  | #Foreign
+  | #Fixed { bits: Nat, signed: Bool }
+  | #Array Nat
+  | #Function { argument: Nat, result: Nat }
+  | #Record [Field]
+  | #Sum [Field]
+  | #Alias Nat
+  | #Extend { base: Nat, rest: Nat }
+  | #Parameter Nat
+  | #Mirror Nat
+  | #Hidden Nat
+  | #Variable Nat
+
+@doc "A named position of a record or sum node."
+type Field = { name: String, node: Nat }
+
+@doc "Authentic evidence for the type this position is inferred at. The compiler supplies it: an annotation, a use, or a caller decides the type, never a runtime value."
+extern mirror: () -> Mirror 'a = "$mirror"
+
+@doc "The mirror of a value's static type at this use. It does not inspect the value."
+extern type_of: 'a -> Mirror 'a = "$typeOf"
+
+@doc "A mirror's structure as ordinary data. Editing the description grants nothing: it cannot be turned back into a mirror."
+extern describe: Mirror 'a -> Description = "$describe"
+
+@private
+extern same_pair: (Mirror 'a, Mirror 'b) -> Option { forward: 'a -> 'b, backward: 'b -> 'a } =
+  "$sameMirror"
+
+@doc "Whether two mirrors are one type, exactly: equal structure, primitives, and effect contracts. On success the two functions convert nothing and return their argument unchanged."
+let same: Mirror 'a -> Mirror 'b -> Option { forward: 'a -> 'b, backward: 'b -> 'a } =
+  fn left right => same_pair (left, right)

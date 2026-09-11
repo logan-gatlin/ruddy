@@ -14,8 +14,10 @@ const $instantiateType = ($template, $arguments, $partial = false) => {
   const $offsets = $arguments.map($argument => {
     const $offset = $nodes.length;
     for (const $node of $argument.nodes) {
-      if (typeof $node === "string" || "Fixed" in $node || "Parameter" in $node) $nodes.push($node);
+      if (typeof $node === "string" || "Fixed" in $node || "Parameter" in $node || "HiddenBound" in $node) $nodes.push($node);
       else if ("Array" in $node) $nodes.push({ Array: $node.Array + $offset });
+      else if ("Mirror" in $node) $nodes.push({ Mirror: $node.Mirror + $offset });
+      else if ("Hidden" in $node) $nodes.push({ Hidden: $node.Hidden + $offset });
       else if ("Alias" in $node) $nodes.push({ Alias: $node.Alias + $offset });
       else if ("Arrow" in $node) $nodes.push({ Arrow: $node.Arrow.map($index => $index + $offset) });
       else {
@@ -59,9 +61,11 @@ const $instantiateType = ($template, $arguments, $partial = false) => {
 const $typeAt = ($descriptor, $index) => ({ nodes: [
   { Alias: $index + 1 },
   ...$descriptor.nodes.map($node => {
-    if (typeof $node === "string" || "Fixed" in $node || "Parameter" in $node) return $node;
+    if (typeof $node === "string" || "Fixed" in $node || "Parameter" in $node || "HiddenBound" in $node) return $node;
     if ("Alias" in $node) return { Alias: $node.Alias + 1 };
     if ("Array" in $node) return { Array: $node.Array + 1 };
+    if ("Mirror" in $node) return { Mirror: $node.Mirror + 1 };
+    if ("Hidden" in $node) return { Hidden: $node.Hidden + 1 };
     if ("Arrow" in $node) return { Arrow: $node.Arrow.map($child => $child + 1) };
     if ("Extend" in $node) return { Extend: $node.Extend.map($child => $child + 1) };
     const $kind = Object.keys($node)[0];
@@ -122,10 +126,10 @@ const $nativeSlots = ($descriptor, $index) => {
     if ($seen.has($key)) continue;
     $seen.add($key);
     const $node = $nodes[$index];
-    if (typeof $node === "string" || "Fixed" in $node) continue;
+    if (typeof $node === "string" || "Fixed" in $node || "HiddenBound" in $node) continue;
     if ("Parameter" in $node) { $slots.add($node.Parameter); continue; }
     if ($defer && "Arrow" in $node) continue;
-    const $children = "Alias" in $node ? [$node.Alias] : "Array" in $node ? [$node.Array] : "Arrow" in $node ? $node.Arrow : "Extend" in $node ? $node.Extend : Object.values($node)[0].map($field => $field[1]);
+    const $children = "Alias" in $node ? [$node.Alias] : "Array" in $node ? [$node.Array] : "Mirror" in $node ? [$node.Mirror] : "Hidden" in $node ? [$node.Hidden] : "Arrow" in $node ? $node.Arrow : "Extend" in $node ? $node.Extend : Object.values($node)[0].map($field => $field[1]);
     for (const $child of $children) $work.push([$child, $defer]);
   }
   return [...$slots].sort(($a, $b) => $a - $b);
@@ -152,10 +156,10 @@ const $sameType = ($left, $right) => {
     }
     const $kind = Object.keys($x)[0];
     if ($kind !== Object.keys($y)[0]) return false;
-    if ($kind === "Fixed") {
-      if ($x.Fixed !== $y.Fixed) return false;
-    } else if ($kind === "Array") {
-      $work.push([$x.Array, $y.Array]);
+    if ($kind === "Fixed" || $kind === "Parameter" || $kind === "HiddenBound") {
+      if ($x[$kind] !== $y[$kind]) return false;
+    } else if ($kind === "Array" || $kind === "Mirror" || $kind === "Hidden") {
+      $work.push([$x[$kind], $y[$kind]]);
     } else if ($kind === "Arrow") {
       $work.push([$x.Arrow[0], $y.Arrow[0]], [$x.Arrow[1], $y.Arrow[1]]);
     } else {
@@ -168,6 +172,51 @@ const $sameType = ($left, $right) => {
     }
   }
   return true;
+};
+// Mirrors are the descriptors the compiler already passes as evidence, made
+// authentic: only a descriptor that came through one of these operations is
+// a mirror, so foreign data cannot forge one.
+const $mirrors = new WeakSet();
+const $mirror = ($descriptor, $value) => {
+  if (!$descriptor) throw new TypeError("missing runtime type information for a mirror");
+  $mirrors.add($descriptor);
+  return $descriptor;
+};
+const $typeOf = $mirror;
+// A function of one value handed back unchanged: what an established equality
+// of two mirrors supplies in each direction. It converts nothing, so it keeps
+// the value's identity as well as its type.
+const $passThroughType = { nodes: [{ Arrow: [1, 1] }, "ForeignValue"] };
+const $passThrough = () => {
+  const $value = $argument => $invoke($value, "Sync", [$argument]);
+  $value[$closureMark] = true;
+  $value.nativeType = { descriptor: $passThroughType, from: 1, to: 1, function: $x => $x, slots: [] };
+  return $value;
+};
+const $sameMirror = ($descriptor, $pair) => $sameType($pair["0"], $pair["1"])
+  ? $sum("Some", $record([["forward", $passThrough()], ["backward", $passThrough()]]))
+  : $sum("None", undefined);
+// A mirror's graph as ordinary data: one node per descriptor node, indices
+// kept, so recursion stays finite and nothing here can be turned back into
+// a mirror.
+const $describe = ($descriptor, $mirror) => {
+  const $node = $n => {
+    if (typeof $n === "string") return $sum($n === "ForeignValue" ? "Foreign" : $n, undefined);
+    if ("Fixed" in $n) return $sum("Fixed", $record([["bits", Number($n.Fixed.match(/\d+/)[0])], ["signed", $n.Fixed.startsWith("Int")]]));
+    if ("Array" in $n) return $sum("Array", $n.Array);
+    if ("Arrow" in $n) return $sum("Function", $record([["argument", $n.Arrow[0]], ["result", $n.Arrow[1]]]));
+    if ("Struct" in $n || "Sum" in $n) {
+      const $fields = "Struct" in $n ? $n.Struct : $n.Sum;
+      return $sum("Struct" in $n ? "Record" : "Sum", $array($fields.map(([$name, $index]) => $record([["name", $name], ["node", $index]]))));
+    }
+    if ("Alias" in $n) return $sum("Alias", $n.Alias);
+    if ("Extend" in $n) return $sum("Extend", $record([["base", $n.Extend[0]], ["rest", $n.Extend[1]]]));
+    if ("Parameter" in $n) return $sum("Parameter", $n.Parameter);
+    if ("Mirror" in $n) return $sum("Mirror", $n.Mirror);
+    if ("Hidden" in $n) return $sum("Hidden", $n.Hidden);
+    return $sum("Variable", $n.HiddenBound);
+  };
+  return $record([["root", 0], ["nodes", $array($mirror.nodes.map($node))]]);
 };
 const $anyUpcast = ($descriptor, $value) => {
   if (!$descriptor) throw new TypeError("missing runtime type information for Any");
@@ -225,6 +274,12 @@ const $convertType = ($descriptor, $value, $outgoing, $rootIndex = 0, $callable 
       $put($input);
       continue;
     }
+    if ("Mirror" in $node) {
+      if (!$mirrors.has($input)) $fail($path, "an authentic mirror");
+      $put($input);
+      continue;
+    }
+    if ("Hidden" in $node || "HiddenBound" in $node) $fail($path, "a supported native type; hidden types cannot cross a foreign boundary exactly");
     if ("Arrow" in $node) {
       if (!$callable) $fail($path, "a verifiable data type; function contracts cannot be decoded");
       if (typeof $input !== "function") $fail($path, "Function");

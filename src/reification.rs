@@ -106,6 +106,27 @@ pub fn explain(scheme: &Scheme) -> Option<String> {
     })
 }
 
+/// The evidence slot of a type a `hide` pattern opened, by the rigid's id.
+/// Above every quantified parameter's index, so the two share one key space
+/// in the demand solver and in a frame's descriptors without colliding.
+pub const SCOPED: u32 = 1 << 31;
+
+/// Whether a rigid is one a `hide` pattern opened, as opposed to a local
+/// region's, whose ids are minted from the top of the space.
+pub fn scoped_rigid(id: u32) -> bool {
+    id < (1 << 30)
+}
+
+/// The evidence slot a type stands for: a quantified parameter's index, or
+/// the slot of an opened type. See [`SCOPED`].
+pub fn evidence_slot(ty: &Ty) -> Option<u32> {
+    match ty {
+        Ty::Bound(index) => Some(*index),
+        Ty::Rigid { id, .. } if scoped_rigid(*id) => Some(SCOPED | id),
+        _ => None,
+    }
+}
+
 /// Row substitutions use an empty record/sum around their remainder, while
 /// ordinary type substitutions name the bound parameter directly.
 pub fn parameter_index(ty: &Ty) -> Option<u32> {
@@ -160,7 +181,13 @@ impl Analysis {
             let binding = &self.bindings[symbol];
             if matches!(
                 declaration.value.target.anchored.as_str(),
-                "$anyUpcast" | "$anyDowncast" | "$ffiDecode"
+                "$anyUpcast"
+                    | "$anyDowncast"
+                    | "$ffiDecode"
+                    | "$mirror"
+                    | "$typeOf"
+                    | "$describe"
+                    | "$sameMirror"
             ) && Intrinsic::recognize(&declaration.value.target.anchored, &binding.ty, aliases)
                 .is_none()
             {
@@ -205,8 +232,6 @@ impl Analysis {
                         }
                     }
                 }
-                let mut nested = Vec::new();
-                children(term, &mut nested);
                 let mut available = available;
                 if let conventions::Shape::Arrow { needs, .. } =
                     self.callables.graph.exposed(flow.value)
@@ -214,6 +239,19 @@ impl Analysis {
                 {
                     available.extend(solved[*needs as usize].iter().map(|need| need.parameter));
                 }
+                // An arm has what its pattern's mirrors are evidence for,
+                // from the moment the pattern matched.
+                if let TermKind::Match { scrutinee, arms } = &term.kind {
+                    work.push((scrutinee, available.clone()));
+                    for (pattern, body) in arms {
+                        let mut extended = available.clone();
+                        extended.extend(self.callables.arm_evidence(pattern));
+                        work.push((body, extended));
+                    }
+                    continue;
+                }
+                let mut nested = Vec::new();
+                children(term, &mut nested);
                 work.extend(nested.into_iter().map(|term| (term, available.clone())));
             }
         }
@@ -323,13 +361,17 @@ pub fn parameters(ty: &Arc<Ty>) -> BTreeSet<u32> {
             Ty::Bound(index) => {
                 parameters.insert(*index);
             }
+            Ty::Rigid { id, .. } if scoped_rigid(*id) => {
+                parameters.insert(SCOPED | id);
+            }
             Ty::Arrow(from, to, row) => {
                 work.extend([from.clone(), to.clone()]);
                 row_parameters(row, &mut work, &mut parameters);
             }
-            Ty::Array(inner) | Ty::Package(inner) | Ty::Hidden { body: inner, .. } => {
-                work.push(inner.clone())
-            }
+            Ty::Array(inner)
+            | Ty::Mirror(inner)
+            | Ty::Package(inner)
+            | Ty::Hidden { body: inner, .. } => work.push(inner.clone()),
             Ty::Mut(region, inner) => work.extend([region.clone(), inner.clone()]),
             Ty::Struct(row) | Ty::Sum(row) => row_parameters(row, &mut work, &mut parameters),
             Ty::Named { args, .. } => work.extend(args.iter().cloned()),
@@ -371,8 +413,8 @@ pub fn instantiate(
     let mut visited = Vec::new();
     let mut aliases_seen = HashSet::new();
     while let Some((declared, used)) = work.pop() {
-        if let Ty::Bound(index) = &*declared {
-            result.entry(*index).or_insert(used);
+        if let Some(slot) = evidence_slot(&declared) {
+            result.entry(slot).or_insert(used);
             continue;
         }
         if visited
@@ -420,7 +462,9 @@ pub fn instantiate(
             (Ty::Arrow(a, b, _), Ty::Arrow(x, y, _)) | (Ty::Mut(a, b), Ty::Mut(x, y)) => {
                 work.extend([(a.clone(), x.clone()), (b.clone(), y.clone())]);
             }
-            (Ty::Array(a), Ty::Array(b)) => work.push((a.clone(), b.clone())),
+            (Ty::Array(a), Ty::Array(b)) | (Ty::Mirror(a), Ty::Mirror(b)) => {
+                work.push((a.clone(), b.clone()))
+            }
             (Ty::Struct(a), Ty::Struct(b)) | (Ty::Sum(a), Ty::Sum(b)) => {
                 let a = flattened(a);
                 let mut b = flattened(b);
@@ -485,6 +529,15 @@ pub enum Intrinsic {
     Upcast,
     Downcast,
     Decode,
+    /// `() -> Mirror 'a`: the evidence for the inferred type, as a value.
+    Mirror,
+    /// `'a -> Mirror 'a`: the evidence for the argument's static type.
+    TypeOf,
+    /// `Mirror 'a -> Description`: the mirror's finite graph as ordinary data.
+    Describe,
+    /// `(Mirror 'a, Mirror 'b) -> Option { forward, backward }`: exact
+    /// structural equality of two mirrors, with identity functions on success.
+    Same,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -554,24 +607,102 @@ impl Intrinsic {
                     && same_finite_syntax(&none.ty, &Arc::new(Ty::unit())))
                 .then_some(Self::Downcast)
             }
+            "$mirror" if same_finite_syntax(from, &Arc::new(Ty::unit())) => {
+                matches!(&**to, Ty::Mirror(inner) if matches!(&**inner, Ty::Bound(_)))
+                    .then_some(Self::Mirror)
+            }
+            "$typeOf" => match (&**from, &**to) {
+                (Ty::Bound(argument), Ty::Mirror(inner)) if matches!(&**inner, Ty::Bound(mirrored) if mirrored == argument) => {
+                    Some(Self::TypeOf)
+                }
+                _ => None,
+            },
+            "$describe" if matches!(&**from, Ty::Mirror(_)) => {
+                let result = inference::unfold(aliases, to);
+                let Ty::Struct(row) = &*result else {
+                    return None;
+                };
+                (matches!(row.rest, Rest::Closed)
+                    && row.labels.len() == 2
+                    && ["root", "nodes"].iter().all(|name| {
+                        row.labels
+                            .get(*name)
+                            .is_some_and(|field| matches!(field.presence, Presence::Present))
+                    }))
+                .then_some(Self::Describe)
+            }
+            "$sameMirror" => {
+                let pair = inference::unfold(aliases, from);
+                let Ty::Struct(pair) = &*pair else {
+                    return None;
+                };
+                let mirrored = |name: &str| match &*pair.labels.get(name)?.ty {
+                    Ty::Mirror(inner) => match &**inner {
+                        Ty::Bound(index) => Some(*index),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                let (left, right) = (mirrored("0")?, mirrored("1")?);
+                if pair.labels.len() != 2 || !matches!(pair.rest, Rest::Closed) {
+                    return None;
+                }
+                let result = inference::unfold(aliases, to);
+                let Ty::Sum(row) = &*result else {
+                    return None;
+                };
+                let some = row.labels.get("Some")?;
+                let none = row.labels.get("None")?;
+                let casts = inference::unfold(aliases, &some.ty);
+                let Ty::Struct(casts) = &*casts else {
+                    return None;
+                };
+                let arrow = |name: &str, from: u32, to: u32| {
+                    casts.labels.get(name).is_some_and(|field| {
+                        matches!(&*field.ty, Ty::Arrow(a, b, effects)
+                            if matches!(&**a, Ty::Bound(x) if *x == from)
+                                && matches!(&**b, Ty::Bound(y) if *y == to)
+                                && effects.labels.is_empty()
+                                && matches!(effects.rest, Rest::Closed))
+                    })
+                };
+                (row.labels.len() == 2
+                    && matches!(row.rest, Rest::Closed)
+                    && matches!(some.presence, Presence::Present)
+                    && matches!(none.presence, Presence::Present)
+                    && same_finite_syntax(&none.ty, &Arc::new(Ty::unit()))
+                    && casts.labels.len() == 2
+                    && matches!(casts.rest, Rest::Closed)
+                    && arrow("forward", left, right)
+                    && arrow("backward", right, left))
+                .then_some(Self::Same)
+            }
             _ => None,
         }
     }
 
-    pub fn represented(self, ty: &Arc<Ty>, aliases: &IndexMap<Symbol, Scheme>) -> Arc<Ty> {
+    /// The type the intrinsic needs runtime information for, if any. A
+    /// mirror-consuming intrinsic needs none: the mirror it is handed is that
+    /// information already.
+    pub fn represented(self, ty: &Arc<Ty>, aliases: &IndexMap<Symbol, Scheme>) -> Option<Arc<Ty>> {
         let ty = inference::unfold(aliases, ty);
         let Ty::Arrow(from, to, _) = &*ty else {
             unreachable!("a reviewed reflection intrinsic is a function")
         };
         match self {
-            Self::Upcast => from.clone(),
+            Self::Upcast | Self::TypeOf => Some(from.clone()),
             Self::Downcast | Self::Decode => {
                 let result = inference::unfold(aliases, to);
                 let Ty::Sum(row) = &*result else {
                     unreachable!("a reviewed downcast returns Option")
                 };
-                row.labels["Some"].ty.clone()
+                Some(row.labels["Some"].ty.clone())
             }
+            Self::Mirror => match &**to {
+                Ty::Mirror(inner) => Some(inner.clone()),
+                _ => unreachable!("a reviewed mirror intrinsic returns a mirror"),
+            },
+            Self::Describe | Self::Same => None,
         }
     }
 }
@@ -594,6 +725,14 @@ pub enum Node {
     Any,
     ForeignValue,
     Array(u32),
+    /// Authentic evidence of the type at the index: a mirror.
+    Mirror(u32),
+    /// `hide 'a => T`, binding a variable over the body at the index.
+    Hidden(u32),
+    /// A hidden type's variable, by how many binders out it was bound: zero
+    /// is the nearest enclosing [`Node::Hidden`]. Depth rather than a number,
+    /// so two hidden types spelled with different variables are one graph.
+    HiddenBound(u32),
     Arrow([u32; 2]),
     Extend([u32; 2]),
     Struct(Vec<(String, u32)>),
@@ -670,18 +809,22 @@ impl Descriptor {
         let mut optional_fields = std::collections::BTreeMap::<u32, BTreeSet<String>>::new();
         let mut parameters = Vec::new();
         let mut nodes = vec![Node::ForeignValue];
-        let mut shared = HashMap::from([(root, 0u32)]);
-        let mut work = vec![(0, root)];
-        while let Some((at, source)) = work.pop() {
+        // A graph node is shared per enclosing hidden binder list: the same
+        // body under different binders would number its variables differently.
+        let binders: Vec<u32> = Vec::new();
+        let mut shared = HashMap::from([((root, binders.clone()), 0u32)]);
+        let mut work = vec![(0, root, binders)];
+        while let Some((at, source, binders)) = work.pop() {
             let (label, edges) = &graph[source];
-            let mut child = |source: usize| {
-                *shared.entry(source).or_insert_with(|| {
+            let mut child_under = |source: usize, binders: Vec<u32>| {
+                *shared.entry((source, binders.clone())).or_insert_with(|| {
                     let index = nodes.len() as u32;
                     nodes.push(Node::ForeignValue);
-                    work.push((index as usize, source));
+                    work.push((index as usize, source, binders));
                     index
                 })
             };
+            let mut child = |source: usize| child_under(source, binders.clone());
             let edge = |name: &str| {
                 edges
                     .iter()
@@ -697,14 +840,31 @@ impl Descriptor {
                 "ForeignValue" => Node::ForeignValue,
                 "Unit" => Node::Struct(Vec::new()),
                 "package" if native => Node::Alias(child(edge("body").expect("package body"))),
+                "mirror" => Node::Mirror(child(edge("of").expect("mirror graph edge"))),
                 // A hidden type crosses a foreign boundary as its body, and
                 // the type it hides as an opaque host value: nothing about the
-                // payload is known to convert, and nothing is. An exact
-                // identity for a hidden type is a mirror's to establish.
+                // payload is known to convert, and nothing is. Its exact
+                // identity binds the variable over the body, numbered by depth
+                // so the spelling of the variable is no part of it.
                 name if name.starts_with("hidden:") && native => {
                     Node::Alias(child(edge("body").expect("hidden body")))
                 }
                 name if name.starts_with("hidden-var:") && native => Node::ForeignValue,
+                name if name.starts_with("hidden:") => {
+                    let binder: u32 = name[7..].parse().expect("a hidden graph binder");
+                    let mut inner = binders.clone();
+                    inner.push(binder);
+                    Node::Hidden(child_under(edge("body").expect("hidden body"), inner))
+                }
+                name if name.starts_with("hidden-var:") => {
+                    let binder: u32 = name[11..].parse().expect("a hidden graph variable");
+                    let depth = binders
+                        .iter()
+                        .rev()
+                        .position(|bound| *bound == binder)
+                        .expect("a hidden variable is written under its binder");
+                    Node::HiddenBound(depth as u32)
+                }
                 "array" => Node::Array(child(edge("element").expect("array graph edge"))),
                 "arrow" => {
                     let effects = &graph[edge("effects").expect("arrow effect graph edge")];
@@ -830,7 +990,12 @@ impl Descriptor {
                 Node::Parameter(index) if *index as usize >= parameters => {
                     return Err("invalid runtime type parameter");
                 }
-                Node::Array(index) | Node::Alias(index) => vec![*index],
+                Node::Array(index)
+                | Node::Alias(index)
+                | Node::Mirror(index)
+                | Node::Hidden(index) => {
+                    vec![*index]
+                }
                 Node::Arrow(indices) | Node::Extend(indices) => indices.to_vec(),
                 Node::Struct(fields) | Node::Sum(fields) => {
                     if fields.windows(2).any(|pair| pair[0].0 >= pair[1].0) {

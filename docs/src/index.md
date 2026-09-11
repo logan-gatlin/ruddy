@@ -64,7 +64,7 @@ The runtime supplies the console effect handler; a program can also supply its o
 ## Getting started
 
 The [download page](download.md) covers installation and editor setup.
-The [platform API guide](platform-apis.md) covers JSON, process information, paths, HTTP requests, and URLs.
+The [platform API guide](platform-apis.md) covers JSON, process information, paths, HTTP requests, URLs, and mirrors.
 
 The following reading order builds on this introduction:
 

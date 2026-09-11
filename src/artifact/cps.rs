@@ -532,6 +532,25 @@ pub(super) fn validate(lir: &Lir) -> Result<(), String> {
                             {
                                 return error("decoding requires ForeignValue and returns Result");
                             }
+                            crate::reification::Intrinsic::Mirror
+                            | crate::reification::Intrinsic::TypeOf
+                                if i.rep != Rep::TypeDescriptor =>
+                            {
+                                return error(
+                                    "a mirror intrinsic yields a runtime type descriptor",
+                                );
+                            }
+                            crate::reification::Intrinsic::Describe
+                                if available[value] != Rep::TypeDescriptor
+                                    || i.rep != Rep::Struct =>
+                            {
+                                return error("describing requires a mirror and yields a struct");
+                            }
+                            crate::reification::Intrinsic::Same
+                                if available[value] != Rep::Struct || i.rep != Rep::Sum =>
+                            {
+                                return error("comparing mirrors takes a pair and yields Option");
+                            }
                             _ => {}
                         }
                     }
