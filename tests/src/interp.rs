@@ -969,6 +969,77 @@ end
     );
 }
 
+/// A type whose recursion runs through a hidden binder still has a finite
+/// graph. Re-entering the binder used to give every turn of the recursion a
+/// descriptor of its own, and construction never finished.
+#[test]
+fn recursion_through_a_hidden_binder_has_a_finite_graph() {
+    let source = r#"
+type Loop = hide 'a => { value: 'a, next: std::option::Option Loop }
+type Renamed = hide 'z => { value: 'z, next: std::option::Option Renamed }
+type Other = hide 'a => { value: 'a, next: std::option::Option Nat }
+type Nested = hide 'a => hide 'b => { outer: 'a, inner: 'b, next: std::option::Option Nested }
+type Both = hide 'a => {
+  here: 'a,
+  deeper: hide 'b => { there: 'b, back: 'a, next: std::option::Option Both },
+}
+type Plain = { head: Nat, tail: std::option::Option Plain }
+type Even = hide 'a => { value: 'a, odd: std::option::Option Odd }
+type Odd = hide 'b => { value: 'b, even: std::option::Option Even }
+
+@private
+let of_loop: Mirror Loop = std::reflect::mirror ()
+@private
+let of_renamed: Mirror Renamed = std::reflect::mirror ()
+@private
+let of_other: Mirror Other = std::reflect::mirror ()
+@private
+let of_nested: Mirror Nested = std::reflect::mirror ()
+@private
+let of_both: Mirror Both = std::reflect::mirror ()
+@private
+let of_plain: Mirror Plain = std::reflect::mirror ()
+@private
+let of_even: Mirror Even = std::reflect::mirror ()
+@private
+let of_odd: Mirror Odd = std::reflect::mirror ()
+
+@private
+let size: Mirror 'a -> String = fn of =>
+  std::str::from_nat (std::array::len (std::reflect::describe of).nodes)
+let sizes = std::str::join "," [
+  size of_loop,
+  size of_nested,
+  size of_both,
+  size of_plain,
+  size of_even,
+  size of_odd,
+]
+
+@private
+let decided: Mirror 'x -> Mirror 'y -> String = fn left right =>
+  match std::reflect::same left right with
+  | #Some _ => "same"
+  | #None => "different"
+  end
+let answers = std::str::join "," [
+  decided of_loop of_renamed,
+  decided of_loop of_loop,
+  decided of_loop of_other,
+  decided of_even of_odd,
+]
+"#;
+    let exports = ["sizes", "answers"];
+    let (node, interpreted) = both(source, &exports, None);
+    assert_eq!(node, interpreted);
+    // Finite, and small: a graph that grew per turn of the recursion would
+    // not get here at all.
+    assert_eq!(
+        interpreted,
+        vec!["\"6,9,13,4,16,16\"", "\"same,same,different,different\"",]
+    );
+}
+
 #[test]
 fn a_host_value_the_interpreter_does_not_provide_is_named() {
     let mut program = load(

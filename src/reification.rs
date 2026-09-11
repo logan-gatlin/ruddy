@@ -549,6 +549,12 @@ pub enum Intrinsic {
 
 /// The cases of `std::reflect::Shape`, which `$shape` builds at runtime: a
 /// declaration naming the intrinsic must have exactly these.
+/// How large a type's finite graph may grow before the compiler reports that
+/// it does not have one. A graph is finite by construction; this bounds the
+/// damage of a form whose construction is not yet finite, so a program gets a
+/// diagnostic rather than an exhausted process.
+const NODE_LIMIT: usize = 1 << 16;
+
 pub const SHAPE_CASES: [&str; 20] = [
     "Nat", "Int", "Real", "String", "Bool", "Nat8", "Nat16", "Nat32", "Nat64", "Int8", "Int16",
     "Int32", "Int64", "Array", "Record", "Sum", "Function", "Hidden", "Mirror", "Foreign",
@@ -827,6 +833,11 @@ impl Descriptor {
         let mut shared = HashMap::from([((root, binders.clone()), 0u32)]);
         let mut work = vec![(0, root, binders)];
         while let Some((at, source, binders)) = work.pop() {
+            if nodes.len() > NODE_LIMIT {
+                return Err(
+                    "runtime type information for this type does not fit a finite graph".into(),
+                );
+            }
             let (label, edges) = &graph[source];
             let mut child_under = |source: usize, binders: Vec<u32>| {
                 *shared.entry((source, binders.clone())).or_insert_with(|| {
@@ -858,7 +869,20 @@ impl Descriptor {
                 // nothing of the body is converted, or can be made outside.
                 name if name.starts_with("hidden:") => {
                     let binder: u32 = name[7..].parse().expect("a hidden graph binder");
-                    let mut inner = binders.clone();
+                    // A variable always names the nearest enclosing binder of
+                    // its own, so re-entering a binder through recursion
+                    // shadows the occurrence already in scope and that one can
+                    // never be named again. Dropping it keeps every depth a
+                    // variable resolves to and bounds the list by the number of
+                    // distinct binders, which is what closes the back edge: a
+                    // list that only grew would give every turn of the
+                    // recursion a key of its own and the graph would never
+                    // finish.
+                    let mut inner: Vec<u32> = binders
+                        .iter()
+                        .copied()
+                        .filter(|bound| *bound != binder)
+                        .collect();
                     inner.push(binder);
                     Node::Hidden(child_under(edge("body").expect("hidden body"), inner))
                 }

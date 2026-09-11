@@ -1,6 +1,6 @@
 # 19 Terminate descriptor construction for recursion through `hide`
 
-Status: open
+Status: resolved
 Type: task
 Priority: P1
 
@@ -78,3 +78,32 @@ Do not run the unfixed reproduction without memory and time limits.
   bug returns. Run Rust tests only through `just test`; preserve that
   recipe's process-tree memory limit and use an additional bounded child
   process where necessary for the failure regression.
+
+## Answer
+
+`Descriptor::from_graph_policy` shares a source node per enclosing binder
+list. Re-entering a hidden binder through recursion pushed that binder onto
+the list again, so every turn had a key of its own and no back edge ever
+closed. A variable always names the nearest enclosing binder of its own, so
+the occurrence already in scope is shadowed and can never be named again:
+re-entering a binder now drops the outer occurrence instead of stacking a
+second one. Every depth a variable resolves to is unchanged — the entries
+removed are outside the ones that remain, and depth is counted from the
+innermost — while the list is bounded by the number of distinct binders, which
+is what closes the back edge.
+
+`NODE_LIMIT` bounds the graph at 65536 nodes, so a form whose construction is
+not finite is a compiler diagnostic rather than an exhausted process.
+
+Measured node counts, all finite and small: the ticket's `Loop` is 6, two
+nested binders 9, a binder naming two surrounding binders 13, an ordinary
+recursive record 4, and each side of a mutually recursive pair 16.
+Alpha-renaming a binder leaves the type the same, a structurally different
+recursive type is unequal, and the two sides of the mutual pair are told
+apart.
+
+Regression: `recursion_through_a_hidden_binder_has_a_finite_graph` in
+`tests/src/interp.rs` builds all six shapes, exports their node counts and
+those four equality answers, and holds JavaScript against the interpreter.
+It cannot exhaust the test process: the node limit bounds construction
+whether or not the sharing rule is right.
