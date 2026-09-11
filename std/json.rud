@@ -1,48 +1,1058 @@
-@doc "JSON data as immutable, pattern-matchable values. Objects preserve member order."
+@doc "A JSON number as written: the token, kept exactly until a conversion is asked for and checked."
+type Number = { token: String }
+
+@doc "JSON data as immutable, pattern-matchable values. Objects keep their members in order, repeated keys among them; numbers keep their spelling."
 type Value =
   | #Null
   | #Bool Bool
-  | #Number Real
+  | #Number Number
   | #String String
   | #Array [Value]
   | #Object [(String, Value)]
-type Error = { message: String }
-type DecodeError = #Parse Error | #Decode ffi::DecodeError
 
-extern parse: String -> Result Value Error = "$json.parse"
+@doc "Why JSON could not be read or written: the type has no default codec, or the codec or the document failed, at a path."
+type Error = #Derive codec::DeriveError | #Codec codec::Error
+
+@doc "What a reader refuses before it allocates: input longer than `bytes`, nesting deeper than `depth`, a record or array with more than `members` members, or a number token with more than `digits` digits."
+type Limits = { depth: Nat, bytes: Nat, members: Nat, digits: Nat }
+
+let default_limits: Limits = { depth: 512n, bytes: 67108864n, members: 1000000n, digits: 400n }
+
 @private
-extern parse_raw: String -> Result ForeignValue Error = "$json.raw"
+type FrameKind = #Record | #Sequence | #Variant
+
 @private
-extern quote: String -> String = "JSON.stringify"
+type Frame = { serial: Nat, kind: FrameKind, count: Nat }
+
 @private
-extern number: Real -> Result String Error = "$json.number"
-@doc "Decode JSON into the inferred result type, with a path to any invalid field."
-let decode: String -> Result 'a DecodeError = fn text => match parse_raw text with
-| #Error error => #Error (#Parse error)
-| #Some value => result::map_error (fn error => #Decode error) (ffi::decode value)
+extern char_code: fn(String) -> Nat = "text => text.charCodeAt(0)"
+@private
+extern char_from_code: fn(Nat) -> String = "String.fromCodePoint"
+@private
+extern quote: fn(String) -> String = "JSON.stringify"
+@private
+extern real_value: fn(String) -> Real = "Number"
+@private
+extern real_token: fn(Real) -> String = "value => Object.is(value, -0) ? \"-0.0\" : String(value)"
+@private
+extern nat_of_digits: fn(String) -> Nat = "Number"
+@private
+extern int_of_digits: fn(String) -> Int = "Number"
+@private
+extern nat64_of_digits: fn(String) -> Nat64 = "BigInt"
+@private
+extern int64_of_digits: fn(String) -> Int64 = "BigInt"
+
+@private
+let chain = result::and_then
+
+@private
+let parse_failure: String -> Nat -> Result 'a codec::Error = fn message offset =>
+  #Error { path: [], kind: #Parse { message: message, offset: offset } }
+
+@private
+let protocol: String -> Result 'a codec::Error = fn message =>
+  #Error { path: [], kind: #Protocol message }
+
+@private
+let limit: String -> Result 'a codec::Error = fn message =>
+  #Error { path: [], kind: #Limit message }
+
+@private
+let range: String -> String -> Result 'a codec::Error = fn expected found =>
+  #Error { path: [], kind: #Range { expected: expected, found: found } }
+
+@private
+let found_at: String -> Nat -> String = fn input at =>
+  match peek input at with
+  | "{" => "an object"
+  | "[" => "an array"
+  | "\"" => "a string"
+  | "t" => "true"
+  | "f" => "false"
+  | "n" => "null"
+  | "" => "the end of the input"
+  | c => if is_digit c or str::equal c "-" then "a number" else "an invalid token" end
+  end
+
+@private
+let unexpected: String -> String -> Nat -> Result 'a codec::Error = fn expected input at =>
+  #Error { path: [], kind: #Unexpected { expected: expected, found: found_at input at } }
+
+@private
+let number_starts: String -> Nat -> Bool = fn input at => do
+  let c = peek input at
+  return is_digit c or str::equal c "-"
 end
 
-@doc "Serialize JSON values; non-finite numbers are errors rather than silently becoming null."
-let stringify: Value -> Result String Error = fn value => match value with
+-- ── Tokens ─────────────────────────────────────────────────────────────────
+
+@private
+let peek: String -> Nat -> String = fn input pos =>
+  if nat::less_than pos (str::len input) then str::char_at input pos else "" end
+
+@private
+let is_digit: String -> Bool = fn c =>
+  if str::is_empty c then false else str::contains "0123456789" c end
+
+@private
+let skip_whitespace: String -> Nat -> Nat = fn input pos =>
+  match peek input pos with
+  | " " => skip_whitespace input (nat::add pos 1n)
+  | "\t" => skip_whitespace input (nat::add pos 1n)
+  | "\n" => skip_whitespace input (nat::add pos 1n)
+  | "\r" => skip_whitespace input (nat::add pos 1n)
+  | _ => pos
+  end
+
+@private
+let expect: String -> Nat -> String -> Result Nat codec::Error = fn input pos c =>
+  if str::equal (peek input pos) c then #Some (nat::add pos 1n)
+  else parse_failure (str::concat "expected `" (str::concat c "`")) pos
+  end
+
+@private
+let scan_digits: String -> Nat -> Nat = fn input pos =>
+  if is_digit (peek input pos) then scan_digits input (nat::add pos 1n) else pos end
+
+@doc "The end of the JSON number token starting at `pos`, checked against the grammar, and its text."
+@private
+let scan_number: String -> Nat -> Limits -> Result (String, Nat) codec::Error =
+  fn input pos limits => do
+    let start = pos
+    let after_sign = if str::equal (peek input pos) "-" then nat::add pos 1n else pos end
+    let integer_end =
+      if str::equal (peek input after_sign) "0" then #Some (nat::add after_sign 1n)
+      else if is_digit (peek input after_sign) then #Some (scan_digits input after_sign)
+      else parse_failure "expected a digit" after_sign
+      end
+    let fraction_end = result::and_then
+      (fn at =>
+        if str::equal (peek input at) "." then
+          do
+            let digits = nat::add at 1n
+            return
+              if is_digit (peek input digits) then #Some (scan_digits input digits)
+              else parse_failure "expected a digit after `.`" digits
+              end
+          end
+        else #Some at
+        end)
+      integer_end
+    let exponent_end = result::and_then
+      (fn at =>
+        if str::equal (peek input at) "e" or str::equal (peek input at) "E" then
+          do
+            let signed = nat::add at 1n
+            let digits =
+              if str::equal (peek input signed) "+" or str::equal (peek input signed) "-" then
+                nat::add signed 1n
+              else signed
+              end
+            return
+              if is_digit (peek input digits) then #Some (scan_digits input digits)
+              else parse_failure "expected a digit in the exponent" digits
+              end
+          end
+        else #Some at
+        end)
+      fraction_end
+    return result::and_then
+      (fn stop =>
+        if nat::greater_than (nat::subtract stop start) limits.digits then
+          limit "a number with too many digits"
+        else #Some (str::slice input start stop, stop)
+        end)
+      exponent_end
+  end
+
+@private
+let hex_digit: String -> Option Nat = fn c => match str::index_of_option
+  "0123456789abcdef"
+  (str::to_lowercase c) with
+| #Some value => if str::is_empty c then #None else #Some value end
+| #None => #None
+end
+
+@private
+let scan_hex: String -> Nat -> Nat -> Nat -> Option Nat = fn input pos count value =>
+  if nat::is_zero count then #Some value
+  else
+    match hex_digit (peek input pos) with
+    | #Some digit =>
+      scan_hex
+        input
+        (nat::add pos 1n)
+        (nat::subtract count 1n)
+        (nat::add (nat::multiply value 16n) digit)
+    | #None => #None
+    end
+  end
+
+@doc "The text of the JSON string whose opening quote is just before `pos`, with escapes decoded, and the position after its closing quote."
+@private
+let scan_string: String -> Nat -> [String] -> Result (String, Nat) codec::Error =
+  fn input pos parts => do
+    let c = peek input pos
+    return
+      if str::is_empty c then parse_failure "unterminated string" pos
+      else if str::equal c "\"" then #Some (str::join "" (array::reverse parts), nat::add pos 1n)
+      else if str::equal c "\\" then
+        do
+          let escaped = peek input (nat::add pos 1n)
+          let next = nat::add pos 2n
+          return match escaped with
+          | "\"" => scan_string input next ["\"", ..parts]
+          | "\\" => scan_string input next ["\\", ..parts]
+          | "/" => scan_string input next ["/", ..parts]
+          | "b" => scan_string input next [char_from_code 8n, ..parts]
+          | "f" => scan_string input next [char_from_code 12n, ..parts]
+          | "n" => scan_string input next ["\n", ..parts]
+          | "r" => scan_string input next ["\r", ..parts]
+          | "t" => scan_string input next ["\t", ..parts]
+          | "u" =>
+            match scan_hex input next 4n 0n with
+            | #Some code =>
+              if nat::less_than code 55296n or nat::greater_than code 57343n then
+                scan_string input (nat::add next 4n) [char_from_code code, ..parts]
+              else if nat::greater_than code 56319n then
+                parse_failure "a lone low surrogate escape" next
+              else
+                do
+                  let low_at = nat::add next 6n
+                  return
+                    if str::equal (peek input (nat::add next 4n)) "\\"
+                      and str::equal (peek input (nat::add next 5n)) "u" then
+                      match scan_hex input low_at 4n 0n with
+                      | #Some low =>
+                        if nat::less_than low 56320n or nat::greater_than low 57343n then
+                          parse_failure "a high surrogate escape without its low surrogate" next
+                        else
+                          scan_string
+                            input
+                            (nat::add low_at 4n)
+                            [
+                              char_from_code
+                                (nat::add
+                                  65536n
+                                  (nat::add
+                                    (nat::multiply (nat::subtract code 55296n) 1024n)
+                                    (nat::subtract low 56320n))),
+                              ..parts,
+                            ]
+                        end
+                      | #None => parse_failure "expected four hex digits after `\\u`" low_at
+                      end
+                    else parse_failure "a high surrogate escape without its low surrogate" next
+                    end
+                end
+              end
+            | #None => parse_failure "expected four hex digits after `\\u`" next
+            end
+          | _ => parse_failure "invalid escape" pos
+          end
+        end
+      else if nat::less_than (char_code c) 32n then
+        parse_failure "a control character in a string" pos
+      else scan_string input (nat::add pos 1n) [c, ..parts]
+      end
+  end
+
+@private
+let keyword: String -> Nat -> String -> Result Nat codec::Error = fn input pos word =>
+  if str::equal (str::slice input pos (nat::add pos (str::len word))) word then
+    #Some (nat::add pos (str::len word))
+  else parse_failure "unexpected token" pos
+  end
+
+-- ── Numbers ────────────────────────────────────────────────────────────────
+
+@private
+let strip_zeros: String -> String = fn digits =>
+  if nat::greater_than (str::len digits) 1n and str::equal (str::char_at digits 0n) "0" then
+    strip_zeros (str::drop digits 1n)
+  else digits
+  end
+
+@private
+let all_zeros: String -> Bool = fn digits => not (str::contains digits "1"
+  or str::contains digits "2"
+  or str::contains digits "3"
+  or str::contains digits "4"
+  or str::contains digits "5"
+  or str::contains digits "6"
+  or str::contains digits "7"
+  or str::contains digits "8"
+  or str::contains digits "9")
+
+@doc "The digits of an integral number token, or none when the token has a fractional part: `1.0`, `1e3`, and `100e-2` are integral, `1.5` is not."
+@private
+let integral: String -> Limits -> Result (Option { negative: Bool, digits: String }) codec::Error =
+  fn token limits => do
+    let negative = str::starts_with token "-"
+    let unsigned = if negative then str::drop token 1n else token end
+    let split = match str::split_once (str::to_lowercase unsigned) "e" with
+    | #Some pair => pair
+    | #None => (unsigned, "0")
+    end
+    let parts = match str::split_once split.0 "." with
+    | #Some pair => pair
+    | #None => (split.0, "")
+    end
+    let exponent = split.1
+    let fraction = parts.1
+    let exponent_value = int_of_digits
+      (match str::strip_prefix exponent "+" with | #Some rest => rest | #None => exponent end)
+    let scale = int::subtract exponent_value (int::from_nat (str::len fraction))
+    let digits = str::concat parts.0 fraction
+    return
+      if int::greater_than_or_equal scale 0i then
+        if int::greater_than scale (int::from_nat limits.digits) then
+          limit "a number with too many digits"
+        else
+          #Some (#Some {
+            negative: negative,
+            digits: strip_zeros (str::concat digits (str::repeat "0" (nat::from_int scale))),
+          })
+        end
+      else
+        do
+          let dropped = nat::from_int (int::negate scale)
+          let kept =
+            if nat::greater_than dropped (str::len digits) then ""
+            else str::take digits (nat::subtract (str::len digits) dropped)
+            end
+          let removed = str::drop digits (str::len kept)
+          return
+            if all_zeros removed then
+              #Some (#Some {
+                negative: negative,
+                digits: strip_zeros (if str::is_empty kept then "0" else kept end),
+              })
+            else #Some (#None)
+            end
+        end
+      end
+  end
+
+@private
+let digits_at_most: String -> String -> Bool = fn digits maximum =>
+  if nat::less_than (str::len digits) (str::len maximum) then true
+  else if nat::greater_than (str::len digits) (str::len maximum) then false
+  else str::less_than_or_equal digits maximum
+  end
+
+@private
+let nat_of_token: String -> Limits -> Result Nat codec::Error = fn token limits =>
+  chain
+    (fn parsed => match parsed with
+    | #Some { negative, digits } =>
+      if negative and not str::equal digits "0" then range "Nat" token
+      else if digits_at_most digits "9007199254740991" then #Some (nat_of_digits digits)
+      else range "Nat" token
+      end
+    | #None => range "Nat" token
+    end)
+    (integral token limits)
+
+@private
+let int_of_token: String -> Limits -> Result Int codec::Error = fn token limits =>
+  chain
+    (fn parsed => match parsed with
+    | #Some { negative, digits } =>
+      if digits_at_most digits "9007199254740991" then
+        #Some (if negative then int::negate (int_of_digits digits) else int_of_digits digits end)
+      else range "Int" token
+      end
+    | #None => range "Int" token
+    end)
+    (integral token limits)
+
+@private
+let nat64_of_token: String -> Limits -> Result Nat64 codec::Error = fn token limits =>
+  chain
+    (fn parsed => match parsed with
+    | #Some { negative, digits } =>
+      if negative and not str::equal digits "0" then range "Nat64" token
+      else if digits_at_most digits "18446744073709551615" then #Some (nat64_of_digits digits)
+      else range "Nat64" token
+      end
+    | #None => range "Nat64" token
+    end)
+    (integral token limits)
+
+@private
+let int64_of_token: String -> Limits -> Result Int64 codec::Error = fn token limits =>
+  chain
+    (fn parsed => match parsed with
+    | #Some { negative, digits } =>
+      if negative then
+        if digits_at_most digits "9223372036854775808" then
+          #Some (int64_of_digits (str::concat "-" digits))
+        else range "Int64" token
+        end
+      else if digits_at_most digits "9223372036854775807" then #Some (int64_of_digits digits)
+      else range "Int64" token
+      end
+    | #None => range "Int64" token
+    end)
+    (integral token limits)
+
+@private
+let real_of_token: String -> Result Real codec::Error = fn token => do
+  let value = real_value token
+  return
+    if not real::is_finite value then range "Real" token
+    else if real::ordering_equal value 0
+      and not all_zeros
+        (match str::split_once (str::to_lowercase token) "e" with
+        | #Some (mantissa, _) => mantissa
+        | #None => token
+        end) then
+      range "Real" token
+    else #Some value
+    end
+end
+
+@doc "The value of a document number as a `Real`, correctly rounded; infinite and nonzero-underflowing tokens are range errors."
+let number_to_real: Number -> Result Real Error = fn number =>
+  result::map_error
+    (fn error => #Codec error)
+    (chain (fn _ => real_of_token number.token) (checked_token number.token))
+
+@doc "The value of an integral document number as a `Nat`, in range."
+let number_to_nat: Number -> Result Nat Error = fn number =>
+  result::map_error
+    (fn error => #Codec error)
+    (chain (fn _ => nat_of_token number.token default_limits) (checked_token number.token))
+
+@doc "The value of an integral document number as an `Int`, in range."
+let number_to_int: Number -> Result Int Error = fn number =>
+  result::map_error
+    (fn error => #Codec error)
+    (chain (fn _ => int_of_token number.token default_limits) (checked_token number.token))
+
+@doc "A document number spelling a `Real`; a non-finite one is an error."
+let number_of_real: Real -> Result Number Error = fn value =>
+  if real::is_finite value then #Some { token: real_token value }
+  else
+    #Error (#Codec {
+      path: [],
+      kind: #Range { expected: "a finite number", found: real_token value },
+    })
+  end
+
+let number_of_nat: Nat -> Number = fn value => { token: str::from_nat value }
+
+let number_of_int: Int -> Number = fn value => { token: str::from_int value }
+
+-- ── Documents ──────────────────────────────────────────────────────────────
+
+@private
+let parse_members:
+  String
+  -> Nat
+  -> Nat
+  -> Limits
+  -> [(String, Value)]
+  -> Result ([(String, Value)], Nat) codec::Error =
+  fn input pos depth limits members => do
+    let at = skip_whitespace input pos
+    return
+      if str::equal (peek input at) "}" then #Some (array::reverse members, nat::add at 1n)
+      else
+        do
+          let after_comma =
+            if nat::is_zero (array::len members) then #Some at
+            else result::map (fn next => skip_whitespace input next) (expect input at ",")
+            end
+          return chain
+            (fn at =>
+              if nat::greater_than_or_equal (array::len members) limits.members then
+                limit "an object with too many members"
+              else
+                chain
+                  (fn at => chain
+                    (fn scanned =>
+                      chain
+                        (fn at => chain
+                          (fn parsed => parse_members input parsed.1 depth limits [
+                            (scanned.0, parsed.0),
+                            ..members,
+                          ])
+                          (parse_value input (skip_whitespace input at) depth limits))
+                        (expect input (skip_whitespace input scanned.1) ":"))
+                    (scan_string input at []))
+                  (expect input at "\"")
+              end)
+            after_comma
+        end
+      end
+  end
+
+@private
+let parse_elements:
+  String -> Nat -> Nat -> Limits -> [Value] -> Result ([Value], Nat) codec::Error =
+  fn input pos depth limits elements => do
+    let at = skip_whitespace input pos
+    return
+      if str::equal (peek input at) "]" then #Some (array::reverse elements, nat::add at 1n)
+      else
+        do
+          let after_comma =
+            if nat::is_zero (array::len elements) then #Some at
+            else result::map (fn next => skip_whitespace input next) (expect input at ",")
+            end
+          return chain
+            (fn at =>
+              if nat::greater_than_or_equal (array::len elements) limits.members then
+                limit "an array with too many elements"
+              else
+                chain
+                  (fn parsed => parse_elements input parsed.1 depth limits [parsed.0, ..elements])
+                  (parse_value input at depth limits)
+              end)
+            after_comma
+        end
+      end
+  end
+
+@doc "One JSON value starting at `pos`, and the position after it."
+@private
+let parse_value: String -> Nat -> Nat -> Limits -> Result (Value, Nat) codec::Error =
+  fn input pos depth limits =>
+    match peek input pos with
+    | "{" =>
+      if nat::greater_than_or_equal depth limits.depth then limit "a document nested too deeply"
+      else
+        result::map
+          (fn parsed => (#Object parsed.0, parsed.1))
+          (parse_members input (nat::add pos 1n) (nat::add depth 1n) limits [])
+      end
+    | "[" =>
+      if nat::greater_than_or_equal depth limits.depth then limit "a document nested too deeply"
+      else
+        result::map
+          (fn parsed => (#Array parsed.0, parsed.1))
+          (parse_elements input (nat::add pos 1n) (nat::add depth 1n) limits [])
+      end
+    | "\"" =>
+      result::map
+        (fn scanned => (#String scanned.0, scanned.1))
+        (scan_string input (nat::add pos 1n) [])
+    | "t" => result::map (fn at => (#Bool true, at)) (keyword input pos "true")
+    | "f" => result::map (fn at => (#Bool false, at)) (keyword input pos "false")
+    | "n" => result::map (fn at => (#Null, at)) (keyword input pos "null")
+    | "" => parse_failure "unexpected end of input" pos
+    | _ =>
+      result::map
+        (fn scanned => (#Number { token: scanned.0 }, scanned.1))
+        (scan_number input pos limits)
+    end
+
+@private
+let finished: String -> Nat -> Result () codec::Error = fn input pos => do
+  let at = skip_whitespace input pos
+  return
+    if nat::less_than at (str::len input) then parse_failure "unexpected trailing input" at
+    else #Some ()
+    end
+end
+
+@doc "A JSON document as a value, within the limits: exactly one value, with only whitespace after it. Members keep their order and their repeats; numbers keep their spelling."
+let parse_with: Limits -> String -> Result Value Error = fn limits input =>
+  result::map_error
+    (fn error => #Codec error)
+    (if nat::greater_than (str::len input) limits.bytes then
+      limit "a document longer than the limit"
+    else
+      chain
+        (fn parsed => result::map (fn _ => parsed.0) (finished input parsed.1))
+        (parse_value input (skip_whitespace input 0n) 0n limits)
+    end)
+
+@doc "A JSON document as a value. See `parse_with`."
+let parse: String -> Result Value Error = parse_with default_limits
+
+@private
+let checked_token: String -> Result String codec::Error = fn token =>
+  chain
+    (fn scanned =>
+      if nat::equal scanned.1 (str::len token) then #Some scanned.0
+      else parse_failure "an invalid number token" scanned.1
+      end)
+    (scan_number token 0n default_limits)
+
+@doc "A value as a JSON document. Members are written in order, repeats among them, and numbers as spelled, after a check that each spells a JSON number."
+let stringify: Value -> Result String Error = fn value =>
+  result::map_error (fn error => #Codec error) (stringify_value value)
+
+@private
+let stringify_value: Value -> Result String codec::Error = fn value => match value with
 | #Null => #Some "null"
 | #Bool b => #Some (str::from_boolean b)
-| #Number n => number n
+| #Number number => checked_token number.token
 | #String s => #Some (quote s)
 | #Array values =>
   result::map
     (fn parts => str::concat "[" (str::concat (str::join "," parts) "]"))
-    (array::traverse_result stringify values)
-| #Object values => do
+    (array::traverse_result stringify_value values)
+| #Object members => do
   let member = fn pair =>
-    result::map (fn text => str::concat (quote pair.0) (str::concat ":" text)) (stringify pair.1)
+    result::map
+      (fn text => str::concat (quote pair.0) (str::concat ":" text))
+      (stringify_value pair.1)
   return result::map
     (fn parts => str::concat "{" (str::concat (str::join "," parts) "}"))
-    (array::traverse_result member values)
+    (array::traverse_result member members)
 end
 end
 
+@doc "The first member of an object with the name."
 let get: String -> Value -> Option Value = fn key value => match value with
 | #Object entries =>
   option::map (fn pair => pair.1) (array::find (fn pair => str::equal key pair.0) entries)
 | _ => #None
 end
+
+-- ── The reader ─────────────────────────────────────────────────────────────
+
+@private
+let read_document: codec::Decoder 'a -> Limits -> String -> Result 'a Error =
+  fn decoder limits input => do
+    let pos = mut 0n
+    let stack = mut []
+    let serial = mut 0n
+    let pending = mut false
+    let done = mut false
+    let top = fn kind cursor => match ~stack with
+    | [frame, ..] =>
+      if nat::equal frame.serial cursor.frame then
+        match (frame.kind, kind) with
+        | (#Record, #Record) => #Some frame
+        | (#Sequence, #Sequence) => #Some frame
+        | (#Variant, #Variant) => #Some frame
+        | _ => protocol "the cursor is for another kind of frame"
+        end
+      else protocol "the cursor is not the innermost open frame"
+      end
+    | [] => protocol "no frame is open"
+    end
+    let replace_top = fn frame => match ~stack with
+    | [_, ..rest] => stack := [frame, ..rest]
+    | [] => ~stack
+    end
+    let expect_value = fn _ =>
+      if ~pending then #Some ()
+      else if nat::is_zero (array::len (~stack)) and not ~done then #Some ()
+      else protocol "no value is expected here"
+      end
+    let consumed = fn at => do
+      _ = pos := at
+      _ = pending := false
+      _ = if nat::is_zero (array::len (~stack)) then done := true else ~done end
+      return ()
+    end
+    let scalar = fn read => chain
+      (fn _ => chain
+        (fn read_at => do _ = consumed read_at.1 return #Some read_at.0 end)
+        (read (skip_whitespace input (~pos))))
+      (expect_value ())
+    let open = fn kind opener expected => chain
+      (fn _ => chain
+        (fn at =>
+          if nat::greater_than_or_equal (array::len (~stack)) limits.depth then
+            limit "a document nested too deeply"
+          else
+            do
+              _ = serial := nat::add (~serial) 1n
+              _ = stack := [{ serial: ~serial, kind: kind, count: 0n }, ..~stack]
+              _ = pos := at
+              _ = pending := false
+              return #Some { frame: ~serial }
+            end
+          end)
+        (do
+          let at = skip_whitespace input (~pos)
+          return
+            if str::equal (peek input at) opener then #Some (nat::add at 1n)
+            else unexpected expected input at
+            end
+        end))
+      (expect_value ())
+    let close = fn kind cursor closer => chain
+      (fn _ =>
+        if ~pending then protocol "a value is still expected"
+        else
+          chain
+            (fn at => do
+              _ = stack := match ~stack with | [_, ..rest] => rest | [] => [] end
+              _ = consumed at
+              return #Some ()
+            end)
+            (expect input (skip_whitespace input (~pos)) closer)
+        end)
+      (top kind cursor)
+    let separator = fn frame => do
+      let at = skip_whitespace input (~pos)
+      return
+        if nat::is_zero frame.count then #Some at
+        else result::map (fn next => skip_whitespace input next) (expect input at ",")
+        end
+    end
+    let counted = fn frame =>
+      if nat::greater_than_or_equal frame.count limits.members then limit "too many members"
+      else #Some ()
+      end
+    return match handle decoder.run () with
+    | codec::!Read.read_bool _ =>
+      scalar
+        (fn at => match peek input at with
+        | "t" => result::map (fn next => (true, next)) (keyword input at "true")
+        | "f" => result::map (fn next => (false, next)) (keyword input at "false")
+        | _ => unexpected "true or false" input at
+        end)
+    | codec::!Read.read_nat _ =>
+      scalar
+        (fn at =>
+          if number_starts input at then
+            chain
+              (fn scanned =>
+                result::map (fn value => (value, scanned.1)) (nat_of_token scanned.0 limits))
+              (scan_number input at limits)
+          else unexpected "a number" input at
+          end)
+    | codec::!Read.read_int _ =>
+      scalar
+        (fn at =>
+          if number_starts input at then
+            chain
+              (fn scanned =>
+                result::map (fn value => (value, scanned.1)) (int_of_token scanned.0 limits))
+              (scan_number input at limits)
+          else unexpected "a number" input at
+          end)
+    | codec::!Read.read_nat64 _ =>
+      scalar
+        (fn at =>
+          if number_starts input at then
+            chain
+              (fn scanned =>
+                result::map (fn value => (value, scanned.1)) (nat64_of_token scanned.0 limits))
+              (scan_number input at limits)
+          else unexpected "a number" input at
+          end)
+    | codec::!Read.read_int64 _ =>
+      scalar
+        (fn at =>
+          if number_starts input at then
+            chain
+              (fn scanned =>
+                result::map (fn value => (value, scanned.1)) (int64_of_token scanned.0 limits))
+              (scan_number input at limits)
+          else unexpected "a number" input at
+          end)
+    | codec::!Read.read_real _ =>
+      scalar
+        (fn at =>
+          if number_starts input at then
+            chain
+              (fn scanned => result::map (fn value => (value, scanned.1)) (real_of_token scanned.0))
+              (scan_number input at limits)
+          else unexpected "a number" input at
+          end)
+    | codec::!Read.read_text _ =>
+      scalar
+        (fn at =>
+          if str::equal (peek input at) "\"" then scan_string input (nat::add at 1n) []
+          else unexpected "a string" input at
+          end)
+    | codec::!Read.skip_value _ =>
+      scalar
+        (fn at => result::map
+          (fn parsed => ((), parsed.1))
+          (parse_value input at (array::len (~stack)) limits))
+    | codec::!Read.begin_record _ => open (#Record) "{" "an object"
+    | codec::!Read.next_field cursor =>
+      chain
+        (fn frame =>
+          if ~pending then protocol "a value is still expected"
+          else
+            chain
+              (fn at =>
+                if str::equal (peek input at) "}" then #Some (#None)
+                else
+                  chain
+                    (fn _ => chain
+                      (fn at => chain
+                        (fn at => chain
+                          (fn scanned => chain
+                            (fn at => do
+                              _ = pos := at
+                              _ = pending := true
+                              _ = replace_top {
+                                serial: frame.serial,
+                                kind: frame.kind,
+                                count: nat::add frame.count 1n,
+                              }
+                              return #Some (#Some scanned.0)
+                            end)
+                            (expect input (skip_whitespace input scanned.1) ":"))
+                          (scan_string input at []))
+                        (expect input at "\""))
+                      (separator frame))
+                    (counted frame)
+                end)
+              (#Some (skip_whitespace input (~pos)))
+          end)
+        (top (#Record) cursor)
+    | codec::!Read.end_record cursor => close (#Record) cursor "}"
+    | codec::!Read.begin_sequence _ => open (#Sequence) "[" "an array"
+    | codec::!Read.next_element cursor =>
+      chain
+        (fn frame =>
+          if ~pending then protocol "a value is still expected"
+          else
+            do
+              let at = skip_whitespace input (~pos)
+              return
+                if str::equal (peek input at) "]" then #Some false
+                else
+                  chain
+                    (fn _ => chain
+                      (fn at => do
+                        _ = pos := at
+                        _ = pending := true
+                        _ = replace_top {
+                          serial: frame.serial,
+                          kind: frame.kind,
+                          count: nat::add frame.count 1n,
+                        }
+                        return #Some true
+                      end)
+                      (separator frame))
+                    (counted frame)
+                end
+            end
+          end)
+        (top (#Sequence) cursor)
+    | codec::!Read.end_sequence cursor => close (#Sequence) cursor "]"
+    | codec::!Read.begin_variant _ =>
+      chain
+        (fn cursor =>
+          chain
+            (fn at => chain
+              (fn key =>
+                if not str::equal key.0 "tag" then
+                  parse_failure "expected the `tag` member first" key.1
+                else
+                  chain
+                    (fn at => chain
+                      (fn at => chain
+                        (fn tag =>
+                          chain
+                            (fn at => chain
+                              (fn at => chain
+                                (fn key =>
+                                  if not str::equal key.0 "value" then
+                                    parse_failure "expected the `value` member" key.1
+                                  else
+                                    chain
+                                      (fn at => do
+                                        _ = pos := at
+                                        _ = pending := true
+                                        return #Some { cursor: cursor, tag: tag.0 }
+                                      end)
+                                      (expect input (skip_whitespace input key.1) ":")
+                                  end)
+                                (scan_string input at []))
+                              (expect input (skip_whitespace input at) "\""))
+                            (expect input (skip_whitespace input tag.1) ","))
+                        (scan_string input at []))
+                      (expect input (skip_whitespace input at) "\""))
+                    (expect input (skip_whitespace input key.1) ":")
+                end)
+              (scan_string input at []))
+            (expect input (skip_whitespace input (~pos)) "\""))
+        (open (#Variant) "{" "an object")
+    | codec::!Read.end_variant cursor => close (#Variant) cursor "}"
+    end with
+    | #Some value =>
+      if not ~done or not nat::is_zero (array::len (~stack)) then
+        #Error (#Codec { path: [], kind: #Protocol "the decoder did not read the whole document" })
+      else
+        result::map_error
+          (fn error => #Codec error)
+          (result::map (fn _ => value) (finished input (~pos)))
+      end
+    | #Error error => #Error (#Codec error)
+    end
+  end
+
+@doc "Read a value with a decoder from a JSON document, within the limits: the strict structural profile, which takes records as objects, sums as `{ \"tag\", \"value\" }` objects, and refuses unknown, repeated, and missing fields, and anything after the one document."
+let decode_with: codec::Decoder 'a -> Limits -> String -> Result 'a Error =
+  fn decoder limits input =>
+    if nat::greater_than (str::len input) limits.bytes then
+      #Error (#Codec { path: [], kind: #Limit "a document longer than the limit" })
+    else read_document decoder limits input
+    end
+
+@doc "Read a value of the inferred type from a JSON document with its default codec. See `decode_with`."
+let decode: String -> Result 'a Error = fn input =>
+  match codec::derive_decoder (reflect::mirror ()) with
+  | #Some decoder => decode_with decoder default_limits input
+  | #Error error => #Error (#Derive error)
+  end
+
+-- ── The writer ─────────────────────────────────────────────────────────────
+
+@doc "Write a value with an encoder as a JSON document, within the limits. On failure there is no output."
+let encode_with: codec::Encoder 'a -> Limits -> 'a -> Result String Error =
+  fn encoder limits value => do
+    let out = mut []
+    let stack = mut []
+    let serial = mut 0n
+    let pending = mut false
+    let done = mut false
+    let emit = fn text => do
+      _ = out := array::push (~out) text
+      return ()
+    end
+    let top = fn kind cursor => match ~stack with
+    | [frame, ..] =>
+      if nat::equal frame.serial cursor.frame then
+        match (frame.kind, kind) with
+        | (#Record, #Record) => #Some frame
+        | (#Sequence, #Sequence) => #Some frame
+        | (#Variant, #Variant) => #Some frame
+        | _ => protocol "the cursor is for another kind of frame"
+        end
+      else protocol "the cursor is not the innermost open frame"
+      end
+    | [] => protocol "no frame is open"
+    end
+    let replace_top = fn frame => match ~stack with
+    | [_, ..rest] => stack := [frame, ..rest]
+    | [] => ~stack
+    end
+    let expect_value = fn _ =>
+      if ~pending then #Some ()
+      else if nat::is_zero (array::len (~stack)) and not ~done then #Some ()
+      else protocol "no value is expected here"
+      end
+    let written = fn _ => do
+      _ = pending := false
+      _ = if nat::is_zero (array::len (~stack)) then done := true else ~done end
+      return #Some ()
+    end
+    let scalar = fn text => chain (fn _ => do _ = emit text return written () end) (expect_value ())
+    let open = fn kind opener => chain
+      (fn _ =>
+        if nat::greater_than_or_equal (array::len (~stack)) limits.depth then
+          limit "a value nested too deeply"
+        else
+          do
+            _ = serial := nat::add (~serial) 1n
+            _ = stack := [{ serial: ~serial, kind: kind, count: 0n }, ..~stack]
+            _ = pending := false
+            _ = emit opener
+            return #Some { frame: ~serial }
+          end
+        end)
+      (expect_value ())
+    let close = fn kind cursor closer => chain
+      (fn _ =>
+        if ~pending then protocol "a value is still expected"
+        else
+          do
+            _ = stack := match ~stack with | [_, ..rest] => rest | [] => [] end
+            _ = emit closer
+            return written ()
+          end
+        end)
+      (top kind cursor)
+    let separate = fn frame => do
+      _ = if nat::is_zero frame.count then () else emit "," end
+      _ = replace_top { serial: frame.serial, kind: frame.kind, count: nat::add frame.count 1n }
+      _ = pending := true
+      return #Some ()
+    end
+    return match handle encoder.run value with
+    | codec::!Write.write_bool b => scalar (str::from_boolean b)
+    | codec::!Write.write_nat n => scalar (str::from_nat n)
+    | codec::!Write.write_int i => scalar (str::from_int i)
+    | codec::!Write.write_nat64 n => scalar (nat::to_string64 n)
+    | codec::!Write.write_int64 i => scalar (int::to_string64 i)
+    | codec::!Write.write_real r =>
+      if real::is_finite r then scalar (real_token r)
+      else range "a finite number" (real_token r)
+      end
+    | codec::!Write.write_text text => scalar (quote text)
+    | codec::!Write.begin_record _ => open (#Record) "{"
+    | codec::!Write.write_field field =>
+      chain
+        (fn frame =>
+          if ~pending then protocol "a value is still expected"
+          else
+            chain
+              (fn _ => do _ = emit (str::concat (quote field.name) ":") return #Some () end)
+              (separate frame)
+          end)
+        (top (#Record) field.cursor)
+    | codec::!Write.end_record cursor => close (#Record) cursor "}"
+    | codec::!Write.begin_sequence _ => open (#Sequence) "["
+    | codec::!Write.next_element cursor =>
+      chain
+        (fn frame =>
+          if ~pending then protocol "a value is still expected" else separate frame end)
+        (top (#Sequence) cursor)
+    | codec::!Write.end_sequence cursor => close (#Sequence) cursor "]"
+    | codec::!Write.begin_variant opened =>
+      if array::any (fn known => str::equal known opened.tag) opened.schema.cases then
+        chain
+          (fn cursor => do
+            _ = emit (str::concat "\"tag\":" (str::concat (quote opened.tag) ",\"value\":"))
+            _ = pending := true
+            return #Some cursor
+          end)
+          (open (#Variant) "{")
+      else protocol (str::concat "not a case of the sum: " opened.tag)
+      end
+    | codec::!Write.end_variant cursor => close (#Variant) cursor "}"
+    end with
+    | #Some _ =>
+      if not ~done or not nat::is_zero (array::len (~stack)) then
+        #Error (#Codec { path: [], kind: #Protocol "the encoder did not write a whole document" })
+      else #Some (str::join "" (~out))
+      end
+    | #Error error => #Error (#Codec error)
+    end
+  end
+
+@doc "Write a value as a JSON document with its type's default codec. See `encode_with`."
+let encode: 'a -> Result String Error = fn value =>
+  match codec::derive_encoder (reflect::type_of value) with
+  | #Some encoder => encode_with encoder default_limits value
+  | #Error error => #Error (#Derive error)
+  end
+
+-- ── The canonical profile ──────────────────────────────────────────────────
+
+@doc "A document in the named canonical profile `sorted-members-1`: object members ordered by key, by scalar value, keeping repeated keys in their order; no whitespace; numbers as the encoder spelled them. Two encodings of one value under this profile are one text, byte for byte."
+let canonical: Value -> Value = fn value => match value with
+| #Array values => #Array (array::map canonical values)
+| #Object members =>
+  #Object (array::map
+    (fn member => (member.0, canonical member.1))
+    (array::sort_by (fn left right => str::compare left.0 right.0) members))
+| #Null => #Null
+| #Bool b => #Bool b
+| #Number n => #Number n
+| #String s => #String s
+end
+
+@doc "Write a value as a JSON document in the canonical profile `sorted-members-1`. See `canonical`."
+let encode_canonical: 'a -> Result String Error = fn value =>
+  chain
+    (fn text => chain (fn document => stringify (canonical document)) (parse text))
+    (encode value)

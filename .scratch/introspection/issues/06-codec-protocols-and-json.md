@@ -1,6 +1,6 @@
 # 06 Codec protocols, derivation, and JSON
 
-Status: open
+Status: resolved
 Type: task
 Blocked by: 04
 
@@ -21,3 +21,13 @@ documents", "Streaming, failure, and limits".
 - Retire the `ffi::decode` route for typed JSON decoding.
 
 Seams: generated JS execution of Ruddy programs; `tests/src/stdlib_apis.rs`.
+
+Resolution: `std/codec.rud` (Read/Write effects with a checked session
+stack, Encoder/Decoder/Codec, `derive` over the views with type paths in
+derivation errors and value paths in codec errors) and `std/json.rud`
+rewritten over it: strict typed decoding, exact number tokens in the document
+API, correctly rounded reals, integral spellings for integers, limits, and
+the `#Unexpected` failure for a value of another kind. `ffi::decode` is no
+longer the typed JSON route. Along the way the demand planner's instantiation
+and solver were made linear, ports supplied by sealed callables resolve, and
+values packaged under hidden types are sealed at their own types.

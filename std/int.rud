@@ -1,9 +1,10 @@
 extern add: fn(Int, Int) -> Int = "(left, right) => left + right"
 extern subtract: fn(Int, Int) -> Int = "(left, right) => left - right"
-extern multiply: fn(Int, Int) -> Int = "(left, right) => left * right"
-extern divide: fn(Int, Int) -> Int = "(left, right) => Math.trunc(left / right)"
-extern remainder: fn(Int, Int) -> Int = "(left, right) => left % right"
-extern negate: fn(Int) -> Int = "value => -value"
+extern multiply: fn(Int, Int) -> Int = "(left, right) => left * right + 0"
+extern divide: fn(Int, Int) -> Int = "(left, right) => Math.trunc(left / right) + 0"
+extern remainder: fn(Int, Int) -> Int = "(left, right) => left % right + 0"
+@doc "The negation. Integers have one zero: negating zero is zero."
+extern negate: fn(Int) -> Int = "value => -value + 0"
 extern abs: fn(Int) -> Int = "Math.abs"
 
 @private
@@ -18,7 +19,7 @@ extern clamp: fn(Int, Int, Int) -> Int =
 let is_zero: Int -> Bool = fn value => match value with | 0i => true | _ => false end
 
 extern from_nat: fn(Nat) -> Int = "value => value"
-extern from_real: fn(Real) -> Int = "Math.trunc"
+extern from_real: fn(Real) -> Int = "value => Math.trunc(value) + 0"
 
 let compare: order::Ordering Int = fn left right =>
   if ordering_less_than left right then #Less

@@ -1,5 +1,7 @@
 extern concat: fn(String, String) -> String = "(left, right) => left + right"
-extern len: fn(String) -> Nat = "value => value.length"
+@doc "The number of Unicode scalar values in the text: `\"😀\"` has length one."
+extern len: fn(String) -> Nat =
+  "value => { let count = 0; for (const _ of value) count++; return count; }"
 let is_empty: String -> Bool = fn value => match value with | "" => true | _ => false end
 
 extern from_nat: fn(Nat) -> String = "value => String(value)"
@@ -8,17 +10,25 @@ extern from_real: fn(Real) -> String = "value => String(value)"
 let from_boolean: Bool -> String = fn b => match b with | true => "true" | false => "false" end
 
 @private
-extern ordering_less_than: fn(String, String) -> Bool = "(left, right) => left < right"
+extern ordering_less_than: fn(String, String) -> Bool =
+  "(left, right) => { const a = Array.from(left, c => c.codePointAt(0)); const b = Array.from(right, c => c.codePointAt(0)); for (let i = 0; i < a.length && i < b.length; i++) { if (a[i] !== b[i]) return a[i] < b[i]; } return a.length < b.length; }"
 @private
-extern ordering_greater_than: fn(String, String) -> Bool = "(left, right) => left > right"
+extern ordering_greater_than: fn(String, String) -> Bool =
+  "(left, right) => { const a = Array.from(left, c => c.codePointAt(0)); const b = Array.from(right, c => c.codePointAt(0)); for (let i = 0; i < a.length && i < b.length; i++) { if (a[i] !== b[i]) return a[i] > b[i]; } return a.length > b.length; }"
 
 extern contains: fn(String, String) -> Bool = "(value, search) => value.includes(search)"
 extern starts_with: fn(String, String) -> Bool = "(value, prefix) => value.startsWith(prefix)"
 extern ends_with: fn(String, String) -> Bool = "(value, suffix) => value.endsWith(suffix)"
-extern char_at: fn(String, Nat) -> String = "(value, index) => value.charAt(index)"
-extern index_of: fn(String, String) -> Int = "(value, search) => value.indexOf(search)"
+@doc "The scalar at a position, counting scalars from zero; empty past the end."
+extern char_at: fn(String, Nat) -> String =
+  "(value, index) => { let at = 0; for (const c of value) { if (at === index) return c; at++; } return \"\"; }"
+@doc "The scalar position of the first occurrence of `search`, or -1."
+extern index_of: fn(String, String) -> Int =
+  "(value, search) => { const at = value.indexOf(search); if (at < 0) return -1; let count = 0; for (let i = 0; i < at; i++) { const code = value.charCodeAt(i); if (code < 0xdc00 || code > 0xdfff) count++; } return count; }"
 
-extern slice: fn(String, Nat, Nat) -> String = "(value, start, end) => value.slice(start, end)"
+@doc "The scalars from `start` up to `end`, counting scalars from zero."
+extern slice: fn(String, Nat, Nat) -> String =
+  "(value, start, end) => Array.from(value).slice(start, end).join(\"\")"
 extern trim: fn(String) -> String = "value => value.trim()"
 extern trim_start: fn(String) -> String = "value => value.trimStart()"
 extern trim_end: fn(String) -> String = "value => value.trimEnd()"
@@ -31,10 +41,10 @@ extern replace_first: fn(String, String, String) -> String =
 extern replace_all: fn(String, String, String) -> String =
   "(value, search, replacement) => value.replaceAll(search, replacement)"
 extern pad_start: fn(String, Nat, String) -> String =
-  "(value, length, fill) => value.padStart(length, fill)"
+  "(value, length, fill) => { const units = Array.from(fill); let count = Array.from(value).length; let pad = \"\"; for (let i = 0; units.length && count < length; i++, count++) pad += units[i % units.length]; return pad + value; }"
 extern pad_end: fn(String, Nat, String) -> String =
-  "(value, length, fill) => value.padEnd(length, fill)"
-extern reverse: fn(String) -> String = "value => value.split('').reverse().join('')"
+  "(value, length, fill) => { const units = Array.from(fill); let count = Array.from(value).length; let pad = \"\"; for (let i = 0; units.length && count < length; i++, count++) pad += units[i % units.length]; return value + pad; }"
+extern reverse: fn(String) -> String = "value => Array.from(value).reverse().join(\"\")"
 
 let compare: order::Ordering String = fn left right =>
   if ordering_less_than left right then #Less

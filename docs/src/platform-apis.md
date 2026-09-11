@@ -15,43 +15,80 @@ objects and promises do not escape into application code.
 
 ## JSON
 
-`std::json::parse : String -> Result Value Error` returns this recursive value:
+`std::json::encode : 'a -> Result String Error` writes a value of the inferred
+type as a JSON document, and `std::json::decode : String -> Result 'a Error`
+reads one back. Both obtain the type's mirror and derive its default codec, so
+they need no annotation beyond the one that decides the type:
+
+```ruddy
+let decode_config: String -> Result { name: String, retries: Nat } std::json::Error =
+  std::json::decode
+```
+
+The default profile is strict and structural: records are objects, arrays are
+arrays, sums are `{ "tag": ..., "value": ... }` objects, unit is `{}`, and
+tuples are objects with their numeric labels. Typed decoding refuses unknown,
+repeated, and missing fields, anything after the one document, and a number
+outside its type's domain: an integer accepts any integral token, `1e3` and
+`100e-2` among them, and a `Real` is correctly rounded, with overflow and a
+nonzero underflow to zero refused and negative zero kept. Errors say whether
+the type has no default codec (`#Derive`, with a path into the type) or what
+went wrong where (`#Codec`, with a path of fields, indexes, and cases into the
+value): a parse failure with its offset, a missing, duplicate, or unknown
+field, an unexpected case, a value of another kind than the type asked for, a
+range failure, a protocol misuse, or a limit.
+
+`encode_with` and `decode_with` take an explicit `codec::Encoder` or
+`codec::Decoder` and `Limits` on input length, nesting depth, member count,
+and number digits, refused before anything is allocated. A codec derived with
+`std::codec::derive` may be reused across calls.
+
+`std::json::parse : String -> Result Value Error` reads a document as data
+instead, keeping members in order, repeated keys among them, and numbers as
+their exact tokens:
 
 ```ruddy
 type Value =
   | #Null
   | #Bool Bool
-  | #Number Real
+  | #Number Number
   | #String String
   | #Array [Value]
   | #Object [(String, Value)]
 ```
 
-Use pattern matching to inspect arbitrary JSON, or `json::get name value` to
-look up an object member. `json::stringify` accepts a `Value` and returns
-`Result String Error`. `Error` contains a `message`.
+`number_to_real`, `number_to_nat`, and `number_to_int` convert a token under
+the same checked policies. `stringify` writes a value back, preserving member
+order, repeats, and number spellings after checking that each spells a JSON
+number. `get name value` looks up the first member with a name.
 
-For known data, `json::decode : String -> Result 'a DecodeError` uses the expected
-Ruddy type as its schema, including nested records and arrays:
+## Codecs
 
-```ruddy
-let decode_config:
-  String -> Result { name: String, retries: Nat } std::json::DecodeError =
-  std::json::decode
-```
+`std::codec` is the portable layer under JSON: `Read` and `Write` are effects
+whose operations are typed by what they carry, so an encoder is a function
+`'a -> Result () Error + !Write` and a decoder `() -> Result 'a Error + !Read`.
+A format is a handler for those effects owning its input or output and a
+checked session stack, and a buffered runner such as JSON's discharges the
+protocol purely. `derive : Mirror 'a -> Result (Codec 'a) DeriveError` gives
+the structural codec of any type made of primitives, arrays, records, sums, and
+regular recursion; it interprets the mirror's views, so a recursive type is
+handled one level at a time. A custom codec bypasses derivation and speaks the
+protocol itself, and a misordered or incomplete session is a protocol error.
 
-Its errors distinguish `#Parse { message }` from
-`#Decode { path, expected, message }`. Decoding uses `ffi::decode` and its existing
-native-data rules; JSON null is represented explicitly by `#Null` in `Value`,
-and is not automatically converted to `Option` in typed decoding. Tagged unions
-in typed decoding use the existing foreign `{ tag, value }` representation.
+`std::binary` runs the same codecs over a positional binary format: no names
+or tags on the wire, only what the decoder's schema says comes next, with
+`Nat` and `Int` as 64 bits, text as a length and UTF-8, sequences as a count,
+and cases as their index. `encode_versioned` and `decode_versioned` put an
+application-owned schema identity and version before the value, so a reader
+refuses another schema before reading any of it.
 
-Parsing follows JavaScript JSON semantics: duplicate object keys retain the last
-value, integer-like keys follow JavaScript property order, and numbers use
-binary64 precision. Non-finite numbers (including overflowing input such as
-`1e400`) are errors. Stringifying a constructed object preserves its member
-sequence, including duplicate keys; `get` returns the first matching member.
-Parse errors also include host recursion-limit failures for deeply nested data.
+Dynamic values go through a caller-selected `codec::Registry`: `encode_any`
+writes an `Any` as the identity its type is registered under and the value, and
+`decode_any` reads one back as the registered type, with the entry's own mirror.
+A wire identity never manufactures a mirror, so an unregistered type is an
+error in both directions. `json::encode_canonical` writes the named canonical
+profile, with members sorted by key and no whitespace, for hashes and
+signatures.
 
 ## Process
 

@@ -48,4 +48,4 @@ let header: String -> Headers -> Option String = fn name headers =>
 extern decode_text: [Nat8] -> String = "$http.text"
 @doc "Decode UTF-8 using Fetch text semantics (replace malformed sequences and strip a BOM)."
 let text = fn response => decode_text response.body
-let json: Response -> Result 'a json::DecodeError = fn response => json::decode (text response)
+let json: Response -> Result 'a json::Error = fn response => json::decode (text response)

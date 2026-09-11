@@ -3,7 +3,9 @@ module effects
 module fs
 module io
 module process
+module codec
 module json
+module binary
 module url
 module http
 @if { platform: "node" }

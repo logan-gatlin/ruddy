@@ -38,6 +38,11 @@ A [literal](dictionary.md#literal) writes a value directly in source code.
 | Bool | `true`, `false` | `Bool` |
 | [Unit](dictionary.md#unit) | `()` or `{}` | `()` |
 
+Integers have a precision chosen by the target, measured in bits, with exact bounds: on JavaScript `Nat` holds `0` to `9007199254740991` and `Int` holds `-9007199254740991` to `9007199254740991`, the safe integers, while `Nat64` and `Int64` have their fixed 64-bit domains everywhere.
+A literal outside the target's domain is a compile error, and integers have one zero.
+`Real` is an IEEE binary64 number with its signed zeros, infinities, and NaNs.
+A `String` is a sequence of Unicode scalar values: `std::str::len "😀"` is one, and character positions, slicing, search, and ordering count scalars the same way.
+
 The fixed-width suffixes support widths of `8`, `16`, `32`, and `64`.
 Number literals use decimal digits; a decimal point requires digits on both sides.
 The `n` and `i` suffixes require whole numbers, and natural numbers cannot be negative.

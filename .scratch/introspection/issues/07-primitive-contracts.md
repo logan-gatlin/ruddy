@@ -1,6 +1,6 @@
 # 07 Portable primitive contracts
 
-Status: open
+Status: claimed
 Type: task
 
 Spec section: "Portable primitive contracts" and acceptance bullets on target

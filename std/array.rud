@@ -188,3 +188,30 @@ let sequence_option: [Option 'a] -> Option ['a] =
 
 let sequence_result: [Result 'a 'failure] -> Result ['a] 'failure =
   fn values => traverse_result (fn value => value) values
+
+@private
+let merge: ('a -> 'a -> order::Order + ..'effects) -> ['a] -> ['a] -> ['a] + ..'effects =
+  fn ordering left right => match (left, right) with
+  | ([], _) => right
+  | (_, []) => left
+  | ([head, ..tail], [first, ..rest]) =>
+    match ordering first head with
+    | #Less => [first, ..merge ordering left rest]
+    | _ => [head, ..merge ordering tail right]
+    end
+  end
+
+@doc "The values in order, stable: values the ordering calls equal keep their order."
+let sort_by: ('a -> 'a -> order::Order + ..'effects) -> ['a] -> ['a] + ..'effects =
+  fn ordering values => match values with
+  | [] => []
+  | [only] => [only]
+  | _ =>
+    do
+      let half = nat::divide (len values) 2n
+      return match (slice values 0n half, slice values half (len values)) with
+      | (#Some front, #Some back) => merge ordering (sort_by ordering front) (sort_by ordering back)
+      | _ => values
+      end
+    end
+  end

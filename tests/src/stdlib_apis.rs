@@ -40,7 +40,7 @@ fn json_and_url_values_work_on_node_and_web() {
             r#"
 let parse = std::json::parse
 let stringify = std::json::stringify
-let decode: String -> std::result::Result { name: String, counts: [Nat] } std::json::DecodeError = std::json::decode
+let decode: String -> std::result::Result { name: String, counts: [Nat] } std::json::Error = std::json::decode
 let inspect = fn text => match std::json::parse text with
 | #Some (#Object fields) => std::array::len fields
 | _ => 0n
@@ -71,13 +71,15 @@ const text = some(await app.stringify(value));
 assert.deepEqual(JSON.parse(text), JSON.parse('{"name":"hé\\n\\\"","counts":[0,3],"nil":null,"ok":true,"__proto__":{"safe":true}}'));
 assert.equal(await app.inspect('{"a":1,"b":2}'), 2);
 assert.equal((await app.parse('{')).tag, 'Error');
-assert.equal((await app.parse('1e400')).tag, 'Error');
-assert.equal((await app.stringify(sum('Number', Infinity))).tag, 'Error');
-assert.equal((await app.stringify(sum('Number', NaN))).tag, 'Error');
+assert.equal((await app.parse('1e400')).tag, 'Some');
+assert.equal((await app.stringify(sum('Number', { token: 'Infinity' }))).tag, 'Error');
+assert.equal((await app.stringify(sum('Number', { token: 'NaN' }))).tag, 'Error');
 assert.deepEqual({...some(await app.decode('{"name":"Ada","counts":[1,2,3]}'))}, {name:'Ada', counts:[1,2,3]});
 const bad = await app.decode('{"name":"Ada","counts":[1,"bad"]}');
-assert.equal(bad.tag, 'Error'); assert.equal(bad.value.tag, 'Decode'); assert.equal(bad.value.value.path, '$.counts[1]');
-assert.equal((await app.decode('no')).value.tag, 'Parse');
+assert.equal(bad.tag, 'Error'); assert.equal(bad.value.tag, 'Codec');
+assert.deepEqual(bad.value.value.path, [sum('Field', 'counts'), sum('Index', 1)]);
+assert.equal(bad.value.value.kind.tag, 'Unexpected');
+assert.equal((await app.decode('no')).value.value.kind.tag, 'Unexpected');
 const big = Array.from({length: 1100}, (_,i) => i);
 const bigValue = some(await app.parse(JSON.stringify(big)));
 assert.deepEqual(JSON.parse(some(await app.stringify(bigValue))), big);
@@ -184,7 +186,7 @@ let post = std::http::post
 let text: std::http::Response -> String = std::http::text
 let header = std::http::header
 let is_success: std::http::Response -> Bool = std::http::is_success
-let json: std::http::Response -> std::result::Result { answer: Nat } std::json::DecodeError = std::http::json
+let json: std::http::Response -> std::result::Result { answer: Nat } std::json::Error = std::http::json
 "#,
             platform,
             "library",
@@ -512,6 +514,329 @@ assert.equal(app.duplicated, 'duplicate age');
 await assert.rejects(async () => app.forged({}), /package/);
 assert.equal(app.admin, '#Admin {}');
 assert.deepEqual(app.backwards, ['y', 'x']);
+"#,
+    );
+}
+
+#[test]
+fn codecs_derive_json_round_trips_and_report_paths() {
+    let project = project(
+        r##"
+type Role = #Admin | #User Nat
+type Person = { name: String, age: Nat, tags: [String], role: Role, score: Real, small: Int8, wide: Int64 }
+type Tree = #Leaf | #Node { left: Tree, value: Int, right: Tree }
+let encode_person: Person -> Result String std::json::Error = std::json::encode
+let decode_person: String -> Result Person std::json::Error = std::json::decode
+let decode_people: String -> Result [Person] std::json::Error = std::json::decode
+let encode_tree: Tree -> Result String std::json::Error = std::json::encode
+let decode_tree: String -> Result Tree std::json::Error = std::json::decode
+let decode_nat: String -> Result Nat std::json::Error = std::json::decode
+let decode_int: String -> Result Int std::json::Error = std::json::decode
+let decode_nat64: String -> Result Nat64 std::json::Error = std::json::decode
+let decode_int64: String -> Result Int64 std::json::Error = std::json::decode
+let decode_small: String -> Result Int8 std::json::Error = std::json::decode
+let decode_real: String -> Result Real std::json::Error = std::json::decode
+let encode_real: Real -> Result String std::json::Error = std::json::encode
+let encode_function: (Nat -> Nat) -> Result String std::json::Error = std::json::encode
+let decode_any: String -> Result Any std::json::Error = std::json::decode
+let encode_nats: [Nat] -> Result String std::json::Error = std::json::encode
+let parse = std::json::parse
+let stringify = std::json::stringify
+let to_real = std::json::number_to_real
+let to_nat = std::json::number_to_nat
+let to_int = std::json::number_to_int
+let limited: String -> Result [[Nat]] std::json::Error = fn text =>
+  match std::codec::derive_decoder (std::reflect::mirror ()) with
+  | #Some decoder => std::json::decode_with decoder { depth: 2n, bytes: 40n, members: 3n, digits: 4n } text
+  | #Error error => #Error (#Derive error)
+  end
+let shallow: String -> Result [[Nat]] std::json::Error = fn text =>
+  match std::codec::derive_decoder (std::reflect::mirror ()) with
+  | #Some decoder => std::json::decode_with decoder { depth: 1n, bytes: 40n, members: 3n, digits: 4n } text
+  | #Error error => #Error (#Derive error)
+  end
+@private
+let nat_schema = std::reflect::describe (std::reflect::type_of 0n)
+@private
+let as_text: std::codec::Codec Nat = {
+  encoder: { schema: nat_schema, run: fn n => std::codec::!Write.write_text (std::str::from_nat n) },
+  decoder: {
+    schema: nat_schema,
+    run: fn _ => std::result::and_then
+      (fn text => match std::json::number_to_nat { token: text } with
+        | #Some n => #Some n
+        | #Error _ => std::codec::fail [] (#Custom "not a number")
+        end)
+      (std::codec::!Read.read_text ()),
+  },
+}
+let encode_as_text: Nat -> Result String std::json::Error = std::json::encode_with as_text.encoder std::json::default_limits
+let decode_as_text: String -> Result Nat std::json::Error = std::json::decode_with as_text.decoder std::json::default_limits
+@private
+let misused: std::codec::Encoder Nat = {
+  schema: nat_schema,
+  run: fn n => std::codec::!Write.end_record { frame: 7n },
+}
+@private
+let silent: std::codec::Encoder Nat = { schema: nat_schema, run: fn n => #Some () }
+@private
+let twice: std::codec::Encoder Nat = {
+  schema: nat_schema,
+  run: fn n => std::result::and_then (fn _ => std::codec::!Write.write_nat n) (std::codec::!Write.write_nat n),
+}
+let encode_misused = std::json::encode_with misused std::json::default_limits
+let encode_silent = std::json::encode_with silent std::json::default_limits
+let encode_twice = std::json::encode_with twice std::json::default_limits
+"##,
+        "node",
+        "library",
+    );
+    run(
+        project.path(),
+        r#"
+const sum = (tag, value) => ({tag, value});
+const big = (k, v) => typeof v === 'bigint' ? v.toString() + 'n' : v;
+const norm = v => JSON.parse(JSON.stringify(v, big));
+const some = result => { assert.equal(result.tag, 'Some', JSON.stringify(result, big)); return result.value; };
+const error = result => { assert.equal(result.tag, 'Error', JSON.stringify(result, big)); return norm(result.value); };
+const codec = result => { const e = error(result); assert.equal(e.tag, 'Codec'); return e.value; };
+const ada = { name: 'Ada', age: 36, tags: ['x', 'y'], role: sum('User', 3), score: 0.1, small: -3, wide: 9223372036854775807n };
+const text = some(await app.encode_person(ada));
+assert.equal(text, '{"age":36,"name":"Ada","role":{"tag":"User","value":3},"score":0.1,"small":-3,"tags":["x","y"],"wide":9223372036854775807}');
+assert.deepEqual(norm(some(await app.decode_person(text))), norm(ada));
+assert.deepEqual(codec(await app.decode_person('{"name":"A","age":1,"tags":[],"role":{"tag":"Admin","value":{}},"score":1,"small":0,"wide":0,"extra":2}')), { path: [], kind: sum('Unknown', 'extra') });
+assert.deepEqual(codec(await app.decode_person('{"name":"A"}')).kind, sum('Missing', 'age'));
+assert.deepEqual(codec(await app.decode_person('{"name":"A","name":"B","age":1,"tags":[],"role":{"tag":"Admin","value":{}},"score":1,"small":0,"wide":0}')).kind, sum('Duplicate', 'name'));
+const nested = codec(await app.decode_people('[' + text + ',{"name":"B","age":1,"tags":["ok",5],"role":{"tag":"Admin","value":{}},"score":1,"small":0,"wide":0}]'));
+assert.deepEqual(nested.path, [sum('Index', 1), sum('Field', 'tags'), sum('Index', 1)]);
+assert.deepEqual(nested.kind, sum('Unexpected', { expected: 'a string', found: 'a number' }));
+const badCase = codec(await app.decode_person(text.replace('"User"', '"Guest"')));
+assert.deepEqual(badCase, { path: [sum('Field', 'role')], kind: sum('UnexpectedCase', 'Guest') });
+assert.deepEqual(codec(await app.decode_person(text.replace('"small":-3', '"small":300'))), { path: [sum('Field', 'small')], kind: sum('Range', { expected: 'Int8', found: '300' }) });
+assert.deepEqual(codec(await app.decode_nat('12 x')).kind, sum('Parse', { message: 'unexpected trailing input', offset: 3 }));
+assert.deepEqual(codec(await app.decode_nat('')).kind, sum('Unexpected', { expected: 'a number', found: 'the end of the input' }));
+assert.equal(some(await app.decode_nat('1e3')), 1000);
+assert.equal(some(await app.decode_nat('100e-2')), 1);
+assert.equal(some(await app.decode_nat('-0')), 0);
+assert.equal(some(await app.decode_int('-1.0')), -1);
+assert.equal(codec(await app.decode_nat('1.5')).kind.tag, 'Range');
+assert.equal(codec(await app.decode_nat('-1')).kind.tag, 'Range');
+assert.equal(codec(await app.decode_nat('9007199254740992')).kind.tag, 'Range');
+assert.equal(some(await app.decode_nat('9007199254740991')), 9007199254740991);
+assert.equal(some(await app.decode_nat64('18446744073709551615')), 18446744073709551615n);
+assert.equal(codec(await app.decode_nat64('18446744073709551616')).kind.tag, 'Range');
+assert.equal(some(await app.decode_int64('-9223372036854775808')), -9223372036854775808n);
+assert.equal(codec(await app.decode_int64('9223372036854775808')).kind.tag, 'Range');
+assert.equal(some(await app.decode_small('-128')), -128);
+assert.equal(codec(await app.decode_small('128')).kind.tag, 'Range');
+assert.equal(some(await app.decode_real('0.1')), 0.1);
+assert.ok(Object.is(some(await app.decode_real('-0')), -0));
+assert.equal(codec(await app.decode_real('1e400')).kind.tag, 'Range');
+assert.equal(codec(await app.decode_real('1e-400')).kind.tag, 'Range');
+assert.equal(some(await app.decode_real('0e5')), 0);
+assert.equal(some(await app.encode_real(-0)), '-0.0');
+assert.equal(some(await app.encode_real(1e21)), '1e+21');
+assert.equal(codec(await app.encode_real(NaN)).kind.tag, 'Range');
+const tree = sum('Node', { left: sum('Leaf', {}), value: -5, right: sum('Node', { left: sum('Leaf', {}), value: 7, right: sum('Leaf', {}) }) });
+const treeText = some(await app.encode_tree(tree));
+assert.deepEqual(norm(some(await app.decode_tree(treeText))), norm(tree));
+assert.deepEqual(error(await app.encode_function(x => x)), sum('Derive', { path: [], reason: 'a function has no default codec' }));
+assert.deepEqual(error(await app.decode_any('1')).value.path, [sum('Field', 'value')].slice(0, 0));
+assert.equal(error(await app.decode_any('1')).tag, 'Derive');
+assert.equal(some(await app.encode_nats([1, 2, 3])), '[1,2,3]');
+const doc = some(await app.parse('{"a":1,"a":2.50,"b":[true,null,"s\\u0041\\n"]}'));
+assert.deepEqual(norm(doc), sum('Object', [
+  {0: 'a', 1: sum('Number', { token: '1' })},
+  {0: 'a', 1: sum('Number', { token: '2.50' })},
+  {0: 'b', 1: sum('Array', [sum('Bool', true), { tag: 'Null' }, sum('String', 'sA\n')])},
+]));
+assert.equal(some(await app.stringify(doc)), '{"a":1,"a":2.50,"b":[true,null,"sA\\n"]}');
+assert.equal(error(await app.stringify(sum('Number', { token: '01' }))).tag, 'Codec');
+assert.equal(some(await app.to_real({ token: '2.50' })), 2.5);
+assert.equal(some(await app.to_nat({ token: '2.50e2' })), 250);
+assert.equal(some(await app.to_int({ token: '-7' })), -7);
+assert.equal(error(await app.to_nat({ token: '2.5' })).tag, 'Codec');
+assert.equal(codec(await app.parse('[1, 2')).kind.tag, 'Parse');
+assert.equal(codec(await app.parse('{"a" 1}')).kind.tag, 'Parse');
+assert.equal(codec(await app.parse('"\\x"')).kind.tag, 'Parse');
+assert.equal(codec(await app.parse('"a\\u12"')).kind.tag, 'Parse');
+assert.equal(codec(await app.parse('"a\nb"')).kind.tag, 'Parse');
+assert.equal(codec(await app.parse('tru')).kind.tag, 'Parse');
+assert.equal(codec(await app.parse('01')).kind.tag, 'Parse');
+assert.equal(codec(await app.parse('1.')).kind.tag, 'Parse');
+assert.equal(codec(await app.parse('1e')).kind.tag, 'Parse');
+assert.equal(codec(await app.parse('[1,]')).kind.tag, 'Parse');
+assert.equal(some(await app.limited('[[1],[2]]')).length, 2);
+assert.deepEqual(codec(await app.limited('[[[1]]]')).kind, sum('Unexpected', { expected: 'a number', found: 'an array' }));
+assert.deepEqual(codec(await app.shallow('[[1]]')), { path: [sum('Index', 0)], kind: sum('Limit', 'a document nested too deeply') });
+assert.deepEqual(codec(await app.limited('[[1,2,3,4]]')).kind, sum('Limit', 'too many members'));
+assert.deepEqual(codec(await app.limited('[[12345]]')).kind, sum('Limit', 'a number with too many digits'));
+assert.deepEqual(codec(await app.limited('[[1],[1],[1],[1],[1],[1],[1],[1],[1],[1],[1],[1],[1]]')).kind, sum('Limit', 'a document longer than the limit'));
+assert.equal(some(await app.encode_as_text(42)), '"42"');
+assert.equal(some(await app.decode_as_text('"42"')), 42);
+assert.deepEqual(codec(await app.decode_as_text('"x"')).kind, sum('Custom', 'not a number'));
+assert.deepEqual(codec(await app.encode_misused(1)).kind, sum('Protocol', 'no frame is open'));
+assert.deepEqual(codec(await app.encode_silent(1)).kind, sum('Protocol', 'the encoder did not write a whole document'));
+assert.deepEqual(codec(await app.encode_twice(1)).kind, sum('Protocol', 'no value is expected here'));
+"#,
+    );
+}
+
+#[test]
+fn strings_count_scalars_and_integers_have_one_zero() {
+    let project = project(
+        r#"
+let len = std::str::len
+let char_at: String -> Nat -> String = fn text index => std::str::char_at text index
+let slice: String -> Nat -> Nat -> String = fn text start stop => std::str::slice text start stop
+let index_of: String -> String -> Int = fn text search => std::str::index_of text search
+let reverse = std::str::reverse
+let pad_start: String -> Nat -> String -> String = fn text width fill => std::str::pad_start text width fill
+let pad_end: String -> Nat -> String -> String = fn text width fill => std::str::pad_end text width fill
+let less_than: String -> String -> Bool = fn left right => std::str::less_than left right
+let chars = std::str::chars
+let split: String -> String -> [String] = fn text separator => std::str::split text separator
+let times: Int -> Int -> Int = fn left right => std::int::multiply left right
+let negate = std::int::negate
+let quotient: Int -> Int -> Int = fn left right => std::int::divide left right
+let remainder: Int -> Int -> Int = fn left right => std::int::remainder left right
+let truncate = std::int::from_real
+let decode_text: String -> Result String std::json::Error = std::json::decode
+let encode_text: String -> Result String std::json::Error = std::json::encode
+"#,
+        "node",
+        "library",
+    );
+    run(
+        project.path(),
+        r#"
+const some = result => { assert.equal(result.tag, 'Some', JSON.stringify(result)); return result.value; };
+assert.equal(await app.len('😀é'), 2);
+assert.equal(await (await app.char_at('a😀b'))(1), '😀');
+assert.equal(await (await app.char_at('a😀b'))(3), '');
+assert.equal(await (await (await app.slice('a😀bc'))(1))(3), '😀b');
+assert.equal(await (await app.index_of('😀😀x'))('x'), 2);
+assert.equal(await (await app.index_of('😀😀x'))('y'), -1);
+assert.equal(await app.reverse('a😀b'), 'b😀a');
+assert.equal(await (await (await app.pad_start('😀'))(3))('ab'), 'ab😀');
+assert.equal(await (await (await app.pad_end('😀'))(4))('ab'), '😀aba');
+assert.equal(await (await app.less_than('￿'))('😀'), true);
+assert.equal(await (await app.less_than('😀'))('￿'), false);
+assert.deepEqual(await app.chars('a😀'), ['a', '😀']);
+assert.deepEqual(await (await app.split('😀,b'))(','), ['😀', 'b']);
+for (const value of [await (await app.times(0))(-1), await app.negate(0), await (await app.quotient(0))(-5), await (await app.remainder(-4))(2), await app.truncate(-0.5)]) {
+  assert.ok(Object.is(value, 0), String(value));
+}
+assert.equal(some(await app.decode_text('"\\ud83d\\ude00"')), '😀');
+assert.equal((await app.decode_text('"\\ud83d"')).value.value.kind.tag, 'Parse');
+assert.equal((await app.decode_text('"\\ude00"')).value.value.kind.tag, 'Parse');
+assert.equal((await app.decode_text('"\\ud83dx"')).value.value.kind.tag, 'Parse');
+assert.equal(some(await app.encode_text('😀\n')), '"😀\\n"');
+"#,
+    );
+}
+
+#[test]
+fn binary_documents_registries_and_canonical_json_round_trip() {
+    let project = project(
+        r##"
+type Role = #Admin | #User Nat
+type Person = { name: String, age: Nat, tags: [String], role: Role, score: Real }
+let encode_person: Person -> Result [Nat8] std::binary::Error = std::binary::encode
+let decode_person: [Nat8] -> Result Person std::binary::Error = std::binary::decode
+let encode_role: Role -> Result [Nat8] std::binary::Error = std::binary::encode
+let decode_role: [Nat8] -> Result Role std::binary::Error = std::binary::decode
+let encode_real: Real -> Result [Nat8] std::binary::Error = std::binary::encode
+let decode_real: [Nat8] -> Result Real std::binary::Error = std::binary::decode
+let decode_int: [Nat8] -> Result Int std::binary::Error = std::binary::decode
+let encode_wide: Int64 -> Result [Nat8] std::binary::Error = std::binary::encode
+let decode_wide: [Nat8] -> Result Int64 std::binary::Error = std::binary::decode
+let decode_text: [Nat8] -> Result String std::binary::Error = std::binary::decode
+let encode_function: (Nat -> Nat) -> Result [Nat8] std::binary::Error = std::binary::encode
+@private
+let person_mirror: Mirror Person = std::reflect::mirror ()
+@private
+let person_codec = std::codec::derive person_mirror
+let schema = { id: "person", version: 2n }
+let encode_versioned: Person -> Result [Nat8] std::binary::Error = fn person =>
+  match person_codec with
+  | #Some codec => std::binary::encode_versioned schema codec.encoder std::binary::default_limits person
+  | #Error error => #Error (#Derive error)
+  end
+let decode_versioned: Nat -> [Nat8] -> Result Person std::binary::Error = fn version bytes =>
+  match person_codec with
+  | #Some codec => std::binary::decode_versioned { id: "person", version: version } codec.decoder std::binary::default_limits bytes
+  | #Error error => #Error (#Derive error)
+  end
+let limited: [Nat8] -> Result [Nat] std::binary::Error = fn bytes =>
+  match std::codec::derive_decoder (std::reflect::mirror ()) with
+  | #Some decoder => std::binary::decode_with decoder { depth: 2n, bytes: 64n, members: 2n } bytes
+  | #Error error => #Error (#Derive error)
+  end
+@private
+let registry: std::codec::Registry = match std::codec::register "person" person_mirror with
+| #Some entry => [entry]
+| #Error _ => []
+end
+@private
+let any_schema = std::reflect::describe (std::reflect::type_of ())
+let encode_any: Any -> Result String std::json::Error = fn any =>
+  std::json::encode_with { schema: any_schema, run: std::codec::encode_any registry } std::json::default_limits any
+let decode_any: String -> Result Any std::json::Error = fn text =>
+  std::json::decode_with { schema: any_schema, run: std::codec::decode_any registry } std::json::default_limits text
+let ada: Person = { name: "Ada", age: 36n, tags: ["x"], role: #User 3n, score: 1.5 }
+let boxed_ada = std::any::upcast ada
+let boxed_nat = std::any::upcast 1n
+let unbox_person: Any -> Option Person = std::any::downcast
+let canonical_person: Person -> Result String std::json::Error = std::json::encode_canonical
+let canon: String -> Result String std::json::Error = fn text =>
+  std::result::and_then (fn document => std::json::stringify (std::json::canonical document)) (std::json::parse text)
+"##,
+        "node",
+        "library",
+    );
+    run(
+        project.path(),
+        r#"
+const big = (k, v) => typeof v === 'bigint' ? v.toString() + 'n' : v;
+const norm = v => JSON.parse(JSON.stringify(v, big));
+const some = result => { assert.equal(result.tag, 'Some', JSON.stringify(result, big)); return result.value; };
+const codec = result => { assert.equal(result.tag, 'Error', JSON.stringify(result, big)); const e = norm(result.value); assert.equal(e.tag, 'Codec'); return e.value; };
+const sum = (tag, value) => ({ tag, value });
+const ada = { name: 'Ada', age: 36, tags: ['x'], role: sum('User', 3), score: 1.5 };
+const bytes = some(await app.encode_person(ada));
+const le64 = n => [n, 0, 0, 0, 0, 0, 0, 0];
+assert.deepEqual(bytes, [...le64(36), 3, 0, 0, 0, 65, 100, 97, 1, 0, 0, 0, ...le64(3), 0, 0, 0, 0, 0, 0, 248, 63, 1, 0, 0, 0, 1, 0, 0, 0, 120]);
+assert.deepEqual(norm(some(await app.decode_person(bytes))), norm(ada));
+assert.deepEqual(codec(await app.decode_person(bytes.slice(0, 10))).kind, sum('Parse', { message: 'the input ends early', offset: 8 }));
+assert.deepEqual(codec(await app.decode_person([...bytes, 0])).kind, sum('Parse', { message: 'unexpected trailing input', offset: bytes.length }));
+assert.deepEqual(some(await app.encode_role(sum('Admin', {}))), [0, 0, 0, 0]);
+assert.deepEqual(norm(some(await app.decode_role([1, 0, 0, 0, ...le64(9)]))), sum('User', 9));
+assert.deepEqual(codec(await app.decode_role([2, 0, 0, 0])).kind.tag, 'Unexpected');
+assert.ok(Object.is(some(await app.decode_real(some(await app.encode_real(-0)))), -0));
+assert.ok(Number.isNaN(some(await app.decode_real(some(await app.encode_real(NaN))))));
+assert.equal(some(await app.decode_int([255, 255, 255, 255, 255, 255, 255, 255])), -1);
+assert.equal(codec(await app.decode_int([0, 0, 0, 0, 0, 0, 0, 128])).kind.tag, 'Range');
+assert.equal(some(await app.decode_wide(some(await app.encode_wide(-9223372036854775808n)))), -9223372036854775808n);
+assert.equal(some(await app.decode_text([4, 0, 0, 0, 240, 159, 152, 128])), '😀');
+assert.equal(codec(await app.decode_text([2, 0, 0, 0, 255, 254])).kind.tag, 'Parse');
+assert.equal(norm(await app.encode_function(x => x)).value.tag, 'Derive');
+const versioned = some(await app.encode_versioned(ada));
+assert.deepEqual(versioned.slice(0, 18), [6, 0, 0, 0, 112, 101, 114, 115, 111, 110, ...le64(2)]);
+assert.deepEqual(norm(some(await (await app.decode_versioned(2))(versioned))), norm(ada));
+assert.deepEqual(codec(await (await app.decode_versioned(3))(versioned)).kind, sum('Unexpected', { expected: 'schema person version 3', found: 'another schema' }));
+assert.deepEqual(codec(await (await app.decode_versioned(2))(versioned.slice(0, 5))).kind.tag, 'Parse');
+assert.deepEqual(some(await app.limited([2, 0, 0, 0, ...le64(1), ...le64(2)])), [1, 2]);
+assert.deepEqual(codec(await app.limited([3, 0, 0, 0, ...le64(1), ...le64(2), ...le64(3)])).kind, sum('Limit', 'a sequence longer than the limit'));
+const envelope = some(await app.encode_any(app.boxed_ada));
+assert.equal(envelope, '{"id":"person","value":{"age":36,"name":"Ada","role":{"tag":"User","value":3},"score":1.5,"tags":["x"]}}');
+const back = some(await app.decode_any(envelope));
+assert.deepEqual(norm(some(await app.unbox_person(back))), norm(ada));
+assert.deepEqual(codec(await app.encode_any(app.boxed_nat)).kind.tag, 'Unsupported');
+assert.deepEqual(codec(await app.decode_any('{"id":"nobody","value":1}')).kind, sum('Unexpected', { expected: 'a registered identity', found: 'nobody' }));
+assert.deepEqual(codec(await app.decode_any('{"value":1}')).kind, sum('Unknown', 'value'));
+assert.equal(some(await app.canonical_person(ada)), '{"age":36,"name":"Ada","role":{"tag":"User","value":3},"score":1.5,"tags":["x"]}');
+assert.equal(some(await app.canon('{"b": {"y":1,"x":[{"q":1,"p":2}]}, "a":2, "a":1}')), '{"a":2,"a":1,"b":{"x":[{"p":2,"q":1}],"y":1}}');
 "#,
     );
 }
