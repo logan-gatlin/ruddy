@@ -183,7 +183,13 @@ impl Analysis {
             let binding = &self.bindings[symbol];
             if matches!(
                 declaration.value.target.anchored.as_str(),
-                "$ffiDecode" | "$mirror" | "$typeOf" | "$describe" | "$sameMirror" | "$shape"
+                "$ffiDecode"
+                    | "$ffiEncode"
+                    | "$mirror"
+                    | "$typeOf"
+                    | "$describe"
+                    | "$sameMirror"
+                    | "$shape"
             ) && Intrinsic::recognize(&declaration.value.target.anchored, &binding.ty, aliases)
                 .is_none()
             {
@@ -922,6 +928,14 @@ impl Descriptor {
                     let from = child(edge("from").unwrap());
                     let to = child(edge("to").unwrap());
                     let effects = nodes.len() as u32;
+                    // A row is unordered, and a descriptor is compared member
+                    // by member, so the members are put in one order here:
+                    // two arrows written `+ !A + !B` and `+ !B + !A` are one
+                    // type, and a mirror of each must say so. A row carries
+                    // at most one member per identity, so this orders them
+                    // completely.
+                    let mut row = row;
+                    row.sort_by(|left, right| left.identity.cmp(&right.identity));
                     nodes.push(Node::Effects(row));
                     Node::Arrow([from, to, effects])
                 }

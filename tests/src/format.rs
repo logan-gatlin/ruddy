@@ -1058,6 +1058,18 @@ fn hidden_types_and_patterns_format_as_written() {
         fmt("let g : (hide 'a => 'a) -> Mirror (hide 'b => Box 'b) = f"),
         "let g: (hide 'a => 'a) -> Mirror (hide 'b => Box 'b) = f\n"
     );
+    // A row written after the result belongs to the arrow. A hidden result
+    // would take it inside its body, so it keeps its parentheses; with
+    // nothing after it, the body running to the end is the same type and
+    // the parentheses go.
+    assert_eq!(
+        fmt("let h : Nat -> (hide 'a => Nat -> 'a) + !Log = f"),
+        "let h: Nat -> (hide 'a => Nat -> 'a) + !Log = f\n"
+    );
+    assert_eq!(
+        fmt("let i : Nat -> (hide 'a => Nat -> 'a) = f"),
+        "let i: Nat -> hide 'a => Nat -> 'a = f\n"
+    );
     assert_eq!(
         fmt("let f = fn b => match b with | hide 'i { m, v } => m | hide 'x #Some y => y end"),
         "let f = fn b => match b with | hide 'i { m, v } => m | hide 'x (#Some y) => y end\n"

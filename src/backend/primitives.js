@@ -314,7 +314,7 @@ const $prim = {
       Number
     ),
     int_of_digits: (
-      Number
+      text => Number(text) + 0
     ),
     nat64_of_digits: (
       BigInt
@@ -573,16 +573,16 @@ const $prim = {
       (value, minimum, maximum) => Math.min(Math.max(value, minimum), maximum)
     ),
     floor: (
-      Math.floor
+      value => Math.floor(value) + 0
     ),
     ceil: (
-      Math.ceil
+      value => Math.ceil(value) + 0
     ),
     round: (
-      Math.round
+      value => Math.round(value) + 0
     ),
     truncate: (
-      Math.trunc
+      value => Math.trunc(value) + 0
     ),
     is_nan: (
       Number.isNaN

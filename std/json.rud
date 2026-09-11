@@ -455,7 +455,7 @@ let real_of_token: String -> Result Real codec::Error = fn token => do
   let value = real_value token
   return
     if not real::is_finite value then range "Real" token
-    else if real::ordering_equal value 0
+    else if real::ordering_equal (real::abs value) 0
       and not all_zeros
         (match str::split_once (str::to_lowercase token) "e" with
         | #Some (mantissa, _) => mantissa

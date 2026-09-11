@@ -34,6 +34,17 @@ impl Failure {
     }
 }
 
+struct Conversion<'a> {
+    machine: &'a Machine,
+    plan: &'a Rc<Type>,
+    outgoing: bool,
+    callable: bool,
+    host_export: bool,
+    /// The values on the path from the root, so a cycle is refused rather
+    /// than followed forever.
+    active: &'a mut HashSet<usize>,
+}
+
 /// Convert one value across the boundary, in the direction `outgoing` names,
 /// starting at the plan's node `root`. `callable` is false where a function
 /// contract may not be reconstructed, and `host_export` marks the outermost
@@ -57,17 +68,6 @@ pub fn convert(
         active: &mut active,
     }
     .walk(root, value, "$")
-}
-
-struct Conversion<'a> {
-    machine: &'a Machine,
-    plan: &'a Rc<Type>,
-    outgoing: bool,
-    callable: bool,
-    host_export: bool,
-    /// The values on the path from the root, so a cycle is refused rather
-    /// than followed forever.
-    active: &'a mut HashSet<usize>,
 }
 
 /// A value's identity, where it has one a cycle could be built from.

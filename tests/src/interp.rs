@@ -780,6 +780,77 @@ end
     );
 }
 
+/// Cases where the two backends had answered differently, or had answered at
+/// all where the specification says a value is refused.
+#[test]
+fn the_backends_agree_on_zero_underflow_and_effect_order() {
+    let source = r#"
+effect A = { a: () -> Nat }
+effect B = { b: () -> Nat }
+
+-- An integer has one zero, however it was reached.
+let zeroes = std::str::join "," [
+  std::str::from_int (std::real::truncate (-0.5)),
+  std::str::from_int (std::real::ceil (-0.5)),
+  std::str::from_int (std::real::round (-0.2)),
+  std::str::from_int (std::real::floor 0.5),
+]
+let read_int: String -> std::result::Result Int std::json::Error = std::json::decode
+let read_real: String -> std::result::Result Real std::json::Error = std::json::decode
+let negative_zero = match read_int "-0" with
+| #Some value => std::str::from_int value
+| #Error _ => "refused"
+end
+
+-- A nonzero number that underflows to zero is refused, whichever zero it
+-- reached; a real number's own zero keeps its sign.
+let underflow = std::str::join "," [
+  match read_real "1e-400" with | #Some _ => "read" | #Error _ => "refused" end,
+  match read_real "-1e-400" with | #Some _ => "read" | #Error _ => "refused" end,
+  match read_real "-0.0" with
+  | #Some value => match std::json::encode value with
+    | #Some text => text
+    | #Error _ => "unwritable"
+    end
+  | #Error _ => "refused"
+  end,
+]
+
+-- A row is unordered, so two arrows written with the same effects in
+-- different orders are one type.
+let both_ways: Mirror (Nat -> Nat + !A + !B) = std::reflect::mirror ()
+let other_way: Mirror (Nat -> Nat + !B + !A) = std::reflect::mirror ()
+let pure_way: Mirror (Nat -> Nat) = std::reflect::mirror ()
+let reordered = match std::reflect::same both_ways other_way with
+| #Some _ => "same"
+| #None => "different"
+end
+let effects_count = match std::reflect::same both_ways pure_way with
+| #Some _ => "same"
+| #None => "different"
+end
+"#;
+    let exports = [
+        "zeroes",
+        "negative_zero",
+        "underflow",
+        "reordered",
+        "effects_count",
+    ];
+    let (node, interpreted) = both(source, &exports, None);
+    assert_eq!(node, interpreted);
+    assert_eq!(
+        interpreted,
+        vec![
+            "\"0,0,0,0\"",
+            "\"0\"",
+            "\"refused,refused,-0.0\"",
+            "\"same\"",
+            "\"different\"",
+        ]
+    );
+}
+
 #[test]
 fn a_host_value_the_interpreter_does_not_provide_is_named() {
     let mut program = load(
@@ -798,7 +869,7 @@ end
         .unwrap_err();
     assert_eq!(
         error.to_string(),
-        "unsupported: the host value `$url.parse`, which this interpreter does not provide"
+        "unsupported: this interpreter does not provide the host value `$url.parse`"
     );
 }
 

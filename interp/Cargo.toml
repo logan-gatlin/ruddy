@@ -14,4 +14,3 @@ path = "src/main.rs"
 [dependencies]
 indexmap = "2"
 ruddy = { package = "ruddy-compiler", path = ".." }
-serde_json = "1"

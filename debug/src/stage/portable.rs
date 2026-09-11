@@ -45,7 +45,7 @@ pub fn build(spec: &Spec, cx: &Cx) -> Stage {
                 None => node.child(Node::new(
                     ids.next(),
                     "Contract",
-                    "none: this target text is JavaScript a second target cannot read",
+                    "none: this target reads its own JavaScript, which no other target can",
                 )),
             }
         })

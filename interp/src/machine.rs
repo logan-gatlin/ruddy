@@ -577,7 +577,7 @@ impl Machine {
                 applied.extend(args);
                 let Some(arity) = crate::prim::arity(&target) else {
                     return Err(unsupported(format!(
-                        "the host value `{target}`, which this interpreter does not provide"
+                        "this interpreter does not provide the host value `{target}`"
                     )));
                 };
                 if applied.len() < arity {

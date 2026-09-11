@@ -2353,7 +2353,7 @@ fn format_semantic(f: &mut fmt::Formatter<'_>, root: SemanticRoot<'_>) -> fmt::R
                         }
                         work.push(SemanticJob::Ty(
                             to,
-                            shown && matches!(unpackaged(to), Ty::Arrow(..)),
+                            shown && matches!(unpackaged(to), Ty::Arrow(..) | Ty::Hidden { .. }),
                         ));
                         work.push(SemanticJob::Text(" -> "));
                         work.push(SemanticJob::Ty(from, from.prec() < Prec::Sum));
@@ -4362,9 +4362,11 @@ pub fn write_arrow(
 ) -> fmt::Result {
     write_grouped(f, from.prec() < Prec::Sum, from)?;
     f.write_str(" -> ")?;
-    // An arrow is the one node at this level, in all three printers, so
-    // comparing against it is asking exactly "is the result an arrow".
-    write_grouped(f, effects.is_some() && to.prec() == Prec::Arrow, to)?;
+    // A row written after the result belongs to this arrow. An arrow result
+    // would take it as its own, and a hidden result would take it inside the
+    // body, so both are grouped: those are the two levels at or under an
+    // arrow's.
+    write_grouped(f, effects.is_some() && to.prec() <= Prec::Arrow, to)?;
     match effects {
         Some(effects) => write!(f, " + {effects}"),
         None => Ok(()),

@@ -58,36 +58,6 @@ impl fmt::Display for Error {
     }
 }
 
-/// Run what a command line asks for: load the artifact it names, and either
-/// render the exports it names or list every export there is.
-pub fn run(arguments: &[String]) -> Result<Vec<String>, Error> {
-    let Some((path, names)) = arguments.split_first() else {
-        return Err(Error::Usage);
-    };
-    let program = read(Path::new(path))?;
-    if names.is_empty() {
-        return Ok(program.exports().map(str::to_owned).collect());
-    }
-    names
-        .iter()
-        .map(|name| program.export(name).map(|value| render::json(&value)))
-        .collect()
-}
-
-/// Read a linked artifact from disk and load it, checking as strictly as a
-/// dependency admission would.
-pub fn read(path: &Path) -> Result<Program, Error> {
-    let text = fs::read_to_string(path).map_err(|error| Error::Unreadable {
-        path: path.display().to_string(),
-        message: error.to_string(),
-    })?;
-    let artifact = ruddy::artifact::try_parse(&text)
-        .map_err(|error| Error::Load(error.to_string()))?
-        .validate()
-        .map_err(|error| Error::Load(error.to_string()))?;
-    Program::load(&artifact)
-}
-
 impl std::error::Error for Error {}
 
 /// A loaded program: its globals initialized, ready to be called.
@@ -154,4 +124,34 @@ impl Program {
     pub fn call(&mut self, function: &Value, argument: Value) -> Result<Value, Error> {
         self.machine.call(function.clone(), argument)
     }
+}
+
+/// Run what a command line asks for: load the artifact it names, and either
+/// render the exports it names or list every export there is.
+pub fn run(arguments: &[String]) -> Result<Vec<String>, Error> {
+    let Some((path, names)) = arguments.split_first() else {
+        return Err(Error::Usage);
+    };
+    let program = read(Path::new(path))?;
+    if names.is_empty() {
+        return Ok(program.exports().map(str::to_owned).collect());
+    }
+    names
+        .iter()
+        .map(|name| program.export(name).map(|value| render::json(&value)))
+        .collect()
+}
+
+/// Read a linked artifact from disk and load it, checking as strictly as a
+/// dependency admission would.
+pub fn read(path: &Path) -> Result<Program, Error> {
+    let text = fs::read_to_string(path).map_err(|error| Error::Unreadable {
+        path: path.display().to_string(),
+        message: error.to_string(),
+    })?;
+    let artifact = ruddy::artifact::try_parse(&text)
+        .map_err(|error| Error::Load(error.to_string()))?
+        .validate()
+        .map_err(|error| Error::Load(error.to_string()))?;
+    Program::load(&artifact)
 }

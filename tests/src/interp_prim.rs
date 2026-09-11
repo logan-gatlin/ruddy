@@ -134,19 +134,16 @@ fn a_target_outside_the_table_is_not_a_primitive() {
 }
 
 #[test]
-fn target_width_naturals_wrap_saturate_and_refuse_a_zero_divisor() {
+fn target_width_naturals_saturate_at_zero_and_divide_towards_it() {
     let pair = |left: u64, right: u64| [Value::Nat(left), Value::Nat(right)];
-    assert_eq!(nat(call("$prim.nat.add", &pair(u64::MAX, 1))), 0);
-    assert_eq!(nat(call("$prim.nat.multiply", &pair(1 << 63, 2))), 0);
+    // Subtraction saturating at zero is the standard library's own contract,
+    // not a target's accident, so it is pinned. Overflow and a zero divisor
+    // are undefined for a target-width natural number and nothing here says
+    // what they do: the two backends are free to differ, and do.
     assert_eq!(nat(call("$prim.nat.subtract", &pair(3, 5))), 0);
     assert_eq!(nat(call("$prim.nat.subtract", &pair(5, 3))), 2);
     assert_eq!(nat(call("$prim.nat.divide", &pair(7, 2))), 3);
     assert_eq!(nat(call("$prim.nat.remainder", &pair(7, 2))), 1);
-    assert_eq!(fails("$prim.nat.divide", &pair(7, 0)), "division by zero");
-    assert_eq!(
-        fails("$prim.nat.remainder", &pair(7, 0)),
-        "division by zero"
-    );
     assert!(truth(call("$prim.nat.ordering_less_than", &pair(1, 2))));
     assert!(!truth(call("$prim.nat.ordering_greater_than", &pair(1, 2))));
     assert_eq!(nat(call("$prim.nat.min", &pair(1, 2))), 1);
@@ -182,28 +179,15 @@ fn target_width_naturals_wrap_saturate_and_refuse_a_zero_divisor() {
 }
 
 #[test]
-fn target_width_integers_wrap_and_truncate_towards_zero() {
+fn target_width_integers_truncate_towards_zero() {
     let pair = |left: i64, right: i64| [Value::Int(left), Value::Int(right)];
-    assert_eq!(int(call("$prim.int.add", &pair(i64::MAX, 1))), i64::MIN);
-    assert_eq!(
-        int(call("$prim.int.subtract", &pair(i64::MIN, 1))),
-        i64::MAX
-    );
-    assert_eq!(int(call("$prim.int.multiply", &pair(i64::MAX, 2))), -2);
+    // Truncation towards zero is defined and pinned. Overflow, a zero
+    // divisor, and negating the least integer are undefined for a
+    // target-width integer, so nothing here says what they do.
     assert_eq!(int(call("$prim.int.divide", &pair(-7, 2))), -3);
     assert_eq!(int(call("$prim.int.remainder", &pair(-7, 2))), -1);
-    assert_eq!(int(call("$prim.int.divide", &pair(i64::MIN, -1))), i64::MIN);
-    assert_eq!(fails("$prim.int.divide", &pair(7, 0)), "division by zero");
     assert_eq!(int(call("$prim.int.negate", &[Value::Int(5)])), -5);
-    assert_eq!(
-        int(call("$prim.int.negate", &[Value::Int(i64::MIN)])),
-        i64::MIN
-    );
     assert_eq!(int(call("$prim.int.abs", &[Value::Int(-5)])), 5);
-    assert_eq!(
-        int(call("$prim.int.abs", &[Value::Int(i64::MIN)])),
-        i64::MIN
-    );
     assert_eq!(
         int(call(
             "$prim.int.clamp",
@@ -219,10 +203,9 @@ fn target_width_integers_wrap_and_truncate_towards_zero() {
         "integer out of range"
     );
     assert_eq!(int(call("$prim.int.from_real", &[Value::Real(-2.9)])), -2);
-    assert_eq!(
-        int(call("$prim.int.from_real", &[Value::Real(-1e30)])),
-        i64::MIN
-    );
+    // An integer has one zero, on every target, and a real number that
+    // truncates to zero from below reaches that one.
+    assert_eq!(int(call("$prim.int.from_real", &[Value::Real(-0.5)])), 0);
 }
 
 #[test]

@@ -302,10 +302,28 @@ impl<'a> Generator<'a> {
         // The domains the program bound `Nat` and `Int` to, for conversion
         // at the foreign boundary and for what a mirror describes.
         let domains = self.artifact.header().domains;
+        // `min` and `max` are the exact bounds as text, which is what a
+        // mirror describes. `low` and `high` are the numbers a check
+        // compares against, so they are clamped to what this target holds
+        // exactly: a domain wider than the safe integers cannot be checked
+        // numerically here, and rounding one outwards would admit a value
+        // outside it.
         let bounds = |bounds: crate::types::Bounds| {
+            let safe = 9007199254740991i128;
+            let clamp = |text: &str| {
+                text.parse::<i128>()
+                    .unwrap_or(0)
+                    .clamp(-safe, safe)
+                    .to_string()
+            };
             format!(
                 "{{ bits: {}, signed: {}, min: {:?}, max: {:?}, low: {}, high: {} }}",
-                bounds.bits, bounds.signed, bounds.min, bounds.max, bounds.min, bounds.max
+                bounds.bits,
+                bounds.signed,
+                bounds.min,
+                bounds.max,
+                clamp(bounds.min),
+                clamp(bounds.max)
             )
         };
         out.push_str(&format!(

@@ -2694,7 +2694,7 @@ impl<'a> Printer<'a> {
                 let last_effects = steps.last().and_then(|(_, _, effects)| *effects);
                 parts.push(self.ty_after(
                     result,
-                    last_effects.is_some() && prec(result) == Prec::Arrow,
+                    last_effects.is_some() && prec(result) <= Prec::Arrow,
                 ));
                 if let Some(row) = last_effects {
                     parts.push(text(" + "));

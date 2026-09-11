@@ -175,6 +175,8 @@ const $sameType = ($left, $right) => {
         $work.push([$a.payload, $b.payload]);
         for (let $j = 0; $j < $a.args.length; $j++) $work.push([$a.args[$j], $b.args[$j]]);
       }
+    } else if ($kind === "Extend") {
+      $work.push([$x.Extend[0], $y.Extend[0]], [$x.Extend[1], $y.Extend[1]]);
     } else {
       const $xs = $x[$kind], $ys = $y[$kind];
       if ($xs.length !== $ys.length) return false;
@@ -198,7 +200,7 @@ const $mirror = ($descriptor, $value) => {
 const $typeOf = $mirror;
 // A Ruddy function implemented here: it is handed the value as it is and
 // hands back what it makes, with nothing converted in either direction.
-const $nativeType = { nodes: [{ Arrow: [1, 1] }, "ForeignValue"] };
+const $nativeType = { nodes: [{ Arrow: [1, 1, 2] }, "ForeignValue", { Effects: [] }] };
 const $native = $function => {
   const $value = $argument => $invoke($value, "Sync", [$argument]);
   $value[$closureMark] = true;
