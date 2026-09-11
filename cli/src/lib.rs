@@ -25,6 +25,7 @@ use ruddy::{
 use serde::{Deserialize, Serialize};
 
 mod cache;
+mod documentation;
 pub mod lsp;
 pub mod workspace;
 
@@ -69,6 +70,8 @@ enum Command {
     Clean,
     /// Type-check a project without writing build artifacts.
     Check,
+    /// Generate Markdown documentation for the public API.
+    Doc,
     /// Build and execute a JavaScript-targeted project.
     Run,
     /// Serve the language server over standard input and output.
@@ -99,6 +102,8 @@ pub enum Outcome {
     Cleaned(PathBuf),
     /// This project was checked successfully.
     Checked(PathBuf),
+    /// Public API documentation was written to this directory.
+    Documented(PathBuf),
     /// This JavaScript module was built and executed successfully.
     Ran(PathBuf),
     /// The language server ran until its client asked it to exit.
@@ -227,6 +232,7 @@ where
             check_project(current_directory)?;
             Ok(Outcome::Checked(current_directory.to_path_buf()))
         }
+        Command::Doc => document_project(current_directory).map(Outcome::Documented),
         Command::Run => run_project(current_directory).map(Outcome::Ran),
         Command::Lsp => {
             let (connection, threads) = lsp_server::Connection::stdio();
@@ -482,6 +488,29 @@ pub fn check_project(directory: impl AsRef<Path>) -> Result<(), CliError> {
         usage: false,
         exit_code: 1,
     })
+}
+
+/// Generate flat Markdown pages for the enclosing bundle's public API.
+pub fn document_project(directory: impl AsRef<Path>) -> Result<PathBuf, CliError> {
+    let directory = enclosing_bundle(directory.as_ref())?;
+    let manifest =
+        load_manifest(&directory, None).map_err(|error| CliError::one(error.to_string()))?;
+    let target = directory.join(
+        manifest
+            .documentation
+            .target
+            .as_deref()
+            .unwrap_or(Path::new("docs")),
+    );
+    let (_, pages) =
+        compile_graph_output(&directory, true).map_err(|error| CliError::one(error.to_string()))?;
+    documentation::write(
+        &target,
+        &manifest.name,
+        manifest.documentation.frontmatter.as_deref(),
+        &pages,
+    )?;
+    Ok(target)
 }
 
 /// Remove the current project's `build/` entry, if one exists.
@@ -1185,7 +1214,16 @@ struct Manifest {
     platform: Option<Platform>,
     #[serde(default)]
     run: RunConfig,
+    #[serde(default)]
+    documentation: DocumentationConfig,
     dependencies: ManifestDependencies,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DocumentationConfig {
+    target: Option<PathBuf>,
+    frontmatter: Option<String>,
 }
 
 impl Manifest {
@@ -1569,10 +1607,18 @@ pub fn compile(directory: impl AsRef<Path>) -> Result<Artifact, CompileError> {
 /// Compile every unique project reachable from `directory`, dependencies first.
 /// This single-root graph ends with the requested project.
 pub fn compile_graph(directory: impl AsRef<Path>) -> Result<CompiledGraph, CompileError> {
-    let root = canonical_project(directory.as_ref())?;
+    compile_graph_output(directory.as_ref(), false).map(|(graph, _)| graph)
+}
+
+fn compile_graph_output(
+    directory: &Path,
+    document: bool,
+) -> Result<(CompiledGraph, Vec<documentation::Page>), CompileError> {
+    let root = canonical_project(directory)?;
     let resolver = git::Resolver::new(&root)?;
     let build = load_manifest(&root, None)?.build();
     let mut compiler = GraphCompiler {
+        document,
         root: Some(root.clone()),
         resolver: Some(resolver),
         build: Some(build),
@@ -1605,9 +1651,12 @@ pub fn compile_graph(directory: impl AsRef<Path>) -> Result<CompiledGraph, Compi
     if let Some(resolver) = &compiler.resolver {
         resolver.write_if_changed()?;
     }
-    Ok(CompiledGraph {
-        projects: compiler.projects,
-    })
+    Ok((
+        CompiledGraph {
+            projects: compiler.projects,
+        },
+        compiler.documentation,
+    ))
 }
 
 /// Compile several dependency roots with one shared graph cache. The returned
@@ -1934,6 +1983,8 @@ where
 }
 
 struct GraphCompiler {
+    document: bool,
+    documentation: Vec<documentation::Page>,
     sandbox: Option<PathBuf>,
     resolver: Option<git::Resolver>,
     root: Option<PathBuf>,
@@ -1958,6 +2009,8 @@ struct GraphCompiler {
 impl Default for GraphCompiler {
     fn default() -> Self {
         Self {
+            document: false,
+            documentation: Vec::new(),
             sandbox: None,
             resolver: None,
             root: None,
@@ -2182,6 +2235,11 @@ impl GraphCompiler {
                     linked_artifacts,
                     boundary.as_deref(),
                     build,
+                    if self.document && self.root.as_ref() == Some(&directory) {
+                        Some(&mut self.documentation)
+                    } else {
+                        None
+                    },
                 )?;
                 if let (Some(key), Some(cache)) = (key, &mut self.cache) {
                     cache.store(key, &artifact);
@@ -2288,6 +2346,7 @@ fn dependency_error(
 
 /// Compile one project for `build`, the root's, against the artifacts of its
 /// dependencies.
+#[allow(clippy::too_many_arguments)]
 fn compile_one(
     directory: &Path,
     manifest: Manifest,
@@ -2296,6 +2355,7 @@ fn compile_one(
     linked: Vec<Artifact>,
     sandbox: Option<&Path>,
     build: Build,
+    documentation: Option<&mut Vec<documentation::Page>>,
 ) -> Result<Artifact, CompileError> {
     if sandbox.is_some() && manifest.root.is_absolute() {
         return Err(CompileError::report(
@@ -2406,6 +2466,7 @@ fn compile_one(
             artifact: ruddy::compile::DependencyArtifact::Checked(artifact),
         })
         .collect();
+    let doc_statements = documentation.as_ref().map(|_| loaded.stmts.clone());
     let accepted = ruddy::compile::compile_with_dependencies(
         mint,
         loaded.stmts,
@@ -2451,6 +2512,10 @@ fn compile_one(
         }
     };
 
+    if let Some(pages) = documentation {
+        *pages = documentation::render(&accepted, doc_statements.as_ref().unwrap(), &mut files)
+            .map_err(|message| CompileError::report("documentation-invalid", message))?;
+    }
     let artifact = match manifest.kind {
         Kind::Library => accepted.artifact().clone(),
         Kind::Executable => ruddy::entry::executable(accepted.artifact(), &checked)

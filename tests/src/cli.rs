@@ -3489,3 +3489,253 @@ fn fmt_formats_around_syntax_errors_and_reports_them() {
     );
     assert!(!FormatReport::default().failed());
 }
+
+#[test]
+fn doc_renders_flat_pages_including_empty_modules() {
+    let directory = tempfile::tempdir().unwrap();
+    write_project(directory.path(), "example", "1.0.0", &[]);
+    fs::write(
+        directory.path().join("main.rud"),
+        r#"
+@doc "The **foo** module."
+module foo =
+  module bar = end
+end
+module baz = end
+"#,
+    )
+    .unwrap();
+    assert_eq!(
+        run(["doc"], directory.path()).unwrap(),
+        Outcome::Documented(directory.path().join("docs"))
+    );
+    let mut names: Vec<_> = fs::read_dir(directory.path().join("docs"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    assert_eq!(names, ["baz.md", "bundle.md", "foo.bar.md", "foo.md"]);
+    let bundle = fs::read_to_string(directory.path().join("docs/bundle.md")).unwrap();
+    assert!(bundle.starts_with("# example\n"));
+    assert!(bundle.contains("# example\n"));
+    assert!(bundle.contains("[foo](foo.md)"));
+    assert!(bundle.contains("[baz](baz.md)"));
+    let foo = fs::read_to_string(directory.path().join("docs/foo.md")).unwrap();
+    assert!(foo.contains("# example::foo\n"));
+    assert!(foo.contains("The **foo** module."));
+    assert!(foo.contains("[bar](foo.bar.md)"));
+    assert!(foo.contains("[Bundle](bundle.md)"));
+    assert!(!foo.contains("## Types"));
+}
+
+#[test]
+fn doc_describes_public_types_effects_and_values_in_source_order() {
+    let directory = tempfile::tempdir().unwrap();
+    let dependency = directory.path().join("dependency");
+    write_project(&dependency, "dependency", "1.0.0", &[]);
+    write_project(
+        directory.path(),
+        "example",
+        "1.0.0",
+        &[("dependency", "dependency")],
+    );
+    fs::write(
+        directory.path().join("main.rud"),
+        r#"
+@doc "A choice."
+type Option 't = #Some 't | #None
+@private
+type Hidden = Nat
+@doc "Ask for a value."
+effect Ask 'a = () -> 'a
+@private
+effect Secret
+@doc "Return the argument.\n\n```ruddy\nid 1n\n```"
+let id = fn x => x
+extern later: Nat -> Nat = "$implementation"
+let annotated: Option Nat -> Nat = fn option => match option with
+| #Some value => value
+| #None => 0n
+end
+let { first, second } = { first: 1n, second: true }
+let imported = dependency::value
+@private
+let hidden = 1n
+@private
+module internal =
+  module nested = end
+  let secret = 1n
+end
+"#,
+    )
+    .unwrap();
+    run(["doc"], directory.path()).unwrap();
+    let docs = directory.path().join("docs");
+    assert_eq!(fs::read_dir(&docs).unwrap().count(), 1);
+    let page = fs::read_to_string(docs.join("bundle.md")).unwrap();
+    for expected in [
+        "## Types",
+        "type Option 't = #Some 't | #None",
+        "A choice.",
+        "## Effects",
+        "effect Ask 'a = () -> 'a",
+        "Ask for a value.",
+        "## Values",
+        "let id: 'a -> 'a",
+        "Return the argument.\n\n```ruddy\nid 1n\n```",
+        "extern later: Nat -> Nat",
+        "let annotated: Option Nat -> Nat",
+        "let first: Nat",
+        "let second: Bool",
+        "let imported: Nat",
+    ] {
+        assert!(page.contains(expected), "missing {expected:?} in:\n{page}");
+    }
+    for hidden in [
+        "Hidden",
+        "Secret",
+        "hidden",
+        "internal",
+        "secret",
+        "$implementation",
+        "fn x",
+        "match option",
+        "### value",
+    ] {
+        assert!(!page.contains(hidden), "unexpected {hidden:?} in:\n{page}");
+    }
+    assert!(page.find("### id").unwrap() < page.find("### later").unwrap());
+    assert!(!dependency.join("docs").exists());
+}
+
+#[test]
+fn doc_target_and_frontmatter_apply_from_a_subdirectory() {
+    let directory = tempfile::tempdir().unwrap();
+    write_project(directory.path(), "example", "1.0.0", &[]);
+    fs::write(
+        directory.path().join("main.rud"),
+        "module child = end\nlet value = 0n\n",
+    )
+    .unwrap();
+    let manifest = directory.path().join("Ruddy.toml");
+    let text = fs::read_to_string(&manifest).unwrap();
+    fs::write(
+        &manifest,
+        format!(
+            "{text}\n[documentation]\ntarget = \"reference/api\"\nfrontmatter = \"\"\"---\nlayout: reference\n---\n\"\"\"\n"
+        ),
+    )
+    .unwrap();
+    let nested = directory.path().join("nested");
+    fs::create_dir(&nested).unwrap();
+    run(["doc"], &nested).unwrap();
+    let generated = directory.path().join("reference/api/bundle.md");
+    assert!(generated.is_file());
+    assert!(
+        fs::read_to_string(&generated)
+            .unwrap()
+            .starts_with("---\nlayout: reference\n---\n# example\n")
+    );
+    assert!(
+        fs::read_to_string(directory.path().join("reference/api/child.md"))
+            .unwrap()
+            .starts_with("---\nlayout: reference\n---\n# example::child\n")
+    );
+    assert!(!directory.path().join("docs").exists());
+    assert!(!nested.join("reference").exists());
+}
+
+#[test]
+fn doc_checks_before_writing_and_reports_filename_collisions() {
+    let directory = tempfile::tempdir().unwrap();
+    write_project(directory.path(), "example", "1.0.0", &[]);
+    fs::write(directory.path().join("main.rud"), "module index = end").unwrap();
+    run(["doc"], directory.path()).unwrap();
+    assert!(directory.path().join("docs/index.md").is_file());
+    let bundle = fs::read_to_string(directory.path().join("docs/bundle.md")).unwrap();
+    fs::write(directory.path().join("main.rud"), "module bundle = end").unwrap();
+    let error = run(["doc"], directory.path()).unwrap_err();
+    assert!(error.to_string().contains("collides"));
+    assert_eq!(
+        fs::read_to_string(directory.path().join("docs/bundle.md")).unwrap(),
+        bundle
+    );
+    fs::write(directory.path().join("main.rud"), "let broken: Nat = true").unwrap();
+    assert!(run(["doc"], directory.path()).is_err());
+    assert_eq!(
+        fs::read_to_string(directory.path().join("docs/bundle.md")).unwrap(),
+        bundle
+    );
+}
+
+#[test]
+fn doc_regeneration_removes_newly_private_modules_but_preserves_manual_docs() {
+    let directory = tempfile::tempdir().unwrap();
+    write_project(directory.path(), "example", "1.0.0", &[]);
+    let source = directory.path().join("main.rud");
+    fs::write(&source, "module visible = module nested = end end").unwrap();
+    run(["doc"], directory.path()).unwrap();
+    let docs = directory.path().join("docs");
+    fs::write(docs.join("manual.md"), "Hand-written guide").unwrap();
+    fs::write(
+        &source,
+        "@private\nmodule visible = module nested = end end",
+    )
+    .unwrap();
+    run(["doc"], directory.path()).unwrap();
+    assert!(!docs.join("visible.md").exists());
+    assert!(!docs.join("visible.nested.md").exists());
+    assert_eq!(
+        fs::read_to_string(docs.join("manual.md")).unwrap(),
+        "Hand-written guide"
+    );
+    let bundle = fs::read_to_string(docs.join("bundle.md")).unwrap();
+    fs::write(&source, "let broken: Nat = true").unwrap();
+    assert!(run(["doc"], directory.path()).is_err());
+    assert_eq!(fs::read_to_string(docs.join("bundle.md")).unwrap(), bundle);
+}
+
+#[test]
+fn doc_standard_library_uses_its_configured_directory_and_file_modules() {
+    let repository = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    fs::copy(
+        repository.join("Ruddy.toml"),
+        directory.path().join("Ruddy.toml"),
+    )
+    .unwrap();
+    fs::create_dir(directory.path().join("std")).unwrap();
+    for entry in fs::read_dir(repository.join("std")).unwrap() {
+        let entry = entry.unwrap();
+        if entry
+            .path()
+            .extension()
+            .is_some_and(|extension| extension == "rud")
+        {
+            fs::copy(
+                entry.path(),
+                directory.path().join("std").join(entry.file_name()),
+            )
+            .unwrap();
+        }
+    }
+    fs::create_dir(directory.path().join("docs")).unwrap();
+    fs::write(directory.path().join("docs/index.md"), "Existing website").unwrap();
+    run(["doc"], directory.path()).unwrap();
+    let docs = directory.path().join("docs/src/std");
+    assert!(docs.join("bundle.md").is_file());
+    let bundle = fs::read_to_string(docs.join("bundle.md")).unwrap();
+    assert!(bundle.starts_with("---\ndoc: true\n---\n\n# std\n"));
+    assert!(bundle.contains("effect mut 'a"));
+    assert!(!bundle.contains("```ruddy\n\n```"));
+    let ffi = fs::read_to_string(docs.join("ffi.md")).unwrap();
+    assert!(ffi.contains("effect Immediate"));
+    assert!(ffi.contains("An unhandlable effect performed by external code"));
+    let option = fs::read_to_string(docs.join("option.md")).unwrap();
+    assert!(option.contains("type Option 't = #Some 't | #None"));
+    assert!(!bundle.contains("### Option"));
+    assert_eq!(
+        fs::read_to_string(directory.path().join("docs/index.md")).unwrap(),
+        "Existing website"
+    );
+}

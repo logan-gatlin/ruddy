@@ -12,6 +12,10 @@ fn main() -> ExitCode {
             println!("Built `{}`", path.display());
             ExitCode::SUCCESS
         }
+        Ok(ruddy_cli::Outcome::Documented(path)) => {
+            println!("Documented `{}`", path.display());
+            ExitCode::SUCCESS
+        }
         Ok(ruddy_cli::Outcome::Cleaned(path)) => {
             println!("Cleaned `{}`", path.display());
             ExitCode::SUCCESS
