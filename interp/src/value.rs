@@ -85,6 +85,10 @@ pub struct Sum {
 pub struct Closure {
     pub function: usize,
     pub captures: Vec<Value>,
+    /// Whether a host caller supplied this closure as an argument. Such a
+    /// closure can implement a narrower evidence convention than the call
+    /// site passes, so the mark travels with it rather than with its address.
+    pub supplied: Cell<bool>,
 }
 
 /// A continuation: where a value goes next.

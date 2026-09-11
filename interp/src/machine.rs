@@ -5,11 +5,7 @@
 //! transfer, so a call, a handler entry, and a handler exit are data here
 //! rather than Rust stack frames, and resuming a continuation costs no stack.
 
-use std::{
-    cell::RefCell,
-    collections::{HashMap, HashSet},
-    rc::Rc,
-};
+use std::{cell::RefCell, collections::HashMap, rc::Rc};
 
 use ruddy::{
     artifact::{Artifact, Block, Callee, End, FieldKey, Literal, Op, Rep, Test},
@@ -91,10 +87,6 @@ pub struct Machine {
     externs: HashMap<String, Value>,
     /// The next run identity. A run owns the handlers it installs.
     runs: u64,
-    /// Closures the host supplied as arguments. Such a closure may implement
-    /// a narrower evidence convention than the call site passes, so its
-    /// visible argument is taken from the end of the list.
-    supplied: HashSet<usize>,
     /// How deep nested runs are, so an interpreter bug cannot exhaust the
     /// Rust stack silently.
     depth: usize,
@@ -187,7 +179,6 @@ impl Machine {
             initializers,
             externs,
             runs: 0,
-            supplied: HashSet::new(),
             depth: 0,
         })
     }
@@ -198,6 +189,7 @@ impl Machine {
             let closure = Value::Closure(Rc::new(Closure {
                 function,
                 captures: Vec::new(),
+                supplied: std::cell::Cell::new(false),
             }));
             let value = self
                 .start(closure, Vec::new(), None)
@@ -281,7 +273,7 @@ impl Machine {
         }
         for argument in &args {
             if let Value::Closure(closure) = argument {
-                self.supplied.insert(Rc::as_ptr(closure) as usize);
+                closure.supplied.set(true);
             }
         }
         self.runs += 1;
@@ -479,7 +471,7 @@ impl Machine {
                 let mut args = args;
                 // A closure the host supplied can implement a narrower
                 // evidence convention. Its visible argument remains last.
-                if args.len() != wanted && self.supplied.contains(&(Rc::as_ptr(closure) as usize)) {
+                if args.len() != wanted && closure.supplied.get() {
                     while args.len() > wanted {
                         args.remove(0);
                     }
@@ -744,6 +736,7 @@ impl Machine {
                     Callee::Direct(id) => Value::Closure(Rc::new(Closure {
                         function: *id as usize,
                         captures: Vec::new(),
+                        supplied: std::cell::Cell::new(false),
                     })),
                     Callee::Indirect(temp) => at(temp),
                 },
@@ -898,7 +891,6 @@ impl Machine {
                 Value::Record(record) => {
                     record.get(&key_of(field)).cloned().unwrap_or(Value::Absent)
                 }
-                Value::Absent => Value::Absent,
                 other => {
                     return Err(runtime(format!("cannot read a field of {}", other.kind())));
                 }
@@ -935,6 +927,7 @@ impl Machine {
             Op::Closure { func, captures } => Value::Closure(Rc::new(Closure {
                 function: *func as usize,
                 captures: captures.iter().map(at).collect(),
+                supplied: std::cell::Cell::new(false),
             })),
             Op::Continuation { code, captures } => Value::Cont(Rc::new(Cont::Code {
                 function: code.function as usize,
