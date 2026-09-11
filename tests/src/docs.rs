@@ -4,7 +4,9 @@ use std::path::{Path, PathBuf};
 
 use indexmap::IndexMap;
 use ruddy_debug::{
-    docs::{delete, dependency_path, path, read, valid_file_path, valid_name, write},
+    docs::{
+        delete, dependency_path, path, read, valid_file_path, valid_name, write, write_configured,
+    },
     wire::{DependencySpec, FileSpec, RunConfig, StdConfig},
 };
 
@@ -252,6 +254,54 @@ fn scratch(name: &str) -> PathBuf {
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(&root).expect("the scratch directory is created");
     root
+}
+
+/// The bundle contract a document is compiled under: what it builds, for
+/// which platform, and how wide its integers are. A document that binds none
+/// of them says nothing about them in its manifest.
+#[test]
+fn a_documents_build_contract_round_trips() {
+    let root = scratch("contract");
+    let files = [file("main.rud", "let value = 1n\n")];
+    write_configured(
+        &root,
+        "bound",
+        "bound",
+        "0.1.0",
+        "main.rud",
+        ruddy::artifact::Kind::Executable,
+        Some(ruddy_cli::Target::Js),
+        Some(ruddy_cli::Platform::Web),
+        Some(32),
+        &Default::default(),
+        &Default::default(),
+        &Default::default(),
+        &files,
+    )
+    .expect("the document is written");
+    let doc = read(&root, "bound").expect("the document is read back");
+    assert_eq!(doc.kind, ruddy::artifact::Kind::Executable);
+    assert_eq!(doc.target, Some(ruddy_cli::Target::Js));
+    assert_eq!(doc.platform, Some(ruddy_cli::Platform::Web));
+    assert_eq!(doc.integers, Some(32));
+
+    write(
+        &root,
+        "free",
+        "free",
+        "0.1.0",
+        "main.rud",
+        &Default::default(),
+        &Default::default(),
+        &Default::default(),
+        &files,
+    )
+    .expect("the document is written");
+    let doc = read(&root, "free").expect("the document is read back");
+    assert_eq!(doc.target, None);
+    assert_eq!(doc.integers, None);
+    let manifest = std::fs::read_to_string(root.join("free/Ruddy.toml")).unwrap();
+    assert!(!manifest.contains("integers"), "{manifest}");
 }
 
 #[test]

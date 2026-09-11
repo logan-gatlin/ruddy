@@ -34,6 +34,7 @@ const state = {
   kind: "library",
   target: null,
   platform: null,
+  integers: null,
   /// Runtime configuration is not used by snapshots, but is preserved when
   /// debugger documents are loaded and saved.
   run: {},
@@ -284,6 +285,7 @@ async function openDoc(name) {
   state.kind = configured?.kind ?? "library";
   state.target = configured?.target ?? null;
   state.platform = configured?.platform ?? null;
+  state.integers = configured?.integers ?? null;
   state.run = configured?.run ?? {};
   state.std = configured?.std ?? null;
   // Older caches have no stdPrevious. A currently configured custom source is
@@ -347,6 +349,7 @@ function sameDocumentConfiguration(cache, server, documentName) {
     (cache.kind ?? "library") === (server.kind ?? "library") &&
     (cache.target ?? null) === (server.target ?? null) &&
     (cache.platform ?? null) === (server.platform ?? null) &&
+    (cache.integers ?? null) === (server.integers ?? null) &&
     JSON.stringify(cache.run ?? {}) === JSON.stringify(server.run ?? {}) &&
     JSON.stringify(cache.std ?? null) === JSON.stringify(server.std ?? null) &&
     sameFiles(cache.files ?? [], server.files ?? []) &&
@@ -373,6 +376,7 @@ function cacheLocally() {
           kind: state.kind,
           target: state.target,
           platform: state.platform,
+          integers: state.integers,
           run: state.run,
           std: state.std,
           stdPrevious: state.stdPrevious,
@@ -413,6 +417,7 @@ async function saveNow() {
         kind: state.kind,
         target: state.target,
         platform: state.platform,
+        integers: state.integers,
         run: state.run,
         ...(state.std === null ? {} : { std: state.std }),
         dependencies: state.dependencies,
@@ -452,6 +457,7 @@ async function compileNow() {
         kind: state.kind,
         target: state.target,
         platform: state.platform,
+        integers: state.integers,
         document: state.doc,
         files: state.files,
         ...(state.std === null ? {} : { std: state.std }),
@@ -557,6 +563,7 @@ async function syncSharedSession(shared = null) {
   state.kind = request.kind ?? "library";
   state.target = request.target ?? null;
   state.platform = request.platform ?? null;
+  state.integers = request.integers ?? null;
   state.std = request.std ?? null;
   state.dependencies = request.dependencies ?? {};
   state.files = request.files;
@@ -691,6 +698,12 @@ function wireTitlebar() {
     scheduleSave();
     scheduleCompile();
   });
+  el("integers").addEventListener("change", event => {
+    state.integers = event.target.value ? Number(event.target.value) : null;
+    cacheLocally();
+    scheduleSave();
+    scheduleCompile();
+  });
   el("platform").addEventListener("change", event => {
     state.platform = event.target.value || null;
     cacheLocally();
@@ -753,6 +766,7 @@ function renderTitlebar() {
   el("kind").value = state.kind;
   el("target").value = state.target ?? "";
   el("platform").value = state.platform ?? "";
+  el("integers").value = state.integers === null ? "" : String(state.integers);
   el("std").textContent = state.std === null
     ? "std: default"
     : state.std === false

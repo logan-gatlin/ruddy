@@ -402,6 +402,9 @@ pub struct Doc {
     pub kind: ruddy::artifact::Kind,
     pub target: Option<ruddy_cli::Target>,
     pub platform: Option<ruddy_cli::Platform>,
+    /// The precision of `Nat` and `Int` in bits, when the document binds one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub integers: Option<u32>,
     pub name: String,
     pub bundle_name: String,
     pub version: String,
@@ -472,6 +475,8 @@ pub struct DocBody {
     pub target: Option<ruddy_cli::Target>,
     #[serde(default)]
     pub platform: Option<ruddy_cli::Platform>,
+    #[serde(default)]
+    pub integers: Option<u32>,
     /// Optional only for compatibility with saves from debugger pages opened
     /// before identity moved into document configuration.
     #[serde(default)]
