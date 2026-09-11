@@ -90,7 +90,7 @@ fn every_primitive_the_backend_declares_has_an_arity() {
             targets.push(format!("$prim.{module}.{name}"));
         }
     }
-    assert_eq!(targets.len(), 239, "the table's size changed");
+    assert_eq!(targets.len(), 240, "the table's size changed");
     for target in &targets {
         let arity = prim::arity(target)
             .unwrap_or_else(|| panic!("{target} has no implementation in the interpreter"));

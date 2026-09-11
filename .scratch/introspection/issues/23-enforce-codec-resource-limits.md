@@ -1,6 +1,6 @@
 # 23 Enforce codec resource limits before allocation
 
-Status: open
+Status: resolved
 Type: task
 Priority: P2
 
@@ -74,3 +74,32 @@ Acceptance checks:
   exceed the numeric work budget; no unchecked large allocation first.
 - Run the same portable codec programs on JS and the interpreter. Add tests
   under `tests/` and run Rust tests only through `just test`.
+
+## Answer
+
+Every limit a codec advertises is now counted, and counted before the material
+that would exceed it is built.
+
+Both writers keep a running byte total and a member count. Emitting checks the
+budget before the bytes are kept, so output past it is never held and a
+failure leaves no partial document; the JSON writer counts the bytes its text
+will be, delimiters and escapes among them, since every emission goes through
+the same place. A field and an element each count as one member.
+
+Both readers measure their input first: the binary decoder against the byte
+budget before any of the document is read, and the JSON reader in UTF-8 bytes
+rather than in scalars. `std::str::utf8_len` is the new portable primitive
+that says how many bytes text is, implemented on both backends, and UTF-8 is
+what the byte budget means everywhere.
+
+A versioned binary document's header comes out of the same budget as its body,
+rather than each getting one of its own.
+
+Regression: `codec_limits_are_counted_before_the_work` in
+`tests/src/interp.rs` exercises each budget at the boundary, one unit short of
+it, and at zero, with the others left permissive so the failing budget is the
+one under test: JSON output bytes (`[1,2]` is five), JSON members (two
+elements need two), binary output bytes (the document is twenty), binary
+members, binary input bytes, and JSON input bytes, where `"😀"` is three
+scalars in six bytes and a budget of five refuses it. The two encoders in the
+ticket are the zero cases. Both backends are run and held against each other.

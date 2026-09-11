@@ -189,8 +189,8 @@ fn real_arity(name: &str) -> Option<usize> {
 
 fn text_arity(name: &str) -> Option<usize> {
     match name {
-        "len" | "from_nat" | "from_int" | "from_real" | "trim" | "trim_start" | "trim_end"
-        | "to_lowercase" | "to_uppercase" | "reverse" => Some(1),
+        "len" | "utf8_len" | "from_nat" | "from_int" | "from_real" | "trim" | "trim_start"
+        | "trim_end" | "to_lowercase" | "to_uppercase" | "reverse" => Some(1),
         "concat"
         | "ordering_less_than"
         | "ordering_greater_than"
@@ -479,6 +479,8 @@ fn text(name: &str, args: &[Value]) -> Result<Value, String> {
     Ok(match name {
         "concat" => Value::string(&format!("{value}{}", args[1].as_str()?)),
         "len" => Value::Nat(value.chars().count() as u64),
+        // A Rust string is already UTF-8, so its own length is the count.
+        "utf8_len" => Value::Nat(value.len() as u64),
         "ordering_less_than" => Value::Bool(value < args[1].as_str()?),
         "ordering_greater_than" => Value::Bool(value > args[1].as_str()?),
         "contains" => Value::Bool(value.contains(args[1].as_str()?)),

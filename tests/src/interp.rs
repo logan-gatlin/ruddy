@@ -1147,6 +1147,95 @@ let too_long = as_binary (of_length 4294967296n [])
     );
 }
 
+/// The limits a codec advertises are counted before the material that would
+/// exceed them is built, and each one is checked on its own.
+#[test]
+fn codec_limits_are_counted_before_the_work() {
+    let source = r#"
+@private
+let numbers: [Nat] = [1n, 2n]
+@private
+let writer: std::codec::Encoder [Nat] = match
+  std::codec::derive_encoder (std::reflect::type_of numbers) with
+| #Some encoder => encoder
+| #Error _ => { schema: std::reflect::describe (std::reflect::type_of numbers), run: fn _ => #Some () }
+end
+@private
+let reader: std::codec::Decoder [Nat] = match
+  std::codec::derive_decoder (std::reflect::mirror ()) with
+| #Some decoder => decoder
+| #Error _ => { schema: std::reflect::describe (std::reflect::type_of numbers), run: fn _ => #Some [] }
+end
+@private
+let as_text: Nat -> Nat -> Nat -> String = fn bytes members digits =>
+  match std::json::encode_with
+    writer
+    { depth: 10n, bytes: bytes, members: members, digits: digits }
+    numbers with
+  | #Some out => out
+  | #Error _ => "refused"
+  end
+@private
+let as_bytes: Nat -> Nat -> String = fn bytes members =>
+  match std::binary::encode_with writer { depth: 10n, bytes: bytes, members: members } numbers with
+  | #Some out => std::str::from_nat (std::array::len out)
+  | #Error _ => "refused"
+  end
+@private
+let written: [Nat8] = match std::binary::encode_with writer std::binary::default_limits numbers with
+| #Some out => out
+| #Error _ => []
+end
+@private
+let read_within: Nat -> String = fn bytes =>
+  match std::binary::decode_with reader { depth: 10n, bytes: bytes, members: 10n } written with
+  | #Some _ => "read"
+  | #Error _ => "refused"
+  end
+
+-- Output bytes: `[1,2]` is five, and four is one short.
+let json_bytes = std::str::join "," [as_text 5n 9n 9n, as_text 4n 9n 9n, as_text 0n 9n 9n]
+-- Members: two elements need two.
+let json_members = std::str::join "," [as_text 99n 2n 9n, as_text 99n 1n 9n, as_text 99n 0n 9n]
+-- The binary document is twenty bytes, and nineteen is one short.
+let binary_bytes = std::str::join "," [as_bytes 20n 9n, as_bytes 19n 9n, as_bytes 0n 9n]
+let binary_members = std::str::join "," [as_bytes 99n 2n, as_bytes 99n 1n]
+-- Input bytes, measured before any of the document is read.
+let binary_input = std::str::join "," [read_within 20n, read_within 19n, read_within 0n]
+-- The byte budget counts bytes, and this text is three scalars in six of them.
+@private
+let parsed: Nat -> String = fn bytes =>
+  match std::json::parse_with
+    { depth: 10n, bytes: bytes, members: 10n, digits: 10n }
+    "\"😀\"" with
+  | #Some _ => "read"
+  | #Error _ => "refused"
+  end
+let json_input = std::str::join "," [parsed 6n, parsed 5n, parsed 3n]
+"#;
+    let exports = [
+        "json_bytes",
+        "json_members",
+        "binary_bytes",
+        "binary_members",
+        "binary_input",
+        "json_input",
+    ];
+    let (node, interpreted) = both(source, &exports, None);
+    assert_eq!(node, interpreted);
+    assert_eq!(
+        interpreted,
+        vec![
+            "\"[1,2],refused,refused\"",
+            "\"[1,2],refused,refused\"",
+            "\"20,refused,refused\"",
+            "\"20,refused\"",
+            "\"read,refused,refused\"",
+            "\"read,refused,refused\"",
+        ]
+    );
+}
+
 #[test]
 fn a_host_value_the_interpreter_does_not_provide_is_named() {
     let mut program = load(

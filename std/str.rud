@@ -1,6 +1,9 @@
 extern concat: fn(String, String) -> String = "$prim.str.concat"
 @doc "The number of Unicode scalar values in the text: `\"😀\"` has length one."
 extern len: fn(String) -> Nat = "$prim.str.len"
+
+@doc "How many bytes this text is as UTF-8. Scalars are what `len` counts; this is what a byte budget counts, and what crosses a binary boundary."
+extern utf8_len: fn(String) -> Nat = "$prim.str.utf8_len"
 let is_empty: String -> Bool = fn value => match value with | "" => true | _ => false end
 
 extern from_nat: fn(Nat) -> String = "$prim.str.from_nat"

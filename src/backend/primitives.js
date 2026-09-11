@@ -664,6 +664,9 @@ const $prim = {
     len: (
       value => { let count = 0; for (const _ of value) count++; return count; }
     ),
+    utf8_len: (
+      value => { let count = 0; for (const scalar of value) { const code = scalar.codePointAt(0); count += code < 0x80 ? 1 : code < 0x800 ? 2 : code < 0x10000 ? 3 : 4; } return count; }
+    ),
     from_nat: (
       value => String(value)
     ),

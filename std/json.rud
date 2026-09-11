@@ -616,7 +616,7 @@ end
 let parse_with: Limits -> String -> Result Value Error = fn limits input =>
   result::map_error
     (fn error => #Codec error)
-    (if nat::greater_than (str::len input) limits.bytes then
+    (if nat::greater_than (str::utf8_len input) limits.bytes then
       limit "a document longer than the limit"
     else
       chain
@@ -947,7 +947,7 @@ let read_document: codec::Decoder 'a -> Limits -> String -> Result 'a Error =
 @doc "Read a value with a decoder from a JSON document, within the limits: the strict structural profile, which takes records as objects, sums as `{ \"tag\", \"value\" }` objects, and refuses unknown, repeated, and missing fields, and anything after the one document."
 let decode_with: codec::Decoder 'a -> Limits -> String -> Result 'a Error =
   fn decoder limits input =>
-    if nat::greater_than (str::len input) limits.bytes then
+    if nat::greater_than (str::utf8_len input) limits.bytes then
       #Error (#Codec { path: [], kind: #Limit "a document longer than the limit" })
     else read_document decoder limits input
     end
@@ -969,10 +969,29 @@ let encode_with: codec::Encoder 'a -> Limits -> 'a -> Result String Error =
     let serial = mut 0n
     let pending = mut false
     let done = mut false
-    let emit = fn text => do
-      _ = out := array::push (~out) text
-      return ()
-    end
+    let written_bytes = mut 0n
+    let members = mut 0n
+    -- The budget counts the bytes the text will be, delimiters and escapes among them, before any
+    -- of it is kept: a failure leaves no output.
+    let emit = fn text =>
+      if nat::greater_than (nat::add (~written_bytes) (str::utf8_len text)) limits.bytes then
+        limit "more output than the byte limit"
+      else
+        do
+          _ = written_bytes := nat::add (~written_bytes) (str::utf8_len text)
+          _ = out := array::push (~out) text
+          return #Some ()
+        end
+      end
+    let counted = fn _ =>
+      if nat::greater_than_or_equal (~members) limits.members then
+        limit "more members than the limit"
+      else
+        do
+          _ = members := nat::add (~members) 1n
+          return #Some ()
+        end
+      end
     let top = fn kind cursor => match ~stack with
     | [frame, ..] =>
       if nat::equal frame.serial cursor.frame then
@@ -1000,19 +1019,22 @@ let encode_with: codec::Encoder 'a -> Limits -> 'a -> Result String Error =
       _ = if nat::is_zero (array::len (~stack)) then done := true else ~done end
       return #Some ()
     end
-    let scalar = fn text => chain (fn _ => do _ = emit text return written () end) (expect_value ())
+    let scalar = fn text =>
+      chain (fn _ => chain (fn _ => written ()) (emit text)) (expect_value ())
     let open = fn kind declared opener => chain
       (fn _ =>
         if nat::greater_than_or_equal (array::len (~stack)) limits.depth then
           limit "a value nested too deeply"
         else
-          do
-            _ = serial := nat::add (~serial) 1n
-            _ = stack := [{ serial: ~serial, kind: kind, count: 0n, declared: declared }, ..~stack]
-            _ = pending := false
-            _ = emit opener
-            return #Some { frame: ~serial }
-          end
+          chain
+            (fn _ => do
+              _ = serial := nat::add (~serial) 1n
+              _ = stack
+                := [{ serial: ~serial, kind: kind, count: 0n, declared: declared }, ..~stack]
+              _ = pending := false
+              return #Some { frame: ~serial }
+            end)
+            (emit opener)
         end)
       (expect_value ())
     let close = fn kind cursor expected closer => chain
@@ -1020,24 +1042,28 @@ let encode_with: codec::Encoder 'a -> Limits -> 'a -> Result String Error =
         if ~pending then protocol "a value is still expected"
         else if not nat::equal frame.count expected then protocol "the frame is not complete"
         else
-          do
-            _ = stack := match ~stack with | [_, ..rest] => rest | [] => [] end
-            _ = emit closer
-            return written ()
-          end
+          chain
+            (fn _ => do
+              _ = stack := match ~stack with | [_, ..rest] => rest | [] => [] end
+              return written ()
+            end)
+            (emit closer)
         end)
       (top kind cursor)
-    let separate = fn frame => do
-      _ = if nat::is_zero frame.count then () else emit "," end
-      _ = replace_top {
-        serial: frame.serial,
-        kind: frame.kind,
-        count: nat::add frame.count 1n,
-        declared: frame.declared,
-      }
-      _ = pending := true
-      return #Some ()
-    end
+    let separate = fn frame => chain
+      (fn _ => chain
+        (fn _ => do
+          _ = replace_top {
+            serial: frame.serial,
+            kind: frame.kind,
+            count: nat::add frame.count 1n,
+            declared: frame.declared,
+          }
+          _ = pending := true
+          return #Some ()
+        end)
+        (if nat::is_zero frame.count then #Some () else emit "," end))
+      (counted ())
     return match handle encoder.run value with
     | codec::!Write.write_bool b => scalar (str::from_boolean b)
     | codec::!Write.write_nat n => scalar (str::from_nat n)
@@ -1056,7 +1082,7 @@ let encode_with: codec::Encoder 'a -> Limits -> 'a -> Result String Error =
           if ~pending then protocol "a value is still expected"
           else
             chain
-              (fn _ => do _ = emit (str::concat (quote field.name) ":") return #Some () end)
+              (fn _ => emit (str::concat (quote field.name) ":"))
               (separate frame)
           end)
         (top (#Record) field.cursor)
@@ -1081,11 +1107,12 @@ let encode_with: codec::Encoder 'a -> Limits -> 'a -> Result String Error =
     | codec::!Write.begin_variant opened =>
       if array::any (fn known => str::equal known opened.tag) opened.schema.cases then
         chain
-          (fn cursor => do
-            _ = emit (str::concat "\"tag\":" (str::concat (quote opened.tag) ",\"value\":"))
-            _ = pending := true
-            return #Some cursor
-          end)
+          (fn cursor => chain
+            (fn _ => do
+              _ = pending := true
+              return #Some cursor
+            end)
+            (emit (str::concat "\"tag\":" (str::concat (quote opened.tag) ",\"value\":"))))
           (open (#Variant) 0n "{")
       else protocol (str::concat "not a case of the sum: " opened.tag)
       end
