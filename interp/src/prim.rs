@@ -142,6 +142,9 @@ fn json_arity(name: &str) -> Option<usize> {
 /// hold the same families, but only the signed one negates and takes an
 /// absolute value, and each converts to the integer type it belongs to.
 fn integral_arity(signed: bool, name: &str) -> Option<usize> {
+    if !signed && name == "xor64" {
+        return Some(2);
+    }
     let (stem, width) = widthed(name);
     let fixed = width.is_some();
     match (stem, fixed, signed) {
@@ -383,6 +386,7 @@ fn fixed(kind: FixedInt, name: &str, args: &[Value], domains: Domains) -> Result
     let signed = kind.signed();
     let whole = |value: i128| Value::Fixed(kind, wrap(kind, value));
     Ok(match (name, signed) {
+        ("xor", false) if kind == FixedInt::Nat64 => whole(left ^ args[1].as_integer()?),
         ("add", _) => whole(left + args[1].as_integer()?),
         ("subtract", _) => whole(left - args[1].as_integer()?),
         ("multiply", _) => whole(left.wrapping_mul(args[1].as_integer()?)),

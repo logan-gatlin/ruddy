@@ -59,6 +59,7 @@ The same import style is used in the [FizzBuzz example](hello-world.md#try-fizzb
 | `std::array` | Operations on immutable arrays |
 | `std::option`, `std::result` | Operations on optional values and results |
 | `std::order` | Comparison results, comparison functions, and derived comparisons |
+| `std::hash` | Pure, seeded structural hashing with errors for unsupported values |
 | `std::tuple`, `std::function` | Tuple and function helpers |
 | `std::cell` | Mutable cell operations |
 | `std::io`, `std::fs`, `std::process` | Output, filesystem operations, and process operations |
@@ -69,6 +70,26 @@ Array and string lengths use `array::len` and `str::len` after importing those m
 The `order` module provides `Ordering`, the type of a comparison function, while `Order` describes its result.
 The numeric and string modules expose `compare` and comparisons such as `equal`, `less_than`, and `greater_than_or_equal`.
 `order::PartialOrder` adds `#Unordered` to the three total-order results. `order::compare` compares values structurally using reflection, and supplies the six infix comparison operators. `real::compare` is partial too: NaNs are unordered and signed zeros are equal. Use `real::total_compare` when sorting requires a total ordering.
+
+`hash::hash` produces a `Result Nat64 hash::Error` through the same typed reflection
+views. For equal values at a shared static type, successful hashes agree when
+the seed agrees. `hash::hash_seeded` accepts a collection's seed, and
+`hash::hash_with` also accepts an explicit mirror. Hashes are ordinary
+noncryptographic collection hashes, with no promise of stability across releases
+or resistance to deliberate collisions. A collection must still compare keys
+after matching hashes.
+
+Hashing rejects NaNs and encountered opaque values, including cells, functions,
+mirrors, and hidden packages. Errors carry a root-to-leaf field, case, and array
+index path. An empty array or an inactive unsupported sum case does not fail.
+Signed zeros hash equally. Open a hidden package that carries a mirror to hash
+its value explicitly.
+
+The implementation threads an immutable FNV-1a 64 accumulator through reflection.
+This keeps the public operation pure and the traversal explicit. Local mutation
+could preserve that same public contract, but is unnecessary for the first
+implementation. A hashing effect could separate traversal from interchangeable
+handlers; it is deferred until there is a consumer for that protocol.
 Opened existential types need a mirror carried by their package before they can be compared. This also applies when the opened type occurs inside a function type; comparisons retain reflection’s existing evidence requirements.
 For example, a comparison can check whether a natural number is below a limit:
 

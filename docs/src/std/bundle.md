@@ -19,6 +19,7 @@ stdReference: true
 [ffi](ffi.md)\
 [fs](fs.md)\
 [function](function.md)\
+[hash](hash.md)\
 [http](http.md)\
 [int](int.md)\
 [io](io.md)\

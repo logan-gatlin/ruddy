@@ -1362,6 +1362,174 @@ fn a_program_that_is_not_linked_is_refused() {
 }
 
 #[test]
+fn structural_hashing_is_pure_seeded_and_normalizes_signed_zero() {
+    let (node, interpreted) = both(
+        r#"
+@private
+let hash: 'a -> Result Nat64 std::hash::Error + | = fn value => std::hash::hash value
+let zeros = hash -0.0 == hash 0.0
+let repeat = hash "hé😀" == hash "hé😀"
+let supported = std::result::is_ok (hash 18446744073709551615n64)
+let explicit = std::hash::hash_with (std::reflect::mirror ()) std::hash::default_seed 42n == hash 42n
+let seeded = std::hash::hash_seeded 1n64 "hello" != std::hash::hash_seeded 2n64 "hello"
+let nan = match hash (0 / 0) with
+| #Error { path: [], kind: #NaN } => true
+| _ => false
+end
+"#,
+        &["zeros", "repeat", "supported", "explicit", "seeded", "nan"],
+        None,
+    );
+    assert_eq!(node, ["true"; 6]);
+    assert_eq!(interpreted, node);
+}
+
+#[test]
+fn structural_hashing_frames_records_arrays_and_recursive_variants() {
+    let (node, interpreted) = both(
+        r#"
+@private
+let hash = fn value => std::hash::hash value
+type Tree = #Leaf Nat | #Branch [Tree]
+@private
+let tree: Tree = #Branch [#Leaf 1n, #Branch [#Leaf 2n]]
+let recursive = std::result::is_ok (hash tree) and hash tree == hash tree
+let records = hash { z: [1n, 2n], a: "é" } == hash { a: "é", z: [1n, 2n] }
+let zeros = hash { points: [#Point -0.0] } == hash { points: [#Point 0.0] }
+let boundaries = hash ["ab", "c"] != hash ["a", "bc"]
+let order = hash [1n, 2n] != hash [2n, 1n]
+let length = hash [1n] != hash [1n, 0n]
+let names = hash { a: 1n } != hash { b: 1n }
+let cases = hash (#A 1n) != hash (#B 1n)
+@private
+let empty_array: [Nat] = []
+let empty = std::result::is_ok (hash ()) and std::result::is_ok (hash empty_array)
+"#,
+        &[
+            "recursive",
+            "records",
+            "zeros",
+            "boundaries",
+            "order",
+            "length",
+            "names",
+            "cases",
+            "empty",
+        ],
+        None,
+    );
+    assert_eq!(node, ["true"; 9]);
+    assert_eq!(interpreted, node);
+}
+
+#[test]
+fn structural_hashing_reports_paths_without_observing_opaque_values() {
+    let (node, interpreted) = both(
+        r#"
+@private
+let hash = fn value => std::hash::hash value
+let nested = match hash { items: [#Reading 1.0, #Reading (0 / 0)] } with
+| #Error { path: [#Field "items", #Index 1n, #Case "Reading"], kind: #NaN } => true
+| _ => false
+end
+@private
+let callback: Nat -> Nat = fn x => x
+let function = match hash { callback: callback } with
+| #Error { path: [#Field "callback"], kind: #Unsupported #Function } => true
+| _ => false
+end
+@private
+let empty_functions: [Nat -> Nat] = []
+type Choice = #Data Nat | #Callback (Nat -> Nat)
+@private
+let inactive: Choice = #Data 7n
+let unvisited = std::result::is_ok (hash empty_functions) and std::result::is_ok (hash inactive)
+@private
+let run = fn _ => do
+  let cell = mut 1n
+  let before = hash cell
+  _ = cell := 2n
+  return match (before, hash cell) with
+  | (#Error { path: [], kind: #Unsupported #Foreign }, #Error { path: [], kind: #Unsupported #Foreign }) => true
+  | _ => false
+  end
+end
+let cell = run ()
+@private
+let witness: Mirror Nat = std::reflect::mirror ()
+let mirror = match hash witness with
+| #Error { path: [], kind: #Unsupported #Mirror } => true
+| _ => false
+end
+type Boxed = hide 'a => { mirror: Mirror 'a, value: 'a }
+@private
+let boxed: Boxed = { mirror: std::reflect::mirror (), value: 42n }
+let hidden = match hash boxed with
+| #Error { path: [], kind: #Unsupported #Hidden } => true
+| _ => false
+end
+let opened = match boxed with
+| hide 'a { mirror, value } => std::hash::hash_with mirror std::hash::default_seed value == hash 42n
+end
+let foreign = match std::ffi::encode 1n with
+| #Some value => match hash value with
+  | #Error { path: [], kind: #Unsupported #Foreign } => true
+  | _ => false
+  end
+| #Error _ => false
+end
+"#,
+        &[
+            "nested",
+            "function",
+            "unvisited",
+            "cell",
+            "mirror",
+            "hidden",
+            "opened",
+            "foreign",
+        ],
+        None,
+    );
+    assert_eq!(node, ["true"; 8]);
+    assert_eq!(interpreted, node);
+}
+
+#[test]
+fn structural_hashing_preserves_fixed_width_values_across_target_domains() {
+    let source = r#"
+@private
+let hash = fn value => std::hash::hash value
+@private
+let results = [
+  hash 0n, hash 4294967295n, hash -2147483648i, hash 2147483647i,
+  hash 0n8, hash 255n8, hash 0n16, hash 65535n16,
+  hash 0n32, hash 4294967295n32, hash 0n64, hash 18446744073709551615n64,
+  hash -128i8, hash 127i8, hash -32768i16, hash 32767i16,
+  hash -2147483648i32, hash 2147483647i32,
+  hash -9223372036854775808i64, hash 9223372036854775807i64,
+  hash false, hash true, hash "", hash "é😀", hash (1 / 0), hash (-1 / 0),
+]
+let supported = std::array::all std::result::is_ok results
+let hashes = std::array::map
+  (fn result => std::nat::to_string64 (std::result::unwrap_or 0n64 result)) results
+let kinds = hash 1n != hash 1n64 and hash 1i8 != hash 1n8
+let extremes = hash -9223372036854775808i64 != hash 9223372036854775807i64
+let vectors = hash false == #Some 586857767355016009n64 and hash true == #Some 586856667843387798n64
+"#;
+    // FNV-1a known answers for the Boolean frames 04 00 and 04 01.
+    // Export hashes as decimal text so Node's JSON does not narrow BigInts.
+    let exports = ["supported", "hashes", "kinds", "extremes", "vectors"];
+    let (node, interpreted) = both(source, &exports, None);
+    assert_eq!(node[0], "true");
+    assert_eq!(&node[2..], ["true"; 3]);
+    assert_eq!(interpreted, node);
+    let (narrow_node, narrow_interpreted) = both(source, &exports, Some(32));
+    assert_eq!(narrow_node, node);
+    assert_eq!(narrow_interpreted, node);
+}
+
+#[test]
 fn real_partial_comparisons_make_nan_unordered_and_signed_zeros_equal() {
     let (node, interpreted) = both(
         r#"

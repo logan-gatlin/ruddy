@@ -504,6 +504,9 @@ const $prim = {
     multiply64: (
       (left, right) => BigInt.asUintN(64, left * right)
     ),
+    xor64: (
+      (left, right) => BigInt.asUintN(64, left ^ right)
+    ),
     divide64: (
       (left, right) => BigInt.asUintN(64, left / right)
     ),
