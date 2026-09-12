@@ -1,3 +1,9 @@
+@doc "Formats any value on one line. See `std::str::debug` for formatting conventions."
+let debug = str::debug
+
+@doc "Pretty prints any value as indented Ruddy-like text. See `std::str::display` for formatting conventions."
+let display = str::display
+
 @doc "Writes text to standard output."
 let print = io::print
 @doc "Writes text to standard error."

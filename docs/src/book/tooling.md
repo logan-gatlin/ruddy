@@ -32,7 +32,10 @@ let status = "Arena ready"
 The language server checks the chapter definitions as they are edited and shows inferred types on hover.
 After saving, `ruddy run` executes the entry point to inspect a result.
 `ruddy check` remains useful for scripted verification and environments without an editor integration.
-The entry point can be changed to print a chapter result, using an explicit conversion such as `std::str::from_nat` when it is not a string.
+To inspect a chapter result of any type, pass it through `display`, for example `println (display examples::status)`.
+[`display`](../std/str.md#display) formats structured values with indentation, quotes strings, and preserves numeric suffixes.
+Use [`debug`](../std/str.md#debug) in the same way for single-line output.
+Use `println examples::status` when the result is already text that should be printed directly.
 An expected type-error example should be tried separately from the valid definitions.
 
 The private module keeps exploratory definitions inside the Ruddy bundle.

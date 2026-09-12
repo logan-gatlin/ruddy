@@ -11,7 +11,8 @@ Examples below are independent unless a chapter definition is explicitly mention
 ## Getting started
 
 Changing `player.health` leaves the result unchanged because `display_name` reads only `name`.
-Changing its body to `std::str::from_nat entity.health` changes the required field and the result.
+Changing its body to `display entity.health` changes the required field and prints `100n`.
+`display` preserves the natural-number suffix; `std::str::from_nat` produces plain decimal text when that is the desired format.
 Removing that field makes the supplied struct unable to satisfy the access in the function body.
 
 ## Expressions

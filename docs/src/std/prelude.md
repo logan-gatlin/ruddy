@@ -84,6 +84,22 @@ Writes text to standard output or standard error.
 
 ## Values
 
+### debug
+
+```ruddy
+let debug: 'a -> String
+```
+
+Formats any value on one line. See `std::str::debug` for formatting conventions.
+
+### display
+
+```ruddy
+let display: 'a -> String
+```
+
+Pretty prints any value as indented Ruddy-like text. See `std::str::display` for formatting conventions.
+
 ### drop
 
 ```ruddy

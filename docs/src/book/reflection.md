@@ -24,18 +24,19 @@ A displayable package contains a value and a function that accepts exactly that 
 ```ruddy
 type Displayable = hide 'a => { value: 'a, show: 'a -> String }
 
-let lives_display: Displayable = { value: 3n, show: std::str::from_nat }
-let enemy_display: Displayable = { value: "slime", show: fn text => text }
+let lives_display: Displayable = { value: 3n, show: display }
+let enemy_display: Displayable = { value: "slime", show: display }
 ```
 
 The packages choose different types, but both have the public type `Displayable`.
+The prelude's `display` specializes to each packaged value's type: it produces `3n` for the lives and `"slime"` (including quotes) for the enemy name.
 The annotation supplies the expected hidden type at the packaging boundary.
 The compiler obtains the particular hidden type from the value; it does not guess one for an ambiguous empty value.
 
 A consumer opens the package inside a pattern:
 
 ```ruddy
-let display: Displayable -> String = fn item => match item with
+let render_item: Displayable -> String = fn item => match item with
 | hide 'item { value, show } => show value
 end
 ```
@@ -43,6 +44,7 @@ end
 Within the arm, `'item` names one type shared by `value` and the argument of `show`.
 The consumer need not know whether that type is `Nat` or `String`.
 Returning `value` directly would let an unknown type escape its scope and is rejected; returning the string produced by `show` is valid.
+`render_item` calls the operation stored in the package. Calling `display item` instead would print `<hidden>`; this package does not carry the mirror evidence needed to call `display value` after opening it.
 An array of `Displayable` packages can therefore be heterogeneous internally while retaining one array element type.
 
 ## Evidence for a type
@@ -60,6 +62,60 @@ The description is ordinary data describing a finite graph of type structure.
 It can be inspected, but editing it cannot create a new mirror or authorize a conversion.
 `reflect::type_of value` obtains a mirror of the value's static type at that use; it does not discover an arbitrary new type by examining host data.
 The [Reflect](../std/reflect.md) reference separates descriptions from typed views.
+
+## Pretty printing arbitrary values
+
+`display: 'a -> String`, also available as `std::str::display`, uses reflection
+to print a value's structure. For example:
+
+```ruddy
+let description = std::str::display { name: "Ada", scores: [3n, 5n] }
+```
+
+The resulting string is:
+
+```text
+{
+    name: "Ada",
+    scores: [
+        3n,
+        5n,
+    ],
+}
+```
+
+For a compact, single-line representation, use `debug` or `std::str::debug`:
+
+```ruddy
+let compact = debug { name: "Ada", scores: [3n, 5n] }
+```
+
+This returns `{ name: "Ada", scores: [3n, 5n] }`. Both functions use the same
+value conventions and escape newlines inside strings. `debug` separates elements
+with a comma and a space; only singleton tuples retain a trailing comma, as in
+`(3n,)`.
+
+Nonempty arrays, tuples, and records expand onto separate lines with four spaces
+per indentation level and trailing commas. Empty arrays print as `[]`; unit
+and empty records print as `()`. Named fields are sorted by Unicode scalar order,
+and tuple elements keep their positional order. Tags use Ruddy syntax, such as
+`#None` or `#Some 3n`; a unit payload is omitted.
+
+Strings are quoted with JSON-style escaping, including when printed on their own.
+Integer suffixes preserve their types, negative real zero prints as `-0`, and
+non-finite reals print as `NaN`, `Infinity`, or `-Infinity`. Output has no final
+newline and is not truncated. It is diagnostic text, not a serialization format.
+
+Functions print as `<function>`. Hidden packages, mirrors, and foreign values
+(including mutable cells) print as `<hidden>`, `<mirror>`, and `<foreign>`.
+Displaying a hidden package does not open it. To display its contents, open a
+package that carries mirror evidence, such as `Any`:
+
+```ruddy
+let contents = match std::any::upcast [1n, 2n] with
+| hide 'a { mirror, value } => std::str::display value
+end
+```
 
 ## Different actor states in one update list
 

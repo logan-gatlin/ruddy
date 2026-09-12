@@ -1690,3 +1690,166 @@ end
     assert_eq!(node, ["[true,true,false,true]"]);
     assert_eq!(interpreted, node);
 }
+
+#[test]
+fn display_formats_scalars_and_opaque_values_on_both_backends() {
+    let (node, interpreted) = both(
+        r#"
+let scalars = [display 3n, display (-2i), display 3.5, display true, display false,
+  display 255n8, display 65535n16, display 4294967295n32, display 18446744073709551615n64,
+  display (-128i8), display (-32768i16), display (-2147483648i32), display (-9223372036854775808i64)]
+let reals = [display (0 / 0), display (1 / 0), display (-1 / 0), display (-0), display 0]
+let text = std::str::display "héllo 😀\n\r\t\"\\"
+let function = display (fn value => value)
+let mirror = display (std::reflect::type_of 3n)
+type Boxed = hide 'a => 'a
+@private
+let boxed: Boxed = 3n
+let hidden = display boxed
+let any = display (std::any::upcast 3n)
+@private
+let show_cell = fn _ => do
+  let cell = mut 1n
+  return display cell
+end
+let cell = show_cell ()
+"#,
+        &[
+            "scalars", "reals", "text", "function", "mirror", "hidden", "any", "cell",
+        ],
+        None,
+    );
+    let expected = vec![
+        serde_json::json!([
+            "3n",
+            "-2i",
+            "3.5",
+            "true",
+            "false",
+            "255n8",
+            "65535n16",
+            "4294967295n32",
+            "18446744073709551615n64",
+            "-128i8",
+            "-32768i16",
+            "-2147483648i32",
+            "-9223372036854775808i64"
+        ])
+        .to_string(),
+        serde_json::json!(["NaN", "Infinity", "-Infinity", "-0", "0"]).to_string(),
+        serde_json::to_string("\"héllo 😀\\n\\r\\t\\\"\\\\\"").unwrap(),
+        serde_json::to_string("<function>").unwrap(),
+        serde_json::to_string("<mirror>").unwrap(),
+        serde_json::to_string("<hidden>").unwrap(),
+        serde_json::to_string("<hidden>").unwrap(),
+        serde_json::to_string("<foreign>").unwrap(),
+    ];
+    assert_eq!(node, expected);
+    assert_eq!(interpreted, expected);
+}
+
+#[test]
+fn display_formats_nested_and_recursive_structures_on_both_backends() {
+    let (node, interpreted) = both(
+        r#"
+let record = display { state: #Some { callback: fn n => n }, scores: [3n, 5n], name: "Ada" }
+let empty = [display (), display {}, display [], display (#None), display (#None ())]
+let tuples = [display (1n,), display (0n, 1n, 2n, 3n, 4n, 5n, 6n, 7n, 8n, 9n, 10n)]
+let labels = display { "let": 1n, "two words": "yes", "😀": true }
+let nested_tag = display (#Some (#Some 1n))
+type Tree = #Leaf Nat | #Branch [Tree]
+@private
+let tree: Tree = #Branch [#Leaf 1n, #Branch [#Leaf 2n]]
+let recursive = display tree
+@private
+let show: 'a -> String = fn value => display value
+let generic = [show 1n, show "ok", show (#Some 2n)]
+let opened = match std::any::upcast { n: 7n } with
+| hide 'a { mirror, value } => display value
+end
+"#,
+        &[
+            "record",
+            "empty",
+            "tuples",
+            "labels",
+            "nested_tag",
+            "recursive",
+            "generic",
+            "opened",
+        ],
+        None,
+    );
+    let expected = vec![
+        serde_json::to_string("{\n    name: \"Ada\",\n    scores: [\n        3n,\n        5n,\n    ],\n    state: #Some {\n        callback: <function>,\n    },\n}").unwrap(),
+        serde_json::json!(["()", "()", "[]", "#None", "#None"]).to_string(),
+        serde_json::json!(["(\n    1n,\n)", "(\n    0n,\n    1n,\n    2n,\n    3n,\n    4n,\n    5n,\n    6n,\n    7n,\n    8n,\n    9n,\n    10n,\n)"]).to_string(),
+        serde_json::to_string("{\n    \"let\": 1n,\n    \"two words\": \"yes\",\n    \"😀\": true,\n}").unwrap(),
+        serde_json::to_string("#Some (#Some 1n)").unwrap(),
+        serde_json::to_string("#Branch [\n    #Leaf 1n,\n    #Branch [\n        #Leaf 2n,\n    ],\n]").unwrap(),
+        serde_json::json!(["1n", "\"ok\"", "#Some 2n"]).to_string(),
+        serde_json::to_string("{\n    n: 7n,\n}").unwrap(),
+    ];
+    assert_eq!(node, expected);
+    assert_eq!(interpreted, expected);
+}
+
+#[test]
+fn display_formats_compact_debug_on_both_backends() {
+    let (node, interpreted) = both(
+        r#"
+let record = debug { state: #Some { callback: fn n => n }, scores: [3n, 5n], name: "Ada" }
+let empty = [debug (), debug {}, debug [], debug (#None), debug (#None ())]
+let tuples = [debug (1n,), debug (0n, 1n, 2n, 3n, 4n, 5n, 6n, 7n, 8n, 9n, 10n)]
+let labels = debug { "let": 1n, "two words": "yes", "😀": true }
+let nested_tag = debug (#Some (#Some 1n))
+type Tree = #Leaf Nat | #Branch [Tree]
+@private
+let tree: Tree = #Branch [#Leaf 1n, #Branch [#Leaf 2n]]
+let recursive = std::str::debug tree
+let scalar = debug (18446744073709551615n64, -9223372036854775808i64, -0, 0 / 0, 1 / 0, -1 / 0, "héllo 😀\n\r\t\"\\")
+@private
+let show: 'a -> String = fn value => debug value
+let generic = [show 1n, show "ok", show (#Some 2n)]
+let opened = match std::any::upcast { n: 7n } with
+| hide 'a { mirror, value } => debug value
+end
+let opaque = [debug (fn x => x), debug (std::reflect::type_of 3n), debug (std::any::upcast 3n)]
+@private
+let show_cell = fn _ => do
+  let cell = mut 1n
+  return debug cell
+end
+let cell = show_cell ()
+"#,
+        &[
+            "record",
+            "empty",
+            "tuples",
+            "labels",
+            "nested_tag",
+            "recursive",
+            "scalar",
+            "generic",
+            "opened",
+            "opaque",
+            "cell",
+        ],
+        None,
+    );
+    let expected = vec![
+        serde_json::to_string("{ name: \"Ada\", scores: [3n, 5n], state: #Some { callback: <function> } }").unwrap(),
+        serde_json::json!(["()", "()", "[]", "#None", "#None"]).to_string(),
+        serde_json::json!(["(1n,)", "(0n, 1n, 2n, 3n, 4n, 5n, 6n, 7n, 8n, 9n, 10n)"]).to_string(),
+        serde_json::to_string("{ \"let\": 1n, \"two words\": \"yes\", \"😀\": true }").unwrap(),
+        serde_json::to_string("#Some (#Some 1n)").unwrap(),
+        serde_json::to_string("#Branch [#Leaf 1n, #Branch [#Leaf 2n]]").unwrap(),
+        serde_json::to_string("(18446744073709551615n64, -9223372036854775808i64, -0, NaN, Infinity, -Infinity, \"héllo 😀\\n\\r\\t\\\"\\\\\")").unwrap(),
+        serde_json::json!(["1n", "\"ok\"", "#Some 2n"]).to_string(),
+        serde_json::to_string("{ n: 7n }").unwrap(),
+        serde_json::json!(["<function>", "<mirror>", "<hidden>"]).to_string(),
+        serde_json::to_string("<foreign>").unwrap(),
+    ];
+    assert_eq!(node, expected);
+    assert_eq!(interpreted, expected);
+}

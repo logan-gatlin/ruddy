@@ -141,3 +141,206 @@ let slice_with: String -> { start when 'start: Nat, stop when 'stop: Nat } -> St
   | { stop } => slice value 0n stop
   | { start, stop } => slice value start stop
   end
+
+@private
+extern display_quote: String -> String = "$prim.json.quote"
+
+-- Labels outside the portable ASCII identifier subset remain readable quoted.
+@private
+let display_label: String -> String = fn name => do
+  let letters = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_"
+  let digits = "0123456789"
+  let reserved = [
+    "let",
+    "extern",
+    "do",
+    "return",
+    "type",
+    "end",
+    "with",
+    "match",
+    "hide",
+    "if",
+    "then",
+    "else",
+    "fn",
+    "effect",
+    "handle",
+    "raise",
+    "and",
+    "or",
+    "xor",
+    "not",
+    "mut",
+    "module",
+    "using",
+    "true",
+    "false",
+    "_",
+  ]
+  return
+    if not is_empty name
+      and contains letters (char_at name 0n)
+      and array::all (fn ch => contains (concat letters digits) ch) (chars name)
+      and not array::any (equal name) reserved then
+      name
+    else display_quote name
+    end
+end
+
+@private
+type DisplayLayout = { multiline: Bool, indent: String }
+
+@private
+let display_child: DisplayLayout -> DisplayLayout = fn layout =>
+  if layout.multiline then { multiline: true, indent: concat layout.indent "    " }
+  else layout
+  end
+
+@private
+let display_block: String -> String -> DisplayLayout -> [String] -> String =
+  fn open close layout items => match items with
+  | [] => concat open close
+  | _ =>
+    if layout.multiline then
+      do
+        let child = concat layout.indent "    "
+        let lines = array::map (fn item => concat child (concat item ",\n")) items
+        return join "" [open, "\n", join "" lines, layout.indent, close]
+      end
+    else if equal open "{" then join "" [open, " ", join ", " items, " ", close]
+    else if equal open "(" and nat::equal (array::len items) 1n then
+      join "" [open, join "" items, ",", close]
+    else join "" [open, join ", " items, close]
+    end
+  end
+
+@private
+let display_field_name: reflect::SomeField 'a -> String = fn field => match field with
+| hide 'f { name, .. } => name
+end
+
+-- Length followed by scalar order puts canonical numeric labels in numeric order without parsing
+-- them into the target's bounded Nat type.
+@private
+let display_position_order: reflect::SomeField 'a -> reflect::SomeField 'a -> order::Order =
+  fn left right => match nat::compare
+    (len (display_field_name left))
+    (len (display_field_name right)) with
+  | #Equal => compare (display_field_name left) (display_field_name right)
+  | #Less => #Less
+  | #Greater => #Greater
+  end
+
+@private
+let display_is_tuple: [reflect::SomeField 'a] -> Nat -> Bool = fn fields index => match fields with
+| [] => true
+| [field, ..tail] =>
+  equal (display_field_name field) (from_nat index)
+    and display_is_tuple tail (nat::add index 1n)
+end
+
+@private
+let display_fields: [reflect::SomeField 'a] -> 'a -> DisplayLayout -> Bool -> [String] =
+  fn fields value layout tuple => array::map
+    (fn field => match field with
+    | hide 'f { name, mirror, read, .. } => do
+      let text = match read value with
+      | #Some item => display_value mirror item layout
+      | #None => "<absent>"
+      end
+      return if tuple then text else join "" [display_label name, ": ", text] end
+    end
+    end)
+    fields
+
+@private
+let display_record: reflect::RecordView 'a -> 'a -> DisplayLayout -> String =
+  fn view value layout =>
+    match array::sort_by display_position_order view.fields with
+    | positions =>
+      if display_is_tuple positions 0n then
+        display_block "(" ")" layout (display_fields positions value (display_child layout) true)
+      else
+        display_block
+          "{"
+          "}"
+          layout
+          (display_fields
+            (array::sort_by (order::compare_by compare display_field_name) view.fields)
+            value
+            (display_child layout)
+            false)
+      end
+    end
+
+@private
+let display_cases: [reflect::SomeCase 'a] -> 'a -> DisplayLayout -> String =
+  fn cases value layout => match cases with
+  | [] => "<unknown>"
+  | [case, ..tail] =>
+    match case with
+    | hide 'p { name, mirror, project, .. } =>
+      match project value with
+      | #None => display_cases tail value layout
+      | #Some payload => do
+        let tag = concat "#" (display_label name)
+        return match reflect::shape mirror with
+        | #Record view =>
+          if nat::equal (array::len view.fields) 0n then tag
+          else join "" [tag, " ", display_value mirror payload layout]
+          end
+        | #Sum _ => join "" [tag, " (", display_value mirror payload layout, ")"]
+        | _ => join "" [tag, " ", display_value mirror payload layout]
+        end
+      end
+      end
+    end
+  end
+
+@private
+let display_value: Mirror 'a -> 'a -> DisplayLayout -> String = fn mirror value layout =>
+  match reflect::shape mirror with
+  | #Nat { read, .. } => concat (from_nat (read value)) "n"
+  | #Int { read, .. } => concat (from_int (read value)) "i"
+  | #Real { read, .. } => do
+    let number = read value
+    return
+      if real::equal number 0 and real::less_than (real::divide 1 number) 0 then "-0"
+      else from_real number
+      end
+  end
+  | #String { read, .. } => display_quote (read value)
+  | #Bool { read, .. } => from_boolean (read value)
+  | #Nat8 { read, .. } => concat (nat::to_string8 (read value)) "n8"
+  | #Nat16 { read, .. } => concat (nat::to_string16 (read value)) "n16"
+  | #Nat32 { read, .. } => concat (nat::to_string32 (read value)) "n32"
+  | #Nat64 { read, .. } => concat (nat::to_string64 (read value)) "n64"
+  | #Int8 { read, .. } => concat (int::to_string8 (read value)) "i8"
+  | #Int16 { read, .. } => concat (int::to_string16 (read value)) "i16"
+  | #Int32 { read, .. } => concat (int::to_string32 (read value)) "i32"
+  | #Int64 { read, .. } => concat (int::to_string64 (read value)) "i64"
+  | #Array view =>
+    match view with
+    | hide 'e { element, read, .. } =>
+      display_block
+        "["
+        "]"
+        layout
+        (array::map (fn item => display_value element item (display_child layout)) (read value))
+    end
+  | #Record view => display_record view value layout
+  | #Sum view => display_cases view.cases value layout
+  | #Function _ => "<function>"
+  | #Hidden _ => "<hidden>"
+  | #Mirror _ => "<mirror>"
+  | #Foreign => "<foreign>"
+  end
+
+@doc "Pretty prints a value through reflection using Ruddy-like syntax. Nonempty arrays, tuples, and records use newlines, four-space indentation, and trailing commas; there is no final newline or truncation. Named fields use alphabetical Unicode scalar order, tuples use positional order, and unit prints as `()`. Strings are quoted and escaped; integer suffixes and negative real zero are preserved. Non-finite reals print as `NaN`, `Infinity`, or `-Infinity`. Functions, hidden packages, mirrors, and foreign values (including cells) print as `<function>`, `<hidden>`, `<mirror>`, and `<foreign>`."
+let display: 'a -> String = fn value =>
+  display_value (reflect::mirror ()) value { multiline: true, indent: "" }
+
+@doc "Formats a value on one line using the same reflection, ordering, escaping, numeric suffixes, and opaque placeholders as `display`. Collections use comma-separated elements with spaces; only a singleton tuple keeps a trailing comma. There is no final newline or truncation."
+let debug: 'a -> String = fn value =>
+  display_value (reflect::mirror ()) value { multiline: false, indent: "" }
