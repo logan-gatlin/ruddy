@@ -3579,19 +3579,18 @@ module baz = end
     assert_eq!(names, ["baz.md", "bundle.md", "foo.bar.md", "foo.md"]);
     let bundle = fs::read_to_string(directory.path().join("docs/bundle.md")).unwrap();
     assert!(bundle.starts_with("# example\n"));
-    assert!(bundle.contains("# example\n"));
-    assert!(bundle.contains("[foo](foo.md)"));
-    assert!(bundle.contains("[baz](baz.md)"));
+    assert!(bundle.contains("## Modules\n\n[baz](baz.md)\\\n[foo](foo.md)\n"));
     let foo = fs::read_to_string(directory.path().join("docs/foo.md")).unwrap();
-    assert!(foo.contains("# example::foo\n"));
+    assert!(foo.starts_with("# [example](bundle.md)::foo\n"));
     assert!(foo.contains("The **foo** module."));
-    assert!(foo.contains("[bar](foo.bar.md)"));
-    assert!(foo.contains("[Bundle](bundle.md)"));
+    assert!(foo.contains("## Modules\n\n[bar](foo.bar.md)\n"));
     assert!(!foo.contains("## Types"));
+    let bar = fs::read_to_string(directory.path().join("docs/foo.bar.md")).unwrap();
+    assert!(bar.starts_with("# [example](bundle.md)::[foo](foo.md)::bar\n"));
 }
 
 #[test]
-fn doc_describes_public_types_effects_and_values_in_source_order() {
+fn doc_describes_public_types_effects_and_values_in_alphabetical_order() {
     let directory = tempfile::tempdir().unwrap();
     let dependency = directory.path().join("dependency");
     write_project(&dependency, "dependency", "1.0.0", &[]);
@@ -3666,7 +3665,13 @@ end
     ] {
         assert!(!page.contains(hidden), "unexpected {hidden:?} in:\n{page}");
     }
-    assert!(page.find("### id").unwrap() < page.find("### later").unwrap());
+    let values = ["annotated", "first", "id", "imported", "later", "second"];
+    for pair in values.windows(2) {
+        assert!(
+            page.find(&format!("### {}", pair[0])).unwrap()
+                < page.find(&format!("### {}", pair[1])).unwrap()
+        );
+    }
     assert!(!dependency.join("docs").exists());
 }
 
@@ -3701,7 +3706,7 @@ fn doc_target_and_frontmatter_apply_from_a_subdirectory() {
     assert!(
         fs::read_to_string(directory.path().join("reference/api/child.md"))
             .unwrap()
-            .starts_with("---\nlayout: reference\n---\n# example::child\n")
+            .starts_with("---\nlayout: reference\n---\n# [example](bundle.md)::child\n")
     );
     assert!(!directory.path().join("docs").exists());
     assert!(!nested.join("reference").exists());
@@ -3787,13 +3792,17 @@ fn doc_standard_library_uses_its_configured_directory_and_file_modules() {
     let docs = directory.path().join("docs/src/std");
     assert!(docs.join("bundle.md").is_file());
     let bundle = fs::read_to_string(docs.join("bundle.md")).unwrap();
-    assert!(bundle.starts_with("---\ndoc: true\n---\n\n# std\n"));
-    assert!(bundle.contains("effect mut 'a"));
+    assert!(
+        bundle.starts_with("---\ndoc: true\nlayout: std.njk\nstdReference: true\n---\n\n# std\n")
+    );
+    assert!(!bundle.contains("effect mut 'a"));
+    assert!(bundle.contains("## Modules\n\n[abi](abi.md)\\\n[any](any.md)"));
     assert!(!bundle.contains("```ruddy\n\n```"));
     let ffi = fs::read_to_string(docs.join("ffi.md")).unwrap();
     assert!(ffi.contains("effect Immediate"));
     assert!(ffi.contains("An unhandlable effect performed by external code"));
     let option = fs::read_to_string(docs.join("option.md")).unwrap();
+    assert!(option.contains("# [std](bundle.md)::option"));
     assert!(option.contains("type Option 't = #Some 't | #None"));
     assert!(!bundle.contains("### Option"));
     assert_eq!(

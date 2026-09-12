@@ -4,8 +4,13 @@ const checkIcon = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" st
 for (const pre of document.querySelectorAll("main pre")) {
   const code = pre.querySelector("code");
   if (!code) continue;
-  const wrapper = document.createElement("div");
-  wrapper.className = "copyable-code";
+  let wrapper = pre.closest(".copyable-code");
+  if (!wrapper) {
+    wrapper = document.createElement("div");
+    wrapper.className = "copyable-code";
+    pre.before(wrapper);
+    wrapper.append(pre);
+  }
   const button = document.createElement("button");
   button.type = "button";
   button.className = "copy-code";
@@ -15,8 +20,7 @@ for (const pre of document.querySelectorAll("main pre")) {
   const status = document.createElement("span");
   status.className = "copy-feedback";
   status.setAttribute("role", "status");
-  pre.before(wrapper);
-  wrapper.append(pre, button, status);
+  wrapper.append(button, status);
   let reset;
   button.addEventListener("click", async () => {
     clearTimeout(reset);

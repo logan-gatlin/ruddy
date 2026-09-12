@@ -1,7 +1,11 @@
+@doc "Stops the process with a natural-number status."
 effect Exit = Nat -> |
+@doc "Stops the process with the supplied status and never resumes."
 let exit = !Exit
 
+@doc "The kinds of failure reported while reading process information."
 type ErrorKind = #InvalidName | #Unavailable | #Other
+@doc "A process information failure with its kind and host message."
 type Error = { kind: ErrorKind, message: String }
 @doc "Read the host process. A local handler can supply arguments, environment, and a working directory."
 effect Process = {
@@ -11,5 +15,7 @@ effect Process = {
 }
 @doc "Application arguments, excluding the Node executable and script path."
 let args = !Process.args
+@doc "The value of an environment variable, or `#None` when it is not set."
 let env = !Process.env
+@doc "The process working directory."
 let cwd = !Process.cwd

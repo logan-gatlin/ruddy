@@ -1,3 +1,4 @@
+@doc "The kinds of failure reported by file system operations."
 type ErrorKind =
   | #NotFound
   | #PermissionDenied
@@ -10,13 +11,18 @@ type ErrorKind =
   | #Unsupported
   | #Other
 
+@doc "A file system failure with its kind, path, and host message."
 type Error = { kind: ErrorKind, path: String, message: String }
 
+@doc "The kind of a file system entry."
 type FileKind = #File | #Directory | #Symlink | #Other
 
+@doc "The kind and byte size of a file system entry."
 type Metadata = { kind: FileKind, size: Nat }
+@doc "The name and kind of one directory entry."
 type DirEntry = { name: String, kind: FileKind }
 
+@doc "File and directory operations whose behavior is supplied by a handler."
 effect FileSystem = {
   read_bytes: String -> Result [Nat8] Error,
   write_bytes: { path: String, bytes: [Nat8] } -> Result () Error,
@@ -36,40 +42,56 @@ effect FileSystem = {
   copy_file: { source: String, destination: String } -> Result () Error,
 }
 
+@doc "Reads a file as bytes."
 let read_bytes = !FileSystem.read_bytes
 
+@doc "Replaces a file with bytes."
 let write_bytes = fn path bytes =>
   !FileSystem.write_bytes { path: path, bytes: bytes }
 
+@doc "Appends bytes to a file."
 let append_bytes = fn path bytes =>
   !FileSystem.append_bytes { path: path, bytes: bytes }
 
+@doc "Reads a file as text."
 let read_text = !FileSystem.read_text
 
+@doc "Replaces a file with text."
 let write_text = fn path text =>
   !FileSystem.write_text { path: path, text: text }
 
+@doc "Appends text to a file."
 let append_text = fn path text =>
   !FileSystem.append_text { path: path, text: text }
 
+@doc "Whether a path exists."
 let exists = !FileSystem.exists
 
+@doc "Reads the entries immediately inside a directory."
 let read_dir = !FileSystem.read_dir
 
+@doc "Reads metadata after following a symbolic link."
 let metadata = !FileSystem.metadata
 
+@doc "Reads metadata without following the final symbolic link."
 let symlink_metadata = !FileSystem.symlink_metadata
 
+@doc "Creates one directory."
 let create_dir = !FileSystem.create_dir
 
+@doc "Creates a directory and any missing parents."
 let create_dir_all = !FileSystem.create_dir_all
 
+@doc "Removes a file or symbolic link."
 let remove_file = !FileSystem.remove_file
 
+@doc "Removes an empty directory."
 let remove_dir = !FileSystem.remove_dir
 
+@doc "Moves a file or directory to another path."
 let rename = fn source destination =>
   !FileSystem.rename { source: source, destination: destination }
 
+@doc "Copies a file to another path."
 let copy_file = fn source destination =>
   !FileSystem.copy_file { source: source, destination: destination }

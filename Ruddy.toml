@@ -11,6 +11,8 @@ target = "docs/src/std/"
 frontmatter = """
 ---
 doc: true
+layout: std.njk
+stdReference: true
 ---
 
 """

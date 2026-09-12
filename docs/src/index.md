@@ -2,73 +2,94 @@
 doc: true
 ---
 
-# Ruddy
+# The Ruddy Book
 
-Ruddy is a [functional language](dictionary.md#functional-language) with [static typing](dictionary.md#static-typing).
-Programs combine functions to transform data, and types describe which values those functions accept and return.
-[Type inference](dictionary.md#type-inference) allows types to be omitted when they can be determined from the code.
+Ruddy is an early-stage [functional language](dictionary.md#functional-language) with [structural types](dictionary.md#structural-typing), [type inference](dictionary.md#type-inference), and [algebraic effects](dictionary.md#effect).
+This book introduces the language to intermediate programmers familiar with non-functional languages.
+It assumes programming and undergraduate-level computer science knowledge, but no prior functional-programming experience.
 
-## Functions and values
-
-`let` gives a value a name, and `fn` defines a function.
-Functions are values: they can be passed to other functions and returned as results.
-A function call places its argument after the function name.
-For example, `display_name` extracts a name from a [struct](dictionary.md#struct), a value containing named fields:
-
-```ruddy
-let display_name = fn person => person.name
-let name = display_name { name: "Ada", email: "ada@example.com" }
-```
-
-The result bound to `name` is `"Ada"`.
-The function needs a `name` field but does not need to know about the `email` field.
-
-## Types and data
-
-Ruddy uses [structural typing](dictionary.md#structural-typing): [type compatibility](dictionary.md#type-compatibility) depends on a type's structure, rather than the name of its [definition](dictionary.md#definition).
-`type` gives a type a name, and `:` supplies an explicit type for a value.
-For example, a value fits `Contact` because it has the required field with the required type:
-
-```ruddy
-type Contact = { email: String }
-let contact: Contact = { email: "ada@example.com" }
-```
-
-A [tag](dictionary.md#tag) identifies a case and can carry a value.
-[Pattern matching](dictionary.md#pattern-matching) selects an expression based on the shape of a value and gives names to its parts.
-For example, `email_or_default` uses an address carried by `#Some`, or a default address for `#None`:
-
-```ruddy
-let email_or_default = fn email => match email with
-| #Some address => address
-| #None => "support@example.com"
-end
-```
-
-## Effects
-
-An [effect](dictionary.md#effect) describes an operation whose behavior is supplied by an [effect handler](dictionary.md#effect-handler).
-Effects are tracked in function types, including when those types are inferred.
-This allows code to request operations such as console output while a handler determines how those operations are performed.
-
-For example, `main` prints a greeting through the standard library's `IO` effect:
-
-```ruddy
-let main = fn _ => println "Hello!"
-```
-
-An executable starts by calling `main` with `()`, the [unit](dictionary.md#unit) value.
-The [prelude](standard-library.md#prelude) makes `println` available without qualification.
-Here, `println` writes the text followed by a newline and returns `()`.
-The runtime supplies the `IO` effect handler; a program can also supply its own handlers.
+The central questions are how expressions evaluate, what their types require, and how functions compose into programs with understandable behavior.
+Game objects, movement, state machines, and replayable combat provide the examples.
+Small examples establish rules; exercises apply those rules to new cases; a complete combat replay brings them together.
+The emphasis is on game logic and tools that can be tested independently of an engine.
 
 ## Getting started
 
-The [download page](download.md) covers installation and editor setup.
-The [platform API guide](platform-apis.md) covers JSON, process information, paths, HTTP requests, URLs, and mirrors.
+[Chapter 1](book/getting-started.md) establishes a project with live editor diagnostics and a first runnable program.
+The [installation guide](download.md) covers the CLI and editors.
+The [tooling appendix](book/tooling.md#trying-chapter-fragments) supplies a practice-project layout for trying the smaller examples.
+Unless explicitly marked as complete files, snippets share the definitions introduced earlier in their chapter.
 
-The following reading order builds on this introduction:
+The main reading path runs through Chapter 12.
+Chapters 13–15 develop advanced interfaces and integration when a project needs them.
+The [standard-library reference](std/bundle.md), [syntax reference](grammar.md), and [dictionary](dictionary.md) support lookup throughout.
 
-1. [Hello, World!](hello-world.md)
-2. [Grammar](grammar.md)
-3. [Standard library](standard-library.md)
+## Functions and values
+
+Part I establishes evaluation and application.
+
+1. [Getting started with Ruddy](book/getting-started.md)
+2. [Values, expressions, and bindings](book/expressions.md)
+3. [Functions and application](book/functions.md)
+
+## Types and data
+
+Part II develops representations, their type requirements, and abstractions over repeated computation.
+
+4. [Modeling data and matching its shape](book/data.md)
+5. [Understanding inferred and structural types](book/types.md)
+6. [Higher-order programming](book/higher-order.md)
+
+## Effects
+
+Part III connects program organization with effectful operations and explicit state.
+
+7. [Organizing programs](book/modules.md)
+8. [Effects and handlers](book/effects.md)
+9. [Mutable state and regions](book/state.md)
+
+## Programs that interact with the world
+
+Part IV crosses environmental boundaries and develops a complete application.
+
+10. [Input, output, and failure](book/io.md)
+11. [Structured data and network requests](book/external-data.md)
+12. [Worked program: a combat replay](book/report.md)
+
+## Advanced interfaces and integration
+
+Part V examines relationships that require richer types and explicit host contracts.
+
+13. [Rows, presence, and richer interfaces](book/rows.md)
+14. [Hidden types, mirrors, and generic operations](book/reflection.md)
+15. [JavaScript interoperability](book/interoperability.md)
+
+## Game problems and type relationships
+
+| Problem | Technique | Example |
+| --- | --- | --- |
+| Move objects with different component fields | Open and shared rows | [Geometry and movement](book/types.md#following-a-requirement) |
+| Restrict operations to a known game state | Related field presences | [Pausing and resuming](book/rows.md#carrying-a-relationship-into-the-result) |
+| Keep component combinations consistent | Inferred presence constraints | [Velocity and AI inputs](book/rows.md#presence-is-inferred-from-program-shape) |
+| Restrict selections to equipped weapons | A row shared by a struct and a sum | [Loadouts](book/rows.md#rows-describe-entries-not-a-runtime-container) |
+| Make time-dependent rules reproducible | Effects handled with fixed inputs | [Clocks and pure wrappers](book/effects.md#a-pure-wrapper-around-an-effectful-function) |
+| Update actors with different private state | Hidden types with related operations | [Actor packages](book/reflection.md#different-actor-states-in-one-update-list) |
+| Replay combat and retain checkpoints | Pure rules and immutable updates | [Combat replay](book/report.md) |
+
+## Appendices and reference
+
+- [A. Installation, editors, and CLI](book/tooling.md)
+- [B. Syntax reference](grammar.md)
+- [C. Dictionary](dictionary.md)
+- [D. Numbers, strings, and runtime behavior](book/runtime.md)
+- [E. Selected exercise answers](book/answers.md)
+- [Generated standard-library reference](std/bundle.md)
+- [Prelude and standard-library configuration](standard-library.md)
+- [Detailed platform and representation contracts](platform-apis.md)
+- [Hello World and FizzBuzz walkthrough](hello-world.md)
+
+## About this draft
+
+This first draft draws on the teaching approach of Cornell's [OCaml Programming: Correct + Efficient + Beautiful](https://cs3110.github.io/textbook/cover.html): explicit evaluation and typing explanations, focused examples, and exercises for programmers learning functional ideas.
+Its prose and examples are written for Ruddy and its own language rules.
+The generated standard-library pages remain the API reference; the chapters link to those pages rather than maintain duplicate signature catalogs.

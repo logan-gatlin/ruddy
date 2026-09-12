@@ -1,18 +1,28 @@
+@doc "The number of values in the array."
 extern len: ['a] -> Nat = "$arrayLen"
+@doc "The value at the zero-based position, or `#None` when the position is outside the array."
 extern get: ['a] -> Nat -> Option 'a = "$arrayGet"
+@doc "A copy with the value at the zero-based position replaced, or `#None` when the position is outside the array."
 extern set: ['a] -> Nat -> 'a -> Option ['a] = "$arraySet"
+@doc "A copy with the value added at the end."
 extern push: ['a] -> 'a -> ['a] = "$arrayPush"
+@doc "The values of the first array followed by the values of the second."
 extern concat: ['a] -> ['a] -> ['a] = "$arrayConcat"
+@doc "The values from `start` up to `end`, or `#None` when either position is invalid."
 extern slice: ['a] -> Nat -> Nat -> Option ['a] = "$arraySlice"
+@doc "A copy with the value added at the beginning."
 extern prepend: ['a] -> 'a -> ['a] = "$arrayPrepend"
+@doc "The last value and the remaining prefix, or `#None` for an empty array."
 extern pop: ['a] -> Option ('a, ['a]) = "$arrayPop"
 
+@doc "The results of applying the function to every value in order."
 let map: ('a -> 'b + ..'effects) -> ['a] -> ['b] + ..'effects =
   fn function values => match values with
   | [] => []
   | [head, ..tail] => [function head, ..map function tail]
   end
 
+@doc "Combines the values from left to right, beginning with the supplied state."
 let fold:
   ('state -> 'a -> 'state + ..'effects) -> 'state -> ['a] -> 'state + ..'effects =
   fn step state values => match values with
@@ -20,6 +30,7 @@ let fold:
   | [head, ..tail] => fold step (step state head) tail
   end
 
+@doc "Combines the values from right to left, beginning with the supplied state."
 let fold_right:
   ('a -> 'state -> 'state + ..'effects) -> 'state -> ['a] -> 'state + ..'effects =
   fn step state values => match values with
@@ -27,6 +38,7 @@ let fold_right:
   | [head, ..tail] => step head (fold_right step state tail)
   end
 
+@doc "The values for which the predicate returns `true`, in their original order."
 let filter: ('a -> Bool + ..'effects) -> ['a] -> ['a] + ..'effects =
   fn predicate values => match values with
   | [] => []
@@ -34,6 +46,7 @@ let filter: ('a -> Bool + ..'effects) -> ['a] -> ['a] + ..'effects =
     if predicate head then [head, ..filter predicate tail] else filter predicate tail end
   end
 
+@doc "The present results of applying the function, in their original order."
 let filter_map: ('a -> Option 'b + ..'effects) -> ['a] -> ['b] + ..'effects =
   fn function values => match values with
   | [] => []
@@ -44,12 +57,14 @@ let filter_map: ('a -> Option 'b + ..'effects) -> ['a] -> ['b] + ..'effects =
     end
   end
 
+@doc "Concatenates the arrays produced by applying the function to every value."
 let flat_map: ('a -> ['b] + ..'effects) -> ['a] -> ['b] + ..'effects =
   fn function values => match values with
   | [] => []
   | [head, ..tail] => [..function head, ..flat_map function tail]
   end
 
+@doc "The first value for which the predicate returns `true`."
 let find: ('a -> Bool + ..'effects) -> ['a] -> Option 'a + ..'effects =
   fn predicate values => match values with
   | [] => #None
@@ -67,24 +82,29 @@ let find_index_from:
     end
   end
 
+@doc "The zero-based position of the first value for which the predicate returns `true`."
 let find_index: ('a -> Bool + ..'effects) -> ['a] -> Option Nat + ..'effects =
   fn predicate values => find_index_from predicate 0n values
 
+@doc "Whether the predicate returns `true` for at least one value."
 let any: ('a -> Bool + ..'effects) -> ['a] -> Bool + ..'effects =
   fn predicate values => match values with
   | [] => false
   | [head, ..tail] => predicate head or any predicate tail
   end
 
+@doc "Whether the predicate returns `true` for every value."
 let all: ('a -> Bool + ..'effects) -> ['a] -> Bool + ..'effects =
   fn predicate values => match values with
   | [] => true
   | [head, ..tail] => predicate head and all predicate tail
   end
 
+@doc "The values in reverse order."
 let reverse: ['a] -> ['a] = fn values =>
   fold (fn reversed value => prepend reversed value) [] values
 
+@doc "Pairs corresponding values until either array ends."
 let zip: ['a] -> ['b] -> [('a, 'b)] = fn left right => match (left, right) with
 | ([left_head, ..left_tail], [right_head, ..right_tail]) =>
   [(left_head, right_head), ..zip left_tail right_tail]
@@ -97,6 +117,7 @@ let enumerate_from: Nat -> ['a] -> [(Nat, 'a)] = fn index values => match values
 | [head, ..tail] => [(index, head), ..enumerate_from (nat::add index 1n) tail]
 end
 
+@doc "Pairs every value with its zero-based position."
 let enumerate: ['a] -> [(Nat, 'a)] = fn values => enumerate_from 0n values
 
 @private
@@ -114,15 +135,18 @@ let partition_onto:
     end
   end
 
+@doc "Separates values by the predicate while preserving their order."
 let partition: ('a -> Bool + ..'effects) -> ['a] -> (['a], ['a]) + ..'effects =
   fn predicate values => partition_onto predicate [] [] values
 
+@doc "Combines a nonempty array from left to right, using its first value as the initial state."
 let reduce: ('a -> 'a -> 'a + ..'effects) -> ['a] -> Option 'a + ..'effects =
   fn step values => match values with
   | [] => #None
   | [head, ..tail] => #Some (fold step head tail)
   end
 
+@doc "Applies the function in order and returns all results when every result is present."
 let traverse_option:
   ('a -> Option 'b + ..'effects) -> ['a] -> Option ['b] + ..'effects =
   fn function values => match values with
@@ -138,6 +162,7 @@ let traverse_option:
     end
   end
 
+@doc "Applies the function in order and returns all values or the first error."
 let traverse_result:
   ('a -> Result 'b 'failure + ..'effects)
   -> ['a]
@@ -155,6 +180,7 @@ let traverse_result:
     end
   end
 
+@doc "Combines values from left to right until the step returns `#None`."
 let try_fold_option:
   ('state -> 'a -> Option 'state + ..'effects)
   -> 'state
@@ -169,6 +195,7 @@ let try_fold_option:
     end
   end
 
+@doc "Combines values from left to right until the step returns an error."
 let try_fold_result:
   ('state -> 'a -> Result 'state 'failure + ..'effects)
   -> 'state
@@ -183,9 +210,11 @@ let try_fold_result:
     end
   end
 
+@doc "Collects present values into an array, or returns `#None` when any value is absent."
 let sequence_option: [Option 'a] -> Option ['a] =
   fn values => traverse_option (fn value => value) values
 
+@doc "Collects successful values into an array, or returns the first error."
 let sequence_result: [Result 'a 'failure] -> Result ['a] 'failure =
   fn values => traverse_result (fn value => value) values
 

@@ -10923,17 +10923,27 @@ impl Builder<'_> {
         let kind = ParamKind::Region {
             lacks: IndexSet::new(),
         };
-        program.effects.entry(symbol).or_insert_with(|| Decl {
-            name_at: Anchor::GENERATED,
-            annotation: None,
-            params: vec![Param {
-                at: Anchor::GENERATED,
-                symbol: param,
-                kind: kind.clone(),
-                relevant: true,
-            }],
-            metadata: Metadata::new(),
-            value: Effect::Operations(IndexMap::new()),
+        program.effects.entry(symbol).or_insert_with(|| {
+            let at = Anchor::GENERATED;
+            let metadata = IndexMap::from([(
+                "private".into(),
+                Attribute {
+                    key_at: at,
+                    value: unit_data(at),
+                },
+            )]);
+            Decl {
+                name_at: at,
+                annotation: None,
+                params: vec![Param {
+                    at,
+                    symbol: param,
+                    kind: kind.clone(),
+                    relevant: true,
+                }],
+                metadata,
+                value: Effect::Operations(IndexMap::new()),
+            }
         });
         program
             .effect_ids

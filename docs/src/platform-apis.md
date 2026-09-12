@@ -4,6 +4,8 @@ doc: true
 
 # JSON, process, path, HTTP, and URLs
 
+This detailed reference accompanies the book chapters on [external data](book/external-data.md), [mirrors](book/reflection.md), and [JavaScript interoperability](book/interoperability.md).
+
 JSON, URL, and HTTP work in Node executables and in libraries targeting Node or
 web. Web executables still require a web entry adapter. Process and path effects
 have Node handlers; a web library can use process operations under a local
@@ -21,7 +23,7 @@ reads one back. Both obtain the type's mirror and derive its default codec, so
 they need no annotation beyond the one that decides the type:
 
 ```ruddy
-let decode_config: String -> Result { name: String, retries: Nat } std::json::Error =
+let decode_config: String -> Result { name: String, max_enemies: Nat } std::json::Error =
   std::json::decode
 ```
 

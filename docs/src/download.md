@@ -4,6 +4,8 @@ doc: true
 
 # Download
 
+This installation reference supports [Chapter 1 of The Ruddy Book](book/getting-started.md).
+
 ## Install the CLI
 
 Installation requires a current stable [Rust toolchain](https://www.rust-lang.org/tools/install).

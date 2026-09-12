@@ -1,5 +1,8 @@
+@doc "HTTP header fields in their transmitted order."
 type Headers = [(String, String)]
+@doc "An empty, text, or byte request body."
 type Body = #Empty | #Text String | #Bytes [Nat8]
+@doc "How a request handles redirects."
 type Redirect = #Follow | #Manual | #Error
 @doc "Buffered request. timeout_ms includes reading the body; max_bytes bounds the response body."
 type Request = {
@@ -11,6 +14,7 @@ type Request = {
   max_bytes: Nat,
   redirect: Redirect,
 }
+@doc "A buffered HTTP response with its final URL, status, headers, and body."
 type Response = {
   status: Nat,
   status_text: String,
@@ -19,9 +23,13 @@ type Response = {
   url: String,
   redirected: Bool,
 }
+@doc "The kinds of failure reported for HTTP requests."
 type ErrorKind = #InvalidRequest | #Network | #Timeout | #TooLarge | #Unsupported
+@doc "An HTTP failure with its kind, URL, and message."
 type Error = { kind: ErrorKind, url: String, message: String }
+@doc "Sends a buffered request through an effect handler."
 effect Http = { request: Request -> Result Response Error }
+@doc "Sends a buffered HTTP request."
 let request = !Http.request
 @doc "GET defaults: follow redirects, 30-second timeout, 16 MiB response limit. Customize with a struct spread."
 let defaults: String -> Request = fn url => {
@@ -33,11 +41,15 @@ let defaults: String -> Request = fn url => {
   max_bytes: 16777216n,
   redirect: #Follow,
 }
+@doc "Sends a `GET` request with the default options."
 let get = fn url => request (defaults url)
+@doc "Sends a `POST` request with the default options and supplied body."
 let post = fn url body => request { method: "POST", body: body, ..defaults url }
+@doc "Whether the response status is from 200 through 299."
 let is_success = fn response => boolean::logical_and
   (nat::greater_than_or_equal response.status 200n)
   (nat::less_than response.status 300n)
+@doc "The first header value with the case-insensitive name."
 let header: String -> Headers -> Option String = fn name headers =>
   option::map
     (fn pair => pair.1)
@@ -48,4 +60,5 @@ let header: String -> Headers -> Option String = fn name headers =>
 extern decode_text: [Nat8] -> String = "$http.text"
 @doc "Decode UTF-8 using Fetch text semantics (replace malformed sequences and strip a BOM)."
 let text = fn response => decode_text response.body
+@doc "Decodes the response body as UTF-8 text and then as a value of the inferred type."
 let json: Response -> Result 'a json::Error = fn response => json::decode (text response)

@@ -1,24 +1,33 @@
+@doc "Returns its argument unchanged."
 let identity: 'a -> 'a = fn value => value
+@doc "Returns a function that ignores its argument and returns the supplied value."
 let constant: 'a -> 'b -> 'a = fn value _ => value
 
+@doc "Applies a function to a value."
 let apply: ('a -> 'b + ..'effects) -> 'a -> 'b + ..'effects =
   fn function value => function value
 
+@doc "Passes a value to a function."
 let pipe: 'a -> ('a -> 'b + ..'effects) -> 'b + ..'effects =
   fn value function => function value
 
+@doc "Combines two functions so the result of the second becomes the argument of the first."
 let compose: ('b -> 'c + ..'effects) -> ('a -> 'b + ..'effects) -> 'a -> 'c + ..'effects =
   fn outer inner value => outer (inner value)
 
+@doc "Reverses the first two arguments of a function."
 let flip: ('a -> 'b -> 'c + ..'effects) -> 'b -> 'a -> 'c + ..'effects =
   fn function second first => function first second
 
+@doc "Converts a function on a pair into a function taking two arguments."
 let curry: (('a, 'b) -> 'c + ..'effects) -> 'a -> 'b -> 'c + ..'effects =
   fn function first second => function (first, second)
 
+@doc "Converts a function taking two arguments into a function on a pair."
 let uncurry: ('a -> 'b -> 'c + ..'effects) -> ('a, 'b) -> 'c + ..'effects =
   fn function values => function values.0 values.1
 
+@doc "Repeatedly passes values to a function through a `Consumer`."
 let make_consumer: ('t -> 'r + ..'effects) -> types::Consumer 't (..'effects) =
   fn function input => do
     _ = function input

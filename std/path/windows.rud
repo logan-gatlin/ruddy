@@ -1,14 +1,21 @@
 @async
+@doc "Normalizes a path using Windows conventions."
 extern normalize: String -> String = "$nodePath.win32.normalize"
 @async
+@doc "Returns the final portion of a Windows path."
 extern basename: String -> String = "$nodePath.win32.basename"
 @async
+@doc "Returns all but the final portion of a Windows path."
 extern dirname: String -> String = "$nodePath.win32.dirname"
 @async
+@doc "Returns the extension of the final portion of a Windows path."
 extern extension: String -> String = "$nodePath.win32.extname"
 @async
+@doc "Whether a Windows path is absolute."
 extern is_absolute: String -> Bool = "$nodePath.win32.isAbsolute"
 @async
+@doc "Separates a Windows path into its parts."
 extern parse: String -> Parts = "$nodePath.win32.parse"
 @async
+@doc "Joins Windows path segments and normalizes the result."
 extern join: [String] -> String = "$nodePath.win32.join"

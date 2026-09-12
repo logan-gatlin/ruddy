@@ -28,7 +28,6 @@ struct Item {
     name: String,
     signature: String,
     documentation: String,
-    order: usize,
 }
 
 #[derive(Default)]
@@ -54,8 +53,29 @@ fn filename(module: &str) -> String {
     }
 }
 
-/// Source declarations supply readable spellings and order; accepted semantics
-/// supply inferred signatures and the authoritative public export boundary.
+fn heading(bundle: &str, module: &str) -> String {
+    if module.is_empty() {
+        return bundle.to_owned();
+    }
+    let segments: Vec<_> = module.split("::").collect();
+    let mut path = String::new();
+    let mut parts = vec![format!("[{bundle}](bundle.md)")];
+    for (index, segment) in segments.iter().enumerate() {
+        if !path.is_empty() {
+            path.push_str("::");
+        }
+        path.push_str(segment);
+        if index + 1 == segments.len() {
+            parts.push((*segment).to_owned());
+        } else {
+            parts.push(format!("[{segment}]({})", filename(&path)));
+        }
+    }
+    parts.join("::")
+}
+
+/// Source declarations supply readable spellings; accepted semantics supply
+/// inferred signatures and the authoritative public export boundary.
 pub(crate) fn render(
     accepted: &AcceptedProgram,
     statements: &[Stmt],
@@ -84,8 +104,7 @@ pub(crate) fn render(
     }
 
     let mut written = HashMap::new();
-    let mut order = Vec::new();
-    collect_source(statements, files, &mut written, &mut order);
+    collect_source(statements, files, &mut written);
     let item = |name: &str, metadata: &Metadata, span: Span, inferred: String| {
         let relative = relative(name);
         let (module, name) = relative.rsplit_once("::").unwrap_or(("", &relative));
@@ -95,14 +114,6 @@ pub(crate) fn render(
                 name: name.to_owned(),
                 signature: written.get(&span).cloned().unwrap_or(inferred),
                 documentation: documentation(metadata),
-                order: order
-                    .iter()
-                    .position(|statement: &Span| {
-                        statement.file_id == span.file_id
-                            && statement.start <= span.start
-                            && statement.end() >= span.end()
-                    })
-                    .unwrap_or(usize::MAX),
             },
         )
     };
@@ -173,33 +184,31 @@ pub(crate) fn render(
     Ok(modules
         .into_iter()
         .map(|(name, mut module)| {
-            let title = if name.is_empty() {
-                header.identity.name.clone()
-            } else {
-                format!("{}::{name}", header.identity.name)
-            };
-            let mut markdown = format!("# {title}\n\n");
-            if !name.is_empty() {
-                markdown.push_str("[Bundle](bundle.md)\n\n");
-            }
+            let mut markdown = format!("# {}\n\n", heading(&header.identity.name, &name));
             prose(&mut markdown, &module.documentation);
-            let children: Vec<_> = names
+            let mut children: Vec<_> = names
                 .iter()
                 .filter(|child| {
                     !child.is_empty()
                         && child.rsplit_once("::").map_or("", |(parent, _)| parent) == name
                 })
                 .collect();
+            children.sort_by_key(|child| child.to_lowercase());
             if !children.is_empty() {
                 markdown.push_str("## Modules\n\n");
-                for child in children {
-                    markdown.push_str(&format!(
-                        "- [{}]({})\n",
-                        child.rsplit("::").next().unwrap(),
-                        filename(child)
-                    ));
-                }
-                markdown.push('\n');
+                let links = children
+                    .into_iter()
+                    .map(|child| {
+                        format!(
+                            "[{}]({})",
+                            child.rsplit("::").next().unwrap(),
+                            filename(child)
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\\\n");
+                markdown.push_str(&links);
+                markdown.push_str("\n\n");
             }
             for (heading, items) in [
                 ("Types", &mut module.types),
@@ -210,7 +219,7 @@ pub(crate) fn render(
                     continue;
                 }
                 markdown.push_str(&format!("## {heading}\n\n"));
-                items.sort_by_key(|item| item.order);
+                items.sort_by_key(|item| item.name.to_lowercase());
                 for item in items {
                     // Literal types may contain backticks, so size the fence to
                     // keep every valid signature inside its code block.
@@ -300,17 +309,15 @@ fn collect_source(
     statements: &[Stmt],
     files: &mut FileManager,
     written: &mut HashMap<Span, String>,
-    order: &mut Vec<Span>,
 ) {
     for statement in statements {
         if let StmtKind::Module {
             body: Some(body), ..
         } = &statement.kind
         {
-            collect_source(body, files, written, order);
+            collect_source(body, files, written);
             continue;
         }
-        order.push(statement.span);
         let (name, end) = match &statement.kind {
             StmtKind::Type { name, .. } | StmtKind::Effect { name, .. } => {
                 (name, statement.span.end())

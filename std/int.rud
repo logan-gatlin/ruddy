@@ -1,10 +1,16 @@
+@doc "The sum of two `Int` values."
 extern add: fn(Int, Int) -> Int = "$prim.int.add"
+@doc "The first `Int` value minus the second."
 extern subtract: fn(Int, Int) -> Int = "$prim.int.subtract"
+@doc "The product of two `Int` values."
 extern multiply: fn(Int, Int) -> Int = "$prim.int.multiply"
+@doc "The first `Int` value divided by the second."
 extern divide: fn(Int, Int) -> Int = "$prim.int.divide"
+@doc "The remainder after dividing the first `Int` value by the second."
 extern remainder: fn(Int, Int) -> Int = "$prim.int.remainder"
 @doc "The negation. Integers have one zero: negating zero is zero."
 extern negate: fn(Int) -> Int = "$prim.int.negate"
+@doc "The absolute value of an `Int` value."
 extern abs: fn(Int) -> Int = "$prim.int.abs"
 
 @private
@@ -12,19 +18,27 @@ extern ordering_less_than: fn(Int, Int) -> Bool = "$prim.int.ordering_less_than"
 @private
 extern ordering_greater_than: fn(Int, Int) -> Bool = "$prim.int.ordering_greater_than"
 
+@doc "The lesser of two `Int` values."
 extern min: fn(Int, Int) -> Int = "$prim.int.min"
+@doc "The greater of two `Int` values."
 extern max: fn(Int, Int) -> Int = "$prim.int.max"
+@doc "The `Int` value limited to the inclusive lower and upper bounds."
 extern clamp: fn(Int, Int, Int) -> Int = "$prim.int.clamp"
+@doc "Whether the `Int` value is zero."
 let is_zero: Int -> Bool = fn value => match value with | 0i => true | _ => false end
 
+@doc "Converts a `Nat` to `Int`."
 extern from_nat: fn(Nat) -> Int = "$prim.int.from_nat"
+@doc "Converts a `Real` to `Int`."
 extern from_real: fn(Real) -> Int = "$prim.int.from_real"
 
+@doc "The three-way comparison of two `Int` values."
 let compare: order::Ordering Int = fn left right =>
   if ordering_less_than left right then #Less
   else if ordering_greater_than left right then #Greater
   else #Equal
   end
+@doc "The Boolean comparisons derived from the three-way ordering of `Int` values."
 let {
   equal,
   not_equal,
@@ -35,32 +49,51 @@ let {
 } = order::derive compare
 
 -- Int8: arithmetic wraps modulo 2^8; division truncates toward zero.
+@doc "The least `Int8` value."
 let min_value8: Int8 = -128i8
+@doc "The greatest `Int8` value."
 let max_value8: Int8 = 127i8
+@doc "The sum of two `Int8` values, wrapping to 8 bits."
 extern add8: fn(Int8, Int8) -> Int8 = "$prim.int.add8"
+@doc "The first `Int8` value minus the second, wrapping to 8 bits."
 extern subtract8: fn(Int8, Int8) -> Int8 = "$prim.int.subtract8"
+@doc "The product of two `Int8` values, wrapping to 8 bits."
 extern multiply8: fn(Int8, Int8) -> Int8 = "$prim.int.multiply8"
+@doc "The first `Int8` value divided by the second."
 extern divide8: fn(Int8, Int8) -> Int8 = "$prim.int.divide8"
+@doc "The remainder after dividing the first `Int8` value by the second."
 extern remainder8: fn(Int8, Int8) -> Int8 = "$prim.int.remainder8"
+@doc "The additive inverse of an `Int8` value."
 extern negate8: fn(Int8) -> Int8 = "$prim.int.negate8"
+@doc "The absolute value of an `Int8` value."
 extern abs8: fn(Int8) -> Int8 = "$prim.int.abs8"
 @private
 extern ordering_less_than8: fn(Int8, Int8) -> Bool = "$prim.int.ordering_less_than8"
 @private
 extern ordering_greater_than8: fn(Int8, Int8) -> Bool = "$prim.int.ordering_greater_than8"
+@doc "The lesser of two `Int8` values."
 extern min8: fn(Int8, Int8) -> Int8 = "$prim.int.min8"
+@doc "The greater of two `Int8` values."
 extern max8: fn(Int8, Int8) -> Int8 = "$prim.int.max8"
+@doc "The `Int8` value limited to the inclusive lower and upper bounds."
 extern clamp8: fn(Int8, Int8, Int8) -> Int8 = "$prim.int.clamp8"
+@doc "Whether the `Int8` value is zero."
 extern is_zero8: fn(Int8) -> Bool = "$prim.int.is_zero8"
+@doc "Converts a `Nat` to `Int8`."
 extern from_nat8: fn(Nat) -> Int8 = "$prim.int.from_nat8"
+@doc "Converts an `Int` to `Int8`."
 extern from_int8: fn(Int) -> Int8 = "$prim.int.from_int8"
+@doc "The decimal text of a `Int8` value."
 extern to_string8: fn(Int8) -> String = "$prim.int.to_string8"
+@doc "Converts an `Int8` value to `Int`."
 extern to_int8: fn(Int8) -> Int = "$prim.int.to_int8"
+@doc "The three-way comparison of two `Int8` values."
 let compare8: order::Ordering Int8 = fn left right =>
   if ordering_less_than8 left right then #Less
   else if ordering_greater_than8 left right then #Greater
   else #Equal
   end
+@doc "The Boolean comparisons derived from the three-way ordering of `Int8` values."
 let {
   equal: equal8,
   not_equal: not_equal8,
@@ -71,32 +104,51 @@ let {
 } = order::derive compare8
 
 -- Int16: arithmetic wraps modulo 2^16; division truncates toward zero.
+@doc "The least `Int16` value."
 let min_value16: Int16 = -32768i16
+@doc "The greatest `Int16` value."
 let max_value16: Int16 = 32767i16
+@doc "The sum of two `Int16` values, wrapping to 16 bits."
 extern add16: fn(Int16, Int16) -> Int16 = "$prim.int.add16"
+@doc "The first `Int16` value minus the second, wrapping to 16 bits."
 extern subtract16: fn(Int16, Int16) -> Int16 = "$prim.int.subtract16"
+@doc "The product of two `Int16` values, wrapping to 16 bits."
 extern multiply16: fn(Int16, Int16) -> Int16 = "$prim.int.multiply16"
+@doc "The first `Int16` value divided by the second."
 extern divide16: fn(Int16, Int16) -> Int16 = "$prim.int.divide16"
+@doc "The remainder after dividing the first `Int16` value by the second."
 extern remainder16: fn(Int16, Int16) -> Int16 = "$prim.int.remainder16"
+@doc "The additive inverse of an `Int16` value."
 extern negate16: fn(Int16) -> Int16 = "$prim.int.negate16"
+@doc "The absolute value of an `Int16` value."
 extern abs16: fn(Int16) -> Int16 = "$prim.int.abs16"
 @private
 extern ordering_less_than16: fn(Int16, Int16) -> Bool = "$prim.int.ordering_less_than16"
 @private
 extern ordering_greater_than16: fn(Int16, Int16) -> Bool = "$prim.int.ordering_greater_than16"
+@doc "The lesser of two `Int16` values."
 extern min16: fn(Int16, Int16) -> Int16 = "$prim.int.min16"
+@doc "The greater of two `Int16` values."
 extern max16: fn(Int16, Int16) -> Int16 = "$prim.int.max16"
+@doc "The `Int16` value limited to the inclusive lower and upper bounds."
 extern clamp16: fn(Int16, Int16, Int16) -> Int16 = "$prim.int.clamp16"
+@doc "Whether the `Int16` value is zero."
 extern is_zero16: fn(Int16) -> Bool = "$prim.int.is_zero16"
+@doc "Converts a `Nat` to `Int16`."
 extern from_nat16: fn(Nat) -> Int16 = "$prim.int.from_nat16"
+@doc "Converts an `Int` to `Int16`."
 extern from_int16: fn(Int) -> Int16 = "$prim.int.from_int16"
+@doc "The decimal text of a `Int16` value."
 extern to_string16: fn(Int16) -> String = "$prim.int.to_string16"
+@doc "Converts an `Int16` value to `Int`."
 extern to_int16: fn(Int16) -> Int = "$prim.int.to_int16"
+@doc "The three-way comparison of two `Int16` values."
 let compare16: order::Ordering Int16 = fn left right =>
   if ordering_less_than16 left right then #Less
   else if ordering_greater_than16 left right then #Greater
   else #Equal
   end
+@doc "The Boolean comparisons derived from the three-way ordering of `Int16` values."
 let {
   equal: equal16,
   not_equal: not_equal16,
@@ -107,32 +159,51 @@ let {
 } = order::derive compare16
 
 -- Int32: arithmetic wraps modulo 2^32; division truncates toward zero.
+@doc "The least `Int32` value."
 let min_value32: Int32 = -2147483648i32
+@doc "The greatest `Int32` value."
 let max_value32: Int32 = 2147483647i32
+@doc "The sum of two `Int32` values, wrapping to 32 bits."
 extern add32: fn(Int32, Int32) -> Int32 = "$prim.int.add32"
+@doc "The first `Int32` value minus the second, wrapping to 32 bits."
 extern subtract32: fn(Int32, Int32) -> Int32 = "$prim.int.subtract32"
+@doc "The product of two `Int32` values, wrapping to 32 bits."
 extern multiply32: fn(Int32, Int32) -> Int32 = "$prim.int.multiply32"
+@doc "The first `Int32` value divided by the second."
 extern divide32: fn(Int32, Int32) -> Int32 = "$prim.int.divide32"
+@doc "The remainder after dividing the first `Int32` value by the second."
 extern remainder32: fn(Int32, Int32) -> Int32 = "$prim.int.remainder32"
+@doc "The additive inverse of an `Int32` value."
 extern negate32: fn(Int32) -> Int32 = "$prim.int.negate32"
+@doc "The absolute value of an `Int32` value."
 extern abs32: fn(Int32) -> Int32 = "$prim.int.abs32"
 @private
 extern ordering_less_than32: fn(Int32, Int32) -> Bool = "$prim.int.ordering_less_than32"
 @private
 extern ordering_greater_than32: fn(Int32, Int32) -> Bool = "$prim.int.ordering_greater_than32"
+@doc "The lesser of two `Int32` values."
 extern min32: fn(Int32, Int32) -> Int32 = "$prim.int.min32"
+@doc "The greater of two `Int32` values."
 extern max32: fn(Int32, Int32) -> Int32 = "$prim.int.max32"
+@doc "The `Int32` value limited to the inclusive lower and upper bounds."
 extern clamp32: fn(Int32, Int32, Int32) -> Int32 = "$prim.int.clamp32"
+@doc "Whether the `Int32` value is zero."
 extern is_zero32: fn(Int32) -> Bool = "$prim.int.is_zero32"
+@doc "Converts a `Nat` to `Int32`."
 extern from_nat32: fn(Nat) -> Int32 = "$prim.int.from_nat32"
+@doc "Converts an `Int` to `Int32`."
 extern from_int32: fn(Int) -> Int32 = "$prim.int.from_int32"
+@doc "The decimal text of a `Int32` value."
 extern to_string32: fn(Int32) -> String = "$prim.int.to_string32"
+@doc "Converts an `Int32` value to `Int`."
 extern to_int32: fn(Int32) -> Int = "$prim.int.to_int32"
+@doc "The three-way comparison of two `Int32` values."
 let compare32: order::Ordering Int32 = fn left right =>
   if ordering_less_than32 left right then #Less
   else if ordering_greater_than32 left right then #Greater
   else #Equal
   end
+@doc "The Boolean comparisons derived from the three-way ordering of `Int32` values."
 let {
   equal: equal32,
   not_equal: not_equal32,
@@ -143,32 +214,51 @@ let {
 } = order::derive compare32
 
 -- Int64: arithmetic wraps modulo 2^64; division truncates toward zero.
+@doc "The least `Int64` value."
 let min_value64: Int64 = -9223372036854775808i64
+@doc "The greatest `Int64` value."
 let max_value64: Int64 = 9223372036854775807i64
+@doc "The sum of two `Int64` values, wrapping to 64 bits."
 extern add64: fn(Int64, Int64) -> Int64 = "$prim.int.add64"
+@doc "The first `Int64` value minus the second, wrapping to 64 bits."
 extern subtract64: fn(Int64, Int64) -> Int64 = "$prim.int.subtract64"
+@doc "The product of two `Int64` values, wrapping to 64 bits."
 extern multiply64: fn(Int64, Int64) -> Int64 = "$prim.int.multiply64"
+@doc "The first `Int64` value divided by the second."
 extern divide64: fn(Int64, Int64) -> Int64 = "$prim.int.divide64"
+@doc "The remainder after dividing the first `Int64` value by the second."
 extern remainder64: fn(Int64, Int64) -> Int64 = "$prim.int.remainder64"
+@doc "The additive inverse of an `Int64` value."
 extern negate64: fn(Int64) -> Int64 = "$prim.int.negate64"
+@doc "The absolute value of an `Int64` value."
 extern abs64: fn(Int64) -> Int64 = "$prim.int.abs64"
 @private
 extern ordering_less_than64: fn(Int64, Int64) -> Bool = "$prim.int.ordering_less_than64"
 @private
 extern ordering_greater_than64: fn(Int64, Int64) -> Bool = "$prim.int.ordering_greater_than64"
+@doc "The lesser of two `Int64` values."
 extern min64: fn(Int64, Int64) -> Int64 = "$prim.int.min64"
+@doc "The greater of two `Int64` values."
 extern max64: fn(Int64, Int64) -> Int64 = "$prim.int.max64"
+@doc "The `Int64` value limited to the inclusive lower and upper bounds."
 extern clamp64: fn(Int64, Int64, Int64) -> Int64 = "$prim.int.clamp64"
+@doc "Whether the `Int64` value is zero."
 extern is_zero64: fn(Int64) -> Bool = "$prim.int.is_zero64"
+@doc "Converts a `Nat` to `Int64`."
 extern from_nat64: fn(Nat) -> Int64 = "$prim.int.from_nat64"
+@doc "Converts an `Int` to `Int64`."
 extern from_int64: fn(Int) -> Int64 = "$prim.int.from_int64"
+@doc "The decimal text of a `Int64` value."
 extern to_string64: fn(Int64) -> String = "$prim.int.to_string64"
+@doc "Converts an `Int64` value to `Int`."
 extern to_int64: fn(Int64) -> Int = "$prim.int.to_int64"
+@doc "The three-way comparison of two `Int64` values."
 let compare64: order::Ordering Int64 = fn left right =>
   if ordering_less_than64 left right then #Less
   else if ordering_greater_than64 left right then #Greater
   else #Equal
   end
+@doc "The Boolean comparisons derived from the three-way ordering of `Int64` values."
 let {
   equal: equal64,
   not_equal: not_equal64,

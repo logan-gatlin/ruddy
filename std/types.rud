@@ -1,2 +1,4 @@
+@doc "A type with no values."
 type Never = |
+@doc "A function that repeatedly accepts values and returns itself."
 type Consumer 't 'effects = 't -> Consumer 't 'effects + ..'effects

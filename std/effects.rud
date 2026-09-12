@@ -1,3 +1,6 @@
+@doc "Stops a computation with a value and never resumes it."
 effect Halt 'a = 'a -> |
+@doc "Requests a value without an argument."
 effect Ask 'a = () -> 'a
+@doc "Supplies a value to an effect handler."
 effect Advise 'a = 'a -> ()

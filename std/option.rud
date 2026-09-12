@@ -1,55 +1,67 @@
+@doc "A value that is either present as `#Some` or absent as `#None`."
 type Option 't = #Some 't | #None
+@doc "An open sum that may contain `#Nil`."
 type Maybe 't = #Nil | ..'t
 
+@doc "Transforms a present value and leaves an absent value unchanged."
 let map: ('a -> 'b + ..'effects) -> Option 'a -> Option 'b + ..'effects =
   fn function option => match option with
   | #Some value => #Some (function value)
   | #None => #None
   end
 
+@doc "Transforms a present value with a function that may return no value."
 let and_then: ('a -> Option 'b + ..'effects) -> Option 'a -> Option 'b + ..'effects =
   fn function option => match option with
   | #Some value => function value
   | #None => #None
   end
 
+@doc "Returns the present value or the fallback."
 let unwrap_or: 'a -> Option 'a -> 'a = fn fallback option => match option with
 | #Some value => value
 | #None => fallback
 end
 
+@doc "Returns the original present value or calls the fallback function."
 let or_else: (() -> Option 'a + ..'effects) -> Option 'a -> Option 'a + ..'effects =
   fn fallback option => match option with
   | #Some _ => option
   | #None => fallback ()
   end
 
+@doc "Keeps a present value only when the predicate returns `true`."
 let filter: ('a -> Bool + ..'effects) -> Option 'a -> Option 'a + ..'effects =
   fn predicate option => match option with
   | #Some value => if predicate value then option else #None end
   | #None => #None
   end
 
+@doc "Removes one nested `Option` layer."
 let flatten: Option (Option 'a) -> Option 'a = fn option => match option with
 | #Some inner => inner
 | #None => #None
 end
 
+@doc "Whether an optional value is present."
 let is_some: Option 'a -> Bool = fn option => match option with
 | #Some _ => true
 | #None => false
 end
 
+@doc "Whether an optional value is absent."
 let is_none: Option 'a -> Bool = fn option => match option with
 | #Some _ => false
 | #None => true
 end
 
+@doc "Returns the payload of `#Some` or the fallback for any other case."
 let some_or: 'a -> (#Some 'a | ..'rest) -> 'a = fn fallback value => match value with
 | #Some some => some
 | _ => fallback
 end
 
+@doc "Whether an open sum value is the `#Some` case."
 let is_some_case: (#Some 'a | ..'rest) -> Bool = fn value => match value with
 | #Some _ => true
 | _ => false

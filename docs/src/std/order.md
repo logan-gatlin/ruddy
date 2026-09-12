@@ -1,12 +1,36 @@
 ---
 doc: true
+layout: std.njk
+stdReference: true
 ---
 
-# std::order
+# [std](bundle.md)::order
 
-[Bundle](bundle.md)
+`order` defines three-way ordering and builds comparisons from ordering functions.
+
+Records can be compared by projecting a field before applying an ordering.
+
+```ruddy
+let compare_by_age =
+  std::order::compare_by std::nat::compare (fn person => person.age)
+```
 
 ## Types
+
+### Comparisons
+
+```ruddy
+type Comparisons 't = {
+  equal: 't -> 't -> Bool,
+  not_equal: 't -> 't -> Bool,
+  less_than: 't -> 't -> Bool,
+  less_than_or_equal: 't -> 't -> Bool,
+  greater_than: 't -> 't -> Bool,
+  greater_than_or_equal: 't -> 't -> Bool,
+}
+```
+
+The six Boolean comparisons for a type.
 
 ### Order
 
@@ -14,11 +38,15 @@ doc: true
 type Order = #Less | #Equal | #Greater
 ```
 
+The result of a three-way comparison.
+
 ### Ordering
 
 ```ruddy
 type Ordering 't = 't -> 't -> Order
 ```
+
+A function that performs a three-way comparison.
 
 ### PartialOrder
 
@@ -34,58 +62,17 @@ A comparison that may be unordered: neither equal, less, nor greater.
 type PartialOrdering 't = 't -> 't -> PartialOrder
 ```
 
-### Comparisons
-
-```ruddy
-type Comparisons 't = {
-  equal: 't -> 't -> Bool,
-  not_equal: 't -> 't -> Bool,
-  less_than: 't -> 't -> Bool,
-  less_than_or_equal: 't -> 't -> Bool,
-  greater_than: 't -> 't -> Bool,
-  greater_than_or_equal: 't -> 't -> Bool,
-}
-```
+A function that performs a three-way comparison that may be unordered.
 
 ## Values
 
-### derive
+### compare
 
 ```ruddy
-let derive: Ordering 't -> Comparisons 't
+let compare: PartialOrdering 'a
 ```
 
-### derive_partial
-
-```ruddy
-let derive_partial: PartialOrdering 't -> Comparisons 't
-```
-
-Derive six comparisons. Unordered operands satisfy only `not_equal`; the non-strict comparisons are not negations of the strict ones.
-
-### reverse
-
-```ruddy
-let reverse: Order -> Order
-```
-
-### is_less
-
-```ruddy
-let is_less: Order -> Bool
-```
-
-### is_equal
-
-```ruddy
-let is_equal: Order -> Bool
-```
-
-### is_greater
-
-```ruddy
-let is_greater: Order -> Bool
-```
+Pure structural comparison at the operands' shared inferred type. NaNs and unsupported values are unordered. Opened existential types require mirror evidence, including when nested inside function types.
 
 ### compare_by
 
@@ -98,34 +85,7 @@ let compare_by:
   -> Order + ..'effects
 ```
 
-### reverse_compare
-
-```ruddy
-let reverse_compare: ('a -> 'a -> Order + ..'effects) -> 'a -> 'a -> Order + ..'effects
-```
-
-### then_compare
-
-```ruddy
-let then_compare:
-  ('a -> 'a -> Order + ..'effects)
-  -> ('a -> 'a -> Order + ..'effects)
-  -> 'a
-  -> 'a
-  -> Order + ..'effects
-```
-
-### min_by
-
-```ruddy
-let min_by: ('a -> 'a -> Order + ..'effects) -> 'a -> 'a -> 'a + ..'effects
-```
-
-### max_by
-
-```ruddy
-let max_by: ('a -> 'a -> Order + ..'effects) -> 'a -> 'a -> 'a + ..'effects
-```
+Compares values by applying a projection before an ordering.
 
 ### compare_with
 
@@ -135,36 +95,26 @@ let compare_with: Mirror 'a -> PartialOrdering 'a
 
 Compare through an explicit mirror. Arrays are lexicographic; records and sums use alphabetical field and case names (case-sensitive Unicode scalar order). The first non-equal component decides, including unordered. Unsupported shapes are unordered, even against themselves.
 
-### compare
+### derive
 
 ```ruddy
-let compare: PartialOrdering 'a
+let derive: Ordering 't -> Comparisons 't
 ```
 
-Pure structural comparison at the operands' shared inferred type. NaNs and unsupported values are unordered. Opened existential types require mirror evidence, including when nested inside function types.
+Builds the six Boolean comparisons from a three-way ordering.
+
+### derive_partial
+
+```ruddy
+let derive_partial: PartialOrdering 't -> Comparisons 't
+```
+
+Derive six comparisons. Unordered operands satisfy only `not_equal`; the non-strict comparisons are not negations of the strict ones.
 
 ### equal
 
 ```ruddy
 let equal: 'a -> 'a -> Bool
-```
-
-### not_equal
-
-```ruddy
-let not_equal: 'a -> 'a -> Bool
-```
-
-### less_than
-
-```ruddy
-let less_than: 'a -> 'a -> Bool
-```
-
-### less_than_or_equal
-
-```ruddy
-let less_than_or_equal: 'a -> 'a -> Bool
 ```
 
 ### greater_than
@@ -178,5 +128,92 @@ let greater_than: 'a -> 'a -> Bool
 ```ruddy
 let greater_than_or_equal: 'a -> 'a -> Bool
 ```
+
+### is_equal
+
+```ruddy
+let is_equal: Order -> Bool
+```
+
+Whether an order is `#Equal`.
+
+### is_greater
+
+```ruddy
+let is_greater: Order -> Bool
+```
+
+Whether an order is `#Greater`.
+
+### is_less
+
+```ruddy
+let is_less: Order -> Bool
+```
+
+Whether an order is `#Less`.
+
+### less_than
+
+```ruddy
+let less_than: 'a -> 'a -> Bool
+```
+
+### less_than_or_equal
+
+```ruddy
+let less_than_or_equal: 'a -> 'a -> Bool
+```
+
+### max_by
+
+```ruddy
+let max_by: ('a -> 'a -> Order + ..'effects) -> 'a -> 'a -> 'a + ..'effects
+```
+
+Returns the greater value according to an ordering.
+
+### min_by
+
+```ruddy
+let min_by: ('a -> 'a -> Order + ..'effects) -> 'a -> 'a -> 'a + ..'effects
+```
+
+Returns the lesser value according to an ordering.
+
+### not_equal
+
+```ruddy
+let not_equal: 'a -> 'a -> Bool
+```
+
+### reverse
+
+```ruddy
+let reverse: Order -> Order
+```
+
+Reverses `#Less` and `#Greater` while leaving `#Equal` unchanged.
+
+### reverse_compare
+
+```ruddy
+let reverse_compare: ('a -> 'a -> Order + ..'effects) -> 'a -> 'a -> Order + ..'effects
+```
+
+Reverses the result of an ordering.
+
+### then_compare
+
+```ruddy
+let then_compare:
+  ('a -> 'a -> Order + ..'effects)
+  -> ('a -> 'a -> Order + ..'effects)
+  -> 'a
+  -> 'a
+  -> Order + ..'effects
+```
+
+Uses the second ordering only when the first returns `#Equal`.
 
 <!-- Generated by ruddy doc for std. -->

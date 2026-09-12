@@ -4,6 +4,7 @@ type Error = #Derive codec::DeriveError | #Codec codec::Error
 @doc "What a reader refuses before it allocates: input longer than `bytes`, nesting deeper than `depth`, or a sequence longer than `members`."
 type Limits = { depth: Nat, bytes: Nat, members: Nat }
 
+@doc "The default limits for binary input: 512 levels, 64 MiB, and 1,000,000 sequence members."
 let default_limits: Limits = { depth: 512n, bytes: 67108864n, members: 1000000n }
 
 @doc "An application-owned identity for a wire schema, written before a versioned document and checked when one is read. Editing a type does not change it: the application says when its schema changed."

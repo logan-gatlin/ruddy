@@ -1,12 +1,21 @@
+@doc "The sum."
 let add: Real -> Real -> Real = fn left => fn right => left + right
+@doc "The first value minus the second."
 let subtract: Real -> Real -> Real = fn left => fn right => left - right
+@doc "The product."
 let multiply: Real -> Real -> Real = fn left => fn right => left * right
+@doc "The first value divided by the second."
 let divide: Real -> Real -> Real = fn left => fn right => left / right
+@doc "The additive inverse."
 let negate: Real -> Real = fn value => -value
 
+@doc "The remainder after division."
 extern remainder: fn(Real, Real) -> Real = "$prim.real.remainder"
+@doc "The absolute value."
 extern abs: fn(Real) -> Real = "$prim.real.abs"
+@doc "The square root."
 extern sqrt: fn(Real) -> Real = "$prim.real.sqrt"
+@doc "The first value raised to the second."
 extern power: fn(Real, Real) -> Real = "$prim.real.power"
 
 @private
@@ -16,53 +25,95 @@ extern ordering_less_than: fn(Real, Real) -> Bool = "$prim.real.ordering_less_th
 @private
 extern ordering_greater_than: fn(Real, Real) -> Bool = "$prim.real.ordering_greater_than"
 
+@doc "The lesser value."
 extern min: fn(Real, Real) -> Real = "$prim.real.min"
+@doc "The greater value."
 extern max: fn(Real, Real) -> Real = "$prim.real.max"
+@doc "The value limited to the inclusive lower and upper bounds."
 extern clamp: fn(Real, Real, Real) -> Real = "$prim.real.clamp"
+@doc "The greatest integer not greater than the value."
 extern floor: fn(Real) -> Int = "$prim.real.floor"
+@doc "The least integer not less than the value."
 extern ceil: fn(Real) -> Int = "$prim.real.ceil"
+@doc "The value rounded to the nearest integer."
 extern round: fn(Real) -> Int = "$prim.real.round"
+@doc "The integer portion with the fractional portion removed."
 extern truncate: fn(Real) -> Int = "$prim.real.truncate"
+@doc "Whether the value is not a number."
 extern is_nan: fn(Real) -> Bool = "$prim.real.is_nan"
+@doc "Whether the value is neither infinite nor not a number."
 extern is_finite: fn(Real) -> Bool = "$prim.real.is_finite"
+@doc "Whether the value is a finite integer."
 extern is_integer: fn(Real) -> Bool = "$prim.real.is_integer"
 
+@doc "Converts a natural number to a real number."
 extern from_nat: fn(Nat) -> Real = "$prim.real.from_nat"
+@doc "Converts an integer to a real number."
 extern from_int: fn(Int) -> Real = "$prim.real.from_int"
 
+@doc "The sine of an angle in radians."
 extern sin: fn(Real) -> Real = "$prim.real.sin"
+@doc "The cosine of an angle in radians."
 extern cos: fn(Real) -> Real = "$prim.real.cos"
+@doc "The tangent of an angle in radians."
 extern tan: fn(Real) -> Real = "$prim.real.tan"
+@doc "The arcsine in radians."
 extern asin: fn(Real) -> Real = "$prim.real.asin"
+@doc "The arccosine in radians."
 extern acos: fn(Real) -> Real = "$prim.real.acos"
+@doc "The arctangent in radians."
 extern atan: fn(Real) -> Real = "$prim.real.atan"
+@doc "The angle in radians from the origin to the point."
 extern atan2: fn(Real, Real) -> Real = "$prim.real.atan2"
 
+@doc "The hyperbolic sine."
 extern sinh: fn(Real) -> Real = "$prim.real.sinh"
+@doc "The hyperbolic cosine."
 extern cosh: fn(Real) -> Real = "$prim.real.cosh"
+@doc "The hyperbolic tangent."
 extern tanh: fn(Real) -> Real = "$prim.real.tanh"
+@doc "The inverse hyperbolic sine."
 extern asinh: fn(Real) -> Real = "$prim.real.asinh"
+@doc "The inverse hyperbolic cosine."
 extern acosh: fn(Real) -> Real = "$prim.real.acosh"
+@doc "The inverse hyperbolic tangent."
 extern atanh: fn(Real) -> Real = "$prim.real.atanh"
 
+@doc "`e` raised to the value."
 extern exp: fn(Real) -> Real = "$prim.real.exp"
+@doc "`e` raised to the value, minus one."
 extern expm1: fn(Real) -> Real = "$prim.real.expm1"
+@doc "The natural logarithm."
 extern log: fn(Real) -> Real = "$prim.real.log"
+@doc "The natural logarithm of one plus the value."
 extern log1p: fn(Real) -> Real = "$prim.real.log1p"
+@doc "The base-2 logarithm."
 extern log2: fn(Real) -> Real = "$prim.real.log2"
+@doc "The base-10 logarithm."
 extern log10: fn(Real) -> Real = "$prim.real.log10"
 
+@doc "The base of natural logarithms."
 let e: Real = 2.718281828459045
+@doc "The natural logarithm of 2."
 let ln_2: Real = 0.6931471805599453
+@doc "The natural logarithm of 10."
 let ln_10: Real = 2.302585092994046
+@doc "The base-2 logarithm of `e`."
 let log2_e: Real = 1.4426950408889634
+@doc "The base-10 logarithm of `e`."
 let log10_e: Real = 0.4342944819032518
+@doc "The ratio of a circle circumference to its diameter."
 let pi: Real = 3.141592653589793
+@doc "The square root of one half."
 let sqrt_1_2: Real = 0.7071067811865476
+@doc "The square root of 2."
 let sqrt_2: Real = 1.4142135623730951
+@doc "Twice `pi`."
 let tau: Real = 2 * pi
 
+@doc "Converts an angle from degrees to radians."
 let degrees_to_radians: Real -> Real = fn degrees => degrees * (pi / 180)
+@doc "Converts an angle from radians to degrees."
 let radians_to_degrees: Real -> Real = fn radians => radians * (180 / pi)
 
 @doc "A total ordering for sorting: NaNs compare equal and last, and negative zero precedes positive zero."
@@ -84,6 +135,7 @@ let compare: order::PartialOrdering Real = fn left right =>
   else #Equal
   end
 
+@doc "The Boolean comparisons derived from the partial numeric ordering."
 let {
   equal,
   not_equal,

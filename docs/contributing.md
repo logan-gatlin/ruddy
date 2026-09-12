@@ -46,6 +46,17 @@ Ruddy code blocks are formatted like:
 let id = fn a => a
 ```
 
+A fence may include a filename when it represents a file or a precise edit to one:
+
+````text
+```ruddy filename="src/main.rud"
+let main = fn _ => println "Hello"
+```
+````
+
+The filename appears in a separate bar and is excluded from copied code.
+Fragments without a file context omit this metadata.
+
 ## Website preview
 
 The documentation website uses [Eleventy](https://www.11ty.dev/docs/) and requires Node.js 22 or newer and a C compiler for Tree-sitter.
@@ -60,9 +71,11 @@ The preview reloads after edits and is available at the URL printed by Eleventy,
 The command `npm run build` creates a clean static website in `docs/_site/`, ready to serve from a domain root or subdirectory.
 Language documentation lives in `docs/src/`; only Markdown files marked `doc: true` become pages.
 Relative `.md` links become `.html` links, and headings receive anchors compatible with the dictionary links.
-The shared layout is `_includes/page.njk`, and the stylesheet is `assets/style.css`.
+The shared layout is `_includes/page.njk`, the generated standard-library reference extends it through `_includes/std.njk`, and the stylesheet is `assets/style.css`.
 
 Code fences marked `ruddy` or `rud` are highlighted during the build using the existing Tree-sitter parser and the highlight and local-name queries in `treesitter/`.
+Shell fences (`sh`, `bash`, or `shell`), `toml`, and `json` use the corresponding Tree-sitter grammars installed with the website dependencies.
+Fences marked `text`, unlabelled fences, and unsupported languages remain plain text.
 The Tree-sitter CLI is installed with the website dependencies; syntax highlighting adds no browser JavaScript.
 The preview rebuilds when the generated parser or queries change.
 After edits to `treesitter/grammar.js`, `just grammar` from the repository root regenerates the parser and checks the grammar.

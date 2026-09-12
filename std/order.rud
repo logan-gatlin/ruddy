@@ -1,10 +1,14 @@
+@doc "The result of a three-way comparison."
 type Order = #Less | #Equal | #Greater
+@doc "A function that performs a three-way comparison."
 type Ordering 't = 't -> 't -> Order
 
 @doc "A comparison that may be unordered: neither equal, less, nor greater."
 type PartialOrder = #Less | #Equal | #Greater | #Unordered
+@doc "A function that performs a three-way comparison that may be unordered."
 type PartialOrdering 't = 't -> 't -> PartialOrder
 
+@doc "The six Boolean comparisons for a type."
 type Comparisons 't = {
   equal: 't -> 't -> Bool,
   not_equal: 't -> 't -> Bool,
@@ -14,6 +18,7 @@ type Comparisons 't = {
   greater_than_or_equal: 't -> 't -> Bool,
 }
 
+@doc "Builds the six Boolean comparisons from a three-way ordering."
 let derive: Ordering 't -> Comparisons 't = fn ordering => {
   equal: fn left right => match ordering left right with
   | #Equal => true
@@ -71,27 +76,32 @@ let derive_partial: PartialOrdering 't -> Comparisons 't = fn ordering => {
   end,
 }
 
+@doc "Reverses `#Less` and `#Greater` while leaving `#Equal` unchanged."
 let reverse: Order -> Order = fn value => match value with
 | #Less => #Greater
 | #Equal => #Equal
 | #Greater => #Less
 end
 
+@doc "Whether an order is `#Less`."
 let is_less: Order -> Bool = fn value => match value with
 | #Less => true
 | _ => false
 end
 
+@doc "Whether an order is `#Equal`."
 let is_equal: Order -> Bool = fn value => match value with
 | #Equal => true
 | _ => false
 end
 
+@doc "Whether an order is `#Greater`."
 let is_greater: Order -> Bool = fn value => match value with
 | #Greater => true
 | _ => false
 end
 
+@doc "Compares values by applying a projection before an ordering."
 let compare_by:
   ('b -> 'b -> Order + ..'effects)
   -> ('a -> 'b + ..'effects)
@@ -100,9 +110,11 @@ let compare_by:
   -> Order + ..'effects =
   fn comparator project left right => comparator (project left) (project right)
 
+@doc "Reverses the result of an ordering."
 let reverse_compare: ('a -> 'a -> Order + ..'effects) -> 'a -> 'a -> Order + ..'effects =
   fn comparator left right => reverse (comparator left right)
 
+@doc "Uses the second ordering only when the first returns `#Equal`."
 let then_compare:
   ('a -> 'a -> Order + ..'effects)
   -> ('a -> 'a -> Order + ..'effects)
@@ -115,12 +127,14 @@ let then_compare:
   | #Greater => #Greater
   end
 
+@doc "Returns the lesser value according to an ordering."
 let min_by: ('a -> 'a -> Order + ..'effects) -> 'a -> 'a -> 'a + ..'effects =
   fn comparator left right => match comparator left right with
   | #Greater => right
   | _ => left
   end
 
+@doc "Returns the greater value according to an ordering."
 let max_by: ('a -> 'a -> Order + ..'effects) -> 'a -> 'a -> 'a + ..'effects =
   fn comparator left right => match comparator left right with
   | #Less => right

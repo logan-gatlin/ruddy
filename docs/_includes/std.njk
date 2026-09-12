@@ -1,0 +1,11 @@
+{% extends "page.njk" %}
+
+{% block bodyAttributes %} class="std-page"{% endblock %}
+
+{% block pageScripts %}<script src="{{ '/assets/std-sections.js' | relativeUrl(page.url) }}" defer></script>{% endblock %}
+
+{% block pageContent %}
+  <main id="content" class="std-reference">
+    {{ content | safe }}
+  </main>
+{% endblock %}

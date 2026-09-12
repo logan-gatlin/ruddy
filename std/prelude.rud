@@ -1,17 +1,30 @@
+@doc "Writes text to standard output."
 let print = io::print
+@doc "Writes text to standard error."
 let eprint = io::eprint
 
+@doc "Writes text and a newline to standard output."
 let println = io::println
+@doc "Writes text and a newline to standard error."
 let eprintln = io::eprintln
 
+@doc "Discards a value."
 let drop = fn _ => ()
 
+@doc "Writes text to standard output or standard error."
 effect IO = io::!IO
+@doc "Provides file and directory operations."
 effect FileSystem = fs::!FileSystem
 
+@doc "A value that is present or absent."
 type Option 't = #Some 't | #None
+@doc "An open sum that may contain `#Nil`."
 type Maybe 't = #Nil | ..'t
+@doc "A successful value or an error."
 type Result 'some 'error = #Some 'some | #Error 'error
+@doc "An open sum that may contain an error."
 type Fallible 'error 'rest = #Error 'error | ..'rest
+@doc "The result of a three-way comparison."
 type Order = #Less | #Equal | #Greater
+@doc "A value packaged with its exact type."
 type Any = any::Any

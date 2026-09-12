@@ -1,18 +1,23 @@
+@doc "A successful value or an error."
 type Result 'some 'error = #Some 'some | #Error 'error
+@doc "An open sum that may contain an error."
 type Fallible 'error 'rest = #Error 'error | ..'rest
 
+@doc "Transforms a successful value and leaves an error unchanged."
 let map: ('a -> 'b + ..'effects) -> Result 'a 'error -> Result 'b 'error + ..'effects =
   fn function result => match result with
   | #Some value => #Some (function value)
   | #Error error => #Error error
   end
 
+@doc "Transforms an error and leaves a successful value unchanged."
 let map_error: ('a -> 'b + ..'effects) -> Result 'some 'a -> Result 'some 'b + ..'effects =
   fn function result => match result with
   | #Some value => #Some value
   | #Error error => #Error (function error)
   end
 
+@doc "Transforms a successful value with a function that may fail."
 let and_then:
   ('a -> Result 'b 'error + ..'effects) -> Result 'a 'error -> Result 'b 'error + ..'effects =
   fn function result => match result with
@@ -20,11 +25,13 @@ let and_then:
   | #Error error => #Error error
   end
 
+@doc "Returns the successful value or the fallback."
 let unwrap_or: 'a -> Result 'a 'error -> 'a = fn fallback result => match result with
 | #Some value => value
 | #Error _ => fallback
 end
 
+@doc "Transforms an error with a function that may recover."
 let or_else:
   ('a -> Result 'some 'b + ..'effects) -> Result 'some 'a -> Result 'some 'b + ..'effects =
   fn fallback result => match result with
@@ -32,26 +39,31 @@ let or_else:
   | #Error error => fallback error
   end
 
+@doc "Whether a result is successful."
 let is_ok: Result 'some 'error -> Bool = fn result => match result with
 | #Some _ => true
 | #Error _ => false
 end
 
+@doc "Whether a result is an error."
 let is_error: Result 'some 'error -> Bool = fn result => match result with
 | #Some _ => false
 | #Error _ => true
 end
 
+@doc "Converts a successful result to `#Some` and an error to `#None`."
 let to_option: Result 'some 'error -> Option 'some = fn result => match result with
 | #Some value => #Some value
 | #Error _ => #None
 end
 
+@doc "Returns the payload of `#Error` or the fallback for any other case."
 let error_or: 'error -> (#Error 'error | ..'rest) -> 'error = fn fallback value => match value with
 | #Error error => error
 | _ => fallback
 end
 
+@doc "Whether an open sum value is the `#Error` case."
 let is_error_case: (#Error 'error | ..'rest) -> Bool = fn value => match value with
 | #Error _ => true
 | _ => false

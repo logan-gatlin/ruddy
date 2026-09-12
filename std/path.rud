@@ -1,24 +1,50 @@
+@doc "The root, directory, base name, extension, and stem of a path."
 type Parts = { root: String, dir: String, base: String, ext: String, name: String }
+@doc "A path operation failure with its host message."
 type Error = { message: String }
+@doc "Path operations that depend on a working directory and are supplied by a handler."
 effect Path = {
   resolve: [String] -> Result String Error,
   relative: { from: String, to: String } -> Result String Error,
 }
+@doc "Resolves path segments to an absolute path."
 let resolve = !Path.resolve
+@doc "Finds a relative path from one path to another."
 let relative = fn from to => !Path.relative { from: from, to: to }
+@doc \\`posix` manipulates paths with POSIX conventions regardless of the host platform.
+\\
+\\A path can be normalized with POSIX conventions on every platform.
+\\
+\\```ruddy
+\\let logs = std::path::posix::normalize "/srv/ruddy/../logs/app.log"
+\\```
 module posix
+@doc \\`windows` manipulates paths with Windows conventions regardless of the host platform.
+\\
+\\A path can be normalized with Windows conventions on every platform.
+\\
+\\```ruddy
+\\let logs = std::path::windows::normalize "C:\\ruddy\\..\\logs\\app.log"
+\\```
 module windows
 @async
+@doc "Normalizes a path using the host convention."
 extern normalize: String -> String = "$nodePath.native.normalize"
 @async
+@doc "Returns the final portion of a path."
 extern basename: String -> String = "$nodePath.native.basename"
 @async
+@doc "Returns all but the final portion of a path."
 extern dirname: String -> String = "$nodePath.native.dirname"
 @async
+@doc "Returns the extension of the final portion of a path."
 extern extension: String -> String = "$nodePath.native.extname"
 @async
+@doc "Whether a path is absolute."
 extern is_absolute: String -> Bool = "$nodePath.native.isAbsolute"
 @async
+@doc "Separates a path into its parts."
 extern parse: String -> Parts = "$nodePath.native.parse"
 @async
+@doc "Joins path segments and normalizes the result."
 extern join: [String] -> String = "$nodePath.native.join"

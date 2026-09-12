@@ -15,10 +15,13 @@
   },
   "devDependencies": {
     "@11ty/eleventy": "^3.1.6",
+    "@tree-sitter-grammars/tree-sitter-toml": "0.7.0",
     "github-slugger": "^2.0.0",
     "markdown-it": "^15.0.1",
     "markdown-it-anchor": "^10.0.0",
+    "tree-sitter-bash": "0.25.1",
     "tree-sitter-cli": "0.26.12",
+    "tree-sitter-json": "0.24.8",
     "wrangler": "^4.130.0"
   },
   "allowScripts": {

@@ -4,6 +4,9 @@ doc: true
 
 # Standard library
 
+The [Ruddy Book](index.md) introduces these modules as their concepts become relevant.
+The [generated API reference](std/bundle.md) contains the complete public declarations.
+
 The [standard library](dictionary.md#standard-library) is available through the dependency name `std` by default.
 It provides common types, functions, and effects.
 The [grammar](grammar.md#modules-attributes-and-foreign-values) describes qualified paths and `using` statements.

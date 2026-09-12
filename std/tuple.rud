@@ -1,17 +1,25 @@
+@doc "Constructs a pair from two values."
 let pair: 'a -> 'b -> ('a, 'b) = fn first second => (first, second)
+@doc "Constructs a pair containing the value twice."
 let duplicate: 'a -> ('a, 'a) = fn value => (value, value)
 
+@doc "Returns the first value."
 let first: { 0: 'a, ..'rest } -> 'a = fn values => values.0
+@doc "Returns the second value."
 let second: { 0: 'a, 1: 'b, ..'rest } -> 'b = fn values => values.1
 
+@doc "Exchanges the values in a pair."
 let swap: ('a, 'b) -> ('b, 'a) = fn values => (values.1, values.0)
 
+@doc "Transforms the first value of a pair."
 let map_first: ('a -> 'c + ..'effects) -> ('a, 'b) -> ('c, 'b) + ..'effects =
   fn function values => (function values.0, values.1)
 
+@doc "Transforms the second value of a pair."
 let map_second: ('b -> 'c + ..'effects) -> ('a, 'b) -> ('a, 'c) + ..'effects =
   fn function values => (values.0, function values.1)
 
+@doc "Transforms both values of a pair."
 let map_both:
   ('a -> 'c + ..'effects) -> ('b -> 'd + ..'effects) -> ('a, 'b) -> ('c, 'd) + ..'effects =
   fn left right values => (left values.0, right values.1)

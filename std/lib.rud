@@ -1,32 +1,267 @@
+@doc \\`types` defines foundational types shared by the standard library.
+\\
+\\A consumer can repeatedly discard incoming values.
+\\
+\\```ruddy
+\\let discard: std::types::Consumer 'a (|) = fn _ => discard
+\\```
 module types
+@doc \\`effects` defines reusable effects for control flow and passing values.
+\\
+\\A computation can request a configuration value through `Ask`.
+\\
+\\```ruddy
+\\let port = std::effects::!Ask ()
+\\```
 module effects
+@doc \\`fs` provides file and directory operations through the `FileSystem` effect.
+\\
+\\A file can be replaced with UTF-8 text.
+\\
+\\```ruddy
+\\let save_notes = fn text =>
+\\  std::fs::write_text "notes.txt" text
+\\```
 module fs
+@doc \\`io` writes text to standard output and standard error through the `IO` effect.
+\\
+\\A greeting can be written as a line on standard output.
+\\
+\\```ruddy
+\\let greet = fn name =>
+\\  std::io::println (std::str::concat "Hello, " name)
+\\```
 module io
+@doc \\`process` reads process state and can exit the process.
+\\
+\\An environment variable lookup can return optional text or a process error.
+\\
+\\```ruddy
+\\let home = std::process::env "HOME"
+\\```
 module process
+@doc \\`codec` defines format-independent encoders, decoders, and their protocols.
+\\
+\\A default codec can be derived for a record type.
+\\
+\\```ruddy
+\\type Settings = { theme: String, retries: Nat }
+\\
+\\let settings_codec: Result (std::codec::Codec Settings) std::codec::DeriveError =
+\\  std::codec::derive (std::reflect::mirror ())
+\\```
 module codec
+@doc \\`json` parses, inspects, encodes, and decodes JSON documents.
+\\
+\\JSON text can be decoded directly into an expected Ruddy type.
+\\
+\\```ruddy
+\\let names: Result [String] std::json::Error =
+\\  std::json::decode "[\"Ada\",\"Grace\"]"
+\\```
 module json
+@doc \\`binary` encodes and decodes typed values in a positional binary format.
+\\
+\\A record can be encoded with its default positional binary codec.
+\\
+\\```ruddy
+\\let packet = std::binary::encode { sequence: 7n, message: "ready" }
+\\```
 module binary
+@doc \\`url` parses and resolves URLs and provides immutable operations on their query parameters.
+\\
+\\An absolute URL can be parsed into a validated snapshot.
+\\
+\\```ruddy
+\\let endpoint = std::url::parse "https://api.example.com/users?page=2"
+\\```
 module url
+@doc \\`http` sends buffered requests and provides helpers for common responses.
+\\
+\\A buffered `GET` request can use the default options.
+\\
+\\```ruddy
+\\let response = std::http::get "https://api.example.com/health"
+\\```
 module http
 @if { platform: "node" }
+@doc \\`path` supports host, POSIX, and Windows path conventions.
+\\
+\\Path segments can be joined using the host convention.
+\\
+\\```ruddy
+\\let config = std::path::join ["var", "lib", "ruddy", "config.json"]
+\\```
 module path
+@doc \\`str` inspects, transforms, searches, and combines text by Unicode scalar value.
+\\
+\\Every plain occurrence of a substring can be replaced.
+\\
+\\```ruddy
+\\let redacted =
+\\  std::str::replace_all ("Call 555-0100", "555-", "***-")
+\\```
 module str
+@doc \\`nat` provides arithmetic, comparison, and conversion for natural numbers.
+\\
+\\A quantity can be kept within inclusive bounds.
+\\
+\\```ruddy
+\\let table_size = std::nat::clamp (requested_size, 1n, 12n)
+\\```
 module nat
+@doc \\`int` provides arithmetic, comparison, conversion, and bounded operations for integers.
+\\
+\\A signed difference can be converted to a nonnegative distance.
+\\
+\\```ruddy
+\\let distance_from_zero = std::int::abs (-14i)
+\\```
 module int
+@doc \\`real` provides arithmetic and mathematical functions for real numbers.
+\\
+\\An angle in degrees can be converted to radians.
+\\
+\\```ruddy
+\\let quarter_turn = std::real::degrees_to_radians 90.0
+\\```
 module real
+@doc \\`boolean` provides logical operations and ordering for `Bool` values.
+\\
+\\An implication can require a true conclusion only when its premise is true.
+\\
+\\```ruddy
+\\let access_allowed =
+\\  std::boolean::implies account_is_private viewer_follows_account
+\\```
 module boolean
+@doc \\`option` defines optional values and functions for transforming and combining them.
+\\
+\\A fallback can replace an absent optional value.
+\\
+\\```ruddy
+\\let display_name = std::option::unwrap_or "Guest" saved_name
+\\```
 module option
+@doc \\`result` defines and transforms successful or failed results.
+\\
+\\An error can be transformed without changing a successful value.
+\\
+\\```ruddy
+\\let readable_response =
+\\  std::result::map_error (fn _ => "Request failed") response
+\\```
 module result
+@doc \\`array` provides immutable operations on arrays.
+\\
+\\Available items can be kept in their original order.
+\\
+\\```ruddy
+\\let available_items = std::array::filter is_available inventory
+\\```
 module array
+@doc \\`cell` creates and updates mutable cells whose effects stay within a tracked region.
+\\
+\\A mutable running total can be updated with a function.
+\\
+\\```ruddy
+\\let add_fee = fn subtotal => do
+\\  let total = std::cell::new subtotal
+\\  return std::cell::update (fn value => std::nat::add value 5n) total
+\\end
+\\```
 module cell
+@doc \\`any` packages a value with its type and recovers it through an exact type check.
+\\
+\\A packaged value can be recovered when the requested type matches exactly.
+\\
+\\```ruddy
+\\let stored = std::any::upcast "ready"
+\\let status: Option String = std::any::downcast stored
+\\```
 module any
+@doc \\`ffi` marks immediate foreign effects and converts values at foreign boundaries.
+\\
+\\A foreign value can be checked against an expected record shape.
+\\
+\\```ruddy
+\\let preferences: Result { dark_mode: Bool } std::ffi::DecodeError =
+\\  std::ffi::decode foreign_preferences
+\\```
 module ffi
+@doc \\`abi` validates C and WebAssembly component calling contracts.
+\\
+\\A scalar-only C calling plan can be validated for a 64-bit target.
+\\
+\\```ruddy
+\\let plan: std::abi::Plan = {
+\\  name: "absolute_value",
+\\  target: { convention: #C, address_bits: 64n, scalar_alignment: #None },
+\\  parameters: [{
+\\    name: "value",
+\\    shape: #Scalar (#Integer { bits: 32n, signed: true }),
+\\  }],
+\\  result: #Some (#Scalar (#Integer { bits: 32n, signed: true })),
+\\  obligations: [],
+\\}
+\\
+\\let validation = std::abi::validate plan
+\\```
 module abi
+@doc \\`js` converts and observes values at JavaScript boundaries.
+\\
+\\A Ruddy record can be lowered into host data for JavaScript.
+\\
+\\```ruddy
+\\let host_user = std::js::lower { name: "Ada", active: true }
+\\```
 module js
+@doc \\`reflect` describes types as data through compiler-supplied mirrors.
+\\
+\\A value's static type can be described as ordinary data.
+\\
+\\```ruddy
+\\let schema = std::reflect::describe (
+\\  std::reflect::type_of { name: "Ada", active: true }
+\\)
+\\```
 module reflect
+@doc \\`function` provides combinators for applying, composing, and adapting functions.
+\\
+\\Two transformations can be composed into one function.
+\\
+\\```ruddy
+\\let double_after_increment = std::function::compose
+\\  (fn value => std::nat::multiply value 2n)
+\\  (fn value => std::nat::add value 1n)
+\\```
 module function
+@doc \\`tuple` constructs, reads, swaps, and transforms tuple values.
+\\
+\\The second value of a pair can be transformed without changing the first.
+\\
+\\```ruddy
+\\let updated_price = std::tuple::map_second
+\\  (fn cents => std::nat::add cents 200n)
+\\  ("coffee", 300n)
+\\```
 module tuple
+@doc \\`order` defines three-way ordering and builds comparisons from ordering functions.
+\\
+\\Records can be compared by projecting a field before applying an ordering.
+\\
+\\```ruddy
+\\let compare_by_age =
+\\  std::order::compare_by std::nat::compare (fn person => person.age)
+\\```
 module order
+@doc \\`prelude` contains the types, effects, and values available without an explicit import.
+\\
+\\A line can be written without a module qualifier.
+\\
+\\```ruddy
+\\println "ready"
+\\```
 module prelude
 
 @private

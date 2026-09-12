@@ -1,14 +1,20 @@
+@doc "Joins two strings."
 extern concat: fn(String, String) -> String = "$prim.str.concat"
 @doc "The number of Unicode scalar values in the text: `\"😀\"` has length one."
 extern len: fn(String) -> Nat = "$prim.str.len"
 
 @doc "How many bytes this text is as UTF-8. Scalars are what `len` counts; this is what a byte budget counts, and what crosses a binary boundary."
 extern utf8_len: fn(String) -> Nat = "$prim.str.utf8_len"
+@doc "Whether the string contains no scalar values."
 let is_empty: String -> Bool = fn value => match value with | "" => true | _ => false end
 
+@doc "The decimal text of a natural number."
 extern from_nat: fn(Nat) -> String = "$prim.str.from_nat"
+@doc "The decimal text of an integer."
 extern from_int: fn(Int) -> String = "$prim.str.from_int"
+@doc "The text representation of a real number."
 extern from_real: fn(Real) -> String = "$prim.str.from_real"
+@doc "`\"true\"` for `true` and `\"false\"` for `false`."
 let from_boolean: Bool -> String = fn b => match b with | true => "true" | false => "false" end
 
 @private
@@ -16,8 +22,11 @@ extern ordering_less_than: fn(String, String) -> Bool = "$prim.str.ordering_less
 @private
 extern ordering_greater_than: fn(String, String) -> Bool = "$prim.str.ordering_greater_than"
 
+@doc "Whether the string contains the substring."
 extern contains: fn(String, String) -> Bool = "$prim.str.contains"
+@doc "Whether the string begins with the prefix."
 extern starts_with: fn(String, String) -> Bool = "$prim.str.starts_with"
+@doc "Whether the string ends with the suffix."
 extern ends_with: fn(String, String) -> Bool = "$prim.str.ends_with"
 @doc "The scalar at a position, counting scalars from zero; empty past the end."
 extern char_at: fn(String, Nat) -> String = "$prim.str.char_at"
@@ -26,27 +35,38 @@ extern index_of: fn(String, String) -> Int = "$prim.str.index_of"
 
 @doc "The scalars from `start` up to `end`, counting scalars from zero."
 extern slice: fn(String, Nat, Nat) -> String = "$prim.str.slice"
+@doc "Removes whitespace from both ends."
 extern trim: fn(String) -> String = "$prim.str.trim"
+@doc "Removes whitespace from the beginning."
 extern trim_start: fn(String) -> String = "$prim.str.trim_start"
+@doc "Removes whitespace from the end."
 extern trim_end: fn(String) -> String = "$prim.str.trim_end"
+@doc "Converts cased scalars to lowercase."
 extern to_lowercase: fn(String) -> String = "$prim.str.to_lowercase"
+@doc "Converts cased scalars to uppercase."
 extern to_uppercase: fn(String) -> String = "$prim.str.to_uppercase"
 
+@doc "Repeats the string the supplied number of times."
 extern repeat: fn(String, Nat) -> String = "$prim.str.repeat"
 @doc "Replace the first occurrence of a plain substring. The replacement is inserted as written: `$&` and its relatives are text, not a substitution. An empty search matches before the first scalar."
 extern replace_first: fn(String, String, String) -> String = "$prim.str.replace_first"
 @doc "Replace every occurrence of a plain substring, left to right and without overlapping. The replacement is inserted as written. An empty search matches at every scalar boundary, including before the first scalar and after the last."
 extern replace_all: fn(String, String, String) -> String = "$prim.str.replace_all"
+@doc "Pads the beginning to the requested scalar length."
 extern pad_start: fn(String, Nat, String) -> String = "$prim.str.pad_start"
+@doc "Pads the end to the requested scalar length."
 extern pad_end: fn(String, Nat, String) -> String = "$prim.str.pad_end"
+@doc "The scalar values in reverse order."
 extern reverse: fn(String) -> String = "$prim.str.reverse"
 
+@doc "Compares two strings by scalar value."
 let compare: order::Ordering String = fn left right =>
   if ordering_less_than left right then #Less
   else if ordering_greater_than left right then #Greater
   else #Equal
   end
 
+@doc "The Boolean comparisons derived from the three-way ordering."
 let {
   equal,
   not_equal,
@@ -56,36 +76,46 @@ let {
   greater_than_or_equal,
 } = order::derive compare
 
+@doc "Whether the string is empty or contains only whitespace."
 let is_blank: String -> Bool = fn value => is_empty (trim value)
 
+@doc "The scalar at the zero-based position, or `#None` when the position is outside the string."
 let char_at_option: String -> Nat -> Option String = fn value index =>
   if nat::less_than index (len value) then #Some (char_at value index) else #None end
 
+@doc "The zero-based scalar position of the first occurrence, or `#None` when it is absent."
 let index_of_option: String -> String -> Option Nat = fn value search => do
   let index = index_of value search
   return if int::less_than index 0i then #None else #Some (nat::from_int index) end
 end
 
+@doc "The first requested number of scalar values."
 let take: String -> Nat -> String = fn value count => slice value 0n count
+@doc "The text after the requested number of scalar values."
 let drop: String -> Nat -> String = fn value count => slice value count (len value)
 
+@doc "The text after a matching prefix."
 let strip_prefix: String -> String -> Option String = fn value prefix =>
   if starts_with value prefix then #Some (drop value (len prefix)) else #None end
 
+@doc "The text before a matching suffix."
 let strip_suffix: String -> String -> Option String = fn value suffix =>
   if ends_with value suffix then #Some (take value (nat::subtract (len value) (len suffix)))
   else #None
   end
 
+@doc "The text before and after the first separator, or `#None` when it is absent."
 let split_once: String -> String -> Option (String, String) = fn value separator =>
   match index_of_option value separator with
   | #Some index => #Some (take value index, drop value (nat::add index (len separator)))
   | #None => #None
   end
 
+@doc "The scalar values as one-scalar strings."
 let chars: String -> [String] = fn value =>
   if is_empty value then [] else [char_at value 0n, ..chars (drop value 1n)] end
 
+@doc "Splits at every occurrence of a separator."
 let split: String -> String -> [String] = fn value separator =>
   if is_empty separator then chars value
   else
@@ -96,12 +126,14 @@ let split: String -> String -> [String] = fn value separator =>
     end
   end
 
+@doc "Joins strings with a separator between adjacent values."
 let join: String -> [String] -> String = fn separator values => match values with
 | [] => ""
 | [head] => head
 | [head, ..tail] => concat head (concat separator (join separator tail))
 end
 
+@doc "The scalars from `start` up to `end`, or `#None` when the positions are invalid."
 let slice_with: String -> { start when 'start: Nat, stop when 'stop: Nat } -> String =
   fn value bounds => match bounds with
   | {} => value

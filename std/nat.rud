@@ -1,7 +1,12 @@
+@doc "The sum of two `Nat` values."
 extern add: fn(Nat, Nat) -> Nat = "$prim.nat.add"
+@doc "The first `Nat` value minus the second."
 extern subtract: fn(Nat, Nat) -> Nat = "$prim.nat.subtract"
+@doc "The product of two `Nat` values."
 extern multiply: fn(Nat, Nat) -> Nat = "$prim.nat.multiply"
+@doc "The first `Nat` value divided by the second."
 extern divide: fn(Nat, Nat) -> Nat = "$prim.nat.divide"
+@doc "The remainder after dividing the first `Nat` value by the second."
 extern remainder: fn(Nat, Nat) -> Nat = "$prim.nat.remainder"
 
 @private
@@ -9,20 +14,28 @@ extern ordering_less_than: fn(Nat, Nat) -> Bool = "$prim.nat.ordering_less_than"
 @private
 extern ordering_greater_than: fn(Nat, Nat) -> Bool = "$prim.nat.ordering_greater_than"
 
+@doc "The lesser of two `Nat` values."
 extern min: fn(Nat, Nat) -> Nat = "$prim.nat.min"
+@doc "The greater of two `Nat` values."
 extern max: fn(Nat, Nat) -> Nat = "$prim.nat.max"
+@doc "The `Nat` value limited to the inclusive lower and upper bounds."
 extern clamp: fn(Nat, Nat, Nat) -> Nat = "$prim.nat.clamp"
+@doc "Whether the `Nat` value is zero."
 let is_zero: Nat -> Bool = fn value => match value with | 0n => true | _ => false end
 
+@doc "Converts an `Int` to `Nat`."
 extern from_int: fn(Int) -> Nat = "$prim.nat.from_int"
+@doc "Converts a `Real` to `Nat`."
 extern from_real: fn(Real) -> Nat = "$prim.nat.from_real"
 
+@doc "The three-way comparison of two `Nat` values."
 let compare: order::Ordering Nat = fn left right =>
   if ordering_less_than left right then #Less
   else if ordering_greater_than left right then #Greater
   else #Equal
   end
 
+@doc "The Boolean comparisons derived from the three-way ordering of `Nat` values."
 let {
   equal,
   not_equal,
@@ -33,30 +46,47 @@ let {
 } = order::derive compare
 
 -- Nat8: arithmetic wraps modulo 2^8; division truncates toward zero.
+@doc "The least `Nat8` value."
 let min_value8: Nat8 = 0n8
+@doc "The greatest `Nat8` value."
 let max_value8: Nat8 = 255n8
+@doc "The sum of two `Nat8` values, wrapping to 8 bits."
 extern add8: fn(Nat8, Nat8) -> Nat8 = "$prim.nat.add8"
+@doc "The first `Nat8` value minus the second, wrapping to 8 bits."
 extern subtract8: fn(Nat8, Nat8) -> Nat8 = "$prim.nat.subtract8"
+@doc "The product of two `Nat8` values, wrapping to 8 bits."
 extern multiply8: fn(Nat8, Nat8) -> Nat8 = "$prim.nat.multiply8"
+@doc "The first `Nat8` value divided by the second."
 extern divide8: fn(Nat8, Nat8) -> Nat8 = "$prim.nat.divide8"
+@doc "The remainder after dividing the first `Nat8` value by the second."
 extern remainder8: fn(Nat8, Nat8) -> Nat8 = "$prim.nat.remainder8"
 @private
 extern ordering_less_than8: fn(Nat8, Nat8) -> Bool = "$prim.nat.ordering_less_than8"
 @private
 extern ordering_greater_than8: fn(Nat8, Nat8) -> Bool = "$prim.nat.ordering_greater_than8"
+@doc "The lesser of two `Nat8` values."
 extern min8: fn(Nat8, Nat8) -> Nat8 = "$prim.nat.min8"
+@doc "The greater of two `Nat8` values."
 extern max8: fn(Nat8, Nat8) -> Nat8 = "$prim.nat.max8"
+@doc "The `Nat8` value limited to the inclusive lower and upper bounds."
 extern clamp8: fn(Nat8, Nat8, Nat8) -> Nat8 = "$prim.nat.clamp8"
+@doc "Whether the `Nat8` value is zero."
 extern is_zero8: fn(Nat8) -> Bool = "$prim.nat.is_zero8"
+@doc "Converts a `Nat` to `Nat8`."
 extern from_nat8: fn(Nat) -> Nat8 = "$prim.nat.from_nat8"
+@doc "Converts an `Int` to `Nat8`."
 extern from_int8: fn(Int) -> Nat8 = "$prim.nat.from_int8"
+@doc "The decimal text of a `Nat8` value."
 extern to_string8: fn(Nat8) -> String = "$prim.nat.to_string8"
+@doc "Converts a `Nat8` value to `Nat`."
 extern to_nat8: fn(Nat8) -> Nat = "$prim.nat.to_nat8"
+@doc "The three-way comparison of two `Nat8` values."
 let compare8: order::Ordering Nat8 = fn left right =>
   if ordering_less_than8 left right then #Less
   else if ordering_greater_than8 left right then #Greater
   else #Equal
   end
+@doc "The Boolean comparisons derived from the three-way ordering of `Nat8` values."
 let {
   equal: equal8,
   not_equal: not_equal8,
@@ -67,30 +97,47 @@ let {
 } = order::derive compare8
 
 -- Nat16: arithmetic wraps modulo 2^16; division truncates toward zero.
+@doc "The least `Nat16` value."
 let min_value16: Nat16 = 0n16
+@doc "The greatest `Nat16` value."
 let max_value16: Nat16 = 65535n16
+@doc "The sum of two `Nat16` values, wrapping to 16 bits."
 extern add16: fn(Nat16, Nat16) -> Nat16 = "$prim.nat.add16"
+@doc "The first `Nat16` value minus the second, wrapping to 16 bits."
 extern subtract16: fn(Nat16, Nat16) -> Nat16 = "$prim.nat.subtract16"
+@doc "The product of two `Nat16` values, wrapping to 16 bits."
 extern multiply16: fn(Nat16, Nat16) -> Nat16 = "$prim.nat.multiply16"
+@doc "The first `Nat16` value divided by the second."
 extern divide16: fn(Nat16, Nat16) -> Nat16 = "$prim.nat.divide16"
+@doc "The remainder after dividing the first `Nat16` value by the second."
 extern remainder16: fn(Nat16, Nat16) -> Nat16 = "$prim.nat.remainder16"
 @private
 extern ordering_less_than16: fn(Nat16, Nat16) -> Bool = "$prim.nat.ordering_less_than16"
 @private
 extern ordering_greater_than16: fn(Nat16, Nat16) -> Bool = "$prim.nat.ordering_greater_than16"
+@doc "The lesser of two `Nat16` values."
 extern min16: fn(Nat16, Nat16) -> Nat16 = "$prim.nat.min16"
+@doc "The greater of two `Nat16` values."
 extern max16: fn(Nat16, Nat16) -> Nat16 = "$prim.nat.max16"
+@doc "The `Nat16` value limited to the inclusive lower and upper bounds."
 extern clamp16: fn(Nat16, Nat16, Nat16) -> Nat16 = "$prim.nat.clamp16"
+@doc "Whether the `Nat16` value is zero."
 extern is_zero16: fn(Nat16) -> Bool = "$prim.nat.is_zero16"
+@doc "Converts a `Nat` to `Nat16`."
 extern from_nat16: fn(Nat) -> Nat16 = "$prim.nat.from_nat16"
+@doc "Converts an `Int` to `Nat16`."
 extern from_int16: fn(Int) -> Nat16 = "$prim.nat.from_int16"
+@doc "The decimal text of a `Nat16` value."
 extern to_string16: fn(Nat16) -> String = "$prim.nat.to_string16"
+@doc "Converts a `Nat16` value to `Nat`."
 extern to_nat16: fn(Nat16) -> Nat = "$prim.nat.to_nat16"
+@doc "The three-way comparison of two `Nat16` values."
 let compare16: order::Ordering Nat16 = fn left right =>
   if ordering_less_than16 left right then #Less
   else if ordering_greater_than16 left right then #Greater
   else #Equal
   end
+@doc "The Boolean comparisons derived from the three-way ordering of `Nat16` values."
 let {
   equal: equal16,
   not_equal: not_equal16,
@@ -101,30 +148,47 @@ let {
 } = order::derive compare16
 
 -- Nat32: arithmetic wraps modulo 2^32; division truncates toward zero.
+@doc "The least `Nat32` value."
 let min_value32: Nat32 = 0n32
+@doc "The greatest `Nat32` value."
 let max_value32: Nat32 = 4294967295n32
+@doc "The sum of two `Nat32` values, wrapping to 32 bits."
 extern add32: fn(Nat32, Nat32) -> Nat32 = "$prim.nat.add32"
+@doc "The first `Nat32` value minus the second, wrapping to 32 bits."
 extern subtract32: fn(Nat32, Nat32) -> Nat32 = "$prim.nat.subtract32"
+@doc "The product of two `Nat32` values, wrapping to 32 bits."
 extern multiply32: fn(Nat32, Nat32) -> Nat32 = "$prim.nat.multiply32"
+@doc "The first `Nat32` value divided by the second."
 extern divide32: fn(Nat32, Nat32) -> Nat32 = "$prim.nat.divide32"
+@doc "The remainder after dividing the first `Nat32` value by the second."
 extern remainder32: fn(Nat32, Nat32) -> Nat32 = "$prim.nat.remainder32"
 @private
 extern ordering_less_than32: fn(Nat32, Nat32) -> Bool = "$prim.nat.ordering_less_than32"
 @private
 extern ordering_greater_than32: fn(Nat32, Nat32) -> Bool = "$prim.nat.ordering_greater_than32"
+@doc "The lesser of two `Nat32` values."
 extern min32: fn(Nat32, Nat32) -> Nat32 = "$prim.nat.min32"
+@doc "The greater of two `Nat32` values."
 extern max32: fn(Nat32, Nat32) -> Nat32 = "$prim.nat.max32"
+@doc "The `Nat32` value limited to the inclusive lower and upper bounds."
 extern clamp32: fn(Nat32, Nat32, Nat32) -> Nat32 = "$prim.nat.clamp32"
+@doc "Whether the `Nat32` value is zero."
 extern is_zero32: fn(Nat32) -> Bool = "$prim.nat.is_zero32"
+@doc "Converts a `Nat` to `Nat32`."
 extern from_nat32: fn(Nat) -> Nat32 = "$prim.nat.from_nat32"
+@doc "Converts an `Int` to `Nat32`."
 extern from_int32: fn(Int) -> Nat32 = "$prim.nat.from_int32"
+@doc "The decimal text of a `Nat32` value."
 extern to_string32: fn(Nat32) -> String = "$prim.nat.to_string32"
+@doc "Converts a `Nat32` value to `Nat`."
 extern to_nat32: fn(Nat32) -> Nat = "$prim.nat.to_nat32"
+@doc "The three-way comparison of two `Nat32` values."
 let compare32: order::Ordering Nat32 = fn left right =>
   if ordering_less_than32 left right then #Less
   else if ordering_greater_than32 left right then #Greater
   else #Equal
   end
+@doc "The Boolean comparisons derived from the three-way ordering of `Nat32` values."
 let {
   equal: equal32,
   not_equal: not_equal32,
@@ -135,30 +199,47 @@ let {
 } = order::derive compare32
 
 -- Nat64: arithmetic wraps modulo 2^64; division truncates toward zero.
+@doc "The least `Nat64` value."
 let min_value64: Nat64 = 0n64
+@doc "The greatest `Nat64` value."
 let max_value64: Nat64 = 18446744073709551615n64
+@doc "The sum of two `Nat64` values, wrapping to 64 bits."
 extern add64: fn(Nat64, Nat64) -> Nat64 = "$prim.nat.add64"
+@doc "The first `Nat64` value minus the second, wrapping to 64 bits."
 extern subtract64: fn(Nat64, Nat64) -> Nat64 = "$prim.nat.subtract64"
+@doc "The product of two `Nat64` values, wrapping to 64 bits."
 extern multiply64: fn(Nat64, Nat64) -> Nat64 = "$prim.nat.multiply64"
+@doc "The first `Nat64` value divided by the second."
 extern divide64: fn(Nat64, Nat64) -> Nat64 = "$prim.nat.divide64"
+@doc "The remainder after dividing the first `Nat64` value by the second."
 extern remainder64: fn(Nat64, Nat64) -> Nat64 = "$prim.nat.remainder64"
 @private
 extern ordering_less_than64: fn(Nat64, Nat64) -> Bool = "$prim.nat.ordering_less_than64"
 @private
 extern ordering_greater_than64: fn(Nat64, Nat64) -> Bool = "$prim.nat.ordering_greater_than64"
+@doc "The lesser of two `Nat64` values."
 extern min64: fn(Nat64, Nat64) -> Nat64 = "$prim.nat.min64"
+@doc "The greater of two `Nat64` values."
 extern max64: fn(Nat64, Nat64) -> Nat64 = "$prim.nat.max64"
+@doc "The `Nat64` value limited to the inclusive lower and upper bounds."
 extern clamp64: fn(Nat64, Nat64, Nat64) -> Nat64 = "$prim.nat.clamp64"
+@doc "Whether the `Nat64` value is zero."
 extern is_zero64: fn(Nat64) -> Bool = "$prim.nat.is_zero64"
+@doc "Converts a `Nat` to `Nat64`."
 extern from_nat64: fn(Nat) -> Nat64 = "$prim.nat.from_nat64"
+@doc "Converts an `Int` to `Nat64`."
 extern from_int64: fn(Int) -> Nat64 = "$prim.nat.from_int64"
+@doc "The decimal text of a `Nat64` value."
 extern to_string64: fn(Nat64) -> String = "$prim.nat.to_string64"
+@doc "Converts a `Nat64` value to `Nat`."
 extern to_nat64: fn(Nat64) -> Nat = "$prim.nat.to_nat64"
+@doc "The three-way comparison of two `Nat64` values."
 let compare64: order::Ordering Nat64 = fn left right =>
   if ordering_less_than64 left right then #Less
   else if ordering_greater_than64 left right then #Greater
   else #Equal
   end
+@doc "The Boolean comparisons derived from the three-way ordering of `Nat64` values."
 let {
   equal: equal64,
   not_equal: not_equal64,

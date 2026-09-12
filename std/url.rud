@@ -12,25 +12,38 @@ type Url = {
   search: String,
   hash: String,
 }
+@doc "A URL failure with the invalid input and host message."
 type Error = { input: String, message: String }
+@doc "Ordered query parameters that may contain repeated names."
 type Query = [(String, String)]
+@doc "Parses an absolute URL."
 extern parse: String -> Result Url Error = "$url.parse"
 @private
 extern resolve_raw: { base: String, input: String } -> Result Url Error = "$url.resolve"
+@doc "Resolves a URL reference against a base URL."
 let resolve = fn base input => resolve_raw { base: base, input: input }
+@doc "Parses query text into ordered name-value pairs."
 extern parse_query: String -> Query = "$url.parseQuery"
+@doc "Writes ordered query parameters as query text."
 extern stringify_query: Query -> String = "$url.stringifyQuery"
+@doc "Parses the query parameters from a URL snapshot."
 let query = fn url => parse_query url.search
+@doc "The first value with the name."
 let get: String -> Query -> Option String = fn name query =>
   option::map (fn pair => pair.1) (array::find (fn pair => str::equal name pair.0) query)
+@doc "Every value with the name, in order."
 let get_all: String -> Query -> [String] = fn name query =>
   array::filter_map (fn pair => if str::equal name pair.0 then #Some pair.1 else #None end) query
+@doc "A copy with a name-value pair added at the end."
 let append: String -> String -> Query -> Query = fn name value query =>
   array::push query (name, value)
+@doc "A copy without parameters having the name."
 let remove: String -> Query -> Query = fn name query =>
   array::filter (fn pair => str::not_equal name pair.0) query
+@doc "A copy whose first parameter with the name has the value and whose later duplicates are removed."
 let set: String -> String -> Query -> Query = fn name value query =>
   append name value (remove name query)
 @private
 extern with_query_raw: { href: String, search: String } -> Result Url Error = "$url.withQuery"
+@doc "Parses a copy of the URL with the supplied query parameters."
 let with_query = fn url query => with_query_raw { href: url.href, search: stringify_query query }

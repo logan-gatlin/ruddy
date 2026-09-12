@@ -1,13 +1,22 @@
+@doc "Writes text to standard output or standard error."
 effect IO = { write: String -> (), write_error: String -> () }
 
+@doc "Writes text to standard output."
 let print = !IO.write
+@doc "Writes text to standard error."
 let eprint = !IO.write_error
 
+@doc "Writes text and a newline to standard output."
 let println = fn text => print (str::concat text "\n")
+@doc "Writes text and a newline to standard error."
 let eprintln = fn text => eprint (str::concat text "\n")
 
+@doc "A consumer that writes each value to standard output."
 let consumer = function::make_consumer print
+@doc "A consumer that writes each value to standard error."
 let econsumer = function::make_consumer eprint
 
+@doc "A consumer that writes each value and a newline to standard output."
 let consumerln = function::make_consumer println
+@doc "A consumer that writes each value and a newline to standard error."
 let econsumerln = function::make_consumer eprintln

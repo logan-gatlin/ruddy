@@ -1,3 +1,27 @@
+@font-face {
+  font-family: "Cousine";
+  src: url("fonts/Cousine-Regular.woff2") format("woff2");
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: "Cousine";
+  src: url("fonts/Cousine-Italic.woff2") format("woff2");
+  font-style: italic;
+  font-weight: 400;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: "Cousine";
+  src: url("fonts/Cousine-Bold.woff2") format("woff2");
+  font-style: normal;
+  font-weight: 700;
+  font-display: swap;
+}
+
 :root {
   color-scheme: light dark;
   font-family: system-ui, sans-serif;
@@ -32,20 +56,28 @@ header {
   margin-bottom: 2.5rem;
 }
 
-nav { display: flex; flex-wrap: wrap; gap: 1.5rem; }
-nav a:first-child { margin-right: auto; font-weight: 700; }
+header nav { display: flex; flex-wrap: wrap; gap: 1.5rem; }
+header nav a:first-child { margin-right: auto; font-weight: 700; }
 nav a[aria-current="page"] { text-decoration-thickness: 2px; }
-a { color: var(--link); text-underline-offset: 0.15em; }
+a { color: var(--link); text-decoration: none; }
 a:hover { text-decoration-thickness: 2px; }
 :focus-visible { outline: 2px solid var(--link); outline-offset: 4px; }
 
 h1, h2, h3 { line-height: 1.25; scroll-margin-top: 1rem; }
 h1 { font-size: 2.2rem; }
-h2 { margin-top: 2.5rem; font-size: 1.5rem; }
+h2 {
+  margin-top: 2.5rem;
+  padding-bottom: 0.35rem;
+  border-bottom: 1px solid var(--border);
+  font-size: 1.5rem;
+}
 h3 { margin-top: 2rem; font-size: 1.15rem; }
 
 code {
-  font-family: ui-monospace, "Cascadia Code", monospace;
+  color: var(--syntax-keyword);
+  font-family: "Cousine", monospace;
+  font-variant-ligatures: none;
+  font-feature-settings: "liga" 0, "calt" 0;
   font-size: 0.9em;
   background: var(--muted);
   padding: 0.1em 0.25em;
@@ -61,11 +93,11 @@ pre {
   line-height: 1.5;
 }
 
-pre code { padding: 0; }
+pre code { padding: 0; color: inherit; }
 
 pre code .keyword { color: var(--syntax-keyword); }
 pre code .string { color: var(--syntax-string); }
-pre code .number, pre code .boolean { color: var(--syntax-number); }
+pre code .number, pre code .boolean, pre code .constant { color: var(--syntax-number); }
 pre code .function { color: var(--syntax-function); }
 pre code .type, pre code .property { color: var(--syntax-type); }
 pre code .constructor, pre code .module, pre code .namespace,
@@ -85,6 +117,38 @@ th, td { padding: 0.6rem 0.8rem; border: 1px solid var(--border); text-align: le
 th { background: var(--muted); }
 li + li { margin-top: 0.35rem; }
 blockquote { margin-left: 0; padding-left: 1rem; border-left: 3px solid var(--border); }
+
+/* Generated API pages have a predictable section/declaration structure. */
+.std-reference h2 { padding-bottom: 0; }
+.std-section-toggle {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  width: 100%;
+  padding: 0 0 0.35rem;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.std-section-toggle::after {
+  content: "−";
+  margin-left: 1rem;
+  color: var(--syntax-comment);
+  font-weight: 400;
+}
+.std-section-toggle[aria-expanded="false"]::after { content: "+"; }
+.std-reference h3 {
+  margin-top: 1.5rem;
+  margin-bottom: 0.5rem;
+  font-family: "Cousine", monospace;
+  font-variant-ligatures: none;
+  font-feature-settings: "liga" 0, "calt" 0;
+}
+.std-reference h3 + pre,
+.std-reference h3 + .copyable-code { margin-top: 0; }
 
 .editor-tabs { margin: 1.5rem 0; }
 .editor-tab-list {
@@ -171,3 +235,62 @@ blockquote { margin-left: 0; padding-left: 1rem; border-left: 3px solid var(--bo
   font-size: 0.8rem;
 }
 .copy-feedback:empty { display: none; }
+
+
+/* Optional filename labels remain visible even when JavaScript is disabled. */
+.code-block {
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+.code-caption {
+  min-height: 3rem;
+  padding: 0.65rem 3.5rem 0.65rem 1rem;
+  border-bottom: 1px solid var(--border);
+  background: var(--muted);
+}
+.code-filename {
+  font-family: "Cousine", monospace;
+  font-variant-ligatures: none;
+  font-feature-settings: "liga" 0, "calt" 0;
+  font-size: 0.8rem;
+  overflow-wrap: anywhere;
+}
+.code-block pre { border: 0; border-radius: 0; padding-right: 1rem; }
+
+.chapter-navigation {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
+  gap: 0.75rem;
+  width: 100%;
+  margin-top: 3rem;
+  padding-top: 1.5rem;
+  border-top: 1px solid var(--border);
+}
+.chapter-button {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 0.15rem;
+  min-width: 0;
+  min-height: 3rem;
+  padding: 0.85rem 1rem;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--muted);
+  font-size: 0.95rem;
+  line-height: 1.4;
+}
+.chapter-button:hover {
+  border-color: var(--link);
+  text-decoration: underline;
+}
+.chapter-direction { color: var(--syntax-comment); font-size: 0.8rem; }
+.chapter-contents { text-align: center; }
+.chapter-next { text-align: right; }
+
+@media (max-width: 600px) {
+  .chapter-navigation { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
+  .chapter-next { grid-column: 2; grid-row: 1; }
+  .chapter-contents { grid-column: 1 / -1; grid-row: 2; }
+}

@@ -4,6 +4,9 @@ doc: true
 
 # Grammar
 
+This is the syntax appendix to [The Ruddy Book](index.md).
+The [expressions chapter](book/expressions.md) begins the conceptual explanation of evaluation and typing.
+
 Ruddy source files use the `.rud` extension.
 This page describes how names, values, functions, and types are written, followed by effects and other advanced syntax.
 
@@ -64,10 +67,10 @@ let message =
 A [binding](dictionary.md#binding) associates a name with a value.
 An [expression](dictionary.md#expression) computes a value.
 The form `let name = expression` creates a binding, and `let name: Type = expression` adds a [type annotation](dictionary.md#type-annotation).
-For example, an annotation states that a retry limit is a natural number:
+For example, an annotation states that a starting life count is a natural number:
 
 ```ruddy
-let retry_limit: Nat = 3n
+let starting_lives: Nat = 3n
 ```
 
 The shorthand `_ = expression` means `let _ = expression`: it evaluates an expression and discards its result.
@@ -93,32 +96,32 @@ A [tag](dictionary.md#tag) can carry one value, so `#Some (area 3 4)` groups the
 
 A [struct](dictionary.md#struct) uses braces and comma-separated fields in the form `name: expression`.
 A field name can also be a quoted string or a nonnegative decimal position.
-A dot accesses a field, as in `contact.email`, `contact."display name"`, or `pair.0`.
-For example, a struct can group contact details:
+A dot accesses a field, as in `player.sprite`, `player."display name"`, or `pair.0`.
+For example, a struct can group player details:
 
 ```ruddy
-let contact = { name: "Ada", email: "ada@example.com" }
+let player = { name: "Scout", sprite: "scout.png" }
 ```
 
-A [tuple](dictionary.md#tuple) uses parentheses and commas, as in `("Ada", 3n)`.
+A [tuple](dictionary.md#tuple) uses parentheses and commas, as in `("Scout", 3n)`.
 Positions start at zero.
 A single-element tuple needs a comma: `(value,)` is a tuple, while `(value)` groups an expression.
 
-An [array](dictionary.md#array) uses brackets, as in `["Ada", "Lin"]` or `[]`.
+An [array](dictionary.md#array) uses brackets, as in `["Scout", "Slime"]` or `[]`.
 All elements have a compatible element type.
 Structs, tuples, and arrays allow a trailing comma.
 
 A [spread](dictionary.md#spread) uses `..` to include fields or elements from another value.
 A struct allows one spread, written last; explicitly written fields replace fields with the same name.
 An array allows several spreads in any position.
-For example, a spread adds a recipient while retaining the existing recipients:
+For example, a spread adds an enemy while retaining the existing enemies:
 
 ```ruddy
-let recipients = ["ada@example.com"]
-let all_recipients = [..recipients, "lin@example.com"]
+let enemies = ["Slime"]
+let all_enemies = [..enemies, "Golem"]
 ```
 
-A [tag](dictionary.md#tag) begins with `#`, as in `#None` or `#Some "Ada"`.
+A [tag](dictionary.md#tag) begins with `#`, as in `#None` or `#Some "Scout"`.
 A quoted tag such as `#"not found"` permits spaces in its name.
 There is no space between `#` and its name or opening quote.
 
@@ -186,8 +189,8 @@ Patterns appear after `let` and in [pattern matching](dictionary.md#pattern-matc
 | --- | --- |
 | `name` | Bind the value to a name |
 | `_` | Ignore the value |
-| `3n`, `"Ada"`, `true`, `()` | Match a literal value |
-| `{ name, email: address }` | Match fields and bind their values |
+| `3n`, `"Scout"`, `true`, `()` | Match a literal value |
+| `{ name, sprite: image }` | Match fields and bind their values |
 | `{ name, .. }` | Match a field while allowing additional fields |
 | `(first, second)` | Match tuple positions |
 | `[]`, `[first, second]` | Match an exact array length |
@@ -203,23 +206,23 @@ Function parameters written after `fn` are names or `_`; matching their structur
 
 A `match` expression uses `match expression with`, arms separated by `|`, and a closing `end`.
 Each arm has the form `pattern => expression`, and the first `|` is optional.
-For example, matching an array selects its first recipient or a default:
+For example, matching an array selects its first enemy or a default:
 
 ```ruddy
-let first_recipient = fn recipients => match recipients with
+let first_enemy = fn enemies => match enemies with
 | [first, ..] => first
-| [] => "support@example.com"
+| [] => "Training dummy"
 end
 ```
 
 The shorthand `fn | pattern => expression | pattern => expression` defines a function that matches its argument directly, with no closing `end`.
 Its leading `|` is required; parentheses delimit a nested shorthand when more arms follow outside it.
-For example, a function can extract an optional address directly:
+For example, a function can extract an optional target name directly:
 
 ```ruddy
-let email_or_default = fn
-| #Some address => address
-| #None => "support@example.com"
+let target_or_default = fn
+| #Some name => name
+| #None => "Training dummy"
 ```
 
 ## Types
@@ -237,10 +240,10 @@ Parentheses group a type argument that itself contains an application, as in `Op
 
 | Type form | Meaning |
 | --- | --- |
-| `String`, `Nat`, `Contact` | A type name |
+| `String`, `Nat`, `Player` | A type name |
 | `'a` | A type variable |
 | `_` | A type left for inference |
-| `{ name: String, age: Nat }` | A struct type |
+| `{ name: String, health: Nat }` | A struct type |
 | `(String, Nat)` | A tuple type |
 | `[String]` | An array type |
 | `#Some String \| #None` | A [sum type](dictionary.md#sum-type) with two cases |
@@ -275,10 +278,10 @@ end
 
 A [row](dictionary.md#row) describes a collection of struct fields, sum cases, or effects.
 A final `..` permits additional entries, and `..'r` names those entries so another part of the type can refer to them.
-For example, an open struct type accepts a contact with additional fields:
+For example, an open struct type accepts an object with additional fields:
 
 ```ruddy
-let email: { email: String, .. } -> String = fn contact => contact.email
+let sprite: { sprite: String, .. } -> String = fn player => player.sprite
 ```
 
 Struct fields and sum cases share a row kind.
@@ -302,17 +305,20 @@ Struct and sum values remain distinct types.
 A row parameter accepts the fields or cases of a supplied type; it does not convert values.
 A parameter cannot stand for both a whole type and a row, and effect rows remain a separate kind.
 
-A [presence variable](dictionary.md#presence-variable) controls whether a field, case, or effect is present.
+A [presence variable](dictionary.md#presence-variable) controls whether a field, case, or effect belongs to a type.
+Variables and their relationships can be inferred; annotations make those relationships explicit.
+The same presence can occur on struct fields, sum cases, and effects even though effect rows have a separate kind.
+The book derives these rules through [patterns](book/rows.md#presence-is-inferred-from-program-shape) and [shared presences](book/rows.md#sharing-presences-across-structs-sums-and-effects).
 A `where` clause constrains those variables with `not`, `and`, `or`, `=`, and `!=`, in that order from tightest to loosest grouping.
 Semicolons separate multiple constraints, and parentheses group them.
 
 | Form | Meaning |
 | --- | --- |
-| `{ email when 'p: String }` | A field whose presence is controlled by `'p` |
+| `{ sprite when 'p: String }` | A field whose presence is controlled by `'p` |
 | `#Some (when 'p) String` | A case whose presence is controlled by `'p` |
 | `!Log (when 'p)` | An effect whose presence is controlled by `'p` |
 | `when _` | A presence left unnamed |
-| `{ \email, .. }` | An open struct type excluding a field |
+| `{ \sprite, .. }` | An open struct type excluding a field |
 | `\#None \| ..'r` | A sum row excluding a case |
 | `\!Log + ..'e` | An effect row excluding an effect |
 | `where 'p = 'q` | Require two presences to agree |
@@ -360,8 +366,8 @@ For example, a handler can prefix console output before forwarding it to the run
 ```ruddy
 using std::io::IO
 
-let report = fn message => handle println message with
-| !IO.write text => !IO.write (std::str::concat "Report: " text)
+let combat_log = fn message => handle println message with
+| !IO.write text => !IO.write (std::str::concat "Combat: " text)
 | !IO.write_error text => !IO.write_error text
 end
 ```
@@ -375,13 +381,13 @@ Repeated applications must have compatible arguments.
 
 A [mutable cell](dictionary.md#mutable-cell) is created with `mut expression`, read with `~cell`, and updated with `cell := expression`.
 Assignment returns the value written.
-For example, a cell can hold a running total:
+For example, a cell can hold damage while a bonus is applied:
 
 ```ruddy
-let total_with_fee = fn subtotal => do
-  let total = mut subtotal
-  _ = total := ~total + 5
-  return ~total
+let damage_with_bonus = fn damage => do
+  let current = mut damage
+  _ = current := ~current + 5
+  return ~current
 end
 ```
 
@@ -402,7 +408,7 @@ For example, an inline module groups application defaults:
 
 ```ruddy
 module Defaults =
-  let retry_limit = 3n
+  let starting_lives = 3n
 end
 ```
 
@@ -413,12 +419,12 @@ The keyword `as` renames a binding, and braces group imports:
 ```ruddy
 module Defaults =
   type Count = Nat
-  let retry_limit = 3n
+  let starting_lives = 3n
 end
 
-using Defaults::{self as defaults, Count, retry_limit as retries}
-let limit: Count = retries
-let qualified = defaults::retry_limit
+using Defaults::{self as defaults, Count, starting_lives as lives}
+let limit: Count = lives
+let qualified = defaults::starting_lives
 ```
 
 Dependency imports can use the same prefix: `using ::std::nat::{self, *}`.
@@ -434,12 +440,12 @@ Inside a `do` block, imports apply only from their statement onward:
 
 ```ruddy
 module Defaults =
-  let retry_limit = 3n
+  let starting_lives = 3n
 end
 
 let limit = do
-  using Defaults::retry_limit as retries
-  return retries
+  using Defaults::starting_lives as lives
+  return lives
 end
 ```
 
@@ -470,7 +476,7 @@ For example, an attribute can record a version on a value:
 
 ```ruddy
 @since "1.0"
-let retry_limit = 3n
+let starting_lives = 3n
 ```
 
 Row formula projection collects at most 256 product terms by default. Exceeding
@@ -521,3 +527,23 @@ implements it in Rust.
 The debugger's Portable panel holds a program's host values against that
 table, so what keeps a program on one target is visible before a second one
 is written.
+
+
+## Conditional definitions
+
+An `@if` attribute includes a definition when the named facts of the root build match.
+The fields `target` and `platform` have string values, and every field supplied must match.
+A fact not supplied places no restriction on that fact.
+These alternatives select one platform label:
+
+```ruddy
+@if { platform: "node" }
+let platform_label = "Node"
+
+@if { platform: "web" }
+let platform_label = "Web"
+```
+
+A definition excluded by its condition is removed before name resolution.
+Conditional selection can also apply to modules and their files.
+The [tooling appendix](book/tooling.md#targets-and-platforms) explains the available targets and platforms.

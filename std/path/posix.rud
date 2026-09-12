@@ -1,14 +1,21 @@
 @async
+@doc "Normalizes a path using POSIX conventions."
 extern normalize: String -> String = "$nodePath.posix.normalize"
 @async
+@doc "Returns the final portion of a POSIX path."
 extern basename: String -> String = "$nodePath.posix.basename"
 @async
+@doc "Returns all but the final portion of a POSIX path."
 extern dirname: String -> String = "$nodePath.posix.dirname"
 @async
+@doc "Returns the extension of the final portion of a POSIX path."
 extern extension: String -> String = "$nodePath.posix.extname"
 @async
+@doc "Whether a POSIX path is absolute."
 extern is_absolute: String -> Bool = "$nodePath.posix.isAbsolute"
 @async
+@doc "Separates a POSIX path into its parts."
 extern parse: String -> Parts = "$nodePath.posix.parse"
 @async
+@doc "Joins POSIX path segments and normalizes the result."
 extern join: [String] -> String = "$nodePath.posix.join"

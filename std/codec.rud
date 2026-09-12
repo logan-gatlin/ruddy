@@ -79,6 +79,7 @@ type Encoder 'a = { schema: reflect::Description, run: 'a -> Result () Error + !
 @doc "How to read a value through the protocol, with a description of what it reads."
 type Decoder 'a = { schema: reflect::Description, run: () -> Result 'a Error + !Read }
 
+@doc "An encoder and decoder for one type, sharing the same schema."
 type Codec 'a = { encoder: Encoder 'a, decoder: Decoder 'a }
 
 @doc "An error at a path: what an operation reported, placed at the value being worked on."

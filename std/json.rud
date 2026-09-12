@@ -16,6 +16,7 @@ type Error = #Derive codec::DeriveError | #Codec codec::Error
 @doc "What a reader refuses before it allocates: input longer than `bytes`, nesting deeper than `depth`, a record or array with more than `members` members, or a number token with more than `digits` digits."
 type Limits = { depth: Nat, bytes: Nat, members: Nat, digits: Nat }
 
+@doc "The default limits for JSON input: 512 levels, 64 MiB, 1,000,000 members, and 400 digits per number."
 let default_limits: Limits = { depth: 512n, bytes: 67108864n, members: 1000000n, digits: 400n }
 
 @private
@@ -495,8 +496,10 @@ let number_of_real: Real -> Result Number Error = fn value =>
     })
   end
 
+@doc "A JSON number containing the natural number."
 let number_of_nat: Nat -> Number = fn value => { token: str::from_nat value }
 
+@doc "A JSON number containing the integer."
 let number_of_int: Int -> Number = fn value => { token: str::from_int value }
 
 -- ── Documents ──────────────────────────────────────────────────────────────

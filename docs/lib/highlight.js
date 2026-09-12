@@ -7,44 +7,79 @@ import { fileURLToPath } from "node:url";
 
 const require = createRequire(import.meta.url);
 const cli = require.resolve("tree-sitter-cli/cli.js");
-const grammar = fileURLToPath(new URL("../../treesitter/", import.meta.url));
+const grammars = {
+  ruddy: { directory: fileURLToPath(new URL("../../treesitter/", import.meta.url)), extension: "rud" },
+  sh: { directory: path.dirname(require.resolve("tree-sitter-bash/package.json")), extension: "sh" },
+  json: { directory: path.dirname(require.resolve("tree-sitter-json/package.json")), extension: "json" },
+  toml: { directory: path.dirname(require.resolve("@tree-sitter-grammars/tree-sitter-toml/package.json")), extension: "toml" },
+};
+const aliases = { rud: "ruddy", bash: "sh", shell: "sh" };
+
+function grammarFor(language) {
+  const name = Object.hasOwn(aliases, language) ? aliases[language] : language;
+  return Object.hasOwn(grammars, name) ? grammars[name] : undefined;
+}
+
+function configContents(grammar) {
+  const query = readFileSync(path.join(grammar, "queries/highlights.scm"), "utf8");
+  // Register the query's capture names; the website supplies their colors.
+  const captures = [...query.matchAll(/@([\w.]+)/g)].map((match) => match[1]);
+  return JSON.stringify({
+    "parser-directories": [grammar],
+    theme: Object.fromEntries(captures.map((name) => [name, "#000000"])),
+  });
+}
+
+function highlightedLines(table) {
+  const lines = [...table.matchAll(/<td class=line>([\s\S]*?)<\/td>/g)];
+  if (!lines.length) throw new Error("Tree-sitter returned no highlighted code");
+  return lines.map((match) => match[1]).join("");
+}
 
 export function createHighlighter() {
-  const cache = new Map();
+  const caches = new Map();
 
-  function highlight(source, language) {
-    if (language !== "ruddy" && language !== "rud") return "";
-    if (!source) return "";
-    if (cache.has(source)) return cache.get(source);
+  function prime(sources, language = "ruddy") {
+    const grammar = grammarFor(language);
+    if (!grammar) return;
+    if (!caches.has(grammar)) caches.set(grammar, new Map());
+    const cache = caches.get(grammar);
+    const missing = [...new Set(sources)].filter((source) => source && !cache.has(source));
+    if (!missing.length) return;
 
     const temporary = mkdtempSync(path.join(tmpdir(), "ruddy-highlight-"));
     try {
-      const input = path.join(temporary, "snippet.rud");
       const config = path.join(temporary, "config.json");
-      const query = readFileSync(path.join(grammar, "queries/highlights.scm"), "utf8");
-      // Register the query's capture names; the website supplies their colors.
-      const captures = [...query.matchAll(/@([\w.]+)/g)].map((match) => match[1]);
-      writeFileSync(config, JSON.stringify({
-        "parser-directories": [grammar],
-        theme: Object.fromEntries(captures.map((name) => [name, "#000000"])),
-      }));
-      writeFileSync(input, source);
+      writeFileSync(config, configContents(grammar.directory));
+      const inputs = missing.map((source, index) => {
+        const input = path.join(temporary, `${index}.${grammar.extension}`);
+        writeFileSync(input, source);
+        return input;
+      });
+      const paths = path.join(temporary, "paths.txt");
+      writeFileSync(paths, inputs.join("\n"));
       const document = execFileSync(process.execPath, [
         cli, "highlight", "--html", "--css-classes",
-        "--config-path", config, input,
-      ], { cwd: grammar, encoding: "utf8", maxBuffer: 10 * 1024 * 1024 });
-
-      // Tree-sitter 0.26 emits a table, with one escaped code cell per line.
-      // Keep only those cells so the site's normal code-block layout is used.
-      const lines = [...document.matchAll(/<td class=line>([\s\S]*?)<\/td>/g)];
-      if (!lines.length) throw new Error("Tree-sitter returned no highlighted code");
-      const html = lines.map((match) => match[1]).join("");
-      cache.set(source, html);
-      return html;
+        "--config-path", config, "--paths", paths,
+        // Bash omits the query path from its manifest; supply it explicitly.
+        ...(grammar === grammars.sh ? ["--query-paths", path.join(grammar.directory, "queries/highlights.scm")] : []),
+      ], { cwd: grammar.directory, encoding: "utf8", maxBuffer: 50 * 1024 * 1024 });
+      const tables = [...document.matchAll(/<table>([\s\S]*?)<\/table>/g)];
+      if (tables.length !== missing.length) {
+        throw new Error(`Tree-sitter returned ${tables.length} highlighted documents for ${missing.length} snippets`);
+      }
+      missing.forEach((source, index) => cache.set(source, highlightedLines(tables[index][1])));
     } finally {
       rmSync(temporary, { recursive: true, force: true });
     }
   }
 
-  return { highlight, clear: () => cache.clear() };
+  function highlight(source, language) {
+    const grammar = grammarFor(language);
+    if (!grammar || !source) return "";
+    prime([source], language);
+    return caches.get(grammar).get(source);
+  }
+
+  return { highlight, prime, clear: () => caches.clear() };
 }

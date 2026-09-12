@@ -7,20 +7,36 @@
     <link rel="stylesheet" href="{{ '/assets/style.css' | relativeUrl(page.url) }}">
     <script src="{{ '/assets/copy-code.js' | relativeUrl(page.url) }}" defer></script>
     <script src="{{ '/assets/editor-tabs.js' | relativeUrl(page.url) }}" defer></script>
+    {% block pageScripts %}{% endblock %}
   </head>
-  <body>
+  <body{% block bodyAttributes %}{% endblock %}>
     <a class="skip-link" href="#content">Skip to content</a>
     <header>
       <nav aria-label="Documentation">
-        <a href="{{ '/index.html' | relativeUrl(page.url) }}"{% if page.url == '/index.html' %} aria-current="page"{% endif %}>Home</a>
+        <a href="{{ '/index.html' | relativeUrl(page.url) }}"{% if page.url == '/index.html' %} aria-current="page"{% endif %}>Book</a>
         <a href="{{ '/download.html' | relativeUrl(page.url) }}"{% if page.url == '/download.html' %} aria-current="page"{% endif %}>Download</a>
-        <a href="{{ '/grammar.html' | relativeUrl(page.url) }}"{% if page.url == '/grammar.html' %} aria-current="page"{% endif %}>Grammar</a>
+        <a href="{{ '/grammar.html' | relativeUrl(page.url) }}"{% if page.url == '/grammar.html' %} aria-current="page"{% endif %}>Syntax</a>
         <a href="{{ '/dictionary.html' | relativeUrl(page.url) }}"{% if page.url == '/dictionary.html' %} aria-current="page"{% endif %}>Dictionary</a>
-        <a href="{{ '/std/bundle.html' | relativeUrl(page.url) }}"{% if page.url == '/std/bundle.html' %} aria-current="page"{% endif %}>Std</a>
+        <a href="{{ '/std/bundle.html' | relativeUrl(page.url) }}"{% if stdReference %} aria-current="page"{% endif %}>Std</a>
       </nav>
     </header>
-    <main id="content">
-      {{ content | safe }}
-    </main>
+    {% block pageContent %}
+      <main id="content">
+        {{ content | safe }}
+        {% if bookNavigation %}
+          <nav class="chapter-navigation" aria-label="Chapter navigation">
+            <a class="chapter-button chapter-previous" rel="prev" href="{{ bookNavigation.previous.path | relativeUrl(page.url) }}">
+              <span class="chapter-direction">Previous</span>
+              <span>{{ bookNavigation.previous.title }}</span>
+            </a>
+            <a class="chapter-button chapter-contents" href="{{ '/index.html' | relativeUrl(page.url) }}">Contents</a>
+            <a class="chapter-button chapter-next" rel="next" href="{{ bookNavigation.next.path | relativeUrl(page.url) }}">
+              <span class="chapter-direction">Next</span>
+              <span>{{ bookNavigation.next.title }}</span>
+            </a>
+          </nav>
+        {% endif %}
+      </main>
+    {% endblock %}
   </body>
 </html>

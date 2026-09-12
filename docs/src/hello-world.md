@@ -4,6 +4,9 @@ doc: true
 
 # Hello World!
 
+[The Ruddy Book](index.md) provides the main learning path.
+This walkthrough remains available as a compact runnable example; its FizzBuzz program uses recursion and sequencing developed in Chapters [3](book/functions.md) and [8](book/effects.md).
+
 This walkthrough creates a simple program that prints `Hello, world!` using Ruddy.
 The [download page](download.md) covers installation of Ruddy and Node.js.
 The `ruddy` and `node` commands must be available in the terminal.
@@ -35,7 +38,7 @@ No configuration changes are needed.
 
 The following greeting replaces the contents of `src/main.rud`:
 
-```ruddy
+```ruddy filename="src/main.rud"
 let main = fn _ => println "Hello, world!"
 ```
 
@@ -71,7 +74,7 @@ Hello, world!
 The project can also print FizzBuzz for the natural numbers from 1 through 100.
 The following program replaces the greeting in `src/main.rud`:
 
-```ruddy
+```ruddy filename="src/main.rud"
 using std::{nat, str}
 
 let divisible_by = fn number divisor => nat::is_zero (nat::remainder number divisor)
