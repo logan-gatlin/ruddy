@@ -65,6 +65,8 @@ The same import style is used in the [FizzBuzz example](hello-world.md#try-fizzb
 Array and string lengths use `array::len` and `str::len` after importing those modules.
 The `order` module provides `Ordering`, the type of a comparison function, while `Order` describes its result.
 The numeric and string modules expose `compare` and comparisons such as `equal`, `less_than`, and `greater_than_or_equal`.
+`order::PartialOrder` adds `#Unordered` to the three total-order results. `order::compare` compares values structurally using reflection, and supplies the six infix comparison operators. `real::compare` is partial too: NaNs are unordered and signed zeros are equal. Use `real::total_compare` when sorting requires a total ordering.
+Opened existential types need a mirror carried by their package before they can be compared. This also applies when the opened type occurs inside a function type; comparisons retain reflection’s existing evidence requirements.
 For example, a comparison can check whether a natural number is below a limit:
 
 ```ruddy

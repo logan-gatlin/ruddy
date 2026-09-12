@@ -1993,6 +1993,7 @@ impl<'a> Printer<'a> {
             ExprKind::Binary { .. } => {
                 let level = prec(expr);
                 let symbol = |op: &BinaryOp| match op {
+                    BinaryOp::Compare(op) => op.symbol(),
                     BinaryOp::Write => ":=",
                     BinaryOp::Add => "+",
                     BinaryOp::Sub => "-",
@@ -2013,6 +2014,23 @@ impl<'a> Printer<'a> {
                     rest.extend(self.leading_docs(right.span));
                     rest.push(text(format!("{} ", symbol(&BinaryOp::Write))));
                     rest.push(self.expr_after(right, prec(right) < level));
+                    let doc = concat(vec![
+                        self.expr_in(left, prec(left) <= level),
+                        nest(concat(rest)),
+                    ]);
+                    return if signal { broken(doc) } else { group(doc) };
+                }
+                if let ExprKind::Binary {
+                    op: BinaryOp::Compare(op),
+                    left,
+                    right,
+                } = &expr.tracked
+                {
+                    let signal = self.newline_between(left.span.end(), right.span.start);
+                    let mut rest = vec![Doc::Line];
+                    rest.extend(self.leading_docs(right.span));
+                    rest.push(text(format!("{} ", op.symbol())));
+                    rest.push(self.expr_after(right, prec(right) <= level));
                     let doc = concat(vec![
                         self.expr_in(left, prec(left) <= level),
                         nest(concat(rest)),

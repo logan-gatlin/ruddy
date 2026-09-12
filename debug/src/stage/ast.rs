@@ -287,6 +287,7 @@ fn expr_node(ids: &mut Ids, expr: &Expr) -> Node {
         .child(expr_node(ids, value)),
         ExprKind::Binary { op, left, right } => Node {
             label: match op {
+                ruddy::parse::BinaryOp::Compare(op) => op.symbol(),
                 ruddy::parse::BinaryOp::Write => "Write",
                 ruddy::parse::BinaryOp::Add => "Add",
                 ruddy::parse::BinaryOp::Sub => "Sub",

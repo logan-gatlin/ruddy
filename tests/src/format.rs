@@ -1115,3 +1115,15 @@ fn using_groups_and_comments_survive_formatting() {
         assert!(formatted(source).has_errors(), "{source}");
     }
 }
+
+#[test]
+fn comparison_formatting_preserves_explicit_grouping_and_comments() {
+    assert_eq!(fmt("let x=(a==b)==c"), "let x = (a == b) == c\n");
+    assert_eq!(fmt("let x=a==(b==c)"), "let x = a == (b == c)\n");
+    assert_eq!(
+        fmt("let x=a+b<=c and d!=e"),
+        "let x = a + b <= c and d != e\n"
+    );
+    let source = "let x = (a == b)\n  -- compare the result\n  == c\n";
+    assert_eq!(fmt(source), source);
+}

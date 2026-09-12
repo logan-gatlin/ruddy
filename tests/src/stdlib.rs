@@ -257,7 +257,7 @@ let boolean_results = {
     );
     assert_eq!(
         serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap(),
-        serde_json::from_str::<serde_json::Value>(r#"["ruddy",5,true,"42","7","1.5","true",true,true,true,"u",2,"udd","ruddy","ruddy  ","  ruddy","ruddy","RUDDY","haha","rubdy","rubby","007","700",{"added":42,"subtracted":0,"divided":3,"clamped":10,"converted":3,"zero":true},{"subtracted":-3,"divided":-3,"remainder":-3,"absolute":7,"converted":3},{"added":3.5,"divided":3.5,"square_root":3,"rounded":4,"nan":true,"finite":true,"negative_zero_equal":false},{"negated":false,"both":false,"either":true,"exclusive":true,"equal":true,"implies":false}]"#).unwrap()
+        serde_json::from_str::<serde_json::Value>(r#"["ruddy",5,true,"42","7","1.5","true",true,true,true,"u",2,"udd","ruddy","ruddy  ","  ruddy","ruddy","RUDDY","haha","rubdy","rubby","007","700",{"added":42,"subtracted":0,"divided":3,"clamped":10,"converted":3,"zero":true},{"subtracted":-3,"divided":-3,"remainder":-3,"absolute":7,"converted":3},{"added":3.5,"divided":3.5,"square_root":3,"rounded":4,"nan":true,"finite":true,"negative_zero_equal":true},{"negated":false,"both":false,"either":true,"exclusive":true,"equal":true,"implies":false}]"#).unwrap()
     );
 }
 
@@ -313,7 +313,7 @@ let tuple_result = { first: tuple_mapped.0, second: tuple_mapped.1, projected: t
 let reversed_order = ordering_name (std::order::reverse (std::nat::compare 1n 2n))
 let compared_string = ordering_name (std::str::compare "a" "b")
 let compared_boolean = ordering_name (std::boolean::compare false true)
-let compared_real = ordering_name (std::real::compare (std::real::negate 0) 0)
+let compared_real = ordering_name (std::real::total_compare (std::real::negate 0) 0)
 
 let blank = std::str::is_blank " \n\t "
 let safe_char = std::option::unwrap_or "?" (std::str::char_at_option "ruddy" 1n)

@@ -71,6 +71,7 @@
 //! that one mistake is reported once rather than echoed by every consumer.
 
 mod constrain;
+mod defaults;
 pub mod sat;
 mod solve;
 
@@ -7526,7 +7527,10 @@ fn assemble(
         diagnostics,
     };
     if output.errors().is_empty() {
-        let requirements = crate::reification::Analysis::infer(program, output.semantics());
+        let mut requirements = crate::reification::Analysis::infer(program, output.semantics());
+        if defaults::instantiate(&mut output.semantics, &requirements) {
+            requirements = crate::reification::Analysis::infer(program, output.semantics());
+        }
         output.reify(&requirements);
         output.semantics.reification = requirements.clone();
         for (index, error) in requirements
@@ -13966,6 +13970,25 @@ impl Ty {
 fn substitute_type(
     root: &Ty,
     fresh: &[Assigned],
+    bound_ty: impl FnMut(u32) -> Arc<Ty>,
+    bound_row: impl FnMut(u32) -> Row,
+) -> Arc<Ty> {
+    substitute_type_with(
+        root,
+        |index| {
+            fresh
+                .get(index as usize)
+                .map(Assigned::presence)
+                .unwrap_or(Presence::Undecided)
+        },
+        bound_ty,
+        bound_row,
+    )
+}
+
+fn substitute_type_with(
+    root: &Ty,
+    mut bound_presence: impl FnMut(u32) -> Presence,
     mut bound_ty: impl FnMut(u32) -> Arc<Ty>,
     mut bound_row: impl FnMut(u32) -> Row,
 ) -> Arc<Ty> {
@@ -14047,10 +14070,7 @@ fn substitute_type(
                 }
                 work.extend(row.labels.values().rev().filter_map(|field| {
                     let presence = match &field.presence {
-                        Presence::Bound(index) => fresh
-                            .get(*index as usize)
-                            .map(Assigned::presence)
-                            .unwrap_or(Presence::Undecided),
+                        Presence::Bound(index) => bound_presence(*index),
                         Presence::Recovered(_) => Presence::Undecided,
                         presence => presence.clone(),
                     };
@@ -14115,10 +14135,7 @@ fn substitute_type(
                 let mut labels = Vec::with_capacity(row.labels.len());
                 for (name, field) in row.labels.iter().rev() {
                     let presence = match &field.presence {
-                        Presence::Bound(index) => fresh
-                            .get(*index as usize)
-                            .map(Assigned::presence)
-                            .unwrap_or(Presence::Undecided),
+                        Presence::Bound(index) => bound_presence(*index),
                         Presence::Recovered(_) => Presence::Undecided,
                         presence => presence.clone(),
                     };

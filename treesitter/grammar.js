@@ -34,15 +34,16 @@ const PREC = {
   booleanOr: 3,
   booleanXor: 4,
   booleanAnd: 5,
-  addition: 6,
-  multiplication: 7,
-  unary: 8,
-  application: 9,
+  comparison: 6,
+  addition: 7,
+  multiplication: 8,
+  unary: 9,
+  application: 10,
   // A tag takes its payload before an application takes another argument, so
   // `f #A 1` is `f` applied to `#A 1`.
-  tag: 7,
+  tag: 8,
   // `f p.x` reaches into the record before passing it along.
-  projection: 8,
+  projection: 9,
 };
 
 /**
@@ -490,10 +491,17 @@ module.exports = grammar({
       field('right', $._boolean_and),
     )),
 
-    _boolean_and: $ => choice($.boolean_and, $.binary_expression),
+    _boolean_and: $ => choice($.boolean_and, $._comparison),
     boolean_and: $ => prec.left(PREC.booleanAnd, seq(
       field('left', $._boolean_and),
       'and',
+      field('right', $._comparison),
+    )),
+
+    _comparison: $ => choice($.comparison, $.binary_expression),
+    comparison: $ => prec(PREC.comparison, seq(
+      field('left', $.binary_expression),
+      field('operator', choice('==', '!=', '<', '<=', '>', '>=')),
       field('right', $.binary_expression),
     )),
 

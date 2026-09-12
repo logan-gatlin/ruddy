@@ -62,6 +62,11 @@ pub enum Kind {
     /// or bare for a module whose body is another file.
     Module,
     Equal,
+    EqualEqual,
+    Less,
+    LessEqual,
+    Greater,
+    GreaterEqual,
     FatArrow,
     /// `->`, the function type arrow. Distinct from [`FatArrow`](Kind::FatArrow),
     /// which introduces a lambda body.
@@ -83,7 +88,7 @@ pub enum Kind {
     /// struct is written closed. Distinct from two [`Dot`](Kind::Dot)s the way
     /// [`FatArrow`](Kind::FatArrow) is distinct from `=` then `>`.
     DotDot,
-    /// `!=`, the "these two presences differ" of a `where` clause. One token
+    /// `!=`, value inequality or differing presences in a `where` clause. One token
     /// rather than a `!` beside an `=`, the way [`Arrow`](Kind::Arrow) is one
     /// token: the longer lexeme wins, so a `!` followed by an `=` is this and
     /// never an [`Effect`](Kind::Effect) beside an assignment.
@@ -283,13 +288,30 @@ pub fn lex(input: &str, file_id: FileID) -> Output {
             }
             '=' => {
                 chars.next();
-                // `=>` is the function arrow; a lone `=` is assignment.
+                // Longer lexemes win over the binding `=`.
                 if let Some(&(_, '>')) = chars.peek() {
                     chars.next();
                     tokens.push(file_id.span(start, 2).track(Kind::FatArrow));
+                } else if let Some(&(_, '=')) = chars.peek() {
+                    chars.next();
+                    tokens.push(file_id.span(start, 2).track(Kind::EqualEqual));
                 } else {
                     tokens.push(file_id.span(start, 1).track(Kind::Equal));
                 }
+            }
+            '<' | '>' => {
+                chars.next();
+                let equal = chars.peek().is_some_and(|(_, ch)| *ch == '=');
+                if equal {
+                    chars.next();
+                }
+                let kind = match (c, equal) {
+                    ('<', false) => Kind::Less,
+                    ('<', true) => Kind::LessEqual,
+                    (_, false) => Kind::Greater,
+                    (_, true) => Kind::GreaterEqual,
+                };
+                tokens.push(file_id.span(start, if equal { 2 } else { 1 }).track(kind));
             }
             // `->` wins over the standalone minus, and `--` wins over both:
             // the longer lexeme decides before the shorter one is assumed,

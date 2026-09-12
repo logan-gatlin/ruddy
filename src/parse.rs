@@ -300,6 +300,7 @@ pub enum UnaryOp {
 
 #[derive(Debug, Clone, Copy)]
 pub enum BinaryOp {
+    Compare(ComparisonOp),
     Write,
     Add,
     Sub,
@@ -308,6 +309,42 @@ pub enum BinaryOp {
     And,
     Or,
     Xor,
+}
+
+/// Value comparisons share one precedence and do not associate.
+#[derive(Debug, Clone, Copy)]
+pub enum ComparisonOp {
+    Equal,
+    NotEqual,
+    Less,
+    LessEqual,
+    Greater,
+    GreaterEqual,
+}
+
+impl ComparisonOp {
+    pub fn symbol(self) -> &'static str {
+        match self {
+            Self::Equal => "==",
+            Self::NotEqual => "!=",
+            Self::Less => "<",
+            Self::LessEqual => "<=",
+            Self::Greater => ">",
+            Self::GreaterEqual => ">=",
+        }
+    }
+
+    /// The standard-library operation this syntax calls.
+    pub fn function(self) -> &'static str {
+        match self {
+            Self::Equal => "equal",
+            Self::NotEqual => "not_equal",
+            Self::Less => "less_than",
+            Self::LessEqual => "less_than_or_equal",
+            Self::Greater => "greater_than",
+            Self::GreaterEqual => "greater_than_or_equal",
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -946,6 +983,8 @@ pub struct Error {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ErrorKind {
+    /// A comparison followed by another comparison without grouping.
+    ChainedComparison,
     /// A construct or exact piece of syntax was required here.
     Expected {
         expected: Expected,
@@ -1404,6 +1443,11 @@ impl Parser {
             Kind::Not => Expected::Keyword("not"),
             Kind::Module => Expected::Keyword("module"),
             Kind::Using => Expected::Keyword("using"),
+            Kind::EqualEqual => Expected::Punctuation("=="),
+            Kind::Less => Expected::Punctuation("<"),
+            Kind::LessEqual => Expected::Punctuation("<="),
+            Kind::Greater => Expected::Punctuation(">"),
+            Kind::GreaterEqual => Expected::Punctuation(">="),
             Kind::Equal => Expected::Punctuation("="),
             Kind::FatArrow => Expected::Punctuation("=>"),
             Kind::Arrow => Expected::Punctuation("->"),
@@ -2638,7 +2682,48 @@ impl Parser {
     }
 
     fn boolean_and(&mut self) -> Option<Expr> {
-        self.binary(Self::addition, &[(Kind::And, BinaryOp::And)])
+        self.binary(Self::comparison, &[(Kind::And, BinaryOp::And)])
+    }
+
+    fn comparison_op(&self) -> Option<ComparisonOp> {
+        Some(match &self.peek()?.tracked {
+            Kind::EqualEqual => ComparisonOp::Equal,
+            Kind::NotEqual => ComparisonOp::NotEqual,
+            Kind::Less => ComparisonOp::Less,
+            Kind::LessEqual => ComparisonOp::LessEqual,
+            Kind::Greater => ComparisonOp::Greater,
+            Kind::GreaterEqual => ComparisonOp::GreaterEqual,
+            _ => return None,
+        })
+    }
+
+    fn comparison(&mut self) -> Option<Expr> {
+        let left = self.addition()?;
+        let Some(op) = self.comparison_op() else {
+            return Some(left);
+        };
+        let operator = self.advance().expect("a comparison operator");
+        let Some(right) = self.addition() else {
+            return self.expected_related(
+                Expected::Value,
+                Some(Related {
+                    span: operator.span,
+                    kind: RelatedKind::Operator,
+                }),
+            );
+        };
+        if self.comparison_op().is_some() {
+            self.error(
+                self.peek().expect("a comparison operator").span,
+                ErrorKind::ChainedComparison,
+            );
+            return None;
+        }
+        Some(left.span.merge(right.span).track(ExprKind::Binary {
+            op: BinaryOp::Compare(op),
+            left: Box::new(left),
+            right: Box::new(right),
+        }))
     }
 
     /// Real addition and subtraction, left-associative and looser than multiplication.

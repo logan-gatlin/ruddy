@@ -314,11 +314,21 @@ let degrees_to_radians: Real -> Real
 let radians_to_degrees: Real -> Real
 ```
 
+### total_compare
+
+```ruddy
+let total_compare: order::Ordering Real
+```
+
+A total ordering for sorting: NaNs compare equal and last, and negative zero precedes positive zero.
+
 ### compare
 
 ```ruddy
-let compare: order::Ordering Real
+let compare: order::PartialOrdering Real
 ```
+
+Numeric comparison: any NaN operand is unordered, and negative and positive zero compare equal.
 
 ### equal
 

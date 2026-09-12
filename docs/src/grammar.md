@@ -133,6 +133,7 @@ The following table lists expression operators from tightest to loosest grouping
 | `-`, `not`, `mut`, `~` before an expression | Negation, Bool negation, [mutable cell](dictionary.md#mutable-cell) creation, mutable cell reading | Right |
 | `*`, `/` | Real multiplication and division | Left |
 | `+`, `-` | Real addition and subtraction | Left |
+| `==`, `!=`, `<`, `<=`, `>`, `>=` | Structural comparison | Cannot chain |
 | `and` | Bool conjunction | Left |
 | `xor` | Bool exclusive disjunction | Left |
 | `or` | Bool disjunction | Left |
@@ -140,10 +141,18 @@ The following table lists expression operators from tightest to loosest grouping
 | `:=` | Cell assignment | Right |
 
 Parentheses override this grouping.
-The arithmetic operators work on `Real`; integer arithmetic and comparisons use functions such as `std::nat::add` and `std::nat::less_than`.
+The arithmetic operators work on `Real`; integer arithmetic uses functions such as `std::nat::add`.
+Comparison operators use the standard library and accept operands of the same inferred type, including a shared sum type for `#A == #B`.
+Write `a < b and b < c` rather than `a < b < c`.
 An explicit `using std::nat` import permits the shorter names `nat::add` and `nat::less_than`.
 The form `value |> f |> g` means `g (f value)`.
 A minus immediately followed by digits is part of a number literal, so subtraction should have spaces around `-`, as in `total - 1`.
+
+Comparisons are pure and structural. Arrays compare lexicographically, with a shorter equal prefix first. Records compare fields in alphabetical name order; sums compare case names first and then matching payloads. Names use case-sensitive Unicode scalar ordering without normalization. The first non-equal component determines the result, including an unordered component.
+
+Functions and values whose representation reflection cannot read are unordered, even against themselves. A `Real` NaN is also unordered against every value, including NaN; signed zeros compare equal. For unordered operands, `!=` is true and all five other operators are false. In particular, `a <= b` does not mean `not (a > b)`.
+
+`std::order::compare` exposes the four-way `PartialOrder` result directly. `std::real::compare` and its comparison helpers follow the same rules; `std::real::total_compare` provides a total ordering for sorting, placing NaNs last and negative zero before positive zero.
 
 ## Blocks and choices
 

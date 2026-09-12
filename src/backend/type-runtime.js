@@ -22,6 +22,7 @@ const $instantiateType = ($template, $arguments, $partial = false) => {
     const $offset = $nodes.length;
     for (const $node of $argument.nodes) {
       if (typeof $node === "string" || "Fixed" in $node || "Parameter" in $node || "HiddenBound" in $node) $nodes.push($node);
+      else if ("Cell" in $node) $nodes.push({ Cell: $node.Cell.map($child => $child + $offset) });
       else if ("Array" in $node) $nodes.push({ Array: $node.Array + $offset });
       else if ("Mirror" in $node) $nodes.push({ Mirror: $node.Mirror + $offset });
       else if ("Hidden" in $node) $nodes.push({ Hidden: $node.Hidden + $offset });
@@ -73,6 +74,7 @@ const $typeAt = ($descriptor, $index) => ({ nodes: [
   ...$descriptor.nodes.map($node => {
     if (typeof $node === "string" || "Fixed" in $node || "Parameter" in $node || "HiddenBound" in $node) return $node;
     if ("Alias" in $node) return { Alias: $node.Alias + 1 };
+    if ("Cell" in $node) return { Cell: $node.Cell.map($child => $child + 1) };
     if ("Array" in $node) return { Array: $node.Array + 1 };
     if ("Mirror" in $node) return { Mirror: $node.Mirror + 1 };
     if ("Hidden" in $node) return { Hidden: $node.Hidden + 1 };
@@ -89,7 +91,8 @@ const $projectType = ($descriptor, $path) => {
   for (const $step of $path) {
     $index = $typeIndex($descriptor, $index);
     const $node = $descriptor.nodes[$index];
-    if ($step === "Element") $index = $node.Array;
+    if ($step === "Element") $index = $node.Array ?? $node.Cell?.[1];
+    else if ($step === "Region") $index = $node.Cell?.[0];
     else if ($step === "Argument") $index = $node.Arrow?.[0];
     else if ($step === "Result") $index = $node.Arrow?.[1];
     else if ("Field" in $step) $index = ($node.Struct || $node.Sum)?.find($field => $field[0] === $step.Field)?.[1];
@@ -140,7 +143,7 @@ const $nativeSlots = ($descriptor, $index) => {
     if (typeof $node === "string" || "Fixed" in $node || "HiddenBound" in $node) continue;
     if ("Parameter" in $node) { $slots.add($node.Parameter); continue; }
     if ($defer && "Arrow" in $node) continue;
-    const $children = "Alias" in $node ? [$node.Alias] : "Array" in $node ? [$node.Array] : "Mirror" in $node ? [$node.Mirror] : "Hidden" in $node ? [$node.Hidden] : "Arrow" in $node ? $node.Arrow : "Extend" in $node ? $node.Extend : "Effects" in $node ? $node.Effects.flatMap($effect => [$effect.payload, ...$effect.args]) : Object.values($node)[0].map($field => $field[1]);
+    const $children = "Alias" in $node ? [$node.Alias] : "Array" in $node ? [$node.Array] : "Mirror" in $node ? [$node.Mirror] : "Hidden" in $node ? [$node.Hidden] : "Arrow" in $node ? $node.Arrow : "Cell" in $node ? $node.Cell : "Extend" in $node ? $node.Extend : "Effects" in $node ? $node.Effects.flatMap($effect => [$effect.payload, ...$effect.args]) : Object.values($node)[0].map($field => $field[1]);
     for (const $child of $children) $work.push([$child, $defer]);
   }
   return [...$slots].sort(($a, $b) => $a - $b);
@@ -181,6 +184,8 @@ const $sameType = ($left, $right) => {
         $work.push([$a.payload, $b.payload]);
         for (let $j = 0; $j < $a.args.length; $j++) $work.push([$a.args[$j], $b.args[$j]]);
       }
+    } else if ($kind === "Cell") {
+      $work.push([$x.Cell[0], $y.Cell[0]], [$x.Cell[1], $y.Cell[1]]);
     } else if ($kind === "Extend") {
       $work.push([$x.Extend[0], $y.Extend[0]], [$x.Extend[1], $y.Extend[1]]);
     } else {
@@ -255,6 +260,7 @@ const $describe = ($descriptor, $of) => {
       const $size = 1n << BigInt($bits - ($signed ? 1 : 0));
       return $sum("Fixed", $record([["bits", $bits], ["signed", $signed], ["min", ($signed ? -$size : 0n).toString()], ["max", ($size - 1n).toString()]]));
     }
+    if ("Cell" in $n) return $sum("Cell", $record([["region", $n.Cell[0]], ["element", $n.Cell[1]]]));
     if ("Array" in $n) return $sum("Array", $n.Array);
     if ("Arrow" in $n) {
       const $effects = $of.nodes[$typeIndex($of, $n.Arrow[2])].Effects || [];
@@ -326,6 +332,7 @@ const $shape = ($descriptor, $of) => {
     ]));
     return $sum("Sum", $record([["mirror", $of], ["cases", $array($cases)]]));
   }
+  if ("Cell" in $node) return $sum("Foreign", undefined);
   if ("Arrow" in $node) return $sum("Function", $describe($of, $of));
   if ("Hidden" in $node) return $sum("Hidden", $describe($of, $of));
   if ("Mirror" in $node) return $sum("Mirror", $describe($of, $of));
