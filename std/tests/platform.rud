@@ -1,0 +1,44 @@
+let exercise: () -> _ = fn _ => handle do
+  let args = process::args ()
+  let env = process::env "name"
+  let cwd = process::cwd ()
+  let path = path::resolve ["virtual"]
+  let relative = path::relative "a" "b"
+  let response = http::post "https://invalid.example/" (#Text "body")
+  return { args: args, env: env, cwd: cwd, path: path, relative: relative, response: response }
+end with
+| process::!Process.args _ => ["mock"]
+| process::!Process.env name => #Some (#Some name)
+| process::!Process.cwd _ => #Some "/virtual"
+| path::!Path.resolve parts => #Some (str::join "/" parts)
+| path::!Path.relative request => #Some request.to
+| http::!Http.request request =>
+  #Some {
+    status: 201n,
+    status_text: request.method,
+    headers: [],
+    body: [65n8],
+    url: request.url,
+    redirected: false,
+  }
+end
+
+@test
+let local_platform_handlers: () -> () + test::!Assert = fn _ => do
+  let result = exercise ()
+  _ = test::assert (match result.args with | ["mock"] => true | _ => false end) "result.args"
+  _ = test::assert
+    (match result.env with | #Some (#Some "name") => true | _ => false end)
+    "result.env"
+  _ = test::assert (match result.cwd with | #Some "/virtual" => true | _ => false end) "result.cwd"
+  _ = test::assert (match result.path with | #Some "virtual" => true | _ => false end) "result.path"
+  _ =
+    test::assert (match result.relative with | #Some "b" => true | _ => false end) "result.relative"
+  _ = test::assert
+    (match result.response with
+    | #Some { status: 201n, status_text: "POST", body: [65n8], .. } => true
+    | _ => false
+    end)
+    "result.response"
+  return ()
+end

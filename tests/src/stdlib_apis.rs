@@ -258,43 +258,6 @@ try {
 }
 
 #[test]
-fn local_handlers_replace_process_path_and_http_operations() {
-    let project = project(
-        r#"
-let exercise: () -> _ = fn _ => handle do
-  let args = std::process::args ()
-  let env = std::process::env "name"
-  let cwd = std::process::cwd ()
-  let path = std::path::resolve ["virtual"]
-  let relative = std::path::relative "a" "b"
-  let response = std::http::post "https://invalid.example/" (#Text "body")
-  return { args: args, env: env, cwd: cwd, path: path, relative: relative, response: response }
-end with
-| std::process::!Process.args _ => ["mock"]
-| std::process::!Process.env name => #Some (#Some name)
-| std::process::!Process.cwd _ => #Some "/virtual"
-| std::path::!Path.resolve parts => #Some (std::str::join "/" parts)
-| std::path::!Path.relative request => #Some request.to
-| std::http::!Http.request request => #Some {
-  status: 201n, status_text: request.method, headers: [], body: [65n8], url: request.url, redirected: false,
-}
-end
-"#,
-        "node",
-        "library",
-    );
-    run(
-        project.path(),
-        r#"
-const result = await app.exercise({});
-assert.deepEqual(result.args,['mock']); assert.equal(result.env.value.value,'name');
-assert.equal(result.cwd.value,'/virtual'); assert.equal(result.path.value,'virtual'); assert.equal(result.relative.value,'b');
-assert.equal(result.response.value.status,201); assert.equal(result.response.value.status_text,'POST'); assert.deepEqual(result.response.value.body,[65]);
-"#,
-    );
-}
-
-#[test]
 fn node_entry_handles_the_new_effects() {
     let project = project(
         r#"

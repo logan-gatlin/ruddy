@@ -1357,6 +1357,8 @@ impl ir::ErrorKind {
             ir::ErrorKind::DuplicateAttribute { .. } => "duplicate-metadata-key",
             ir::ErrorKind::MetadataTooDeep => "metadata-too-deep",
             ir::ErrorKind::InvalidPrivateValue => "invalid-private-value",
+            ir::ErrorKind::InvalidTestAttribute => "invalid-test-attribute",
+            ir::ErrorKind::InvalidTestSignature => "invalid-test-signature",
             // The shape is not part of the code, for the reason a repeated row
             // field's is not: the wording quotes the label the way it was
             // written, and that already says which kind of row it sits in.
@@ -1533,6 +1535,9 @@ impl ir::Error {
             .help(format!(
                 "a definition's metadata has one value per key; keep one `@{name}`"
             )),
+            E::InvalidTestAttribute => Diagnostic::new(code, "`@test` requires a bare attribute on one named `let`", span),
+            E::InvalidTestSignature => Diagnostic::new(code, "a test must have signature `() -> ()` with only `Assert` permitted", span)
+                .help("annotate the test as `() -> () + !Assert`; handle every effect except `Assert = String -> ()` inside the test"),
             E::InvalidPrivateValue => Diagnostic::new(code, "`@private` requires unit", span)
                 .label("this value is not unit")
                 .help("write `@private` or `@private ()`"),

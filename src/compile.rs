@@ -119,6 +119,15 @@ impl AcceptedProgram {
         &self.artifact
     }
 
+    /// A runner-only library view exposing this bundle's private tests.
+    /// Ordinary artifacts never publish these values to dependencies.
+    pub fn test_artifact(&self) -> artifact::Artifact {
+        let mut artifact = self.artifact.clone();
+        artifact.header.values = artifact::test_values(&self.mint, self.ir(), self.semantics());
+        artifact.header.values.sort_by(|a, b| a.name.cmp(&b.name));
+        artifact
+    }
+
     /// The domains `Nat` and `Int` were bound to.
     pub fn domains(&self) -> types::Domains {
         self.domains
@@ -282,6 +291,8 @@ pub(crate) fn accept(
 ) -> Result<AcceptedProgram, PartialCompilation> {
     if inference.errors().is_empty() {
         ir.errors.extend(externs::review(inference.semantics()));
+        ir.errors
+            .extend(crate::testing::review(&ir.program, inference.semantics()));
     }
     let mut errors = Vec::new();
     errors.extend(ir.errors.iter().cloned().map(Error::Ir));

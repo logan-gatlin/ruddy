@@ -4175,3 +4175,24 @@ fn a_request_the_compiler_cannot_bind_compiles_nothing() {
         );
     }
 }
+
+#[test]
+fn debugger_reports_invalid_test_signatures() {
+    let result = snapshot("@test let invalid = 1n");
+    assert!(result.panic.is_none());
+    assert!(
+        result
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "invalid-test-signature")
+    );
+    assert_eq!(
+        result
+            .stages
+            .iter()
+            .find(|stage| stage.id == "lir")
+            .unwrap()
+            .status,
+        Status::Skipped
+    );
+}

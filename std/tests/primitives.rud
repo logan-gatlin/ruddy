@@ -1,0 +1,132 @@
+@test
+let primitives: () -> () + test::!Assert = fn _ => do
+  let joined = str::concat "rud" "dy"
+  let size = str::len joined
+  let empty = str::is_empty ""
+  let nat = str::from_nat 42n
+  let int = str::from_int 7i
+  let real = str::from_real 1.5
+  let boolean = str::from_boolean true
+  let has = str::contains joined "udd"
+  let starts = str::starts_with joined "rud"
+  let ends = str::ends_with joined "dy"
+  let char = str::char_at joined 1n
+  let index = str::index_of joined "ddy"
+  let part = str::slice joined 1n 4n
+  let trimmed = str::trim "  ruddy  "
+  let left_trimmed = str::trim_start "  ruddy  "
+  let right_trimmed = str::trim_end "  ruddy  "
+  let lower = str::to_lowercase "RuDdY"
+  let upper = str::to_uppercase "RuDdY"
+  let repeated = str::repeat "ha" 2n
+  let replaced = str::replace_first "ruddy" "d" "b"
+  let replaced_all = str::replace_all "ruddy" "d" "b"
+  let left_padded = str::pad_start "7" 3n "0"
+  let right_padded = str::pad_end "7" 3n "0"
+
+  let nat_results = {
+    added: nat::add 20n 22n,
+    subtracted: nat::subtract 2n 5n,
+    divided: nat::divide 7n 2n,
+    clamped: nat::clamp 12n 0n 10n,
+    converted: nat::from_real 3.9,
+    zero: nat::is_zero 0n,
+  }
+  let negative_seven = int::negate 7i
+  let int_results = {
+    subtracted: int::subtract 2i 5i,
+    divided: int::divide negative_seven 2i,
+    remainder: int::remainder negative_seven 4i,
+    absolute: int::abs negative_seven,
+    converted: int::from_real 3.9,
+  }
+  let real_results = {
+    added: real::add 1.25 2.25,
+    divided: real::divide 7 2,
+    square_root: real::sqrt 9,
+    rounded: real::round 3.6,
+    nan: real::is_nan (real::divide 0 0),
+    finite: real::is_finite 42,
+    negative_zero_equal: real::equal (real::negate 0) 0,
+  }
+  let boolean_results = {
+    negated: boolean::logical_not true,
+    both: boolean::logical_and true false,
+    either: boolean::logical_or true false,
+    exclusive: boolean::logical_xor true false,
+    equal: boolean::equal true true,
+    implies: boolean::implies true false,
+  }
+  _ = test::assert (match joined with | "ruddy" => true | _ => false end) "primitives: joined"
+  _ = test::assert (match size with | 5n => true | _ => false end) "primitives: size"
+  _ = test::assert (match empty with | true => true | _ => false end) "primitives: empty"
+  _ = test::assert (match nat with | "42" => true | _ => false end) "primitives: nat"
+  _ = test::assert (match int with | "7" => true | _ => false end) "primitives: int"
+  _ = test::assert (match real with | "1.5" => true | _ => false end) "primitives: real"
+  _ = test::assert (match boolean with | "true" => true | _ => false end) "primitives: boolean"
+  _ = test::assert (match has with | true => true | _ => false end) "primitives: has"
+  _ = test::assert (match starts with | true => true | _ => false end) "primitives: starts"
+  _ = test::assert (match ends with | true => true | _ => false end) "primitives: ends"
+  _ = test::assert (match char with | "u" => true | _ => false end) "primitives: char"
+  _ = test::assert (match index with | 2i => true | _ => false end) "primitives: index"
+  _ = test::assert (match part with | "udd" => true | _ => false end) "primitives: part"
+  _ = test::assert (match trimmed with | "ruddy" => true | _ => false end) "primitives: trimmed"
+  _ = test::assert
+    (match left_trimmed with | "ruddy  " => true | _ => false end)
+    "primitives: left_trimmed"
+  _ = test::assert
+    (match right_trimmed with | "  ruddy" => true | _ => false end)
+    "primitives: right_trimmed"
+  _ = test::assert (match lower with | "ruddy" => true | _ => false end) "primitives: lower"
+  _ = test::assert (match upper with | "RUDDY" => true | _ => false end) "primitives: upper"
+  _ = test::assert (match repeated with | "haha" => true | _ => false end) "primitives: repeated"
+  _ = test::assert (match replaced with | "rubdy" => true | _ => false end) "primitives: replaced"
+  _ = test::assert
+    (match replaced_all with | "rubby" => true | _ => false end)
+    "primitives: replaced_all"
+  _ =
+    test::assert (match left_padded with | "007" => true | _ => false end) "primitives: left_padded"
+  _ = test::assert
+    (match right_padded with | "700" => true | _ => false end)
+    "primitives: right_padded"
+  _ = test::assert
+    (match nat_results with
+    | { added: 42n, subtracted: 0n, divided: 3n, clamped: 10n, converted: 3n, zero: true } => true
+    | _ => false
+    end)
+    "primitives: nat_results"
+  _ = test::assert
+    (match int_results with
+    | { subtracted: -3i, divided: -3i, remainder: -3i, absolute: 7i, converted: 3i } => true
+    | _ => false
+    end)
+    "primitives: int_results"
+  _ = test::assert
+    (match real_results with
+    | {
+      added: 3.5,
+      divided: 3.5,
+      square_root: 3,
+      rounded: 4i,
+      nan: true,
+      finite: true,
+      negative_zero_equal: true,
+    } => true
+    | _ => false
+    end)
+    "primitives: real_results"
+  _ = test::assert
+    (match boolean_results with
+    | {
+      negated: false,
+      both: false,
+      either: true,
+      exclusive: true,
+      equal: true,
+      implies: false,
+    } => true
+    | _ => false
+    end)
+    "primitives: boolean_results"
+  return ()
+end

@@ -1535,6 +1535,10 @@ pub enum ErrorKind {
     MetadataTooDeep,
     /// The compiler-interpreted privacy marker accepts only unit.
     InvalidPrivateValue,
+    /// A test must mark one named let, using a bare attribute.
+    InvalidTestAttribute,
+    /// A test must be monomorphic unit-to-unit with only Assert permitted.
+    InvalidTestSignature,
     /// A second case of a name in one sum, one effect row, or one alias — all
     /// three being a set of labels a name may appear in once.
     DuplicateCase {
@@ -10099,7 +10103,21 @@ impl Builder<'_> {
         for stmt in stmts {
             // Lowered here, on the way past, so a repeated key is reported in
             // the order the reader wrote it and beside nothing else.
-            let metadata = self.metadata(stmt.attributes);
+            let test = stmt
+                .attributes
+                .iter()
+                .find(|attribute| attribute.key.tracked == "test");
+            if let Some(attribute) = test
+                && (attribute.value.is_some()
+                    || !matches!(&stmt.kind, StmtKind::Let { pattern, .. }
+                        if matches!(pattern.tracked, parse::PatternKind::Ident { .. })))
+            {
+                self.error(attribute.key.span, ErrorKind::InvalidTestAttribute);
+            }
+            let mut metadata = self.metadata(stmt.attributes);
+            if let Some(attribute) = metadata.get("test").cloned() {
+                metadata.entry("private".into()).or_insert(attribute);
+            }
             match stmt.kind {
                 StmtKind::Using(tree) => flat.imports.push((outer, tree)),
                 StmtKind::Type { name, params, body } => {

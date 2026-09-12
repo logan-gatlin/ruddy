@@ -436,13 +436,6 @@ fn compile_inner(req: &CompileRequest, build: u64, scratch: Option<&Path>) -> Sn
         }));
     }
 
-    // Sorted by where the reader would look for them — file first, then offset
-    // — and numbered, so a diagnostic's id matches its position in the strip.
-    diagnostics.sort_by_key(|d| d.span.map(|at| (at.file, at.range[0])).unwrap_or((0, 0)));
-    for (i, diagnostic) in diagnostics.iter_mut().enumerate() {
-        diagnostic.id = i as u32;
-    }
-
     // Lowering to LIR runs on an accepted program and nothing else, which is
     // the rule `main.rs` follows too — so it is gated on the whole diagnostic
     // list rather than on any one phase having produced a value. Its tab
@@ -475,15 +468,43 @@ fn compile_inner(req: &CompileRequest, build: u64, scratch: Option<&Path>) -> Sn
                     artifact: ruddy::compile::DependencyArtifact::Checked(artifact),
                 })
                 .collect();
-            ruddy::compile::compile_bound(
+            match ruddy::compile::compile_bound(
                 Mint::new(mint.bundle().clone()),
                 loaded.stmts.clone(),
                 &dependencies,
                 inference::Trace::Complete,
                 output.domains,
-            )
-            .ok()
+            ) {
+                Ok(accepted) => Some(accepted),
+                Err(partial) => {
+                    // Acceptance also reviews contracts such as externs and
+                    // test signatures. Preserve those diagnostics instead of
+                    // silently making the later phase tabs disappear.
+                    diagnostics.extend(partial.errors.iter().map(|error| {
+                        let (stage, diagnostic) = match error {
+                            ruddy::compile::Error::Ir(error) => {
+                                ("ir", error.diagnostic(&partial.ir.source))
+                            }
+                            ruddy::compile::Error::Inference(error) => {
+                                ("types", error.diagnostic(&partial.ir.source))
+                            }
+                            ruddy::compile::Error::Patterns(error) => {
+                                ("patterns", error.diagnostic(&partial.ir.source))
+                            }
+                        };
+                        source_error(stage, diagnostic, &index)
+                    }));
+                    None
+                }
+            }
         });
+    // Sorted by where the reader would look for them — file first, then offset
+    // — and numbered, so a diagnostic's id matches its position in the strip.
+    diagnostics.sort_by_key(|d| d.span.map(|at| (at.file, at.range[0])).unwrap_or((0, 0)));
+    for (i, diagnostic) in diagnostics.iter_mut().enumerate() {
+        diagnostic.id = i as u32;
+    }
+
     let lowered = match &accepted {
         Some(accepted) => {
             let started = Instant::now();

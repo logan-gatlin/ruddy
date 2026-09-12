@@ -34,6 +34,7 @@ stdReference: true
 [reflect](reflect.md)\
 [result](result.md)\
 [str](str.md)\
+[test](test.md)\
 [tuple](tuple.md)\
 [types](types.md)\
 [url](url.md)

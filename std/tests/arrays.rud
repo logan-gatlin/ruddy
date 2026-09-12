@@ -1,0 +1,174 @@
+@test
+let arrays: () -> () + test::!Assert = fn _ => do
+  let original = [
+    0n,
+    1n,
+    2n,
+    3n,
+    4n,
+    5n,
+    6n,
+    7n,
+    8n,
+    9n,
+    10n,
+    11n,
+    12n,
+    13n,
+    14n,
+    15n,
+    16n,
+    17n,
+    18n,
+    19n,
+    20n,
+    21n,
+    22n,
+    23n,
+    24n,
+    25n,
+    26n,
+    27n,
+    28n,
+    29n,
+    30n,
+    31n,
+    32n,
+  ]
+  let changed = match array::set original 0n 99n with
+  | #Some values => values
+  | #None => original
+  end
+  let original_first = match array::get original 0n with | #Some value => value | #None => 999n end
+  let changed_first = match array::get changed 0n with | #Some value => value | #None => 999n end
+  let boundary = match array::get original 32n with | #Some value => value | #None => 999n end
+  let out_of_bounds = match array::get original 33n with | #Some _ => false | #None => true end
+  let pushed = array::push original 33n
+  let pushed_last = match array::get pushed 33n with | #Some value => value | #None => 999n end
+  let original_len = array::len original
+  let pushed_len = array::len pushed
+  let words = array::push [] "array"
+  let first_word = match array::get words 0n with | #Some value => value | #None => "none" end
+  let mapped = array::map (nat::add 1n) original
+  let mapped_boundary = match array::get mapped 32n with | #Some value => value | #None => 999n end
+  let folded = array::fold nat::add 0n original
+  let folded_words = array::fold str::concat "" ["map", "-", "fold"]
+  let filtered = array::filter (fn value => nat::is_zero (nat::remainder value 2n)) [1n, 2n, 3n, 4n]
+  let filter_mapped = array::filter_map (fn value =>
+    if nat::greater_than value 2n then #Some (str::from_nat value) else #None end) [1n, 2n, 3n, 4n]
+  let flat_mapped = array::flat_map (fn value => [value, value]) [1n, 2n, 3n]
+  let found = match array::find (fn value => nat::greater_than value 2n) [1n, 2n, 3n, 4n] with
+  | #Some value => value
+  | #None => 0n
+  end
+  let found_index = match array::find_index (nat::equal 3n) [1n, 2n, 3n, 4n] with
+  | #Some value => value
+  | #None => 99n
+  end
+  let has_large = array::any (fn value => nat::greater_than value 3n) [1n, 2n, 3n, 4n]
+  let all_positive = array::all (fn value => nat::greater_than value 0n) [1n, 2n, 3n, 4n]
+  let reversed = array::reverse [1n, 2n, 3n, 4n]
+  let zipped = array::zip [1n, 2n, 3n] ["a", "b"]
+  let enumerated = array::enumerate ["a", "b"]
+  let partitioned = array::partition (fn value => nat::greater_than value 2n) [1n, 2n, 3n, 4n]
+  let folded_right =
+    array::fold_right (fn value state => str::concat state value) "" ["a", "b", "c"]
+  let reduced = match array::reduce nat::add [1n, 2n, 3n, 4n] with
+  | #Some value => value
+  | #None => 0n
+  end
+  let reduced_empty = match array::reduce nat::add [] with | #Some _ => false | #None => true end
+  let traversed_option: option::Option [Nat] = array::traverse_option (fn value =>
+    if nat::is_zero value then #None else #Some (nat::add value 1n) end) [1n, 2n, 3n]
+  let traversed_option_total = match traversed_option with
+  | #Some values => array::fold nat::add 0n values
+  | #None => 0n
+  end
+  let traversed_result: result::Result [String] String = array::traverse_result (fn value =>
+    if str::is_empty value then #Error "empty" else #Some (str::to_uppercase value) end) ["ok", ""]
+  let traversed_error = match traversed_result with | #Some _ => "none" | #Error error => error end
+  let tried_option: option::Option Nat =
+    array::try_fold_option (fn state value => #Some (nat::add state value)) 0n [1n, 2n, 3n]
+  let tried_option_total = option::unwrap_or 0n tried_option
+  let tried_result: result::Result Nat String = array::try_fold_result (fn state value =>
+    if nat::is_zero value then #Error "zero" else #Some (nat::add state value) end) 0n [
+    1n,
+    2n,
+    0n,
+    4n,
+  ]
+  let tried_error = match tried_result with | #Some _ => "none" | #Error error => error end
+  let option_values: [option::Option Nat] = [#Some 2n, #Some 3n]
+  let sequenced_option: option::Option [Nat] = array::sequence_option option_values
+  let sequenced_total = match sequenced_option with
+  | #Some values => array::fold nat::add 0n values
+  | #None => 0n
+  end
+  let result_values: [result::Result Nat String] = [#Some 2n, #Error "stop", #Some 3n]
+  let sequenced_result: result::Result [Nat] String = array::sequence_result result_values
+  let sequenced_error = match sequenced_result with | #Some _ => "none" | #Error error => error end
+  _ =
+    test::assert (match original_first with | 0n => true | _ => false end) "arrays: original_first"
+  _ = test::assert (match changed_first with | 99n => true | _ => false end) "arrays: changed_first"
+  _ = test::assert (match boundary with | 32n => true | _ => false end) "arrays: boundary"
+  _ =
+    test::assert (match out_of_bounds with | true => true | _ => false end) "arrays: out_of_bounds"
+  _ = test::assert (match pushed_last with | 33n => true | _ => false end) "arrays: pushed_last"
+  _ = test::assert (match original_len with | 33n => true | _ => false end) "arrays: original_len"
+  _ = test::assert (match pushed_len with | 34n => true | _ => false end) "arrays: pushed_len"
+  _ = test::assert (match first_word with | "array" => true | _ => false end) "arrays: first_word"
+  _ = test::assert
+    (match mapped_boundary with | 33n => true | _ => false end)
+    "arrays: mapped_boundary"
+  _ = test::assert (match folded with | 528n => true | _ => false end) "arrays: folded"
+  _ = test::assert
+    (match folded_words with | "map-fold" => true | _ => false end)
+    "arrays: folded_words"
+  _ = test::assert (match filtered with | [2n, 4n] => true | _ => false end) "arrays: filtered"
+  _ = test::assert
+    (match filter_mapped with | ["3", "4"] => true | _ => false end)
+    "arrays: filter_mapped"
+  _ = test::assert
+    (match flat_mapped with | [1n, 1n, 2n, 2n, 3n, 3n] => true | _ => false end)
+    "arrays: flat_mapped"
+  _ = test::assert (match found with | 3n => true | _ => false end) "arrays: found"
+  _ = test::assert (match found_index with | 2n => true | _ => false end) "arrays: found_index"
+  _ = test::assert (match has_large with | true => true | _ => false end) "arrays: has_large"
+  _ = test::assert (match all_positive with | true => true | _ => false end) "arrays: all_positive"
+  _ = test::assert
+    (match reversed with | [4n, 3n, 2n, 1n] => true | _ => false end)
+    "arrays: reversed"
+  _ = test::assert
+    (match zipped with | [{ 0: 1n, 1: "a" }, { 0: 2n, 1: "b" }] => true | _ => false end)
+    "arrays: zipped"
+  _ = test::assert
+    (match enumerated with | [{ 0: 0n, 1: "a" }, { 0: 1n, 1: "b" }] => true | _ => false end)
+    "arrays: enumerated"
+  _ = test::assert
+    (match partitioned.0 with | [3n, 4n] => true | _ => false end)
+    "arrays: partitioned"
+  _ = test::assert
+    (match partitioned.1 with | [1n, 2n] => true | _ => false end)
+    "arrays: partitioned"
+  _ = test::assert (match folded_right with | "cba" => true | _ => false end) "arrays: folded_right"
+  _ = test::assert (match reduced with | 10n => true | _ => false end) "arrays: reduced"
+  _ =
+    test::assert (match reduced_empty with | true => true | _ => false end) "arrays: reduced_empty"
+  _ = test::assert
+    (match traversed_option_total with | 9n => true | _ => false end)
+    "arrays: traversed_option_total"
+  _ = test::assert
+    (match traversed_error with | "empty" => true | _ => false end)
+    "arrays: traversed_error"
+  _ = test::assert
+    (match tried_option_total with | 6n => true | _ => false end)
+    "arrays: tried_option_total"
+  _ = test::assert (match tried_error with | "zero" => true | _ => false end) "arrays: tried_error"
+  _ = test::assert
+    (match sequenced_total with | 5n => true | _ => false end)
+    "arrays: sequenced_total"
+  _ = test::assert
+    (match sequenced_error with | "stop" => true | _ => false end)
+    "arrays: sequenced_error"
+  return ()
+end

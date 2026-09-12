@@ -1,0 +1,133 @@
+@test
+let assertions_can_resume: () -> () + test::!Assert = fn _ => do
+  let resumed = handle do
+    _ = test::fail "handled"
+    return true
+  end with
+  | test::!Assert _ => ()
+  end
+  return test::assert resumed "Assertion handlers may resume"
+end
+
+@test
+let filesystem_mock_records_calls: () -> () + test::!Assert = fn _ => do
+  let contents = test::mock_filesystem
+    {
+      read_text: #Some (fn _ => #Some "virtual contents"),
+      ..test::filesystem_defaults
+    }
+    (fn _ => fs::read_text "virtual")
+  _ = test::assert
+    (match contents.value with | #Some "virtual contents" => true | _ => false end)
+    "Mock response"
+  return test::assert
+    (match contents.calls with | [#ReadText "virtual"] => true | _ => false end)
+    "Recorded read path"
+end
+
+@test
+let unexpected_mock_operations_assert: () -> () + test::!Assert = fn _ => do
+  let caught = handle do
+    _ = test::mock_process test::process_defaults (fn _ => process::args ())
+    return false
+  end with
+  | test::!Assert _ => raise true
+  end
+  return test::assert caught "Unexpected process operations must assert"
+end
+
+module arrays
+module cells
+module primitives
+module functional
+
+@if { platform: "node" }
+module platform
+
+@test
+let process_mock_supplies_responses: () -> () + test::!Assert = fn _ => do
+  let result = test::mock_process
+    {
+      args: #Some (fn _ => ["mock"]),
+      env: #Some (fn name => #Some (#Some name)),
+      cwd: #Some (fn _ => #Some "/virtual"),
+    }
+    (fn _ => do
+      let args = process::args ()
+      let env = process::env "name"
+      let cwd = process::cwd ()
+      return (args, env, cwd)
+    end)
+  _ = test::assert
+    (match result.value with
+    | (["mock"], #Some (#Some "name"), #Some "/virtual") => true
+    | _ => false
+    end)
+    "Process responses"
+  return test::assert
+    (match result.calls with | [#Args (), #Env "name", #Cwd ()] => true | _ => false end)
+    "Process call order"
+end
+
+@test
+let http_mock_records_request: () -> () + test::!Assert = fn _ => do
+  let result = test::mock_http
+    {
+      request: #Some (fn request => #Some {
+        status: 201n,
+        status_text: request.method,
+        headers: [],
+        body: [65n8],
+        url: request.url,
+        redirected: false,
+      }),
+    }
+    (fn _ => http::post "https://invalid.example/" (#Text "body"))
+  _ = test::assert
+    (match result.value with
+    | #Some { status: 201n, status_text: "POST", body: [65n8], .. } => true
+    | _ => false
+    end)
+    "HTTP response"
+  return test::assert
+    (match result.calls with
+    | [#Request { method: "POST", body: #Text "body", .. }] => true
+    | _ => false
+    end)
+    "HTTP call"
+end
+
+@test
+let unexpected_mock_operations_can_resume: () -> () + test::!Assert = fn _ => do
+  let result = handle test::mock_process test::process_defaults (fn _ => process::args ()) with
+  | test::!Assert _ => ()
+  end
+  _ = test::assert (nat::is_zero (array::len result.value)) "Resumed args returns an empty array"
+  return test::assert
+    (match result.calls with | [#Args ()] => true | _ => false end)
+    "Unexpected calls remain recorded"
+end
+
+@if { platform: "node" }
+@test
+let path_mock_records_requests: () -> () + test::!Assert = fn _ => do
+  let result = test::mock_path
+    {
+      resolve: #Some (fn parts => #Some (str::join "/" parts)),
+      relative: #Some (fn request => #Some request.to),
+    }
+    (fn _ => do
+      let resolved = path::resolve ["virtual"]
+      let relative = path::relative "a" "b"
+      return (resolved, relative)
+    end)
+  _ = test::assert
+    (match result.value with | (#Some "virtual", #Some "b") => true | _ => false end)
+    "Path responses"
+  return test::assert
+    (match result.calls with
+    | [#Resolve ["virtual"], #Relative { from: "a", to: "b" }] => true
+    | _ => false
+    end)
+    "Path call order"
+end

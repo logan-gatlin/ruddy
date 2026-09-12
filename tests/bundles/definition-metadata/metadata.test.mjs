@@ -37,7 +37,7 @@ test("metadata leaves no trace in the generated module", async () => {
     "quiet",
     "right",
   ]);
-  for (const key of ["doc", "since", "stable", "owner", "k", "test", "metadata"]) {
+  for (const key of ["doc", "since", "stable", "owner", "k", "example", "metadata"]) {
     assert.equal(key in app, false, key);
   }
 });

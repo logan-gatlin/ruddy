@@ -65,3 +65,6 @@ extern js_length: ForeignValue -> #Some Nat | #Error js::Error = "$js.length"
 extern js_keys: ForeignValue -> #Some [String] | #Error js::Error = "$js.keys"
 extern js_snapshot: ForeignValue -> #Some ForeignValue | #Error js::Error = "$js.snapshot"
 extern js_apply: js::Call -> #Some ForeignValue | #Error js::Error = "$js.apply"
+
+effect Assert = String -> ()
+extern assertion_failed: String -> () = "message => { throw new Error(message); }"

@@ -74,6 +74,8 @@ enum Command {
     Doc,
     /// Build and execute a JavaScript-targeted project.
     Run,
+    /// Run every test in the root bundle.
+    Test,
     /// Serve the language server over standard input and output.
     Lsp,
     /// Format Ruddy source files in place.
@@ -106,6 +108,8 @@ pub enum Outcome {
     Documented(PathBuf),
     /// This JavaScript module was built and executed successfully.
     Ran(PathBuf),
+    /// This root bundle test suite completed successfully.
+    Tested(PathBuf),
     /// The language server ran until its client asked it to exit.
     Served,
     /// Source files were formatted, or checked.
@@ -234,6 +238,7 @@ where
         }
         Command::Doc => document_project(current_directory).map(Outcome::Documented),
         Command::Run => run_project(current_directory).map(Outcome::Ran),
+        Command::Test => test_project(current_directory).map(Outcome::Tested),
         Command::Lsp => {
             let (connection, threads) = lsp_server::Connection::stdio();
             lsp::serve(connection)
@@ -502,8 +507,8 @@ pub fn document_project(directory: impl AsRef<Path>) -> Result<PathBuf, CliError
             .as_deref()
             .unwrap_or(Path::new("docs")),
     );
-    let (_, pages) =
-        compile_graph_output(&directory, true).map_err(|error| CliError::one(error.to_string()))?;
+    let (_, pages) = compile_graph_output(&directory, true, false)
+        .map_err(|error| CliError::one(error.to_string()))?;
     documentation::write(
         &target,
         &manifest.name,
@@ -685,6 +690,53 @@ pub fn run_project(directory: impl AsRef<Path>) -> Result<PathBuf, CliError> {
         None => execute_node_module(OsStr::new("node"), &javascript, &installed.directory)?,
     }
     Ok(javascript)
+}
+
+/// Compile and run only the root bundle's tests, without requiring `main`.
+pub fn test_project(directory: impl AsRef<Path>) -> Result<PathBuf, CliError> {
+    let (graph, _) = compile_graph_output(directory.as_ref(), false, true)
+        .map_err(|error| CliError::one(error.to_string()))?;
+    let root = graph
+        .projects
+        .last()
+        .ok_or_else(|| CliError::one("the project graph was empty"))?;
+    let linked = link_rooted(&graph).map_err(|error| CliError::one(error.to_string()))?;
+    let javascript = ruddy::backend::js::generate_for_platform(&linked, root.platform.backend())
+        .map_err(|error| CliError::one(format!("could not generate tests: {error}")))?;
+    let prefix = format!(
+        "{}@{}::",
+        root.artifact.header().identity.name,
+        root.artifact.header().identity.version
+    );
+    let tests: Vec<_> = root
+        .artifact
+        .header()
+        .values
+        .iter()
+        .map(|value| {
+            let relative = value
+                .name
+                .strip_prefix(&prefix)
+                .expect("tests belong to the root");
+            (value.name.clone(), relative.split("::").collect::<Vec<_>>())
+        })
+        .collect();
+    let runner = format!(
+        "import * as bundle from './suite.mjs';\nconst tests = {};\n{}",
+        serde_json::to_string(&tests).expect("test names serialize"),
+        include_str!("test-runner.js"),
+    );
+    let build = root.directory.join(BUILD_DIRECTORY).join("tests");
+    fs::create_dir_all(&build)
+        .map_err(|error| CliError::one(format!("could not create test output: {error}")))?;
+    replace_file(&build.join("suite.mjs"), javascript.as_bytes())?;
+    let path = build.join("run.mjs");
+    replace_file(&path, runner.as_bytes())?;
+    match root.run.js.as_deref() {
+        Some(runner) => execute_javascript_runner(runner, &path, &root.directory)?,
+        None => execute_node_module(OsStr::new("node"), &path, &root.directory)?,
+    }
+    Ok(path)
 }
 
 fn execute_javascript_runner(runner: &str, path: &Path, directory: &Path) -> Result<(), CliError> {
@@ -1651,18 +1703,25 @@ pub fn compile(directory: impl AsRef<Path>) -> Result<Artifact, CompileError> {
 /// Compile every unique project reachable from `directory`, dependencies first.
 /// This single-root graph ends with the requested project.
 pub fn compile_graph(directory: impl AsRef<Path>) -> Result<CompiledGraph, CompileError> {
-    compile_graph_output(directory.as_ref(), false).map(|(graph, _)| graph)
+    compile_graph_output(directory.as_ref(), false, false).map(|(graph, _)| graph)
 }
 
 fn compile_graph_output(
     directory: &Path,
     document: bool,
+    tests: bool,
 ) -> Result<(CompiledGraph, Vec<documentation::Page>), CompileError> {
     let root = canonical_project(directory)?;
     let resolver = git::Resolver::new(&root)?;
-    let build = load_manifest(&root, None)?.build()?;
+    let manifest = load_manifest(&root, None)?;
+    let build = if tests {
+        Build::resolve(Target::Js, manifest.platform(), manifest.integers)?
+    } else {
+        manifest.build()?
+    };
     let mut compiler = GraphCompiler {
         document,
+        tests,
         root: Some(root.clone()),
         resolver: Some(resolver),
         build: Some(build),
@@ -2028,6 +2087,7 @@ where
 
 struct GraphCompiler {
     document: bool,
+    tests: bool,
     documentation: Vec<documentation::Page>,
     sandbox: Option<PathBuf>,
     resolver: Option<git::Resolver>,
@@ -2054,6 +2114,7 @@ impl Default for GraphCompiler {
     fn default() -> Self {
         Self {
             document: false,
+            tests: false,
             documentation: Vec::new(),
             sandbox: None,
             resolver: None,
@@ -2282,6 +2343,7 @@ impl GraphCompiler {
                     linked_artifacts,
                     boundary.as_deref(),
                     build,
+                    self.tests && self.root.as_ref() == Some(&directory),
                     if self.document && self.root.as_ref() == Some(&directory) {
                         Some(&mut self.documentation)
                     } else {
@@ -2402,6 +2464,7 @@ fn compile_one(
     linked: Vec<Artifact>,
     sandbox: Option<&Path>,
     build: Build,
+    tests: bool,
     documentation: Option<&mut Vec<documentation::Page>>,
 ) -> Result<Artifact, CompileError> {
     if sandbox.is_some() && manifest.root.is_absolute() {
@@ -2563,6 +2626,9 @@ fn compile_one(
     if let Some(pages) = documentation {
         *pages = documentation::render(&accepted, doc_statements.as_ref().unwrap(), &mut files)
             .map_err(|message| CompileError::report("documentation-invalid", message))?;
+    }
+    if tests {
+        return Ok(accepted.test_artifact());
     }
     let artifact = match manifest.kind {
         Kind::Library => accepted.artifact().clone(),

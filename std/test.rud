@@ -1,0 +1,337 @@
+@doc "Reports an assertion failure. A handler may return unit to continue, or halt the computation."
+effect Assert = String -> ()
+
+@doc "Reports the message when the condition is false."
+let assert: Bool -> String -> () + !Assert = fn condition message =>
+  if condition then () else !Assert message end
+
+@doc "Reports an unconditional assertion failure; a handler may resume after it."
+let fail: String -> () + !Assert = !Assert
+
+@private
+let response: String -> Option ('a -> 'b) -> 'a -> 'b -> 'b + !Assert =
+  fn operation configured request fallback => match configured with
+  | #Some respond => respond request
+  | #None => do
+    _ = fail (str::concat "Unexpected mock operation: " operation)
+    return fallback
+  end
+  end
+
+@doc "Optional pure response functions for mock_filesystem. None marks an unexpected operation."
+type FileSystemResponses = {
+  read_bytes: Option (String -> Result [Nat8] fs::Error),
+  write_bytes: Option ({ path: String, bytes: [Nat8] } -> Result () fs::Error),
+  append_bytes: Option ({ path: String, bytes: [Nat8] } -> Result () fs::Error),
+  read_text: Option (String -> Result String fs::Error),
+  write_text: Option ({ path: String, text: String } -> Result () fs::Error),
+  append_text: Option ({ path: String, text: String } -> Result () fs::Error),
+  exists: Option (String -> Result Bool fs::Error),
+  read_dir: Option (String -> Result [fs::DirEntry] fs::Error),
+  metadata: Option (String -> Result fs::Metadata fs::Error),
+  symlink_metadata: Option (String -> Result fs::Metadata fs::Error),
+  create_dir: Option (String -> Result () fs::Error),
+  create_dir_all: Option (String -> Result () fs::Error),
+  remove_file: Option (String -> Result () fs::Error),
+  remove_dir: Option (String -> Result () fs::Error),
+  rename: Option ({ source: String, destination: String } -> Result () fs::Error),
+  copy_file: Option ({ source: String, destination: String } -> Result () fs::Error),
+}
+
+@doc "Recorded filesystem requests in invocation order."
+type FileSystemCall =
+  | #ReadBytes String
+  | #WriteBytes { path: String, bytes: [Nat8] }
+  | #AppendBytes { path: String, bytes: [Nat8] }
+  | #ReadText String
+  | #WriteText { path: String, text: String }
+  | #AppendText { path: String, text: String }
+  | #Exists String
+  | #ReadDir String
+  | #Metadata String
+  | #SymlinkMetadata String
+  | #CreateDir String
+  | #CreateDirAll String
+  | #RemoveFile String
+  | #RemoveDir String
+  | #Rename { source: String, destination: String }
+  | #CopyFile { source: String, destination: String }
+
+@doc "No operations are expected. Override fields with Some response functions using a record spread."
+let filesystem_defaults: FileSystemResponses = {
+  read_bytes: #None,
+  write_bytes: #None,
+  append_bytes: #None,
+  read_text: #None,
+  write_text: #None,
+  append_text: #None,
+  exists: #None,
+  read_dir: #None,
+  metadata: #None,
+  symlink_metadata: #None,
+  create_dir: #None,
+  create_dir_all: #None,
+  remove_file: #None,
+  remove_dir: #None,
+  rename: #None,
+  copy_file: #None,
+}
+
+@doc "Handles FileSystem using supplied responses and returns {value, calls}. Unexpected operations assert; if the assertion resumes, they return an error (or empty arguments)."
+let mock_filesystem: FileSystemResponses -> _ = fn responses body => do
+  let calls = mut []
+  let value = handle body () with
+  | fs::!FileSystem.read_bytes request => do
+    _ = calls := array::push (~calls) (#ReadBytes request)
+    return response
+      "FileSystem.read_bytes"
+      responses.read_bytes
+      request
+      (#Error { kind: #Other, path: request, message: "Unexpected mock operation" })
+  end
+  | fs::!FileSystem.write_bytes request => do
+    _ = calls := array::push (~calls) (#WriteBytes request)
+    return response
+      "FileSystem.write_bytes"
+      responses.write_bytes
+      request
+      (#Error { kind: #Other, path: request.path, message: "Unexpected mock operation" })
+  end
+  | fs::!FileSystem.append_bytes request => do
+    _ = calls := array::push (~calls) (#AppendBytes request)
+    return response
+      "FileSystem.append_bytes"
+      responses.append_bytes
+      request
+      (#Error { kind: #Other, path: request.path, message: "Unexpected mock operation" })
+  end
+  | fs::!FileSystem.read_text request => do
+    _ = calls := array::push (~calls) (#ReadText request)
+    return response
+      "FileSystem.read_text"
+      responses.read_text
+      request
+      (#Error { kind: #Other, path: request, message: "Unexpected mock operation" })
+  end
+  | fs::!FileSystem.write_text request => do
+    _ = calls := array::push (~calls) (#WriteText request)
+    return response
+      "FileSystem.write_text"
+      responses.write_text
+      request
+      (#Error { kind: #Other, path: request.path, message: "Unexpected mock operation" })
+  end
+  | fs::!FileSystem.append_text request => do
+    _ = calls := array::push (~calls) (#AppendText request)
+    return response
+      "FileSystem.append_text"
+      responses.append_text
+      request
+      (#Error { kind: #Other, path: request.path, message: "Unexpected mock operation" })
+  end
+  | fs::!FileSystem.exists request => do
+    _ = calls := array::push (~calls) (#Exists request)
+    return response
+      "FileSystem.exists"
+      responses.exists
+      request
+      (#Error { kind: #Other, path: request, message: "Unexpected mock operation" })
+  end
+  | fs::!FileSystem.read_dir request => do
+    _ = calls := array::push (~calls) (#ReadDir request)
+    return response
+      "FileSystem.read_dir"
+      responses.read_dir
+      request
+      (#Error { kind: #Other, path: request, message: "Unexpected mock operation" })
+  end
+  | fs::!FileSystem.metadata request => do
+    _ = calls := array::push (~calls) (#Metadata request)
+    return response
+      "FileSystem.metadata"
+      responses.metadata
+      request
+      (#Error { kind: #Other, path: request, message: "Unexpected mock operation" })
+  end
+  | fs::!FileSystem.symlink_metadata request => do
+    _ = calls := array::push (~calls) (#SymlinkMetadata request)
+    return response
+      "FileSystem.symlink_metadata"
+      responses.symlink_metadata
+      request
+      (#Error { kind: #Other, path: request, message: "Unexpected mock operation" })
+  end
+  | fs::!FileSystem.create_dir request => do
+    _ = calls := array::push (~calls) (#CreateDir request)
+    return response
+      "FileSystem.create_dir"
+      responses.create_dir
+      request
+      (#Error { kind: #Other, path: request, message: "Unexpected mock operation" })
+  end
+  | fs::!FileSystem.create_dir_all request => do
+    _ = calls := array::push (~calls) (#CreateDirAll request)
+    return response
+      "FileSystem.create_dir_all"
+      responses.create_dir_all
+      request
+      (#Error { kind: #Other, path: request, message: "Unexpected mock operation" })
+  end
+  | fs::!FileSystem.remove_file request => do
+    _ = calls := array::push (~calls) (#RemoveFile request)
+    return response
+      "FileSystem.remove_file"
+      responses.remove_file
+      request
+      (#Error { kind: #Other, path: request, message: "Unexpected mock operation" })
+  end
+  | fs::!FileSystem.remove_dir request => do
+    _ = calls := array::push (~calls) (#RemoveDir request)
+    return response
+      "FileSystem.remove_dir"
+      responses.remove_dir
+      request
+      (#Error { kind: #Other, path: request, message: "Unexpected mock operation" })
+  end
+  | fs::!FileSystem.rename request => do
+    _ = calls := array::push (~calls) (#Rename request)
+    return response
+      "FileSystem.rename"
+      responses.rename
+      request
+      (#Error { kind: #Other, path: request.source, message: "Unexpected mock operation" })
+  end
+  | fs::!FileSystem.copy_file request => do
+    _ = calls := array::push (~calls) (#CopyFile request)
+    return response
+      "FileSystem.copy_file"
+      responses.copy_file
+      request
+      (#Error { kind: #Other, path: request.source, message: "Unexpected mock operation" })
+  end
+  end
+  return { value: value, calls: ~calls }
+end
+
+@doc "Optional pure response functions for mock_process. None marks an unexpected operation."
+type ProcessResponses = {
+  args: Option (() -> [String]),
+  env: Option (String -> Result (Option String) process::Error),
+  cwd: Option (() -> Result String process::Error),
+}
+
+@doc "Recorded process requests in invocation order."
+type ProcessCall =
+  | #Args ()
+  | #Env String
+  | #Cwd ()
+
+@doc "No operations are expected. Override fields with Some response functions using a record spread."
+let process_defaults: ProcessResponses = {
+  args: #None,
+  env: #None,
+  cwd: #None,
+}
+
+@doc "Handles Process using supplied responses and returns {value, calls}. Unexpected operations assert; if the assertion resumes, they return an error (or empty arguments)."
+let mock_process: ProcessResponses -> _ = fn responses body => do
+  let calls = mut []
+  let value = handle body () with
+  | process::!Process.args request => do
+    _ = calls := array::push (~calls) (#Args request)
+    return response "Process.args" responses.args request []
+  end
+  | process::!Process.env request => do
+    _ = calls := array::push (~calls) (#Env request)
+    return response
+      "Process.env"
+      responses.env
+      request
+      (#Error { kind: #Other, message: "Unexpected mock operation" })
+  end
+  | process::!Process.cwd request => do
+    _ = calls := array::push (~calls) (#Cwd request)
+    return response
+      "Process.cwd"
+      responses.cwd
+      request
+      (#Error { kind: #Other, message: "Unexpected mock operation" })
+  end
+  end
+  return { value: value, calls: ~calls }
+end
+
+@doc "Optional pure response functions for mock_http. None marks an unexpected operation."
+type HttpResponses = {
+  request: Option (http::Request -> Result http::Response http::Error),
+}
+
+@doc "Recorded http requests in invocation order."
+type HttpCall =
+  #Request http::Request
+
+@doc "No operations are expected. Override fields with Some response functions using a record spread."
+let http_defaults: HttpResponses = {
+  request: #None,
+}
+
+@doc "Handles Http using supplied responses and returns {value, calls}. Unexpected operations assert; if the assertion resumes, they return an error (or empty arguments)."
+let mock_http: HttpResponses -> _ = fn responses body => do
+  let calls = mut []
+  let value = handle body () with
+  | http::!Http.request request => do
+    _ = calls := array::push (~calls) (#Request request)
+    return response
+      "Http.request"
+      responses.request
+      request
+      (#Error { kind: #Unsupported, url: request.url, message: "Unexpected mock operation" })
+  end
+  end
+  return { value: value, calls: ~calls }
+end
+
+@if { platform: "node" }
+@doc "Optional pure response functions for mock_path. None marks an unexpected operation."
+type PathResponses = {
+  resolve: Option ([String] -> Result String path::Error),
+  relative: Option ({ from: String, to: String } -> Result String path::Error),
+}
+
+@if { platform: "node" }
+@doc "Recorded path requests in invocation order."
+type PathCall =
+  | #Resolve [String]
+  | #Relative { from: String, to: String }
+
+@if { platform: "node" }
+@doc "No operations are expected. Override fields with Some response functions using a record spread."
+let path_defaults: PathResponses = {
+  resolve: #None,
+  relative: #None,
+}
+
+@if { platform: "node" }
+@doc "Handles Path using supplied responses and returns {value, calls}. Unexpected operations assert; if the assertion resumes, they return an error (or empty arguments)."
+let mock_path: PathResponses -> _ = fn responses body => do
+  let calls = mut []
+  let value = handle body () with
+  | path::!Path.resolve request => do
+    _ = calls := array::push (~calls) (#Resolve request)
+    return response
+      "Path.resolve"
+      responses.resolve
+      request
+      (#Error { message: "Unexpected mock operation" })
+  end
+  | path::!Path.relative request => do
+    _ = calls := array::push (~calls) (#Relative request)
+    return response
+      "Path.relative"
+      responses.relative
+      request
+      (#Error { message: "Unexpected mock operation" })
+  end
+  end
+  return { value: value, calls: ~calls }
+end
