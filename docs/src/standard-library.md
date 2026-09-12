@@ -20,6 +20,8 @@ Local declarations and explicit imports can shadow these names.
 | --- | --- |
 | `print`, `println` | Write a string to standard output, without or with a trailing newline |
 | `eprint`, `eprintln` | Write a string to standard error, without or with a trailing newline |
+| `display` | Convert any value to indented diagnostic text |
+| `debug` | Convert any value to single-line diagnostic text |
 | `drop` | Discard a value and return `()` |
 | `IO` | An alias for the output effect, used as `!IO` in types |
 | `FileSystem` | An alias for the filesystem effect, used as `!FileSystem` in types |
@@ -38,15 +40,16 @@ let greet: String -> () + !IO = fn name => println name
 
 Primitive types such as `Bool`, `String`, `Nat`, `Int`, and `Real` are built into the language and remain available without the standard library.
 Other library modules, including `nat`, `str`, and `array`, are not prelude names.
-For example, an explicit import makes string conversion and natural-number arithmetic available through short module paths:
+For example, an explicit import makes value formatting and natural-number arithmetic available through short module paths:
 
 ```ruddy
 using std::{nat, str}
 
-let next_label = fn number => str::from_nat (nat::add number 1n)
+let next_label = fn number => str::display (nat::add number 1n)
 ```
 
-Without those imports, the paths are `std::str::from_nat` and `std::nat::add`.
+Without those imports, the paths are `std::str::display` and `std::nat::add`.
+`display` is also available directly from the prelude; `next_label 2n` returns `"3n"`.
 The same import style is used in the [FizzBuzz example](hello-world.md#try-fizzbuzz).
 
 ## Modules and naming

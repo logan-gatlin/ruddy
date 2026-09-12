@@ -100,7 +100,7 @@ A program is checked before it runs, calls use whitespace, and functions can sta
 Editor diagnostics and inferred types supply evidence about those requirements before execution.
 
 1. Explain why changing the health leaves the output unchanged.
-2. Change the function to format and return the health field using `std::str::from_nat` and predict the output before running it.
+2. Change the function body to `display entity.health` and predict the output before running it. The prelude's [`display`](../std/str.md#display) converts any value to readable text, preserving numeric suffixes.
 3. Remove the field used by the function and identify which expression requires it.
 
 [Selected answers](answers.md#getting-started) explain these observations.

@@ -263,7 +263,7 @@ For example, a boxed value pairs a value with a function that can show it, hidin
 
 ```ruddy
 type Box = hide 'a => { value: 'a, show: 'a -> String }
-let boxed: Box = { value: 3n, show: std::str::from_nat }
+let boxed: Box = { value: 3n, show: display }
 ```
 
 A consumer opens a hidden value in a `match` arm with `hide 'item pattern`, which names the hidden type `'item` for that arm alone: the arm's annotations can refer to it, and its result cannot mention it.
