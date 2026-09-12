@@ -183,20 +183,54 @@ impl EffectScope {
     }
 }
 
-struct Addition {
-    symbol: Option<Symbol>,
-    callable: Option<String>,
-    zero: String,
+#[derive(Clone, Copy)]
+enum ReductionKind {
+    Sum,
+    Product,
 }
 
-impl Addition {
+impl ReductionKind {
+    fn matches(self, op: &BinaryOp) -> bool {
+        matches!(
+            (self, op),
+            (Self::Sum, BinaryOp::Add) | (Self::Product, BinaryOp::Mul)
+        )
+    }
+    fn name(self) -> &'static str {
+        match self {
+            Self::Sum => "add",
+            Self::Product => "multiply",
+        }
+    }
+    fn identity(self) -> &'static str {
+        match self {
+            Self::Sum => "0",
+            Self::Product => "1",
+        }
+    }
+    fn infix(self) -> &'static str {
+        match self {
+            Self::Sum => "+",
+            Self::Product => "*",
+        }
+    }
+}
+
+struct Reduction {
+    kind: ReductionKind,
+    symbol: Option<Symbol>,
+    callable: Option<String>,
+    identity: String,
+}
+
+impl Reduction {
     fn operands<'a>(&self, term: &'a Term) -> Option<(&'a Term, &'a Term)> {
         match &term.kind {
-            TermKind::Binary {
-                op: BinaryOp::Add,
-                left,
-                right,
-            } if self.callable.is_none() => Some((left, right)),
+            TermKind::Binary { op, left, right }
+                if self.callable.is_none() && self.kind.matches(op) =>
+            {
+                Some((left, right))
+            }
             TermKind::Apply { func, arg: right } => {
                 let TermKind::Apply { func, arg: left } = &func.kind else {
                     return None;
@@ -212,7 +246,7 @@ impl Addition {
     fn combine(&self, accumulator: &str, value: &str) -> String {
         match &self.callable {
             Some(name) => format!("{name} {accumulator} ({value})"),
-            None => format!("{accumulator} + ({value})"),
+            None => format!("{accumulator} {} ({value})", self.kind.infix()),
         }
     }
 }
@@ -363,16 +397,18 @@ impl Candidate<'_> {
         );
         Some(text)
     }
-    fn addition(&self, body: &Term) -> Option<Addition> {
+    fn reduction(&self, body: &Term, kind: ReductionKind) -> Option<Reduction> {
+        let operation = kind.name();
+        let identity = kind.identity();
         let ty = crate::inference::unfold(self.analysis.inferred.semantics().aliases(), &body.ty);
-        let (module, operation, zero) = match &*ty {
-            Ty::Real => ("real", "add".to_owned(), "0".to_owned()),
-            Ty::Nat => ("nat", "add".to_owned(), "0n".to_owned()),
-            Ty::Int => ("int", "add".to_owned(), "0i".to_owned()),
+        let (module, operation, identity) = match &*ty {
+            Ty::Real => ("real", operation.to_owned(), identity.to_owned()),
+            Ty::Nat => ("nat", operation.to_owned(), format!("{identity}n")),
+            Ty::Int => ("int", operation.to_owned(), format!("{identity}i")),
             Ty::Fixed(kind) => (
                 if kind.signed() { "int" } else { "nat" },
-                format!("add{}", kind.bits()),
-                format!("0{}", kind.suffix()),
+                format!("{operation}{}", kind.bits()),
+                format!("{identity}{}", kind.suffix()),
             ),
             _ => return None,
         };
@@ -399,26 +435,38 @@ impl Candidate<'_> {
                 let Some(qualified) = self.analysis.mint.external(symbol) else {
                     continue;
                 };
-                let Some((identity, path)) = qualified.split_once("::") else {
+                let Some((dependency, path)) = qualified.split_once("::") else {
                     continue;
                 };
-                if !identity.starts_with("std@") || path != format!("{module}::{operation}") {
+                if !dependency.starts_with("std@") || path != format!("{module}::{operation}") {
                     continue;
                 }
-                return Some(Addition {
+                return Some(Reduction {
+                    kind,
                     symbol: Some(symbol),
                     callable: (!real).then(|| format!("::{alias}::{module}::{operation}")),
-                    zero,
+                    identity,
                 });
             }
         }
-        real.then_some(Addition {
+        real.then_some(Reduction {
+            kind,
             symbol: None,
             callable: None,
-            zero,
+            identity,
         })
     }
     fn plan(&self, name: Anchor, function: &Term) -> Option<TailRecursion> {
+        [ReductionKind::Sum, ReductionKind::Product]
+            .into_iter()
+            .find_map(|kind| self.plan_reduction(name, function, kind))
+    }
+    fn plan_reduction(
+        &self,
+        name: Anchor,
+        function: &Term,
+        kind: ReductionKind,
+    ) -> Option<TailRecursion> {
         let mut body = function;
         let mut parameters = Vec::new();
         while let TermKind::Fn { arg, body: next } = &body.kind {
@@ -438,7 +486,7 @@ impl Candidate<'_> {
         if parameters.is_empty() {
             return None;
         }
-        let addition = self.addition(body)?;
+        let reduction = self.reduction(body, kind)?;
         let fresh = |base: &str| {
             (0..)
                 .map(|n| {
@@ -472,7 +520,7 @@ impl Candidate<'_> {
                     work.push(body);
                 }
                 _ => {
-                    let replacement = if let Some((left, right)) = addition.operands(term)
+                    let replacement = if let Some((left, right)) = reduction.operands(term)
                         && let Some((call, head, contribution)) = self
                             .recursive_call(left, parameters.len(), &function.ty)
                             .map(|head| (left, head, right))
@@ -488,7 +536,7 @@ impl Candidate<'_> {
                             call,
                             head,
                             &helper,
-                            &addition.combine(&accumulator, self.source(contribution)?),
+                            &reduction.combine(&accumulator, self.source(contribution)?),
                         )?
                     } else if let Some(head) =
                         self.recursive_call(term, parameters.len(), &function.ty)
@@ -498,7 +546,7 @@ impl Candidate<'_> {
                         if self.mentions_self(term) {
                             return None;
                         }
-                        format!("({})", addition.combine(&accumulator, self.source(term)?))
+                        format!("({})", reduction.combine(&accumulator, self.source(term)?))
                     };
                     // Comments inside a replaced expression must not be lost.
                     // Other comments in the body are retained by the slice edit.
@@ -538,14 +586,14 @@ impl Candidate<'_> {
             .iter()
             .map(|name| format!("fn {name} => "))
             .collect::<String>();
-        let zero = &addition.zero;
+        let identity = &reduction.identity;
         let newline = if self.text.contains("\r\n") {
             "\r\n"
         } else {
             "\n"
         };
         let replacement = format!(
-            "do{newline}  let {helper} = fn {accumulator} => {lambda}{rewritten}{newline}  return {helper} {zero}{args}{newline}end"
+            "do{newline}  let {helper} = fn {accumulator} => {lambda}{rewritten}{newline}  return {helper} {identity}{args}{newline}end"
         );
         Some(TailRecursion {
             binding: self.analysis.built.source.span(name),

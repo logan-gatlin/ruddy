@@ -76,7 +76,7 @@ document formatting for `.rud` files. Unsaved local dependency buffers participa
 and cached std retain source navigation.
 
 The optional **Convert to tail recursion** quick fix rewrites recognized numeric
-counting and summation functions with an accumulator. It appears as an informational
+counting, summation, and product functions with an accumulator. It appears as an informational
 diagnostic; applying it is a user decision. Calls moved by the rewrite must have
 an empty, closed effect row.
 

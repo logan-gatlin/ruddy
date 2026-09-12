@@ -39,7 +39,7 @@ outside those project folders have highlighting only.
 
 Use the lightbulb on a tail-recursion opportunity to select **Convert to tail
 recursion**. This optional quick fix introduces an accumulator for supported numeric
-counting and summation functions.
+counting, summation, and product functions.
 
 Use **Format Document** for formatting. Format-on-save follows your own VS Code
 settings. Use **Ruddy: Restart Language Server** to recover a stopped server;

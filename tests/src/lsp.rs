@@ -935,74 +935,83 @@ fn editor_tail_recursion_does_not_break_polymorphic_recursion() {
 #[test]
 fn editor_tail_recursion_forwards_the_recursive_continuation() {
     use ruddy::artifact::{End, Op, Rep};
-    let source = "let count: [Real] -> Real = fn xs => match xs with | [] => 0 | [_, ..rest] => 1 + count rest end\n";
-    let rewritten = apply_tail_action(source, &tail_actions(source)[0]);
-    let tree = tempfile::tempdir().unwrap();
-    std::fs::write(tree.path().join("Ruddy.toml"), "name = \"editor\"\nversion = \"0.0.0\"\nkind = \"library\"\nroot = \"main.rud\"\n[dependencies]\nstd = false\n").unwrap();
-    for (text, tail) in [(source, false), (rewritten.as_str(), true)] {
-        std::fs::write(tree.path().join("main.rud"), text).unwrap();
-        let artifact = ruddy_cli::compile(tree.path()).unwrap();
-        // Select the numeric reduction body, then its calls receiving the
-        // remaining array. Curried helper setup may itself need continuations;
-        // the complete recursive invocation must forward the caller's one.
-        let recursive: Vec<_> = artifact
-            .lir()
-            .functions
-            .iter()
-            .filter(|function| {
-                function
-                    .blocks
-                    .iter()
-                    .flat_map(|block| &block.instrs)
-                    .any(|instr| matches!(instr.op, Op::Add { .. }))
-            })
-            .flat_map(|function| {
-                let reps: std::collections::HashMap<_, _> = function
-                    .params
-                    .iter()
-                    .map(|p| (p.temp, p.rep))
-                    .chain(function.blocks.iter().flat_map(|block| {
-                        block
-                            .params
-                            .iter()
-                            .map(|p| (p.temp, p.rep))
-                            .chain(block.instrs.iter().map(|i| (i.temp, i.rep)))
-                    }))
-                    .collect();
-                function
-                    .blocks
-                    .iter()
-                    .filter_map(move |block| match &block.end {
-                        End::Call {
-                            args, continuation, ..
-                        } if args
-                            .last()
-                            .is_some_and(|arg| reps.get(arg) == Some(&Rep::Array)) =>
-                        {
-                            Some(*continuation == function.continuation)
-                        }
-                        _ => None,
-                    })
-            })
-            .collect();
-        assert!(
-            !recursive.is_empty(),
-            "the reduction calls itself with the remaining array"
+    for (operator, base, expected) in [("+", "0", "4096"), ("*", "1", "1")] {
+        let source = &format!(
+            "let count: [Real] -> Real = fn xs => match xs with | [] => {base} | [_, ..rest] => 1 {operator} count rest end\n"
         );
-        assert!(
-            recursive.iter().all(|forwarded| *forwarded == tail),
-            "{recursive:?}\n{text}"
-        );
-        if tail {
-            let mut program = ruddy_interp::Program::load(&artifact).unwrap();
-            let count = program.export("count").unwrap();
-            let value = program
-                .call(
-                    &count,
-                    ruddy_interp::Value::array(vec![ruddy_interp::Value::Real(0.0); 4096]),
-                )
-                .unwrap();
-            assert_eq!(ruddy_interp::render::json(&value), "4096");
+        let rewritten = apply_tail_action(source, &tail_actions(source)[0]);
+        let tree = tempfile::tempdir().unwrap();
+        std::fs::write(tree.path().join("Ruddy.toml"), "name = \"editor\"\nversion = \"0.0.0\"\nkind = \"library\"\nroot = \"main.rud\"\n[dependencies]\nstd = false\n").unwrap();
+        for (text, tail) in [(source.as_str(), false), (rewritten.as_str(), true)] {
+            std::fs::write(tree.path().join("main.rud"), text).unwrap();
+            let artifact = ruddy_cli::compile(tree.path()).unwrap();
+            // Select the numeric reduction body, then its calls receiving the
+            // remaining array. Curried helper setup may itself need continuations;
+            // the complete recursive invocation must forward the caller's one.
+            let recursive: Vec<_> = artifact
+                .lir()
+                .functions
+                .iter()
+                .filter(|function| {
+                    function
+                        .blocks
+                        .iter()
+                        .flat_map(|block| &block.instrs)
+                        .any(|instr| {
+                            matches!(
+                                (&instr.op, operator),
+                                (Op::Add { .. }, "+") | (Op::Mul { .. }, "*")
+                            )
+                        })
+                })
+                .flat_map(|function| {
+                    let reps: std::collections::HashMap<_, _> = function
+                        .params
+                        .iter()
+                        .map(|p| (p.temp, p.rep))
+                        .chain(function.blocks.iter().flat_map(|block| {
+                            block
+                                .params
+                                .iter()
+                                .map(|p| (p.temp, p.rep))
+                                .chain(block.instrs.iter().map(|i| (i.temp, i.rep)))
+                        }))
+                        .collect();
+                    function
+                        .blocks
+                        .iter()
+                        .filter_map(move |block| match &block.end {
+                            End::Call {
+                                args, continuation, ..
+                            } if args
+                                .last()
+                                .is_some_and(|arg| reps.get(arg) == Some(&Rep::Array)) =>
+                            {
+                                Some(*continuation == function.continuation)
+                            }
+                            _ => None,
+                        })
+                })
+                .collect();
+            assert!(
+                !recursive.is_empty(),
+                "the reduction calls itself with the remaining array"
+            );
+            assert!(
+                recursive.iter().all(|forwarded| *forwarded == tail),
+                "{recursive:?}\n{text}"
+            );
+            if tail {
+                let mut program = ruddy_interp::Program::load(&artifact).unwrap();
+                let count = program.export("count").unwrap();
+                let value = program
+                    .call(
+                        &count,
+                        ruddy_interp::Value::array(vec![ruddy_interp::Value::Real(0.0); 4096]),
+                    )
+                    .unwrap();
+                assert_eq!(ruddy_interp::render::json(&value), expected);
+            }
         }
     }
 }
@@ -1071,4 +1080,91 @@ fn editor_tail_recursion_preserves_function_blocks() {
         assert_eq!(interpreted, ["0", "3"], "{rewritten}");
         assert_eq!(javascript, ["0", "3"], "{rewritten}");
     }
+}
+
+#[test]
+fn editor_tail_recursion_rewrites_products() {
+    let source = "let product: [Real] -> Real = fn xs => match xs with | [] => 1 | [x, ..rest] => x * product rest end\nlet empty = product []\nlet sample = product [2, 3, 4]\n";
+    let actions = tail_actions(source);
+    assert_eq!(actions.as_array().unwrap().len(), 1);
+    let rewritten = apply_tail_action(source, &actions[0]);
+    for program in [source, &rewritten] {
+        let (interpreted, javascript) = tail_results(program);
+        assert_eq!(interpreted, ["1", "24"], "{program}");
+        assert_eq!(javascript, ["1", "24"], "{program}");
+    }
+    assert!(tail_actions(&rewritten).as_array().unwrap().is_empty());
+}
+
+#[test]
+fn editor_tail_recursion_rewrites_standard_numeric_multiplication() {
+    for (ty, suffix, multiply) in [
+        ("Nat", "n", "std::nat::multiply"),
+        ("Int", "i", "std::int::multiply"),
+        ("Nat8", "n8", "std::nat::multiply8"),
+        ("Int64", "i64", "std::int::multiply64"),
+        ("Real", "", "std::real::multiply"),
+    ] {
+        let source = format!(
+            "let product: [{ty}] -> {ty} = fn xs => match xs with | [] => 1{suffix} | [x, ..rest] => {multiply} x (product rest) end\nlet empty = product []\nlet sample = product [2{suffix}, 3{suffix}, 4{suffix}]\n"
+        );
+        let actions = standard_tail_actions(&source);
+        assert_eq!(actions.as_array().unwrap().len(), 1, "{ty}: {actions}");
+        let rewritten = apply_tail_action(&source, &actions[0]);
+        for program in [&source, &rewritten] {
+            let (interpreted, javascript) = tail_results(program);
+            let expected = if ty == "Int64" {
+                ["\"1\"", "\"24\""]
+            } else {
+                ["1", "24"]
+            };
+            assert_eq!(interpreted, expected, "{program}");
+            assert_eq!(javascript, ["1", "24"], "{program}");
+        }
+    }
+}
+
+#[test]
+fn editor_tail_recursion_products_preserve_base_cases_and_tail_branches() {
+    for (branch, values) in [
+        ("product rest * x", "2, 3, 4"),
+        (
+            "match rest with | [] => product rest | [..] => x * product rest end",
+            "2, 3, 4, 99",
+        ),
+        (
+            "(do let factor = x return factor end) * product rest",
+            "2, 3, 4",
+        ),
+    ] {
+        let source = format!(
+            "let product: [Real] -> Real = fn xs => match xs with | [] => 2 | [x, ..rest] => {branch} end\nlet empty = product []\nlet sample = product [{values}]\n"
+        );
+        let actions = tail_actions(&source);
+        assert_eq!(actions.as_array().unwrap().len(), 1, "{source}");
+        let rewritten = apply_tail_action(&source, &actions[0]);
+        for program in [&source, &rewritten] {
+            let (interpreted, javascript) = tail_results(program);
+            assert_eq!(interpreted, ["2", "48"], "{program}");
+            assert_eq!(javascript, ["2", "48"], "{program}");
+        }
+    }
+}
+
+#[test]
+fn editor_tail_recursion_products_require_known_operations_and_closed_effects() {
+    for source in [
+        "let product = fn xs => match xs with | [] => 1 | [x, ..rest] => match rest with | [] => x + product rest | [..] => x * product rest end end\n",
+        "let product = fn xs => match xs with | [] => 1 | [x, ..rest] => x * product rest + 1 end\n",
+        "let multiply = fn x => fn y => x - y\nlet product = fn xs => match xs with | [] => 1 | [x, ..rest] => multiply x (product rest) end\n",
+        "let product: (Real -> Real + ..'e) -> [Real] -> Real + ..'e = fn f => fn xs => match xs with | [] => 1 | [x, ..rest] => f x * product f rest end\n",
+        "effect Ask = { ask: Real -> Real }\nlet product: [Real] -> Real + !Ask = fn xs => match xs with | [] => 1 | [x, ..rest] => !Ask.ask x * product rest end\n",
+    ] {
+        assert!(
+            tail_actions(source).as_array().unwrap().is_empty(),
+            "{source}"
+        );
+    }
+    let source = "let product: (Real -> Real) -> [Real] -> Real = fn f => fn xs => match xs with | [] => 1 | [x, ..rest] => f x * product f rest end\n";
+    assert_eq!(tail_actions(source).as_array().unwrap().len(), 1);
 }

@@ -92,3 +92,18 @@ Implementation should preserve the existing architecture in which analysis serve
 Implementation adds the informational diagnostic and quick fix through shared typed analysis. Regression checks use the existing LSP harness, interpreter and generated JavaScript, plus artifact inspection of continuation forwarding. Review uses implementation starting commit `79e6ffa0` as its fixed point. Review corrections cover closed-effect handlers and complete source spans for erased `do` wrappers; both passed the follow-up spec review.
 
 Final validation: `RUST_TEST_THREADS=2 just cov` passed 2,004 tests with 10 ignored; `cargo clippy --workspace --all-targets`, Rust formatting, and diff whitespace checks passed. Compiler coverage measured 96.09% lines and 88.70% branches; the new lint module measured 96.37% lines and 83.04% branches. The repository's required 100% compiler coverage remains unmet. Standards review also suggested an optional enum for the addition representation; spec review found no outstanding blockers after corrections.
+
+
+Follow-up scope: the user requested multiplication after the product-reduction counterexample. Recognize Real `*` and standard numeric `multiply` functions (including fixed-width variants), with identity `1`. Preserve the existing effect-row, binding, source, and callable-interface restrictions. Require one consistent combiner across recursive branches; mixed addition/multiplication recurrence transformations remain unsupported. Extend the existing LSP/runtime and continuation-artifact tests to products.
+
+Multiplication follow-up validation: `just test -- --test-threads=2` passed 2,008 tests with 10 ignored. Clippy, Rust formatting, and diff whitespace checks passed. LSP tests compile and run original and rewritten products in both backends, and artifact inspection verifies continuation forwarding for multiplication as well as addition. Coverage was not rerun; the previously reported coverage shortfall remains unresolved.
+
+### Follow-up standards review
+
+No new documented-standard violations found. The existing 100% coverage requirement remains unmet. Optional maintainability suggestions: share the standard numeric test setup between addition and multiplication, and model intrinsic versus standard callable representation explicitly.
+
+### Follow-up spec review
+
+No outstanding findings. Products use identity `1`, retain effect and source safeguards, and reject mixed recursive combiners.
+
+Review totals: standards—one existing unmet requirement and two optional suggestions; spec—zero outstanding findings.
