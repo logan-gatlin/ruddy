@@ -1,0 +1,196 @@
+@private
+type Operations 'storage 'key 'value = {
+  key: Mirror 'key,
+  len: 'storage -> Nat,
+  get: Nat64 -> 'key -> 'storage -> Option 'value,
+  insert: Nat64 -> 'key -> 'value -> 'storage -> 'storage,
+  remove: Nat64 -> 'key -> 'storage -> 'storage,
+  entries: 'storage -> [hamt::Entry 'key 'value],
+}
+
+@doc "A persistent map with hidden storage. Use the module functions to preserve its key and hash invariants. Keys use structural equality and the fixed default hash seed; values are unrestricted."
+type Map 'key 'value = hide 'storage => {
+  mirror: Mirror 'storage,
+  storage: 'storage,
+  operations: Operations 'storage 'key 'value,
+}
+
+@private
+let wrap: Mirror 's -> 's -> Operations 's 'key 'value -> Map 'key 'value =
+  fn mirror storage operations => { mirror: mirror, storage: storage, operations: operations }
+
+@private
+let pack: Mirror 'key -> hamt::Table 'key 'value -> Map 'key 'value = fn key table => {
+  mirror: reflect::type_of table,
+  storage: table,
+  operations: {
+    key: key,
+    len: fn table => table.size,
+    get: hamt::get key,
+    insert: hamt::insert key,
+    remove: hamt::remove key,
+    entries: hamt::entries,
+  },
+}
+
+@doc "An empty persistent map at the inferred key and value types."
+let empty: () -> Map 'key 'value = fn _ => pack (reflect::mirror ()) (hamt::empty ())
+
+@doc "The number of keys, in constant time."
+let len: Map 'key 'value -> Nat = fn map => match map with
+| hide 's { mirror, storage, operations } => operations.len storage
+end
+
+@doc "Whether the map has no entries."
+let is_empty: Map 'key 'value -> Bool = fn map => nat::is_zero (len map)
+
+@doc "Look up a key, reporting hashing errors. A valid missing key returns Some None."
+let try_get: 'key -> Map 'key 'value -> Result (Option 'value) hash::Error = fn key map =>
+  match map with
+  | hide 's { mirror, storage, operations } =>
+    result::map
+      (fn hash => operations.get hash key storage)
+      (hash::hash_with operations.key hash::default_seed key)
+  end
+
+@doc "Look up a key. Unhashable and missing keys both return None."
+let get: 'key -> Map 'key 'value -> Option 'value = fn key map =>
+  result::unwrap_or (#None) (try_get key map)
+
+@doc "Whether a key is present, reporting hashing errors."
+let try_contains: 'key -> Map 'key 'value -> Result Bool hash::Error = fn key map =>
+  result::map option::is_some (try_get key map)
+
+@doc "Whether a key is present. Unhashable keys return false."
+let contains: 'key -> Map 'key 'value -> Bool = fn key map =>
+  result::unwrap_or false (try_contains key map)
+
+@doc "Insert or replace a value, reporting hashing errors. The original map remains available."
+let try_insert: 'key -> 'value -> Map 'key 'value -> Result (Map 'key 'value) hash::Error =
+  fn key value map => match map with
+  | hide 's { mirror, storage, operations } =>
+    match hash::hash_with operations.key hash::default_seed key with
+    | #Error error => #Error error
+    | #Some hash => #Some (wrap mirror (operations.insert hash key value storage) operations)
+    end
+  end
+
+@doc "Insert or replace a value. An unhashable key leaves the original map unchanged."
+let insert: 'key -> 'value -> Map 'key 'value -> Map 'key 'value =
+  fn key value map => result::unwrap_or map (try_insert key value map)
+
+@doc "Remove a key, reporting hashing errors. A valid missing key succeeds with an unchanged map."
+let try_remove: 'key -> Map 'key 'value -> Result (Map 'key 'value) hash::Error = fn key map =>
+  match map with
+  | hide 's { mirror, storage, operations } =>
+    match hash::hash_with operations.key hash::default_seed key with
+    | #Error error => #Error error
+    | #Some hash => #Some (wrap mirror (operations.remove hash key storage) operations)
+    end
+  end
+
+@doc "Remove a key. Missing or unhashable keys leave the map unchanged."
+let remove: 'key -> Map 'key 'value -> Map 'key 'value = fn key map =>
+  result::unwrap_or map (try_remove key map)
+
+@doc "Build a map, skipping unhashable keys. The last accepted value for an equal key wins."
+let from_array: [('key, 'value)] -> Map 'key 'value = fn entries =>
+  array::fold
+    (fn map entry => match entry with | (key, value) => insert key value map end)
+    (empty ())
+    entries
+
+@private
+let try_entries:
+  Nat -> [('key, 'value)] -> Map 'key 'value -> Result (Map 'key 'value) hash::Error =
+  fn index entries map => match entries with
+  | [] => #Some map
+  | [(key, value), ..tail] =>
+    match try_insert key value map with
+    | #Error error => #Error { path: [#Index index, ..error.path], kind: error.kind }
+    | #Some next => try_entries (nat::add index 1n) tail next
+    end
+  end
+
+@doc "Build a map or stop at the first unhashable key, returning no partial map. The error path starts with the entry index, followed by the path inside its key. The last value for an equal key wins."
+let try_from_array: [('key, 'value)] -> Result (Map 'key 'value) hash::Error = fn entries =>
+  try_entries 0n entries (empty ())
+
+-- These bundle-private operations also serve sets. Only entries accepted by a map are passed here:
+-- their cached hashes use the same fixed seed.
+@private
+let cached_entries: Map 'key 'value -> [hamt::Entry 'key 'value] = fn map => match map with
+| hide 's { mirror, storage, operations } => operations.entries storage
+end
+
+@private
+let get_cached: Nat64 -> 'key -> Map 'key 'value -> Option 'value = fn hash key map =>
+  match map with
+  | hide 's { mirror, storage, operations } => operations.get hash key storage
+  end
+
+@private
+let insert_cached: hamt::Entry 'key 'value -> Map 'key 'value -> Map 'key 'value = fn entry map =>
+  match map with
+  | hide 's { mirror, storage, operations } =>
+    wrap mirror (operations.insert entry.hash entry.key entry.value storage) operations
+  end
+
+@private
+let remove_cached: Nat64 -> 'key -> Map 'key 'value -> Map 'key 'value = fn hash key map =>
+  match map with
+  | hide 's { mirror, storage, operations } =>
+    wrap mirror (operations.remove hash key storage) operations
+  end
+
+@private
+let empty_for: Map 'key 'old -> Map 'key 'value = fn map => match map with
+| hide 's { mirror, storage, operations } => pack operations.key (hamt::empty ())
+end
+
+@doc "All key/value pairs in unspecified traversal order. The array is a snapshot of the map's associations."
+let to_array: Map 'key 'value -> [('key, 'value)] = fn map =>
+  array::map (fn entry => (entry.key, entry.value)) (cached_entries map)
+
+@doc "All keys in unspecified traversal order."
+let keys: Map 'key 'value -> ['key] = fn map =>
+  array::map (fn entry => entry.key) (cached_entries map)
+
+@doc "All values in unspecified traversal order."
+let values: Map 'key 'value -> ['value] = fn map =>
+  array::map (fn entry => entry.value) (cached_entries map)
+
+@doc "Visit every entry once, threading state in unspecified traversal order and propagating callback effects."
+let fold:
+  ('state -> 'key -> 'value -> 'state + ..'effects)
+  -> 'state
+  -> Map 'key 'value
+  -> 'state + ..'effects =
+  fn step state map =>
+    array::fold (fn state entry => step state entry.key entry.value) state (cached_entries map)
+
+@doc "Transform every value once, retaining keys and their cached hashes. Callback effects occur in unspecified traversal order. The original map remains available."
+let map_values:
+  ('value -> 'next + ..'effects) -> Map 'key 'value -> Map 'key 'next + ..'effects =
+  fn transform map => array::fold
+    (fn result entry =>
+      insert_cached { hash: entry.hash, key: entry.key, value: transform entry.value } result)
+    (empty_for map)
+    (cached_entries map)
+
+@doc "Compare contents using structural key equality and the supplied value comparison. Insertion history and trie layout are ignored. Stops at the first mismatch; callback effects follow unspecified traversal order."
+let equal_by:
+  ('value -> 'value -> Bool + ..'effects)
+  -> Map 'key 'value
+  -> Map 'key 'value
+  -> Bool + ..'effects =
+  fn equal left right =>
+    if nat::equal (len left) (len right) then
+      array::all
+        (fn entry => match get_cached entry.hash entry.key right with
+        | #None => false
+        | #Some value => equal entry.value value
+        end)
+        (cached_entries left)
+    else false
+    end

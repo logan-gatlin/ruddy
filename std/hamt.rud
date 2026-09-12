@@ -1,0 +1,283 @@
+-- Private shared storage for maps and sets. Each branch consumes four hash bits. A 16-bit bitmap
+-- maps occupied slots to a packed persistent array. Buckets retain full hashes and resolve
+-- collisions by structural equality.
+type Node 'k 'v =
+  | #Empty
+  | #Bucket { hash: Nat64, entries: [('k, 'v)] }
+  | #Branch { bitmap: Nat, children: [Node 'k 'v] }
+
+type Table 'k 'v = { size: Nat, node: Node 'k 'v }
+
+type Entry 'k 'v = { hash: Nat64, key: 'k, value: 'v }
+
+@private
+let node_entries: Node 'k 'v -> [Entry 'k 'v] = fn node => match node with
+| #Empty => []
+| #Bucket bucket =>
+  array::map
+    (fn pair => match pair with
+    | (key, value) => { hash: bucket.hash, key: key, value: value }
+    end)
+    bucket.entries
+| #Branch { children, .. } => array::flat_map node_entries children
+end
+
+let entries: Table 'k 'v -> [Entry 'k 'v] = fn table => node_entries table.node
+
+let empty: () -> Table 'k 'v = fn _ => { size: 0n, node: #Empty }
+
+@private
+let equal: Mirror 'k -> 'k -> 'k -> Bool = fn mirror left right =>
+  match order::compare_with mirror left right with | #Equal => true | _ => false end
+
+@private
+let shifted: Nat64 -> Nat -> Nat64 = fn hash depth =>
+  if nat::is_zero depth then hash
+  else shifted (nat::divide64 hash 16n64) (nat::subtract depth 1n)
+  end
+
+@private
+let slot: Nat64 -> Nat -> Nat = fn hash depth =>
+  nat::to_nat64 (nat::remainder64 (shifted hash depth) 16n64)
+
+@private
+let bit: Nat -> Nat = fn index =>
+  if nat::is_zero index then 1n else nat::multiply 2n (bit (nat::subtract index 1n)) end
+
+@private
+let occupied: Nat -> Nat -> Bool = fn bitmap mask =>
+  nat::equal (nat::remainder (nat::divide bitmap mask) 2n) 1n
+
+@private
+let popcount: Nat -> Nat = fn bits =>
+  if nat::is_zero bits then 0n
+  else nat::add (nat::remainder bits 2n) (popcount (nat::divide bits 2n))
+  end
+
+@private
+let position: Nat -> Nat -> Nat = fn bitmap mask => popcount (nat::remainder bitmap mask)
+
+@private
+let insert_at: Nat -> 'a -> ['a] -> ['a] = fn index value values =>
+  if nat::is_zero index then [value, ..values]
+  else
+    match values with
+    | [] => [value]
+    | [head, ..tail] => [head, ..insert_at (nat::subtract index 1n) value tail]
+    end
+  end
+
+@private
+let remove_at: Nat -> ['a] -> ['a] = fn index values => match values with
+| [] => []
+| [head, ..tail] =>
+  if nat::is_zero index then tail
+  else [head, ..remove_at (nat::subtract index 1n) tail]
+  end
+end
+
+@private
+let lookup_bucket: Mirror 'k -> 'k -> [('k, 'v)] -> Option 'v =
+  fn mirror key entries => match entries with
+  | [] => #None
+  | [(stored, value), ..tail] =>
+    if equal mirror key stored then #Some value else lookup_bucket mirror key tail end
+  end
+
+@private
+let get_node: Mirror 'k -> Nat64 -> 'k -> Nat -> Node 'k 'v -> Option 'v =
+  fn mirror hash key depth node => match node with
+  | #Empty => #None
+  | #Bucket bucket =>
+    if nat::equal64 hash bucket.hash then lookup_bucket mirror key bucket.entries else #None end
+  | #Branch { bitmap, children } => do
+    let mask = bit (slot hash depth)
+    return
+      if occupied bitmap mask then
+        match array::get children (position bitmap mask) with
+        | #None => #None
+        | #Some child => get_node mirror hash key (nat::add depth 1n) child
+        end
+      else #None
+      end
+  end
+  end
+
+let get: Mirror 'k -> Nat64 -> 'k -> Table 'k 'v -> Option 'v =
+  fn mirror hash key table => get_node mirror hash key 0n table.node
+
+@private
+let put_bucket: Mirror 'k -> 'k -> 'v -> [('k, 'v)] -> { entries: [('k, 'v)], added: Bool } =
+  fn mirror key value entries => match entries with
+  | [] => { entries: [(key, value)], added: true }
+  | [(stored, previous), ..tail] =>
+    if equal mirror key stored then { entries: [(stored, value), ..tail], added: false }
+    else
+      do
+        return match put_bucket mirror key value tail with
+        | next => { entries: [(stored, previous), ..next.entries], added: next.added }
+        end
+      end
+    end
+  end
+
+-- Different hashes must diverge within 16 four-bit fragments. Equal full hashes are handled by
+-- put_bucket before reaching this function.
+@private
+let join: Nat -> Nat64 -> Node 'k 'v -> Nat64 -> Node 'k 'v -> Node 'k 'v =
+  fn depth left_hash left right_hash right => do
+    let a = slot left_hash depth
+    let b = slot right_hash depth
+    return
+      if nat::equal a b then
+        #Branch {
+          bitmap: bit a,
+          children: [join (nat::add depth 1n) left_hash left right_hash right],
+        }
+      else
+        #Branch {
+          bitmap: nat::add (bit a) (bit b),
+          children: if nat::less_than a b then [left, right] else [right, left] end,
+        }
+      end
+  end
+
+@private
+let put_node:
+  Mirror 'k -> Nat64 -> 'k -> 'v -> Nat -> Node 'k 'v -> { node: Node 'k 'v, added: Bool } =
+  fn mirror hash key value depth node => match node with
+  | #Empty => { node: #Bucket { hash: hash, entries: [(key, value)] }, added: true }
+  | #Bucket bucket =>
+    if nat::equal64 hash bucket.hash then
+      do
+        return match put_bucket mirror key value bucket.entries with
+        | next => { node: #Bucket { hash: hash, entries: next.entries }, added: next.added }
+        end
+      end
+    else
+      {
+        node: join depth bucket.hash node hash (#Bucket { hash: hash, entries: [(key, value)] }),
+        added: true,
+      }
+    end
+  | #Branch { bitmap, children } => do
+    let mask = bit (slot hash depth)
+    let index = position bitmap mask
+    return
+      if occupied bitmap mask then
+        do
+          return match put_node
+            mirror
+            hash
+            key
+            value
+            (nat::add depth 1n)
+            (option::unwrap_or (#Empty) (array::get children index)) with
+          | next => {
+            node: #Branch {
+              bitmap: bitmap,
+              children: option::unwrap_or children (array::set children index next.node),
+            },
+            added: next.added,
+          }
+          end
+        end
+      else
+        {
+          node: #Branch {
+            bitmap: nat::add bitmap mask,
+            children: insert_at index (#Bucket { hash: hash, entries: [(key, value)] }) children,
+          },
+          added: true,
+        }
+      end
+  end
+  end
+
+let insert: Mirror 'k -> Nat64 -> 'k -> 'v -> Table 'k 'v -> Table 'k 'v =
+  fn mirror hash key value table => do
+    return match put_node mirror hash key value 0n table.node with
+    | next => { size: nat::add table.size (if next.added then 1n else 0n end), node: next.node }
+    end
+  end
+
+@private
+let remove_bucket: Mirror 'k -> 'k -> [('k, 'v)] -> { entries: [('k, 'v)], removed: Bool } =
+  fn mirror key entries => match entries with
+  | [] => { entries: [], removed: false }
+  | [(stored, value), ..tail] =>
+    if equal mirror key stored then { entries: tail, removed: true }
+    else
+      do
+        return match remove_bucket mirror key tail with
+        | next => { entries: [(stored, value), ..next.entries], removed: next.removed }
+        end
+      end
+    end
+  end
+
+@private
+let compact: Nat -> [Node 'k 'v] -> Node 'k 'v = fn bitmap children => match children with
+| [] => #Empty
+| [#Bucket bucket] => #Bucket bucket
+-- A branch still consumes its own fragment: never lift a lone branch child.
+| _ => #Branch { bitmap: bitmap, children: children }
+end
+
+@private
+let remove_node:
+  Mirror 'k -> Nat64 -> 'k -> Nat -> Node 'k 'v -> { node: Node 'k 'v, removed: Bool } =
+  fn mirror hash key depth node => match node with
+  | #Empty => { node: node, removed: false }
+  | #Bucket bucket =>
+    if nat::equal64 hash bucket.hash then
+      do
+        return match remove_bucket mirror key bucket.entries with
+        | next => {
+          node: if nat::is_zero (array::len next.entries) then #Empty
+          else #Bucket { hash: hash, entries: next.entries }
+          end,
+          removed: next.removed,
+        }
+        end
+      end
+    else { node: node, removed: false }
+    end
+  | #Branch { bitmap, children } => do
+    let mask = bit (slot hash depth)
+    let index = position bitmap mask
+    return
+      if occupied bitmap mask then
+        do
+          return match remove_node
+            mirror
+            hash
+            key
+            (nat::add depth 1n)
+            (option::unwrap_or (#Empty) (array::get children index)) with
+          | next =>
+            if next.removed then
+              {
+                node: match next.node with
+                | #Empty => compact (nat::subtract bitmap mask) (remove_at index children)
+                | _ =>
+                  compact bitmap (option::unwrap_or children (array::set children index next.node))
+                end,
+                removed: true,
+              }
+            else { node: node, removed: false }
+            end
+          end
+        end
+      else { node: node, removed: false }
+      end
+  end
+  end
+
+let remove: Mirror 'k -> Nat64 -> 'k -> Table 'k 'v -> Table 'k 'v =
+  fn mirror hash key table => do
+    return match remove_node mirror hash key 0n table.node with
+    | next =>
+      if next.removed then { size: nat::subtract table.size 1n, node: next.node } else table end
+    end
+  end

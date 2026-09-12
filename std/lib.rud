@@ -269,6 +269,35 @@ module order
 \\let key_hash = std::hash::hash { name: "Ada", age: 37n }
 \\```
 module hash
+@private
+module hamt
+@doc \\`map` stores persistent key/value associations in a hash array mapped trie.
+\\Updates share unchanged branches; earlier versions remain available.
+\\
+\\Ordinary operations treat unhashable keys as absent and skip invalid insertions.
+\\The corresponding `try_*` functions return `hash::Error` for diagnostic use.
+\\Values need not be hashable. Traversal order is unspecified; use `equal_by`
+\\to compare contents rather than generic structural comparison.
+\\
+\\```ruddy
+\\let first = std::map::from_array [("Ada", 37n)]
+\\let second = std::map::insert "Grace" 42n first
+\\let age = std::map::get "Ada" second
+\\```
+module map
+@doc \\`set` stores distinct elements in a persistent hash array mapped trie.
+\\Updates share unchanged branches; earlier versions remain available.
+\\
+\\Ordinary operations treat unhashable elements as absent and skip invalid insertions.
+\\The corresponding `try_*` functions report hashing errors. Set algebra reuses
+\\accepted elements' cached hashes and needs no fallible variants.
+\\Traversal order is unspecified; `equal` compares contents.
+\\
+\\```ruddy
+\\let active = std::set::from_array [1n, 2n, 2n]
+\\let remaining = std::set::difference active (std::set::from_array [2n])
+\\```
+module set
 @doc \\`prelude` contains the types, effects, and values available without an explicit import.
 \\
 \\A line can be written without a module qualifier.

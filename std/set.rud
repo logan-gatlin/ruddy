@@ -1,0 +1,85 @@
+@doc "A persistent set, sharing the map's hidden HAMT storage with unit values. Elements use structural equality and the fixed default hash seed."
+type Set 'element = map::Map 'element ()
+
+@doc "An empty persistent set at the inferred element type."
+let empty: () -> Set 'element = fn _ => map::empty ()
+
+@doc "The number of distinct elements, in constant time."
+let len: Set 'element -> Nat = map::len
+
+@doc "Whether the set has no elements."
+let is_empty: Set 'element -> Bool = map::is_empty
+
+@doc "Whether an element is present. Unhashable elements return false."
+let contains: 'element -> Set 'element -> Bool = map::contains
+
+@doc "Whether an element is present, reporting hashing errors. A valid absent element returns Some false."
+let try_contains: 'element -> Set 'element -> Result Bool hash::Error = map::try_contains
+
+@doc "Insert an element. Equal elements are retained once; unhashable elements leave the original set unchanged."
+let insert: 'element -> Set 'element -> Set 'element = fn element set => map::insert element () set
+
+@doc "Insert an element, reporting hashing errors. The original set remains available."
+let try_insert: 'element -> Set 'element -> Result (Set 'element) hash::Error =
+  fn element set => map::try_insert element () set
+
+@doc "Remove an element. Missing or unhashable elements leave the set unchanged."
+let remove: 'element -> Set 'element -> Set 'element = map::remove
+
+@doc "Remove an element, reporting hashing errors. A valid absent element succeeds with an unchanged set."
+let try_remove: 'element -> Set 'element -> Result (Set 'element) hash::Error = map::try_remove
+
+@doc "Build a set, skipping unhashable elements and retaining equal elements once."
+let from_array: ['element] -> Set 'element = fn elements =>
+  map::from_array (array::map (fn element => (element, ())) elements)
+
+@doc "Build a set or stop at the first unhashable element, returning no partial set. The error path starts with its array index, followed by the path inside the element."
+let try_from_array: ['element] -> Result (Set 'element) hash::Error = fn elements =>
+  map::try_from_array (array::map (fn element => (element, ())) elements)
+
+@doc "All elements in unspecified traversal order."
+let to_array: Set 'element -> ['element] = map::keys
+
+@doc "Visit every element once, threading state in unspecified traversal order and propagating callback effects."
+let fold:
+  ('state -> 'element -> 'state + ..'effects)
+  -> 'state
+  -> Set 'element
+  -> 'state + ..'effects =
+  fn step state set => map::fold (fn state key value => step state key) state set
+
+@doc "Elements present in either set. Reuses accepted elements' cached hashes; neither input changes."
+let union: Set 'element -> Set 'element -> Set 'element = fn left right =>
+  array::fold (fn result entry => map::insert_cached entry result) left (map::cached_entries right)
+
+@private
+let select: Bool -> Set 'element -> Set 'element -> Set 'element = fn present left right =>
+  array::fold
+    (fn result entry =>
+      if boolean::equal present (option::is_some (map::get_cached entry.hash entry.key right)) then
+        result
+      else map::remove_cached entry.hash entry.key result
+      end)
+    left
+    (map::cached_entries left)
+
+@doc "Elements present in both sets. Reuses accepted elements' cached hashes."
+let intersection: Set 'element -> Set 'element -> Set 'element = fn left right =>
+  select true left right
+
+@doc "Elements of left that are absent from right. Reuses accepted elements' cached hashes."
+let difference: Set 'element -> Set 'element -> Set 'element = fn left right =>
+  select false left right
+
+@doc "Whether every element of left is present in right."
+let is_subset: Set 'element -> Set 'element -> Bool = fn left right =>
+  if nat::greater_than (len left) (len right) then false
+  else
+    array::all
+      (fn entry => option::is_some (map::get_cached entry.hash entry.key right))
+      (map::cached_entries left)
+  end
+
+@doc "Whether the sets contain the same elements, independent of insertion history or trie layout."
+let equal: Set 'element -> Set 'element -> Bool = fn left right =>
+  nat::equal (len left) (len right) and is_subset left right
