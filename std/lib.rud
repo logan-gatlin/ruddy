@@ -311,3 +311,9 @@ module prelude
 type Option 't = #Some 't | #None
 @private
 type Result 'some 'error = #Some 'some | #Error 'error
+
+@doc "Assertions and local effect handlers for tests and mocks."
+module test
+
+@private
+module tests

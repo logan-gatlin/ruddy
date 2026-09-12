@@ -7,3 +7,4 @@
   | !Host.snapshot value => js_snapshot value
   | !Host.apply request => js_apply request
   | !Host.text value => js_text value
+  | !Assert message => assertion_failed message

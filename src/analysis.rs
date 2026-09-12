@@ -374,7 +374,11 @@ impl Analysis {
         if self.inferred.errors().is_empty() {
             self.diagnostics.extend(
                 crate::externs::review(self.inferred.semantics())
-                    .iter()
+                    .into_iter()
+                    .chain(crate::testing::review(
+                        &self.built.program,
+                        self.inferred.semantics(),
+                    ))
                     .map(|error| error.diagnostic(&self.built.source)),
             );
         }

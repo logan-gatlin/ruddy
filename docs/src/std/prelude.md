@@ -66,6 +66,14 @@ A successful value or an error.
 
 ## Effects
 
+### Assert
+
+```ruddy
+effect Assert = test::!Assert
+```
+
+Reports assertion failures to a handler that may continue or halt.
+
 ### FileSystem
 
 ```ruddy

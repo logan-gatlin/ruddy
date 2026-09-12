@@ -51,3 +51,5 @@ mod git_fixture;
 
 #[cfg(unix)]
 mod git_transport;
+
+mod native_tests;

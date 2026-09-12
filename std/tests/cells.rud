@@ -1,0 +1,29 @@
+@test
+let cells: () -> () + test::!Assert = fn _ => do
+  let exercise = fn _ => do
+    let left = cell::new 1n
+    let right = cell::new 2n
+    let initial = cell::get left
+    let set_value = cell::set left 3n
+    let replaced = cell::replace left 4n
+    let updated = cell::update (fn value => nat::add value 1n) left
+    _ = cell::swap left right
+    return {
+      initial: initial,
+      set_value: set_value,
+      replaced: replaced,
+      updated: updated,
+      left: cell::get left,
+      right: cell::get right,
+    }
+  end
+
+  let cell_results = exercise ()
+  _ = test::assert
+    (match cell_results with
+    | { initial: 1n, set_value: 3n, replaced: 3n, updated: 5n, left: 2n, right: 5n } => true
+    | _ => false
+    end)
+    "cells: cell_results"
+  return ()
+end

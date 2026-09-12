@@ -1,0 +1,116 @@
+@test
+let functional: () -> () + test::!Assert = fn _ => do
+  let ordering_name = fn ordering => match ordering with
+  | #Less => "less"
+  | #Equal => "equal"
+  | #Greater => "greater"
+  end
+
+  let mapped_option = option::map (nat::add 1n) (#Some 41n)
+  let option_value = option::unwrap_or 0n mapped_option
+  let filtered_option = option::filter (fn value => nat::greater_than value 40n) mapped_option
+  let option_kept = option::is_some filtered_option
+  let option_row_fallback = option::some_or "fallback" (#Error "ignored")
+
+  let mapped_error: result::Result Nat String = result::map_error str::to_uppercase (#Error "bad")
+  let error_text = match mapped_error with | #Some _ => "ok" | #Error error => error end
+  let recovered: result::Result Nat String =
+    result::or_else (fn error => #Some (str::len error)) mapped_error
+  let recovered_value = result::unwrap_or 0n recovered
+  let error_row_fallback = result::error_or "fallback" #None
+
+  let characters: [String] = str::chars "abc"
+  let parts: [String] = str::split "a,b,c" ","
+  let empty_joined = str::join "," []
+  let singleton_joined = str::join "," ["only"]
+
+  let composed = function::compose (nat::multiply 2n) (nat::add 1n) 20n
+  let piped = function::pipe 41n (nat::add 1n)
+  let flipped = function::flip nat::subtract 2n 5n
+  let curried = function::curry (fn values => nat::add values.0 values.1) 20n 22n
+  let uncurried = function::uncurry nat::add (20n, 22n)
+
+  let tuple_mapped = tuple::map_both (nat::add 1n) str::to_uppercase (1n, "ruddy")
+  let tuple_first = tuple::first { 0: 42n, 1: false, 2: "extra" }
+  let tuple_result = { first: tuple_mapped.0, second: tuple_mapped.1, projected: tuple_first }
+
+  let reversed_order = ordering_name (order::reverse (nat::compare 1n 2n))
+  let compared_string = ordering_name (str::compare "a" "b")
+  let compared_boolean = ordering_name (boolean::compare false true)
+  let compared_real = ordering_name (real::total_compare (real::negate 0) 0)
+
+  let blank = str::is_blank " \n\t "
+  let safe_char = option::unwrap_or "?" (str::char_at_option "ruddy" 1n)
+  let stripped = option::unwrap_or "?" (str::strip_prefix "ruddy" "rud")
+  let bounded = str::slice_with "ruddy" { start: 1n, stop: 4n }
+  let open_bounded = str::slice_with "ruddy" { start: 2n }
+  let split_joined = str::join "-" (str::split "a,b,c" ",")
+  let reversed_string = str::reverse "ruddy"
+
+  let trig = real::round (real::multiply 1000 (real::sin (real::divide real::pi 2)))
+  let logarithm = real::round (real::log real::e)
+  let angle = real::round (real::radians_to_degrees real::pi)
+  _ =
+    test::assert (match option_value with | 42n => true | _ => false end) "functional: option_value"
+  _ =
+    test::assert (match option_kept with | true => true | _ => false end) "functional: option_kept"
+  _ = test::assert
+    (match option_row_fallback with | "fallback" => true | _ => false end)
+    "functional: option_row_fallback"
+  _ = test::assert (match error_text with | "BAD" => true | _ => false end) "functional: error_text"
+  _ = test::assert
+    (match recovered_value with | 3n => true | _ => false end)
+    "functional: recovered_value"
+  _ = test::assert
+    (match error_row_fallback with | "fallback" => true | _ => false end)
+    "functional: error_row_fallback"
+  _ = test::assert
+    (match characters with | ["a", "b", "c"] => true | _ => false end)
+    "functional: characters"
+  _ = test::assert (match parts with | ["a", "b", "c"] => true | _ => false end) "functional: parts"
+  _ =
+    test::assert (match empty_joined with | "" => true | _ => false end) "functional: empty_joined"
+  _ = test::assert
+    (match singleton_joined with | "only" => true | _ => false end)
+    "functional: singleton_joined"
+  _ = test::assert (match composed with | 42n => true | _ => false end) "functional: composed"
+  _ = test::assert (match piped with | 42n => true | _ => false end) "functional: piped"
+  _ = test::assert (match flipped with | 3n => true | _ => false end) "functional: flipped"
+  _ = test::assert (match curried with | 42n => true | _ => false end) "functional: curried"
+  _ = test::assert (match uncurried with | 42n => true | _ => false end) "functional: uncurried"
+  _ = test::assert
+    (match tuple_result with
+    | { first: 2n, second: "RUDDY", projected: 42n } => true
+    | _ => false
+    end)
+    "functional: tuple_result"
+  _ = test::assert
+    (match reversed_order with | "greater" => true | _ => false end)
+    "functional: reversed_order"
+  _ = test::assert
+    (match compared_string with | "less" => true | _ => false end)
+    "functional: compared_string"
+  _ = test::assert
+    (match compared_boolean with | "less" => true | _ => false end)
+    "functional: compared_boolean"
+  _ = test::assert
+    (match compared_real with | "less" => true | _ => false end)
+    "functional: compared_real"
+  _ = test::assert (match blank with | true => true | _ => false end) "functional: blank"
+  _ = test::assert (match safe_char with | "u" => true | _ => false end) "functional: safe_char"
+  _ = test::assert (match stripped with | "dy" => true | _ => false end) "functional: stripped"
+  _ = test::assert (match bounded with | "udd" => true | _ => false end) "functional: bounded"
+  _ = test::assert
+    (match open_bounded with | "ddy" => true | _ => false end)
+    "functional: open_bounded"
+  _ = test::assert
+    (match split_joined with | "a-b-c" => true | _ => false end)
+    "functional: split_joined"
+  _ = test::assert
+    (match reversed_string with | "yddur" => true | _ => false end)
+    "functional: reversed_string"
+  _ = test::assert (match trig with | 1000i => true | _ => false end) "functional: trig"
+  _ = test::assert (match logarithm with | 1i => true | _ => false end) "functional: logarithm"
+  _ = test::assert (match angle with | 180i => true | _ => false end) "functional: angle"
+  return ()
+end

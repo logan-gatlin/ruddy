@@ -145,3 +145,56 @@ The book links to the existing [standard-library reference](../std/bundle.md) at
 ---
 
 [Book contents](../index.md) · [Standard-library reference](../std/bundle.md)
+
+## Tests
+
+Run `ruddy test` from the directory containing `Ruddy.toml`. It checks the
+bundle and runs every `@test` definition in that root bundle, including private
+submodules. Dependency tests are excluded. Both library and executable bundles
+work without a `main`; the runner compiles JavaScript and uses Node or `[run].js`.
+
+```ruddy
+@test
+let addition: () -> () + !Assert = fn _ =>
+  std::test::assert (std::nat::equal (std::nat::add 2n 3n) 5n) "addition"
+```
+
+A bare `@test` belongs on one named `let` and implies `@private`. Its inferred
+type must be monomorphic, take unit, return unit, and permit at most `Assert`.
+Pure tests are also valid. Ordinary `check` and `build` validate test definitions.
+
+`std::test::Assert` (also available from the prelude) has signature
+`String -> ()`. `assert` performs it only when its condition is false; `fail`
+performs it unconditionally. A handler may resume or abort. Assertions handled
+inside a test do not fail it. The runner stops a test at its first escaping
+assertion or runtime error, reports the qualified name and details, then runs
+the remaining tests. Tests run sequentially in name order, sharing a runtime;
+purity provides their isolation contract. Failures produce an unsuccessful exit,
+and an empty suite reports zero tests and succeeds.
+
+`Assert` is also supported in `main` and exported library functions: default
+platform handlers halt with the message. Top-level initialization stays pure.
+
+Mock helpers `std::test::mock_filesystem`, `mock_process`, `mock_path` (Node),
+and `mock_http` handle the corresponding std effects. Each accepts a response
+record and a unit-argument function, and returns `{value, calls}`. Response
+functions are pure; `calls` contains tagged requests in invocation order. Start
+from the matching `*_defaults` record and supply `#Some` callbacks for expected
+operations:
+
+```ruddy
+@test
+let reads_virtual_file: () -> () + !Assert = fn _ => do
+  let result = std::test::mock_filesystem {
+    read_text: #Some (fn _ => #Some "contents"),
+    ..std::test::filesystem_defaults
+  } (fn _ => std::fs::read_text "virtual.txt")
+  return std::test::assert
+    (match result.calls with | [#ReadText "virtual.txt"] => true | _ => false end)
+    "expected one read"
+end
+```
+
+An unconfigured operation performs `Assert`. If a custom assertion handler
+resumes, that operation returns an error result (or an empty list for process
+arguments), and its request remains in `calls`.

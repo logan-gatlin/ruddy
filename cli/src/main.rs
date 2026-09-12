@@ -24,7 +24,9 @@ fn main() -> ExitCode {
             println!("Checked `{}`", path.display());
             ExitCode::SUCCESS
         }
-        Ok(ruddy_cli::Outcome::Ran(_) | ruddy_cli::Outcome::Served) => ExitCode::SUCCESS,
+        Ok(
+            ruddy_cli::Outcome::Ran(_) | ruddy_cli::Outcome::Tested(_) | ruddy_cli::Outcome::Served,
+        ) => ExitCode::SUCCESS,
         Ok(ruddy_cli::Outcome::Formatted(report)) => {
             for diagnostic in &report.diagnostics {
                 eprintln!("{}", diagnostic.render(stderr_color()));

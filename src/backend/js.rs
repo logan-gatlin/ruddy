@@ -155,7 +155,7 @@ fn entry_adapter(artifact: &Artifact) -> Result<Artifact, Error> {
 const NODE_ENTRY: &str = concat!(
     include_str!("node-platform.rud"),
     include_str!("web-platform.rud"),
-    "let with_platform: (() -> 'a + !IO + !Exit + !FileSystem + !Process + !Path + !Http + !Host + !Immediate) -> 'a + !Immediate = fn body => handle body () with\n",
+    "let with_platform: (() -> 'a + !IO + !Exit + !FileSystem + !Process + !Path + !Http + !Host + !Assert + !Immediate) -> 'a + !Immediate = fn body => handle body () with\n",
     include_str!("node-handler.rud"),
     include_str!("web-handler.rud"),
     "end\n",

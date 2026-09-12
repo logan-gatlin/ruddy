@@ -751,3 +751,20 @@ fn dependency_completion_distinguishes_absolute_and_bundle_paths() {
         );
     }
 }
+
+#[test]
+fn editor_reports_invalid_test_signatures_before_lowering() {
+    let mut host = ruddy::analysis::Host::default();
+    host.set_file("main.rud", Some("@test let invalid = 1n".into()));
+    let analysis = host.analyze(
+        Bundle::new("editor", Version::new(0, 0, 0)).unwrap(),
+        "main.rud",
+        &ruddy::bundle::Environment::new([]),
+    );
+    assert!(
+        analysis
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "invalid-test-signature")
+    );
+}

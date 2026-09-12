@@ -1612,6 +1612,39 @@ pub fn interface(
     }
 }
 
+/// The private test interface, before ordinary export filtering.
+pub(crate) fn test_values(
+    mint: &Mint,
+    program: &ir::Program,
+    inference: &crate::inference::Semantics,
+) -> Vec<Value> {
+    program
+        .terms
+        .iter()
+        .filter(|(_, declaration)| declaration.metadata.contains_key("test"))
+        .filter_map(|(symbol, declaration)| {
+            inference.schemes().get(symbol).map(|ty| Value {
+                name: qualified(mint, *symbol),
+                scheme: {
+                    let mut result = scheme(mint, ty);
+                    let body = crate::inference::unfold(inference.aliases(), ty.body());
+                    result.body = self::ty(mint, &body);
+                    if let (crate::types::Ty::Arrow(from, to, _), Type::Arrow(input, output, _)) =
+                        (&*body, &mut result.body)
+                    {
+                        **input =
+                            self::ty(mint, &crate::inference::unfold(inference.aliases(), from));
+                        **output =
+                            self::ty(mint, &crate::inference::unfold(inference.aliases(), to));
+                    }
+                    result
+                },
+                metadata: metadata(&declaration.metadata),
+            })
+        })
+        .collect()
+}
+
 /// A source name is exported only when it and every enclosing module are public.
 /// This does not affect resolution or initialization inside the declaring bundle.
 fn is_exported(

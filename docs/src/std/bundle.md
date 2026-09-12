@@ -37,6 +37,7 @@ stdReference: true
 [result](result.md)\
 [set](set.md)\
 [str](str.md)\
+[test](test.md)\
 [tuple](tuple.md)\
 [types](types.md)\
 [url](url.md)

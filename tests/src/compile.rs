@@ -2145,3 +2145,43 @@ fn using_local_effect_alias_chains_keep_the_original_effect_identity() {
         end",
     );
 }
+
+#[test]
+fn test_attribute_checks_signature_and_hides_tests() {
+    let check = |source: &str| {
+        let parsed = parse::parse(token::lex(source, FileID::GENERATED).tokens);
+        assert!(parsed.errors.is_empty(), "{:#?}", parsed.errors);
+        compile::compile(
+            Mint::new(Bundle::new("tests", Version::new(0, 1, 0)).unwrap()),
+            parsed.stmts,
+            inference::Trace::Off,
+        )
+        .map_err(Box::new)
+    };
+    let accepted = check("@test let works: () -> () + .. = fn _ => ()").unwrap();
+    assert!(accepted.artifact().header().values.is_empty());
+    check("type Unit = ()\ntype Test = Unit -> Unit\n@test let alias: Test = fn _ => ()")
+        .expect("aliases of the exact signature are valid");
+    for source in [
+        "@test let bad = 1n",
+        "@test let bad = fn value => value",
+        "@test let bad: Nat -> () = fn _ => ()",
+        "@test let bad: () -> Nat = fn _ => 1n",
+        "@test let bad: () -> () + ..'effects = fn _ => ()",
+        "@test () let bad: () -> () = fn _ => ()",
+        "@test type Bad = ()",
+        "@test effect Bad = () -> ()",
+        "@test extern bad: () -> () = \"() => ({})\"",
+        "@test let bad: () -> () + .. = fn _ => 1n",
+        "@test let (a, b) = (fn _ => (), fn _ => ())",
+        "@test let _: () -> () + .. = fn _ => ()",
+        "@test module bad = end",
+        "@test true let bad = fn _ => ()",
+        "effect Other = () -> ()\n@test let bad: () -> () + .. = fn _ => !Other ()",
+        "effect Assert = Nat -> ()\n@test let bad: () -> () + .. = fn _ => !Assert 1n",
+    ] {
+        assert!(check(source).is_err(), "accepted invalid test: {source}");
+    }
+    check("effect Assert = String -> ()\n@test let works: () -> () + .. = fn _ => !Assert \"failure\"")
+        .expect("tests permit the structural Assert effect");
+}

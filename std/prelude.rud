@@ -34,3 +34,6 @@ type Fallible 'error 'rest = #Error 'error | ..'rest
 type Order = #Less | #Equal | #Greater
 @doc "A value packaged with its exact type."
 type Any = any::Any
+
+@doc "Reports assertion failures to a handler that may continue or halt."
+effect Assert = test::!Assert

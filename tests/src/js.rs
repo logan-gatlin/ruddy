@@ -1190,7 +1190,7 @@ fn trailing_line_comments_in_extern_expressions_do_not_consume_the_initializer()
     );
 }
 
-/// Metadata is inert: two sources that differ only in the attributes in front
+/// Uninterpreted metadata is inert: two sources that differ only in the attributes in front
 /// of their definitions have the same schemes and compile to byte-identical
 /// JavaScript. The artifact differs only in what it publishes about them.
 #[test]
@@ -1208,7 +1208,7 @@ fn metadata_changes_neither_schemes_nor_generated_javascript() {
          @shape (1n, 2n) type Pair 'a = { first: 'a, second: 'a }\n\
          @level #Debug effect Log = Nat -> ()\n\
          @host { from: \"math\" } extern sqrt : Real -> Real = \"Math.sqrt\"\n\
-         @test @tags [\"a\", \"b\"] let pair: Nat -> { first: Nat, second: Nat } = fn x => { first: x, second: x }\n\
+         @example @tags [\"a\", \"b\"] let pair: Nat -> { first: Nat, second: Nat } = fn x => { first: x, second: x }\n\
          @k let (a, b) = (1n, 2n)\n",
     );
     assert_eq!(
