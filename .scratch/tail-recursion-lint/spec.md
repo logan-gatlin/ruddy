@@ -86,3 +86,9 @@ This spec records the agreed distinction between source-level opportunities and 
 The user explicitly clarified that this is an optional lint, not an automatic compiler decision. Ordinary numeric counting and summation belong in the initial scope; numeric boundary nuances are left to the user deciding whether to apply the edit. The effect-row restrictions remain in force.
 
 Implementation should preserve the existing architecture in which analysis serves the editor and lowering handles executable continuations. This issue specifies the feature; it does not implement it.
+
+## Comments
+
+Implementation adds the informational diagnostic and quick fix through shared typed analysis. Regression checks use the existing LSP harness, interpreter and generated JavaScript, plus artifact inspection of continuation forwarding. Review uses implementation starting commit `79e6ffa0` as its fixed point. Review corrections cover closed-effect handlers and complete source spans for erased `do` wrappers; both passed the follow-up spec review.
+
+Final validation: `RUST_TEST_THREADS=2 just cov` passed 2,004 tests with 10 ignored; `cargo clippy --workspace --all-targets`, Rust formatting, and diff whitespace checks passed. Compiler coverage measured 96.09% lines and 88.70% branches; the new lint module measured 96.37% lines and 83.04% branches. The repository's required 100% compiler coverage remains unmet. Standards review also suggested an optional enum for the addition representation; spec review found no outstanding blockers after corrections.

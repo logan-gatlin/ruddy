@@ -3,9 +3,10 @@
 use super::Analysis;
 use crate::{
     ir::{BinaryOp, Term, TermKind, UnaryOp},
+    parse::{self, ExprKind, StmtKind},
     symbol::{Namespace, Symbol},
-    tracking::{Anchor, Span},
-    types::{Rest, Ty},
+    tracking::{Anchor, FileID, Span},
+    types::{Presence, Rest, Row, Ty},
 };
 
 /// One optional editor refactoring, computed entirely from one analysis revision.
@@ -28,6 +29,12 @@ impl Analysis {
         }) {
             return Vec::new();
         }
+        let file = self
+            .paths
+            .iter()
+            .find_map(|(file, known)| (known == path).then_some(*file))
+            .unwrap_or(FileID::GENERATED);
+        let blocks = block_spans(text, file);
         let mut opportunities = Vec::new();
         for (symbol, decl) in self.terms_in(path) {
             crate::cancellation::checkpoint();
@@ -44,6 +51,7 @@ impl Analysis {
                     analysis: self,
                     text,
                     symbol,
+                    blocks: &blocks,
                 })
                 .plan(name, function)
                 {
@@ -55,10 +63,124 @@ impl Analysis {
     }
 }
 
+/// Lowering erases `do` wrappers: a binding's anchor covers its statement,
+/// while a block with only imports inherits its result's anchor. Recover those
+/// wrappers from syntax so copying an expression also copies its lexical scope.
+fn block_spans(text: &str, file: FileID) -> std::collections::HashMap<Span, Span> {
+    let parsed = parse::parse(crate::token::lex(text, file).tokens);
+    let mut blocks = std::collections::HashMap::new();
+    let mut statements: Vec<_> = parsed.stmts.iter().collect();
+    let mut expressions = Vec::new();
+    loop {
+        if let Some(statement) = statements.pop() {
+            match &statement.kind {
+                StmtKind::Let { body, .. } => expressions.push(&body.tracked),
+                StmtKind::Module {
+                    body: Some(body), ..
+                } => statements.extend(body),
+                _ => {}
+            }
+            continue;
+        }
+        let Some(expression) = expressions.pop() else {
+            break;
+        };
+        crate::cancellation::checkpoint();
+        match &expression.tracked {
+            ExprKind::Do { stmts, result } => {
+                let origin = stmts
+                    .iter()
+                    .find(|stmt| matches!(stmt.kind, StmtKind::Let { .. }))
+                    .map(|stmt| stmt.span)
+                    .or_else(|| result.as_ref().map(|value| value.span));
+                if let Some(origin) = origin {
+                    blocks.insert(origin, expression.span);
+                }
+                statements.extend(stmts);
+                expressions.extend(result.as_deref());
+            }
+            ExprKind::Function { body, .. }
+            | ExprKind::Unary { value: body, .. }
+            | ExprKind::Project { base: body, .. }
+            | ExprKind::Raise(body) => expressions.push(body),
+            ExprKind::Binary { left, right, .. } => {
+                expressions.extend([left.as_ref(), right.as_ref()])
+            }
+            ExprKind::Apply { func, arg } => expressions.extend([func.as_ref(), arg.as_ref()]),
+            ExprKind::Pipe { value, function } => {
+                expressions.extend([value.as_ref(), function.as_ref()])
+            }
+            ExprKind::Match { scrutinee, arms } => {
+                expressions.push(scrutinee);
+                expressions.extend(arms.iter().map(|arm| &arm.body));
+            }
+            ExprKind::MatchFunction { arms, .. } => {
+                expressions.extend(arms.iter().map(|arm| &arm.body))
+            }
+            ExprKind::If {
+                predicate,
+                consequent,
+                alternative,
+            } => expressions.extend([
+                predicate.as_ref(),
+                consequent.as_ref(),
+                alternative.as_ref(),
+            ]),
+            ExprKind::Struct { fields, spread } => {
+                expressions.extend(fields.values());
+                if let Some(spread) = spread {
+                    expressions.push(&spread.value);
+                }
+            }
+            ExprKind::Tuple(items) => expressions.extend(items),
+            ExprKind::Array(items) => expressions.extend(items.iter().map(|item| &item.value)),
+            ExprKind::Tag { payload, .. } => expressions.extend(payload.as_deref()),
+            ExprKind::Handle { body, arms } => {
+                expressions.push(body);
+                expressions.extend(arms.iter().map(|arm| &arm.body));
+            }
+            ExprKind::Ident { .. }
+            | ExprKind::Operation { .. }
+            | ExprKind::Natural(_)
+            | ExprKind::Integer(_)
+            | ExprKind::Fixed(_)
+            | ExprKind::Real(_)
+            | ExprKind::String(_)
+            | ExprKind::Bool(_)
+            | ExprKind::Unit => {}
+        }
+    }
+    blocks
+}
+
 struct Candidate<'a> {
     analysis: &'a Analysis,
     text: &'a str,
     symbol: Symbol,
+    blocks: &'a std::collections::HashMap<Span, Span>,
+}
+
+#[derive(Clone, Default)]
+struct EffectScope {
+    handled: std::collections::HashSet<String>,
+    can_raise: bool,
+}
+
+impl EffectScope {
+    fn allows(&self, mut row: &Row) -> bool {
+        loop {
+            if row.labels.iter().any(|(key, field)| {
+                field.presence != Presence::Absent && !self.handled.contains(key)
+            }) {
+                return false;
+            }
+            match &row.rest {
+                Rest::Closed => return true,
+                Rest::More(more) => row = more,
+                _ => return false,
+            }
+        }
+    }
 }
 
 struct Addition {
@@ -97,7 +219,14 @@ impl Addition {
 
 impl Candidate<'_> {
     fn span(&self, term: &Term) -> Span {
-        self.analysis.built.source.span(term.at)
+        let mut span = self.analysis.built.source.span(term.at);
+        while let Some(block) = self.blocks.get(&span) {
+            if block.width <= span.width {
+                break;
+            }
+            span = *block;
+        }
+        span
     }
     fn source(&self, term: &Term) -> Option<&str> {
         let span = self.span(term);
@@ -108,24 +237,48 @@ impl Candidate<'_> {
             .any(|t| matches!(t.kind, TermKind::Ident(s) if s == self.symbol))
     }
     fn pure(&self, term: &Term) -> bool {
-        let mut work = vec![term];
-        while let Some(term) = work.pop() {
+        let mut scopes = vec![EffectScope::default()];
+        let mut work = vec![(term, 0)];
+        while let Some((term, scope)) = work.pop() {
             crate::cancellation::checkpoint();
+            let mut children = Vec::new();
             match &term.kind {
                 TermKind::Apply { func, arg } => {
                     let ty = crate::inference::unfold(
                         self.analysis.inferred.semantics().aliases(),
                         &func.ty,
                     );
-                    if !matches!(&*ty, Ty::Arrow(_, _, row) if row.labels.is_empty() && matches!(row.rest, Rest::Closed))
-                    {
+                    if !matches!(&*ty, Ty::Arrow(_, _, row) if scopes[scope].allows(row)) {
                         return false;
                     }
-                    work.extend([func.as_ref(), arg.as_ref()]);
+                    children.extend([func.as_ref(), arg.as_ref()]);
                 }
                 // Creating a closure does not execute its body. Its arrow row
                 // is checked above if the surrounding expression calls it.
                 TermKind::Fn { .. } => {}
+                TermKind::Handle { body, handler } => {
+                    let mut inside = scopes[scope].clone();
+                    for effect in &handler.discharges {
+                        let Some(identity) =
+                            self.analysis.built.program.effect_ids.get(&effect.anchored)
+                        else {
+                            return false;
+                        };
+                        inside.handled.insert(identity.row_key());
+                    }
+                    work.push((body, scopes.len()));
+                    scopes.push(inside);
+                    // Arms run outside their own handler: a rethrow must be
+                    // covered by an outer handler, never by the arm itself.
+                    let mut arms = scopes[scope].clone();
+                    arms.can_raise = true;
+                    work.extend(handler.arms.iter().map(|arm| (&arm.body, scopes.len())));
+                    if let Some(ret) = &handler.ret {
+                        work.push((&ret.body, scopes.len()));
+                    }
+                    scopes.push(arms);
+                }
+                TermKind::Raise(value) if scopes[scope].can_raise => children.push(value),
                 TermKind::Unary {
                     op: UnaryOp::Allocate | UnaryOp::Read,
                     ..
@@ -134,27 +287,28 @@ impl Candidate<'_> {
                     op: BinaryOp::Write,
                     ..
                 }
-                | TermKind::Handle { .. }
                 | TermKind::Raise(_)
                 | TermKind::Error => return false,
-                TermKind::Unary { value, .. } => work.push(value),
+                TermKind::Unary { value, .. } => children.push(value),
                 TermKind::Binary { left, right, .. } => {
-                    work.extend([left.as_ref(), right.as_ref()])
+                    children.extend([left.as_ref(), right.as_ref()])
                 }
-                TermKind::Let { value, body, .. } => work.extend([value.as_ref(), body.as_ref()]),
+                TermKind::Let { value, body, .. } => {
+                    children.extend([value.as_ref(), body.as_ref()])
+                }
                 TermKind::Match { scrutinee, arms } => {
-                    work.push(scrutinee);
-                    work.extend(arms.iter().map(|(_, body)| body));
+                    children.push(scrutinee);
+                    children.extend(arms.iter().map(|(_, body)| body));
                 }
                 TermKind::Struct { fields, spread } => {
-                    work.extend(fields.values().map(|field| &field.value));
+                    children.extend(fields.values().map(|field| &field.value));
                     if let Some(spread) = spread {
-                        work.push(&spread.value);
+                        children.push(&spread.value);
                     }
                 }
-                TermKind::Array(items) => work.extend(items.iter().map(|item| &item.value)),
-                TermKind::Tag { payload, .. } => work.extend(payload.as_deref()),
-                TermKind::Project { base, .. } => work.push(base),
+                TermKind::Array(items) => children.extend(items.iter().map(|item| &item.value)),
+                TermKind::Tag { payload, .. } => children.extend(payload.as_deref()),
+                TermKind::Project { base, .. } => children.push(base),
                 TermKind::Ident(_)
                 | TermKind::Operation { .. }
                 | TermKind::Natural(_)
@@ -164,6 +318,7 @@ impl Candidate<'_> {
                 | TermKind::String(_)
                 | TermKind::Bool(_) => {}
             }
+            work.extend(children.into_iter().map(|child| (child, scope)));
         }
         true
     }

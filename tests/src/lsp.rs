@@ -692,6 +692,9 @@ fn editor_tail_recursion_obeys_effect_rows() {
         "let sum: (Real -> Real) -> [Real] -> Real = fn f => fn xs => match xs with | [] => 0 | [x, ..rest] => f x + sum f rest end\n",
         "let pure = fn x => x + 1\nlet sum = fn xs => match xs with | [] => 0 | [x, ..rest] => pure x + sum rest end\n",
         "effect Ask = { ask: () -> Real }\nlet sum = fn xs => match xs with | [] => 0 | [x, ..rest] => (fn _ => handle !Ask.ask () with | !Ask.ask _ => 1 end) () + sum rest end\n",
+        "effect Ask = { ask: () -> Real }\nlet sum = fn xs => match xs with | [] => 0 | [x, ..rest] => (handle !Ask.ask () with | !Ask.ask _ => 1 end) + sum rest end\n",
+        "effect Ask = { ask: () -> Real }\nlet sum = fn xs => match xs with | [] => 0 | [x, ..rest] => (handle !Ask.ask () with | !Ask.ask _ => raise 1 | return value => value + 1 end) + sum rest end\n",
+        "effect Ask = { ask: () -> Real }\nlet sum = fn xs => match xs with | [] => 0 | [x, ..rest] => (handle (handle !Ask.ask () with | !Ask.ask _ => !Ask.ask () end) with | !Ask.ask _ => 1 end) + sum rest end\n",
     ] {
         assert_eq!(
             tail_actions(source).as_array().unwrap().len(),
@@ -763,6 +766,8 @@ fn editor_tail_recursion_skips_unsupported_patterns() {
         "let add = fn a => fn b => a - b\nlet count = fn xs => match xs with | [] => 0 | [_, ..rest] => add 1 (count rest) end\n",
         "let apply = fn f => fn x => f x\nlet count = fn xs => match xs with | [] => 0 | [_, ..rest] => 1 + apply count rest end\n",
         "effect Ask = { ask: () -> Real }\nlet count = fn xs => match xs with | [] => 0 | [_, ..rest] => count rest + !Ask.ask () end\n",
+        "effect Ask = { ask: () -> Real }\nlet count = fn xs => match xs with | [] => 0 | [_, ..rest] => (handle !Ask.ask () with | !Ask.ask _ => !Ask.ask () end) + count rest end\n",
+        "effect Ask = { ask: () -> Real }\nlet count = fn xs => match xs with | [] => 0 | [_, ..rest] => (handle !Ask.ask () with | !Ask.ask _ => 1 | return value => !Ask.ask () end) + count rest end\n",
     ] {
         assert!(
             tail_actions(source).as_array().unwrap().is_empty(),
@@ -999,5 +1004,71 @@ fn editor_tail_recursion_forwards_the_recursive_continuation() {
                 .unwrap();
             assert_eq!(ruddy_interp::render::json(&value), "4096");
         }
+    }
+}
+
+#[test]
+fn editor_tail_recursion_reorders_pure_composite_values() {
+    for (expression, expected) in [
+        ("(-x)", "-6"),
+        ("do let y = x return y + 1 end", "9"),
+        ("do return do let y = x return y end end", "6"),
+        ("if not false then x else 0 end", "6"),
+        ("({ value: x, ..{ extra: true } }).value", "6"),
+        (
+            "(fn values => match values with | [y] => y | [..] => 0 end) [x]",
+            "6",
+        ),
+        (
+            "(fn tag => match tag with | #Some y => y end) (#Some x)",
+            "6",
+        ),
+        ("(fn tag => match tag with | #Empty => x end) #Empty", "6"),
+    ] {
+        let source = format!(
+            "let sum: [Real] -> Real = fn xs => match xs with | [] => 0 | [x, ..rest] => ({expression}) + sum rest end\nlet empty = sum []\nlet sample = sum [1, 2, 3]\n"
+        );
+        let actions = tail_actions(&source);
+        assert_eq!(actions.as_array().unwrap().len(), 1, "{source}");
+        let rewritten = apply_tail_action(&source, &actions[0]);
+        let (interpreted, javascript) = tail_results(&rewritten);
+        assert_eq!(interpreted, ["0", expected], "{rewritten}");
+        assert_eq!(javascript, ["0", expected], "{rewritten}");
+    }
+}
+
+#[test]
+fn editor_tail_recursion_declines_unsafe_or_unrepresentable_edits() {
+    for source in [
+        "let count = fn _ => 1 + count ()\n",
+        "let count = fn xs => match count xs with | value => 1 + value end\n",
+        "let count = fn xs => do let value = count xs return 1 + value end\n",
+        "let count = fn xs => match xs with | [] => 0 | [_, ..rest] => 1 (* retain this comment *) + count rest end\n",
+        "let count = fn xs => match xs with | [] => 0 | [_, ..rest] => (do let cell = mut 1 return ~cell end) + count rest end\n",
+        "let count = fn cell => fn xs => match xs with | [] => 0 | [_, ..rest] => (cell := 1) + count cell rest end\n",
+    ] {
+        assert!(
+            tail_actions(source).as_array().unwrap().is_empty(),
+            "{source}"
+        );
+    }
+}
+
+#[test]
+fn editor_tail_recursion_preserves_function_blocks() {
+    for body in [
+        "do let bias = 1 return match xs with | [] => 0 | [_, ..rest] => bias + count rest end end",
+        "do return match xs with | [] => 0 | [_, ..rest] => 1 + count rest end end",
+        "do let (bias, extra) = (1, 0) return match xs with | [] => extra | [_, ..rest] => bias + count rest end end",
+    ] {
+        let source = format!(
+            "let count: [Real] -> Real = fn xs => {body}\nlet empty = count []\nlet sample = count [1, 2, 3]\n"
+        );
+        let actions = tail_actions(&source);
+        assert_eq!(actions.as_array().unwrap().len(), 1, "{source}");
+        let rewritten = apply_tail_action(&source, &actions[0]);
+        let (interpreted, javascript) = tail_results(&rewritten);
+        assert_eq!(interpreted, ["0", "3"], "{rewritten}");
+        assert_eq!(javascript, ["0", "3"], "{rewritten}");
     }
 }
