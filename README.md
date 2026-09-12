@@ -71,9 +71,14 @@ installing. See its README for installation and development instructions.
 
 The language server is `ruddy lsp`. Configure your editor to launch that
 command over stdio, with the directory containing `Ruddy.toml` as its workspace
-root. It provides diagnostics, hover, completion, go-to-definition, and
+root. It provides diagnostics, hover, completion, go-to-definition, quick fixes, and
 document formatting for `.rud` files. Unsaved local dependency buffers participate in analysis; Git dependencies
 and cached std retain source navigation.
+
+The optional **Convert to tail recursion** quick fix rewrites recognized numeric
+counting and summation functions with an accumulator. It appears as an informational
+diagnostic; applying it is a user decision. Calls moved by the rewrite must have
+an empty, closed effect row.
 
 For Helix, add the server table and merge these keys into the existing Ruddy
 language entry from `just helix` ([Helix configuration](https://docs.helix-editor.com/languages.html)):

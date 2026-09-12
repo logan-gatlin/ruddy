@@ -37,6 +37,7 @@ pub fn serve(connection: Connection) -> Result<()> {
     let params = connection.initialize(json!({
         "positionEncoding": "utf-16",
         "textDocumentSync": {"openClose":true,"change":2,"save":{"includeText":false}},
+        "codeActionProvider":{"codeActionKinds":["quickfix"]},
         "hoverProvider":true,"definitionProvider":true,"documentFormattingProvider":true,
         "completionProvider":{"triggerCharacters":[".",":","!"]}
     }))?;
@@ -105,6 +106,10 @@ pub fn serve(connection: Connection) -> Result<()> {
     });
     let mut worker = Worker {
         workspace: Workspace::new(root),
+        versioned_edits: params
+            .pointer("/capabilities/workspace/workspaceEdit/documentChanges")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
         documents: HashMap::new(),
         dirty: true,
         revision: 0,
@@ -186,6 +191,7 @@ fn changes_revision(method: &str) -> bool {
 
 struct Worker {
     workspace: Workspace,
+    versioned_edits: bool,
     documents: HashMap<PathBuf, Document>,
     dirty: bool,
     revision: u64,
@@ -366,6 +372,7 @@ impl Worker {
                 | "textDocument/completion"
                 | "textDocument/definition"
                 | "textDocument/formatting"
+                | "textDocument/codeAction"
         );
         if !supported {
             self.sender.send(Message::Response(Response::new_err(
@@ -396,7 +403,21 @@ impl Worker {
             Ok(Err(message)) => Response::new_err(request.id, -32602, message),
             Err(_) => Response::new_err(request.id, -32800, "analysis was cancelled".into()),
         };
-        self.sender.send(Message::Response(response))?;
+        {
+            let schedule = self.shared.lock().unwrap();
+            let response = if request.method == "textDocument/codeAction"
+                && schedule.revision != self.revision
+            {
+                Response::new_err(
+                    response.id,
+                    -32801,
+                    "document changed during analysis".into(),
+                )
+            } else {
+                response
+            };
+            self.sender.send(Message::Response(response))?;
+        }
         // A request may have finished the revision's analysis before the idle
         // diagnostics task ran. Publish through the same revision barrier.
         self.publish()?;
@@ -426,6 +447,58 @@ impl Worker {
                 "range": {"start": position(source, 0), "end": position(source, source.len())},
                 "newText": formatted.text,
             }]));
+        }
+        if request.method == "textDocument/codeAction" {
+            let Some(document) = self.documents.get(&path) else {
+                return Ok(json!([]));
+            };
+            if request
+                .params
+                .pointer("/context/only")
+                .and_then(Value::as_array)
+                .is_some_and(|kinds| {
+                    !kinds
+                        .iter()
+                        .any(|kind| matches!(kind.as_str(), Some("" | "quickfix")))
+                })
+            {
+                return Ok(json!([]));
+            }
+            let start = request
+                .params
+                .pointer("/range/start")
+                .and_then(|p| offset(source, p))
+                .ok_or("invalid action range")?;
+            let end = request
+                .params
+                .pointer("/range/end")
+                .and_then(|p| offset(source, p))
+                .ok_or("invalid action range")?;
+            if start > end {
+                return Err("invalid action range".into());
+            }
+            let actions: Vec<_> = project
+                .analysis
+                .tail_recursion(logical)
+                .into_iter()
+                .filter(|fix| start <= fix.binding.end() && end >= fix.binding.start)
+                .map(|fix| {
+                    let diagnostic = tail_diagnostic(source, &fix);
+                    let edits = json!([{"range":range(source,fix.span),"newText":fix.replacement}]);
+                    let edit = if self.versioned_edits {
+                        json!({"documentChanges":[{
+                            "textDocument":{"uri":document.uri,"version":document.version},"edits":edits
+                        }]})
+                    } else {
+                        json!({"changes":{(document.uri.clone()):edits}})
+                    };
+                    json!({
+                        "title":ruddy::ui::TAIL_RECURSION_ACTION,"kind":"quickfix",
+                        "diagnostics":[diagnostic],"edit":edit
+                    })
+                })
+                .collect();
+            return Ok(json!(actions));
         }
         let at = request
             .params
@@ -526,7 +599,7 @@ fn diagnostics_for(
     logical: &str,
     text: &str,
 ) -> Vec<Value> {
-    project.analysis.diagnostics.iter().filter(|diagnostic| project.analysis.paths.get(&diagnostic.primary.span.file_id).is_some_and(|path| path == logical)).map(|diagnostic| {
+    let mut diagnostics: Vec<_> = project.analysis.diagnostics.iter().filter(|diagnostic| project.analysis.paths.get(&diagnostic.primary.span.file_id).is_some_and(|path| path == logical)).map(|diagnostic| {
                     let mut message = diagnostic.title.clone();
                     for detail in std::iter::once(&diagnostic.primary.message).chain(&diagnostic.notes).chain(&diagnostic.help) {
                         if !detail.is_empty() && detail != &diagnostic.title { message.push('\n'); message.push_str(detail); }
@@ -538,7 +611,20 @@ fn diagnostics_for(
                         Some(json!({"location":{"uri":uri.as_str(),"range":range(source,annotation.span)},"message":annotation.message}))
                     }).collect();
                     json!({"range":range(text,diagnostic.primary.span),"severity":1,"source":"ruddy","code":diagnostic.code,"message":message,"relatedInformation":related})
-                }).collect()
+                }).collect();
+    diagnostics.extend(
+        project
+            .analysis
+            .tail_recursion(logical)
+            .iter()
+            .map(|fix| tail_diagnostic(text, fix)),
+    );
+    diagnostics
+}
+
+fn tail_diagnostic(text: &str, fix: &ruddy::analysis::TailRecursion) -> Value {
+    json!({"range":range(text,fix.binding),"severity":3,"source":"ruddy",
+        "code":ruddy::ui::TAIL_RECURSION_CODE,"message":ruddy::ui::TAIL_RECURSION_MESSAGE})
 }
 
 fn file_path(uri: &str) -> Option<PathBuf> {

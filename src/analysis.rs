@@ -9,6 +9,9 @@ use crate::{
     tracking::{FileID, FileManager, Span},
     ui,
 };
+mod tail_recursion;
+pub use tail_recursion::TailRecursion;
+
 use salsa::Setter;
 use std::{collections::HashMap, sync::Arc};
 
