@@ -1,7 +1,7 @@
 # Ruddy for VS Code
 
 Syntax highlighting for `.rud` files using the bundled Ruddy Tree-sitter parser,
-plus diagnostics, hover, completion, go-to-definition, and document formatting
+plus diagnostics, hover, completion, go-to-definition, quick fixes, and document formatting
 through `ruddy lsp`.
 
 ## Install
@@ -36,6 +36,10 @@ workspace to start the language server. A multi-root workspace gets one server
 per folder with a `Ruddy.toml` directly at its root. Add nested projects as
 workspace folders explicitly; the extension does not search for them. Files
 outside those project folders have highlighting only.
+
+Use the lightbulb on a tail-recursion opportunity to select **Convert to tail
+recursion**. This optional quick fix introduces an accumulator for supported numeric
+counting, summation, and product functions.
 
 Use **Format Document** for formatting. Format-on-save follows your own VS Code
 settings. Use **Ruddy: Restart Language Server** to recover a stopped server;

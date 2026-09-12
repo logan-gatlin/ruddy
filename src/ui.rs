@@ -41,6 +41,10 @@
 //! sharing can only run in this direction: `ruddy-debug` depends on `ruddy`,
 //! and nothing may make the dependency run back.
 
+pub const TAIL_RECURSION_CODE: &str = "tail-recursion-opportunity";
+pub const TAIL_RECURSION_MESSAGE: &str = "This function can be rewritten as tail recursion. Accumulate the numeric operation before each recursive call instead of retaining work after it.";
+pub const TAIL_RECURSION_ACTION: &str = "Convert to tail recursion";
+
 use std::{collections::HashSet, fmt, path::Path as FsPath};
 
 use crate::{
