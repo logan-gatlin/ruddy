@@ -155,6 +155,8 @@ pub enum Prec {
     Xor,
     /// `left and right`.
     And,
+    /// Value comparisons, which do not associate.
+    Comparison,
     /// `left + right`.
     Addition,
     /// `left * right`.
@@ -207,6 +209,7 @@ pub fn expr_prec(kind: &parse::ExprKind) -> Prec {
         ExprKind::Raise(_) => Prec::Lambda,
         ExprKind::Pipe { .. } => Prec::Pipeline,
         ExprKind::Binary { op, .. } => match op {
+            BinaryOp::Compare(_) => Prec::Comparison,
             BinaryOp::Write => Prec::Assignment,
             BinaryOp::Or => Prec::Or,
             BinaryOp::Xor => Prec::Xor,
@@ -692,6 +695,11 @@ impl fmt::Display for Kind {
             Kind::Not => f.write_str("not"),
             Kind::Using => f.write_str("using"),
             Kind::Module => f.write_str("module"),
+            Kind::EqualEqual => f.write_str("=="),
+            Kind::Less => f.write_str("<"),
+            Kind::LessEqual => f.write_str("<="),
+            Kind::Greater => f.write_str(">"),
+            Kind::GreaterEqual => f.write_str(">="),
             Kind::Equal => f.write_str("="),
             Kind::FatArrow => f.write_str("=>"),
             Kind::Arrow => f.write_str("->"),
@@ -796,6 +804,7 @@ impl parse::Error {
     pub fn code(&self) -> &'static str {
         match self.kind {
             parse::ErrorKind::Expected { expected, .. } => expected.code(),
+            parse::ErrorKind::ChainedComparison => "chained-comparison",
             parse::ErrorKind::Wildcard { .. } => "misplaced-discard",
             parse::ErrorKind::SecondArrayRest { .. } => "second-array-rest",
             parse::ErrorKind::DiscardedArrayRest => "discarded-array-rest",
@@ -905,6 +914,12 @@ impl parse::Error {
                 }
                 diagnostic
             }
+            parse::ErrorKind::ChainedComparison => Diagnostic::new(
+                "chained-comparison",
+                "comparison operators cannot be chained",
+                self.span,
+            )
+            .help("write `a < b and b < c`, or parenthesize the comparison operands"),
             parse::ErrorKind::Wildcard { place } => {
                 let title = match place {
                     parse::Place::Value => "`_` throws a value away, so it cannot be read here",
@@ -4281,7 +4296,7 @@ pub fn write_binary(
 ) -> fmt::Result {
     write_grouped(
         f,
-        if prec == Prec::Assignment {
+        if matches!(prec, Prec::Assignment | Prec::Comparison) {
             left.prec() <= prec
         } else {
             left.prec() < prec

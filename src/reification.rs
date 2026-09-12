@@ -26,6 +26,7 @@ use crate::{
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Projection {
     Element,
+    Region,
     Argument,
     Result,
     Field(String),
@@ -54,6 +55,10 @@ pub fn projection(
             Node::Parameter(p) if *p == parameter => return Some(path),
             Node::Alias(child) => push(*child, None),
             Node::Array(child) => push(*child, Some(Projection::Element)),
+            Node::Cell([region, element]) => {
+                push(*region, Some(Projection::Region));
+                push(*element, Some(Projection::Element));
+            }
             // An effect row's payloads are no position a projection reaches:
             // evidence for a parameter written only there is not derived.
             Node::Arrow([from, to, _]) => {
@@ -227,10 +232,29 @@ impl Analysis {
                 {
                     let supplied = instantiate(&binding.ty, &term.ty, aliases);
                     for parameter in &binding.parameters {
-                        if let Some(ty) = supplied.get(parameter)
-                            && let Err(message) = Descriptor::template(ty, aliases)
-                        {
-                            report(term.at, message);
+                        if let Some(ty) = supplied.get(parameter) {
+                            // A polymorphic host boundary needs a conversion
+                            // contract, not merely an exact type identity. In
+                            // particular, an effectful callback is reflectable
+                            // but cannot be supplied through an opaque slot.
+                            let native = program.externs.get(target).is_some_and(|external| {
+                                !external.value.array_intrinsic
+                                    && Intrinsic::recognize(
+                                        &external.value.target.anchored,
+                                        &binding.ty,
+                                        aliases,
+                                    )
+                                    .is_none()
+                            });
+                            let reviewed = if native {
+                                crate::backend::host::NativeTemplate::template(ty, aliases)
+                                    .map(|_| ())
+                            } else {
+                                Descriptor::template(ty, aliases).map(|_| ())
+                            };
+                            if let Err(message) = reviewed {
+                                report(term.at, message);
+                            }
                         }
                     }
                 }
@@ -786,6 +810,9 @@ mod contract {
                 ("Bool", &unit),
                 ("Foreign", &unit),
                 ("Array", &nat),
+                ("Cell", &|ty: &Arc<Ty>, aliases: &Aliases| {
+                    record(ty, aliases, &[("region", &nat), ("element", &nat)])
+                }),
                 ("Function", &|ty: &Arc<Ty>, aliases: &Aliases| {
                     record(
                         ty,
@@ -1163,6 +1190,8 @@ pub enum Node {
     Bool,
     ForeignValue,
     Array(u32),
+    /// A cell: its region identity and invariant element type, with no reflective reads.
+    Cell([u32; 2]),
     /// Authentic evidence of the type at the index: a mirror.
     Mirror(u32),
     /// `hide 'a => T`, binding a variable over the body at the index.
@@ -1307,6 +1336,10 @@ impl Descriptor {
                     Node::HiddenBound(depth as u32)
                 }
                 "array" => Node::Array(child(edge("element").expect("array graph edge"))),
+                "mut" if !native => Node::Cell([
+                    child(edge("region").expect("cell region")),
+                    child(edge("element").expect("cell element")),
+                ]),
                 "arrow" => {
                     let effects = &graph[edge("effects").expect("arrow effect graph edge")];
                     if effects.0 != "effects" {
@@ -1489,7 +1522,7 @@ impl Descriptor {
                     vec![*index]
                 }
                 Node::Arrow(indices) => indices.to_vec(),
-                Node::Extend(indices) => indices.to_vec(),
+                Node::Extend(indices) | Node::Cell(indices) => indices.to_vec(),
                 Node::Effects(effects) => effects
                     .iter()
                     .flat_map(|effect| {

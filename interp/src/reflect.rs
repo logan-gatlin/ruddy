@@ -174,6 +174,13 @@ fn describe(domains: Domains, of: &Rc<Type>) -> Value {
             Node::Bool => Value::sum("Bool", None),
             Node::ForeignValue => Value::sum("Foreign", None),
             Node::Array(child) => Value::sum("Array", Some(Value::Nat(u64::from(*child)))),
+            Node::Cell([region, element]) => Value::sum(
+                "Cell",
+                Some(Value::record(vec![
+                    ("region", Value::Nat(u64::from(*region))),
+                    ("element", Value::Nat(u64::from(*element))),
+                ])),
+            ),
             Node::Arrow(arrow) => Value::sum(
                 "Function",
                 Some(Value::record(vec![
@@ -230,7 +237,7 @@ fn shape(domains: Domains, of: &Rc<Type>) -> Result<Value, String> {
         Node::String => typed("String"),
         Node::Bool => typed("Bool"),
         Node::Fixed(kind) => typed(kind.name()),
-        Node::ForeignValue => Value::sum("Foreign", None),
+        Node::ForeignValue | Node::Cell(_) => Value::sum("Foreign", None),
         Node::Array(element) => Value::sum(
             "Array",
             Some(Value::record(vec![

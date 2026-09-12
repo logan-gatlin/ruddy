@@ -451,6 +451,7 @@ impl fmt::Display for Ast<'_, ExprKind> {
             ),
             ExprKind::Binary { op, left, right } => {
                 let (symbol, prec) = match op {
+                    ruddy::parse::BinaryOp::Compare(op) => (op.symbol(), Prec::Comparison),
                     ruddy::parse::BinaryOp::Write => (":=", Prec::Assignment),
                     ruddy::parse::BinaryOp::Add => ("+", Prec::Addition),
                     ruddy::parse::BinaryOp::Sub => ("-", Prec::Addition),

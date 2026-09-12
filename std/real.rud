@@ -65,7 +65,8 @@ let tau: Real = 2 * pi
 let degrees_to_radians: Real -> Real = fn degrees => degrees * (pi / 180)
 let radians_to_degrees: Real -> Real = fn radians => radians * (180 / pi)
 
-let compare: order::Ordering Real = fn left right =>
+@doc "A total ordering for sorting: NaNs compare equal and last, and negative zero precedes positive zero."
+let total_compare: order::Ordering Real = fn left right =>
   if ordering_equal left right then #Equal
   else if is_nan left then #Greater
   else if is_nan right then #Less
@@ -75,6 +76,14 @@ let compare: order::Ordering Real = fn left right =>
   else #Greater
   end
 
+@doc "Numeric comparison: any NaN operand is unordered, and negative and positive zero compare equal."
+let compare: order::PartialOrdering Real = fn left right =>
+  if is_nan left or is_nan right then #Unordered
+  else if ordering_less_than left right then #Less
+  else if ordering_greater_than left right then #Greater
+  else #Equal
+  end
+
 let {
   equal,
   not_equal,
@@ -82,4 +91,4 @@ let {
   less_than_or_equal,
   greater_than,
   greater_than_or_equal,
-} = order::derive compare
+} = order::derive_partial compare

@@ -14,6 +14,7 @@ type Node =
   | #Foreign
   | #Fixed Domain
   | #Array Nat
+  | #Cell { region: Nat, element: Nat }
   | #Function { argument: Nat, result: Nat, effects: [Field] }
   | #Effects [Field]
   | #Record [Field]
@@ -48,7 +49,7 @@ let same: Mirror 'a -> Mirror 'b -> Option { forward: 'a -> 'b, backward: 'b -> 
 @doc "Whether a record field is always there. A mirror describes one exact type, whose fields are all required; the case is kept so a reader written against views handles absence as well."
 type Presence = #Required | #Optional
 
-@doc "The outermost structure of a mirrored type, as views whose operations read and make values of that type. Primitive cases carry the typed conversions; the descriptive cases carry the type's description and no way to make one."
+@doc "The outermost structure of a mirrored type, as views whose operations read and make values of that type. Cells use the opaque Foreign shape and expose no read or write operations. Primitive cases carry the typed conversions; the descriptive cases carry the type's description and no way to make one."
 type Shape 'a =
   | #Nat { read: 'a -> Nat, make: Nat -> 'a }
   | #Int { read: 'a -> Int, make: Int -> 'a }

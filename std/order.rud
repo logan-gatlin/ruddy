@@ -1,6 +1,10 @@
 type Order = #Less | #Equal | #Greater
 type Ordering 't = 't -> 't -> Order
 
+@doc "A comparison that may be unordered: neither equal, less, nor greater."
+type PartialOrder = #Less | #Equal | #Greater | #Unordered
+type PartialOrdering 't = 't -> 't -> PartialOrder
+
 type Comparisons 't = {
   equal: 't -> 't -> Bool,
   not_equal: 't -> 't -> Bool,
@@ -34,6 +38,36 @@ let derive: Ordering 't -> Comparisons 't = fn ordering => {
   greater_than_or_equal: fn left right => match ordering left right with
   | #Less => false
   | _ => true
+  end,
+}
+
+@doc "Derive six comparisons. Unordered operands satisfy only `not_equal`; the non-strict comparisons are not negations of the strict ones."
+let derive_partial: PartialOrdering 't -> Comparisons 't = fn ordering => {
+  equal: fn left right => match ordering left right with
+  | #Equal => true
+  | _ => false
+  end,
+  not_equal: fn left right => match ordering left right with
+  | #Equal => false
+  | _ => true
+  end,
+  less_than: fn left right => match ordering left right with
+  | #Less => true
+  | _ => false
+  end,
+  less_than_or_equal: fn left right => match ordering left right with
+  | #Less => true
+  | #Equal => true
+  | _ => false
+  end,
+  greater_than: fn left right => match ordering left right with
+  | #Greater => true
+  | _ => false
+  end,
+  greater_than_or_equal: fn left right => match ordering left right with
+  | #Greater => true
+  | #Equal => true
+  | _ => false
   end,
 }
 
@@ -92,3 +126,119 @@ let max_by: ('a -> 'a -> Order + ..'effects) -> 'a -> 'a -> 'a + ..'effects =
   | #Less => right
   | _ => left
   end
+
+@private
+let partial: Order -> PartialOrder = fn value => match value with
+| #Less => #Less
+| #Equal => #Equal
+| #Greater => #Greater
+end
+
+@private
+let compare_elements: Mirror 'a -> ['a] -> ['a] -> Nat -> PartialOrder =
+  fn mirror left right index => match (array::get left index, array::get right index) with
+  | (#None, #None) => #Equal
+  | (#None, #Some _) => #Less
+  | (#Some _, #None) => #Greater
+  | (#Some a, #Some b) =>
+    match compare_with mirror a b with
+    | #Equal => compare_elements mirror left right (nat::add index 1n)
+    | #Less => #Less
+    | #Greater => #Greater
+    | #Unordered => #Unordered
+    end
+  end
+
+@private
+let field_name: reflect::SomeField 'a -> String = fn field => match field with
+| hide 'f { name, .. } => name
+end
+
+@private
+let compare_fields: [reflect::SomeField 'a] -> PartialOrdering 'a = fn fields left right =>
+  match fields with
+  | [] => #Equal
+  | [field, ..tail] =>
+    match field with
+    | hide 'f { mirror, read, .. } =>
+      match (read left, read right) with
+      | (#Some a, #Some b) =>
+        match compare_with mirror a b with
+        | #Equal => compare_fields tail left right
+        | #Less => #Less
+        | #Greater => #Greater
+        | #Unordered => #Unordered
+        end
+      | _ => #Unordered
+      end
+    end
+  end
+
+@private
+let case_name: reflect::SomeCase 'a -> String = fn case => match case with
+| hide 'p { name, .. } => name
+end
+
+@private
+let compare_cases: [reflect::SomeCase 'a] -> PartialOrdering 'a = fn cases left right =>
+  match cases with
+  | [] => #Unordered
+  | [case, ..tail] =>
+    match case with
+    | hide 'p { mirror, project, .. } =>
+      match (project left, project right) with
+      | (#Some a, #Some b) => compare_with mirror a b
+      | (#Some _, #None) => #Less
+      | (#None, #Some _) => #Greater
+      | (#None, #None) => compare_cases tail left right
+      end
+    end
+  end
+
+@doc "Compare through an explicit mirror. Arrays are lexicographic; records and sums use alphabetical field and case names (case-sensitive Unicode scalar order). The first non-equal component decides, including unordered. Unsupported shapes are unordered, even against themselves."
+let compare_with: Mirror 'a -> PartialOrdering 'a = fn mirror left right =>
+  match reflect::shape mirror with
+  | #Nat { read, .. } => partial (nat::compare (read left) (read right))
+  | #Int { read, .. } => partial (int::compare (read left) (read right))
+  | #Real { read, .. } => real::compare (read left) (read right)
+  | #String { read, .. } => partial (str::compare (read left) (read right))
+  | #Bool { read, .. } => partial (boolean::compare (read left) (read right))
+  | #Nat8 { read, .. } => partial (nat::compare8 (read left) (read right))
+  | #Nat16 { read, .. } => partial (nat::compare16 (read left) (read right))
+  | #Nat32 { read, .. } => partial (nat::compare32 (read left) (read right))
+  | #Nat64 { read, .. } => partial (nat::compare64 (read left) (read right))
+  | #Int8 { read, .. } => partial (int::compare8 (read left) (read right))
+  | #Int16 { read, .. } => partial (int::compare16 (read left) (read right))
+  | #Int32 { read, .. } => partial (int::compare32 (read left) (read right))
+  | #Int64 { read, .. } => partial (int::compare64 (read left) (read right))
+  | #Array view =>
+    match view with
+    | hide 'e { element, read, .. } => compare_elements element (read left) (read right) 0n
+    end
+  | #Record view =>
+    compare_fields (array::sort_by (compare_by str::compare field_name) view.fields) left right
+  | #Sum view =>
+    compare_cases (array::sort_by (compare_by str::compare case_name) view.cases) left right
+  | _ => #Unordered
+  end
+
+@doc "Pure structural comparison at the operands' shared inferred type. NaNs and unsupported values are unordered. Opened existential types require mirror evidence, including when nested inside function types."
+let compare: PartialOrdering 'a = fn left right => compare_with (reflect::mirror ()) left right
+
+let equal: 'a -> 'a -> Bool = fn left right =>
+  (derive_partial compare).equal left right
+
+let not_equal: 'a -> 'a -> Bool = fn left right =>
+  (derive_partial compare).not_equal left right
+
+let less_than: 'a -> 'a -> Bool = fn left right =>
+  (derive_partial compare).less_than left right
+
+let less_than_or_equal: 'a -> 'a -> Bool = fn left right =>
+  (derive_partial compare).less_than_or_equal left right
+
+let greater_than: 'a -> 'a -> Bool = fn left right =>
+  (derive_partial compare).greater_than left right
+
+let greater_than_or_equal: 'a -> 'a -> Bool = fn left right =>
+  (derive_partial compare).greater_than_or_equal left right

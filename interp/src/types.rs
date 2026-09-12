@@ -80,6 +80,7 @@ fn shifted(node: &Node, offset: u32) -> Node {
                 })
                 .collect(),
         ),
+        Node::Cell(children) => Node::Cell(children.map(|child| child + offset)),
         Node::Extend(children) => Node::Extend(children.map(|child| child + offset)),
         Node::Struct(fields) => Node::Struct(
             fields
@@ -112,7 +113,7 @@ fn children(node: &Node) -> Vec<u32> {
             vec![*child]
         }
         Node::Arrow(children) => children.to_vec(),
-        Node::Extend(children) => children.to_vec(),
+        Node::Extend(children) | Node::Cell(children) => children.to_vec(),
         Node::Effects(effects) => effects
             .iter()
             .flat_map(|effect| std::iter::once(effect.payload).chain(effect.args.iter().copied()))
@@ -248,6 +249,8 @@ pub fn project(descriptor: &Value, path: &[Projection]) -> Result<Value, String>
         let node = current.nodes[index as usize].clone();
         let next = match (step, &node) {
             (Projection::Element, Node::Array(child)) => Some(*child),
+            (Projection::Element, Node::Cell(children)) => Some(children[1]),
+            (Projection::Region, Node::Cell(children)) => Some(children[0]),
             (Projection::Argument, Node::Arrow(children)) => Some(children[0]),
             (Projection::Result, Node::Arrow(children)) => Some(children[1]),
             (Projection::Field(name), Node::Struct(fields) | Node::Sum(fields)) => fields
@@ -402,7 +405,7 @@ pub fn same(left: &Type, right: &Type) -> bool {
                     work.extend(e.args.iter().copied().zip(f.args.iter().copied()));
                 }
             }
-            (Node::Extend(p), Node::Extend(q)) => {
+            (Node::Extend(p), Node::Extend(q)) | (Node::Cell(p), Node::Cell(q)) => {
                 work.extend(p.iter().copied().zip(q.iter().copied()));
             }
             (Node::Struct(p), Node::Struct(q)) | (Node::Sum(p), Node::Sum(q)) => {

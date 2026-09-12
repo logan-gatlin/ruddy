@@ -128,6 +128,7 @@ let check_node:
               (fn seen case => check_node description [#Case case.name, ..path] seen case.node)
               seen
               cases
+          | #Cell _ => unsupported path "a cell has no default codec"
           | #Function _ => unsupported path "a function has no default codec"
           | #Effects _ => unsupported path "an effect row has no default codec"
           | #Hidden _ => unsupported path "a hidden type has no default codec"

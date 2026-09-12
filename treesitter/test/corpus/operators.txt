@@ -57,3 +57,26 @@ let value = 1 + 2 |> f |> g
           (natural))
         (identifier))
       (identifier))))
+
+================================================================================
+Comparison operators bind between arithmetic and Boolean operators
+================================================================================
+
+let value = 1 + 2 <= 3 and 4 != 5
+let grouped = (1 == 2) == false
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (let_definition
+    (identifier)
+    (boolean_and
+      (comparison
+        (addition (natural) (natural))
+        (natural))
+      (comparison (natural) (natural))))
+  (let_definition
+    (identifier)
+    (comparison
+      (parenthesized_expression (comparison (natural) (natural)))
+      (boolean))))

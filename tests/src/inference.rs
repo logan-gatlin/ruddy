@@ -11620,7 +11620,7 @@ fn mirror_intrinsics_are_reviewed_by_their_signatures() {
 type Domain = { bits: Nat, signed: Bool, min: String, max: String }\n\
 type Field = { name: String, node: Nat }\n\
 type Node = #Nat Domain | #Int Domain | #Real | #String | #Bool | #Foreign\n\
-  | #Fixed Domain | #Array Nat\n\
+  | #Fixed Domain | #Array Nat | #Cell { region: Nat, element: Nat }\n\
   | #Function { argument: Nat, result: Nat, effects: [Field] }\n\
   | #Effects [Field] | #Record [Field] | #Sum [Field] | #Alias Nat\n\
   | #Extend { base: Nat, rest: Nat }\n\
@@ -11659,9 +11659,9 @@ type Node = #Nat Domain | #Int Domain | #Real | #String | #Bool | #Foreign\n\
         "extern describe: Mirror 'a -> { root: Nat, nodes: Node } = \"$describe\"",
         "extern describe: Mirror 'a -> { root: Nat, nodes: [Nat] } = \"$describe\"",
         "type Thin = #Nat Domain | #Record [Field]\nextern describe: Mirror 'a -> { root: Nat, nodes: [Thin] } = \"$describe\"",
-        "type Wide = #Nat Domain | #Int Domain | #Real | #String | #Bool | #Foreign | #Fixed Domain | #Array Nat | #Function { argument: Nat, result: Nat, effects: [Field] } | #Effects [Field] | #Record [Field] | #Sum [Field] | #Alias Nat | #Extend { base: Nat, rest: Nat } | #Parameter Nat | #Mirror Nat | #Hidden Nat | #Variable Nat | #Extra\nextern describe: Mirror 'a -> { root: Nat, nodes: [Wide] } = \"$describe\"",
-        "type Loose = #Nat Domain | #Int Domain | #Real | #String | #Bool | #Foreign | #Fixed Domain | #Array String | #Function { argument: Nat, result: Nat, effects: [Field] } | #Effects [Field] | #Record [Field] | #Sum [Field] | #Alias Nat | #Extend { base: Nat, rest: Nat } | #Parameter Nat | #Mirror Nat | #Hidden Nat | #Variable Nat\nextern describe: Mirror 'a -> { root: Nat, nodes: [Loose] } = \"$describe\"",
-        "type Half = { bits: Nat, signed: Bool }\ntype Short = #Nat Half | #Int Half | #Real | #String | #Bool | #Foreign | #Fixed Half | #Array Nat | #Function { argument: Nat, result: Nat, effects: [Field] } | #Effects [Field] | #Record [Field] | #Sum [Field] | #Alias Nat | #Extend { base: Nat, rest: Nat } | #Parameter Nat | #Mirror Nat | #Hidden Nat | #Variable Nat\nextern describe: Mirror 'a -> { root: Nat, nodes: [Short] } = \"$describe\"",
+        "type Wide = #Nat Domain | #Int Domain | #Real | #String | #Bool | #Foreign | #Fixed Domain | #Array Nat | #Cell { region: Nat, element: Nat } | #Function { argument: Nat, result: Nat, effects: [Field] } | #Effects [Field] | #Record [Field] | #Sum [Field] | #Alias Nat | #Extend { base: Nat, rest: Nat } | #Parameter Nat | #Mirror Nat | #Hidden Nat | #Variable Nat | #Extra\nextern describe: Mirror 'a -> { root: Nat, nodes: [Wide] } = \"$describe\"",
+        "type Loose = #Nat Domain | #Int Domain | #Real | #String | #Bool | #Foreign | #Fixed Domain | #Array String | #Cell { region: Nat, element: Nat } | #Function { argument: Nat, result: Nat, effects: [Field] } | #Effects [Field] | #Record [Field] | #Sum [Field] | #Alias Nat | #Extend { base: Nat, rest: Nat } | #Parameter Nat | #Mirror Nat | #Hidden Nat | #Variable Nat\nextern describe: Mirror 'a -> { root: Nat, nodes: [Loose] } = \"$describe\"",
+        "type Half = { bits: Nat, signed: Bool }\ntype Short = #Nat Half | #Int Half | #Real | #String | #Bool | #Foreign | #Fixed Half | #Array Nat | #Cell { region: Nat, element: Nat } | #Function { argument: Nat, result: Nat, effects: [Field] } | #Effects [Field] | #Record [Field] | #Sum [Field] | #Alias Nat | #Extend { base: Nat, rest: Nat } | #Parameter Nat | #Mirror Nat | #Hidden Nat | #Variable Nat\nextern describe: Mirror 'a -> { root: Nat, nodes: [Short] } = \"$describe\"",
         "extern same: Nat -> Option { forward: 'a -> 'b, backward: 'b -> 'a } = \"$sameMirror\"",
         "extern same: (Nat, Mirror 'b) -> Option { forward: 'a -> 'b, backward: 'b -> 'a } = \"$sameMirror\"",
         "extern same: (Mirror Nat, Mirror 'b) -> Option { forward: 'a -> 'b, backward: 'b -> 'a } = \"$sameMirror\"",
@@ -11737,6 +11737,7 @@ type Node =\n\
   | #Foreign\n\
   | #Fixed Domain\n\
   | #Array Nat\n\
+  | #Cell { region: Nat, element: Nat }\n\
   | #Function { argument: Nat, result: Nat, effects: [Field] }\n\
   | #Effects [Field]\n\
   | #Record [Field]\n\

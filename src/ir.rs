@@ -12442,8 +12442,50 @@ impl Builder<'_> {
                 value: Box::new(self.term(*value)),
             }
             .at(self.anchor(span)),
+            ExprKind::Binary {
+                op: parse::BinaryOp::Compare(op),
+                left,
+                right,
+            } => {
+                let root = if self.mint.bundle().name() == "std" {
+                    Some(None)
+                } else {
+                    self.dependencies.get("std").copied().map(Some)
+                };
+                let symbol = root
+                    .and_then(|root| self.modules.get(&(root, "order".to_owned())))
+                    .and_then(|&(module, _)| {
+                        self.global_in(Some(module), Namespace::Terms, op.function())
+                    });
+                let Some(symbol) = symbol else {
+                    self.error(
+                        span,
+                        ErrorKind::Using {
+                            message: format!(
+                                "comparison operators require `std::order::{}`",
+                                op.function()
+                            ),
+                        },
+                    );
+                    return TermKind::Error.at(self.anchor(span));
+                };
+                let func = TermKind::Ident(symbol).at(self.anchor(span));
+                let left = self.term(*left);
+                let right = self.term(*right);
+                let func = TermKind::Apply {
+                    func: Box::new(func),
+                    arg: Box::new(left),
+                }
+                .at(self.anchor(span));
+                TermKind::Apply {
+                    func: Box::new(func),
+                    arg: Box::new(right),
+                }
+                .at(self.anchor(span))
+            }
             ExprKind::Binary { op, left, right } => TermKind::Binary {
                 op: match op {
+                    parse::BinaryOp::Compare(_) => unreachable!("comparisons lower to calls"),
                     parse::BinaryOp::Write => {
                         self.mutation_symbol();
                         BinaryOp::Write

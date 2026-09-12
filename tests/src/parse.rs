@@ -4088,3 +4088,27 @@ fn a_hidden_pattern_opens_onto_the_pattern_after_its_variable() {
     let out = parse(lex("let v = f hide", FileID::GENERATED).tokens);
     assert!(!out.errors.is_empty());
 }
+
+#[test]
+fn comparisons_bind_between_arithmetic_and_boolean_operators() {
+    assert_eq!(
+        parse_one("let result = a + b < c and d >= e or f != g"),
+        "let result = a + b < c and d >= e or f != g"
+    );
+    assert_eq!(
+        parse_one("let result = (a == b) == c"),
+        "let result = (a == b) == c"
+    );
+    assert_eq!(
+        parse_one("let result = a == (b == c)"),
+        "let result = a == (b == c)"
+    );
+    for op in ["==", "!=", "<", "<=", ">", ">="] {
+        let source = format!("let result = a {op} b {op} c");
+        let out = parse(lex(&source, FileID::GENERATED).tokens);
+        assert!(
+            !out.errors.is_empty(),
+            "accepted comparison chain: {source}"
+        );
+    }
+}

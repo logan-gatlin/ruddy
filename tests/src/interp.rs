@@ -269,6 +269,7 @@ let kind: std::reflect::Node -> String = fn node => match node with
 | #Foreign => "Foreign"
 | #Fixed _ => "Fixed"
 | #Array _ => "Array"
+| #Cell _ => "Cell"
 | #Function _ => "Function"
 | #Effects _ => "Effects"
 | #Record _ => "Record"
@@ -1358,4 +1359,334 @@ fn a_program_that_is_not_linked_is_refused() {
             .to_string(),
         "the interpreter requires a linked artifact"
     );
+}
+
+#[test]
+fn real_partial_comparisons_make_nan_unordered_and_signed_zeros_equal() {
+    let (node, interpreted) = both(
+        r#"
+let nan = 0 / 0
+let nan_equal = std::real::equal nan nan
+let nan_unequal = std::real::not_equal nan nan
+let nan_less = std::real::less_than nan 1
+let nan_less_equal = std::real::less_than_or_equal nan nan
+let nan_greater = std::real::greater_than 1 nan
+let nan_greater_equal = std::real::greater_than_or_equal nan nan
+let zeros_equal = std::real::equal -0.0 0.0
+"#,
+        &[
+            "nan_equal",
+            "nan_unequal",
+            "nan_less",
+            "nan_less_equal",
+            "nan_greater",
+            "nan_greater_equal",
+            "zeros_equal",
+        ],
+        None,
+    );
+    let expected = ["false", "true", "false", "false", "false", "false", "true"];
+    assert_eq!(node, expected);
+    assert_eq!(interpreted, expected);
+}
+
+#[test]
+fn comparison_operators_use_reflection_through_polymorphic_functions() {
+    let (node, interpreted) = both(
+        r#"
+@private
+let equal: 'a -> 'a -> Bool = fn left right => left == right
+@private
+let less: 'a -> 'a -> Bool = fn left right => left < right
+let natural = equal 3n 3n
+let integer = less -2i 1i
+let real = 1 + 2 <= 3 and 4 > 3 and 4 >= 4
+let boolean = false < true
+let text = "a" != "b"
+let unicode = "" < "𐀀"
+let unit = () == ()
+let nan = 0 / 0
+let unordered = [nan == nan, nan != nan, nan < nan, nan <= nan, nan > nan, nan >= nan]
+let zeros = -0.0 == 0.0
+let fixed = [1n8 < 2n8, 1n16 < 2n16, 1n32 < 2n32, 1n64 < 2n64, -1i8 < 0i8, -1i16 < 0i16, -1i32 < 0i32, -1i64 < 0i64]
+"#,
+        &[
+            "natural",
+            "integer",
+            "real",
+            "boolean",
+            "text",
+            "unicode",
+            "unit",
+            "unordered",
+            "zeros",
+            "fixed",
+        ],
+        None,
+    );
+    let expected = [
+        "true",
+        "true",
+        "true",
+        "true",
+        "true",
+        "true",
+        "true",
+        "[false,true,false,false,false,false]",
+        "true",
+        "[true,true,true,true,true,true,true,true]",
+    ];
+    assert_eq!(node, expected);
+    assert_eq!(interpreted, expected);
+}
+
+#[test]
+fn structural_comparisons_are_alphabetical_lexicographic_and_partial() {
+    let (node, interpreted) = both(
+        r#"
+let record = { z: 0n, a: 2n } > { a: 1n, z: 99n }
+let reordered = { z: 0n, a: 2n } == { a: 2n, z: 0n }
+let a: #A | #B = #A
+let b: #A | #B = #B
+let cases = [a == b, a < b, b > a]
+let p: #Some [Nat] = #Some [1n, 2n]
+let q: #Some [Nat] = #Some [1n, 3n]
+let payload = p < q
+let empty: [Nat] = []
+let arrays = [[1n, 2n] < [1n, 3n], [1n] < [1n, 0n], [1n, 0n] > [1n], empty == empty]
+type Tree = #Leaf Nat | #Branch [Tree]
+let left: Tree = #Branch [#Leaf 1n, #Branch [#Leaf 2n]]
+let right: Tree = #Branch [#Leaf 1n, #Branch [#Leaf 3n]]
+let recursive = [left < right, left == left]
+let f: Nat -> Nat = fn n => n
+let functions = [f == f, f != f, f < f, f <= f, f > f, f >= f]
+let earlier = { z: f, a: 1n } < { a: 2n, z: f }
+let blocked = { a: f, z: 1n } < { z: 2n, a: f }
+let nan = 0 / 0
+let nested_nan = [[nan] == [nan], [nan] != [nan], [nan] <= [nan], [0, nan] < [1, nan]]
+@private
+let mirror: Mirror Nat = std::reflect::mirror ()
+let mirrors = mirror != mirror
+type Boxed = hide 'a => 'a
+@private
+let boxed: Boxed = 1n
+let hidden = boxed != boxed
+let direct = match std::order::compare left right with | #Less => true | _ => false end
+let explicit = match std::order::compare_with (std::reflect::type_of right) right left with | #Greater => true | _ => false end
+"#,
+        &[
+            "record",
+            "reordered",
+            "cases",
+            "payload",
+            "arrays",
+            "recursive",
+            "functions",
+            "earlier",
+            "blocked",
+            "nested_nan",
+            "mirrors",
+            "hidden",
+            "direct",
+            "explicit",
+        ],
+        None,
+    );
+    let expected = [
+        "true",
+        "true",
+        "[false,true,true]",
+        "true",
+        "[true,true,true,true]",
+        "[true,true]",
+        "[false,true,false,false,false,false]",
+        "true",
+        "false",
+        "[false,true,false,true]",
+        "true",
+        "true",
+        "true",
+        "true",
+    ];
+    assert_eq!(node, expected);
+    assert_eq!(interpreted, expected);
+}
+
+#[test]
+fn comparisons_instantiate_unconstrained_rows_without_changing_generic_contracts() {
+    let (node, interpreted) = both(
+        r#"
+@private
+let eq: 'a -> 'a -> Bool = fn a b => a == b
+let cases = [#A == #B, #A < #B, #B > #A, eq (#A) (#B)]
+let bound_cases = do
+  let a = #A
+  let b = #B
+  return a == b
+end
+let bound_empty = do
+  let a = []
+  return a == a
+end
+let empty = [] == []
+let payload = #Some [1n, 2n] < #Some [1n, 3n]
+let functions = (fn x => x) == (fn x => x)
+@private
+let identity = fn x => x
+let same_function = identity == identity
+let local = do
+  let same = fn a b => a == b
+  return [same 1n 1n, same "a" "b", same (#A) (#B)]
+end
+"#,
+        &[
+            "cases",
+            "bound_cases",
+            "bound_empty",
+            "empty",
+            "payload",
+            "functions",
+            "same_function",
+            "local",
+        ],
+        None,
+    );
+    let expected = [
+        "[false,true,true,false]",
+        "false",
+        "true",
+        "true",
+        "true",
+        "false",
+        "false",
+        "[true,false,false]",
+    ];
+    assert_eq!(node, expected);
+    assert_eq!(interpreted, expected);
+}
+
+#[test]
+fn comparisons_evaluate_operands_once_and_leave_opaque_values_unordered() {
+    let (node, interpreted) = both(
+        r#"
+@private
+let effects_run = fn _ => do
+  let count = mut 0n
+  let next = fn _ => do
+    _ = count := std::nat::add (~count) 1n
+    return ~count
+  end
+  let ordered = next () < next ()
+  return (ordered, ~count)
+end
+let effects = effects_run ()
+@private
+let cells_run = fn _ => do
+  let cell = mut 1n
+  return [cell == cell, cell != cell, cell < cell, cell <= cell, cell > cell, cell >= cell]
+end
+let cells = cells_run ()
+@private
+let effectful_functions_run = fn _ => do
+  let cell = mut 1n
+  let read = fn _ => ~cell
+  return [read == read, read != read, read < read]
+end
+let effectful_functions = effectful_functions_run ()
+let foreign = match std::ffi::encode 1n with
+| #Some value => [value == value, value != value, value <= value]
+| #Error _ => []
+end
+"#,
+        &["effects", "cells", "effectful_functions", "foreign"],
+        None,
+    );
+    let expected = [
+        r#"{"0":true,"1":2}"#,
+        "[false,true,false,false,false,false]",
+        "[false,true,false]",
+        "[false,true,false]",
+    ];
+    assert_eq!(node, expected);
+    assert_eq!(interpreted, expected);
+}
+
+#[test]
+fn comparison_diagnostics_require_a_shared_type_and_standard_library() {
+    let mixed = project("let result = 1n == \"one\"", true, None, false);
+    let error = ruddy_cli::check_project(mixed.path())
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("type-mismatch"), "{error}");
+    let missing = project("let result = 1n == 1n", false, None, false);
+    let error = ruddy_cli::check_project(missing.path())
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("comparison operators require `std::order::equal`"),
+        "{error}"
+    );
+}
+
+#[test]
+fn cell_comparison_descriptors_preserve_identity_without_exposing_reads() {
+    let (node, interpreted) = both(
+        r#"
+@private
+let compare_cell: mut 'r 'a -> Bool = fn cell => cell == cell
+@private
+let run = fn _ => do
+  let numbers = mut 1n
+  let words = mut "one"
+  let mirror = std::reflect::type_of numbers
+  let same = match std::reflect::same mirror mirror with | #Some _ => true | #None => false end
+  let different = match std::reflect::same mirror (std::reflect::type_of words) with | #Some _ => false | #None => true end
+  let opaque = match std::reflect::shape mirror with | #Foreign => true | _ => false end
+  let description = std::reflect::describe mirror
+  let described = match std::array::get description.nodes description.root with | #Some (#Cell _) => true | _ => false end
+  return [same, different, opaque, described, compare_cell numbers, [numbers] != [numbers], { a: 1n, z: numbers } < { a: 2n, z: numbers }]
+end
+let result = run ()
+"#,
+        &["result"],
+        None,
+    );
+    let expected = ["[true,true,true,true,false,true,true]"];
+    assert_eq!(node, expected);
+    assert_eq!(interpreted, expected);
+}
+
+#[test]
+fn comparisons_of_opened_existentials_require_their_mirrors() {
+    for expression in ["x == x", "(fn _ => x) == (fn _ => x)"] {
+        let source = format!(
+            "type Boxed = hide 'a => 'a\n@private\nlet boxed: Boxed = 1n\nlet result = match boxed with\n| hide 'a x => {expression}\nend"
+        );
+        let missing = project(&source, true, None, false);
+        let error = ruddy_cli::check_project(missing.path())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("runtime-type-information"), "{error}");
+    }
+    let (node, interpreted) = both(
+        r#"
+type Boxed = hide 'a => { mirror: Mirror 'a, value: 'a }
+@private
+let boxed: Boxed = { mirror: std::reflect::mirror (), value: 1n }
+@private
+let eq = fn left right => left == right
+let result = match boxed with
+| hide 'a { mirror, value } => [
+  value == value,
+  eq value value,
+  (fn _ => value) == (fn _ => value),
+  match std::order::compare_with mirror value value with | #Equal => true | _ => false end,
+]
+end
+"#,
+        &["result"],
+        None,
+    );
+    assert_eq!(node, ["[true,true,false,true]"]);
+    assert_eq!(interpreted, node);
 }
