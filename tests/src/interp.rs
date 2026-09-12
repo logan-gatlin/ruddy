@@ -1362,6 +1362,530 @@ fn a_program_that_is_not_linked_is_refused() {
 }
 
 #[test]
+fn persistent_map_insert_lookup_and_remove_preserve_old_versions() {
+    let (node, interpreted) = both(
+        r#"
+@private
+let initial: std::map::Map String Nat = std::map::empty ()
+@private
+let first = std::map::insert "a" 1n initial
+@private
+let second = std::map::insert "b" 2n first
+@private
+let replaced = std::map::insert "a" 3n second
+@private
+let removed = std::map::remove "a" replaced
+let sizes = [std::map::len initial, std::map::len first, std::map::len second, std::map::len replaced, std::map::len removed]
+let before = std::map::get "a" first == #Some 1n
+let after = std::map::get "a" replaced == #Some 3n
+let kept = std::map::get "b" removed == #Some 2n
+let absent = std::map::get "a" removed == #None
+let missing = std::map::try_get "missing" removed == #Some #None
+let unchanged = std::map::len (std::map::remove "missing" removed) == 1n
+let empty = std::map::is_empty initial and not std::map::contains "a" initial
+"#,
+        &[
+            "sizes",
+            "before",
+            "after",
+            "kept",
+            "absent",
+            "missing",
+            "unchanged",
+            "empty",
+        ],
+        None,
+    );
+    assert_eq!(
+        node,
+        [
+            "[0,1,2,2,1]",
+            "true",
+            "true",
+            "true",
+            "true",
+            "true",
+            "true",
+            "true"
+        ]
+    );
+    assert_eq!(interpreted, node);
+}
+
+#[test]
+fn persistent_map_forgiving_and_strict_operations_agree_on_invalid_keys() {
+    let (node, interpreted) = both(
+        r#"
+@private
+let nan = 0 / 0
+@private
+let entries = [(1.0, "one"), (nan, "bad"), (2.0, "two"), (1.0, "last")]
+@private
+let map = std::map::from_array entries
+let retained = std::map::len map == 2n and std::map::get 1.0 map == #Some "last" and std::map::get 2.0 map == #Some "two"
+let absent = std::map::get nan map == #None and not std::map::contains nan map
+let unchanged = std::map::len (std::map::insert nan "bad" map) == 2n and std::map::len (std::map::remove nan map) == 2n
+let strict = [
+  std::result::is_error (std::map::try_get nan map),
+  std::result::is_error (std::map::try_contains nan map),
+  std::result::is_error (std::map::try_insert nan "bad" map),
+  std::result::is_error (std::map::try_remove nan map),
+]
+let path = match std::map::try_from_array [({ point: 0.0 }, 1n), ({ point: nan }, 2n)] with
+| #Error { path: [#Index 1n, #Field "point"], kind: #NaN } => true
+| _ => false
+end
+let valid = match std::map::try_from_array [(1n, 2n), (1n, 3n)] with
+| #Some result => std::map::get 1n result == #Some 3n and std::map::len result == 1n
+| #Error _ => false
+end
+@private
+let option_map: std::map::Map String (Option Nat) = std::map::insert "present" (#None) (std::map::empty ())
+let option = std::map::try_get "present" option_map == #Some (#Some (#None))
+@private
+let callback: Nat -> Nat = fn value => std::nat::add value 1n
+@private
+let functions = std::map::insert "callback" callback (std::map::empty ())
+let value = match std::map::get "callback" functions with | #Some f => f 4n == 5n | #None => false end
+"#,
+        &[
+            "retained",
+            "absent",
+            "unchanged",
+            "strict",
+            "path",
+            "valid",
+            "option",
+            "value",
+        ],
+        None,
+    );
+    assert_eq!(
+        node,
+        [
+            "true",
+            "true",
+            "true",
+            "[true,true,true,true]",
+            "true",
+            "true",
+            "true",
+            "true"
+        ]
+    );
+    assert_eq!(interpreted, node);
+}
+
+#[test]
+fn persistent_map_traversal_transforms_and_equality_use_contents() {
+    let (node, interpreted) = both(
+        r#"
+@private
+let original = std::map::from_array [(928n, 1n), (1089n, 2n), (1180n, 3n), (7n, 4n)]
+@private
+let reordered = std::map::from_array [(7n, 4n), (1180n, 3n), (1089n, 2n), (928n, 1n)]
+let equal = std::map::equal_by std::nat::equal original reordered
+let different = not std::map::equal_by std::nat::equal original (std::map::insert 928n 9n reordered)
+let keys = std::array::sort_by std::nat::compare (std::map::keys original)
+let values = std::array::sort_by std::nat::compare (std::map::values original)
+let roundtrip = std::map::equal_by std::nat::equal original (std::map::from_array (std::map::to_array original))
+@private
+let run = fn _ => do
+  let calls = mut 0n
+  let changed = std::map::map_values (fn value => do
+    _ = calls := std::nat::add (~calls) 1n
+    return std::str::from_nat value
+  end) original
+  let total = std::map::fold (fn total key value => do
+    _ = calls := std::nat::add (~calls) 1n
+    return std::nat::add total value
+  end) 0n original
+  return [~calls == 8n, total == 10n, std::map::get 1180n changed == #Some "3"]
+end
+let effects = run ()
+@private
+let pruned = std::map::remove 7n (std::map::remove 928n original)
+let pruning = std::map::get 1089n pruned == #Some 2n and std::map::get 1180n pruned == #Some 3n
+let emptied = std::map::is_empty (std::map::remove 1180n (std::map::remove 1089n pruned))
+"#,
+        &[
+            "equal",
+            "different",
+            "keys",
+            "values",
+            "roundtrip",
+            "effects",
+            "pruning",
+            "emptied",
+        ],
+        None,
+    );
+    assert_eq!(
+        node,
+        [
+            "true",
+            "true",
+            "[7,928,1089,1180]",
+            "[1,2,3,4]",
+            "true",
+            "[true,true,true]",
+            "true",
+            "true"
+        ]
+    );
+    assert_eq!(interpreted, node);
+}
+
+#[test]
+fn persistent_set_operations_preserve_versions_and_offer_strict_errors() {
+    let (node, interpreted) = both(
+        r#"
+@private
+let nan = 0 / 0
+@private
+let left = std::set::from_array [1.0, 2.0, nan, 2.0, -0.0, 0.0]
+@private
+let right = std::set::from_array [2.0, 3.0]
+let sizes = [std::set::len left, std::set::len (std::set::insert 2.0 left), std::set::len (std::set::insert nan left), std::set::len (std::set::remove nan left)]
+let absent = not std::set::contains nan left and not std::set::contains 3.0 left
+let removed = not std::set::contains 1.0 (std::set::remove 1.0 left) and std::set::contains 1.0 left
+let strict = [
+  std::result::is_error (std::set::try_contains nan left),
+  std::result::is_error (std::set::try_insert nan left),
+  std::result::is_error (std::set::try_remove nan left),
+  std::set::try_contains 3.0 left == #Some false,
+]
+let path = match std::set::try_from_array [{ point: 0.0 }, { point: nan }] with
+| #Error { path: [#Index 1n, #Field "point"], kind: #NaN } => true
+| _ => false
+end
+let valid = match std::set::try_from_array [1n, 1n, 2n] with
+| #Some set => std::set::len set == 2n
+| #Error _ => false
+end
+let union = std::set::equal (std::set::union left right) (std::set::from_array [3.0, 2.0, 1.0, 0.0])
+let intersection = std::set::equal (std::set::intersection left right) (std::set::from_array [2.0])
+let difference = std::set::equal (std::set::difference left right) (std::set::from_array [1.0, 0.0])
+let subset = std::set::is_subset (std::set::from_array [2.0]) left and not std::set::is_subset right left
+let empty = std::set::is_empty (std::set::difference left left)
+let array = std::array::sort_by std::real::total_compare (std::set::to_array right)
+let folded = std::set::fold (fn total value => total + value) 0.0 right == 5.0
+"#,
+        &[
+            "sizes",
+            "absent",
+            "removed",
+            "strict",
+            "path",
+            "valid",
+            "union",
+            "intersection",
+            "difference",
+            "subset",
+            "empty",
+            "array",
+            "folded",
+        ],
+        None,
+    );
+    assert_eq!(
+        node,
+        [
+            "[3,3,3,3]",
+            "true",
+            "true",
+            "[true,true,true,true]",
+            "true",
+            "true",
+            "true",
+            "true",
+            "true",
+            "true",
+            "true",
+            "[2,3]",
+            "true"
+        ]
+    );
+    assert_eq!(interpreted, node);
+}
+
+#[test]
+fn persistent_map_mixed_updates_match_a_reference_map() {
+    let mut model = std::collections::BTreeMap::new();
+    for key in 0u64..32 {
+        model.insert(key, key + 1);
+    }
+    // Exercise occupied and empty bitmap slots, replacement, deletion, and
+    // reinsertion while retaining the original collection as a snapshot.
+    for step in 0u64..64 {
+        let key = (step * 73 + 19) % 48;
+        if step % 3 == 0 {
+            model.remove(&key);
+        } else {
+            model.insert(key, step);
+        }
+    }
+    let source = r#"
+@private
+let range: Nat -> [Nat] = fn count =>
+  if std::nat::is_zero count then []
+  else [..range (std::nat::subtract count 1n), std::nat::subtract count 1n]
+  end
+@private
+let original = std::map::from_array (std::array::map (fn key => (key, std::nat::add key 1n)) (range 32n))
+@private
+let updated = std::array::fold (fn map step => do
+  let key = std::nat::remainder (std::nat::add (std::nat::multiply step 73n) 19n) 48n
+  return if std::nat::is_zero (std::nat::remainder step 3n) then std::map::remove key map
+  else std::map::insert key step map
+  end
+end) original (range 64n)
+let keys = std::array::sort_by std::nat::compare (std::map::keys updated)
+let values = std::array::map (fn key => std::option::unwrap_or 999n (std::map::get key updated)) keys
+let size = std::map::len updated
+let snapshot = std::map::len original == 32n and std::map::get 19n original == #Some 20n
+let cleared = std::map::is_empty (std::array::fold (fn map key => std::map::remove key map) updated keys)
+"#;
+    let (node, interpreted) = both(
+        source,
+        &["keys", "values", "size", "snapshot", "cleared"],
+        Some(32),
+    );
+    assert_eq!(
+        node,
+        [
+            serde_json::to_string(&model.keys().collect::<Vec<_>>()).unwrap(),
+            serde_json::to_string(&model.values().collect::<Vec<_>>()).unwrap(),
+            model.len().to_string(),
+            "true".to_owned(),
+            "true".to_owned(),
+        ]
+    );
+    assert_eq!(interpreted, node);
+}
+
+#[test]
+fn persistent_collections_resolve_full_hash_collisions_by_key_equality() {
+    let fixture: serde_json::Value =
+        serde_json::from_str(include_str!("../fixtures/hamt-collision.json")).unwrap();
+    let source = format!(
+        r#"
+@private
+let a = {left}
+@private
+let b = {right}
+let collision = a != b and std::hash::hash a == #Some {hash}n64 and std::hash::hash b == #Some {hash}n64
+@private
+let original = std::map::from_array [(a, 1n), (b, 2n)]
+@private
+let reversed = std::map::from_array [(b, 2n), (a, 1n)]
+@private
+let updated = std::map::insert b 3n original
+@private
+let removed_a = std::map::remove a updated
+@private
+let removed_b = std::map::remove b updated
+let lookup = std::map::get a original == #Some 1n and std::map::get b original == #Some 2n and std::map::len original == 2n
+let replaced = std::map::get b updated == #Some 3n and std::map::len updated == 2n
+let removal = std::map::get a removed_a == #None and std::map::get b removed_a == #Some 3n and std::map::get a removed_b == #Some 1n and std::map::get b removed_b == #None
+let equal = std::map::equal_by std::nat::equal original reversed
+@private
+let mixed = std::map::insert "other" 4n original
+let branch = std::map::get b (std::map::remove "other" mixed) == #Some 2n
+let sets = std::set::equal (std::set::union (std::set::from_array [a]) (std::set::from_array [b])) (std::set::from_array [b, a])
+let difference = std::set::equal (std::set::difference (std::set::from_array [a, b]) (std::set::from_array [a])) (std::set::from_array [b])
+"#,
+        left = fixture["left"],
+        right = fixture["right"],
+        hash = fixture["hash"].as_str().unwrap(),
+    );
+    let (node, interpreted) = both(
+        &source,
+        &[
+            "collision",
+            "lookup",
+            "replaced",
+            "removal",
+            "equal",
+            "branch",
+            "sets",
+            "difference",
+        ],
+        None,
+    );
+    assert_eq!(node, ["true"; 8]);
+    assert_eq!(interpreted, node);
+}
+
+#[test]
+fn structural_hashing_is_pure_seeded_and_normalizes_signed_zero() {
+    let (node, interpreted) = both(
+        r#"
+@private
+let hash: 'a -> Result Nat64 std::hash::Error + | = fn value => std::hash::hash value
+let zeros = hash -0.0 == hash 0.0
+let repeat = hash "hé😀" == hash "hé😀"
+let supported = std::result::is_ok (hash 18446744073709551615n64)
+let explicit = std::hash::hash_with (std::reflect::mirror ()) std::hash::default_seed 42n == hash 42n
+let seeded = std::hash::hash_seeded 1n64 "hello" != std::hash::hash_seeded 2n64 "hello"
+let nan = match hash (0 / 0) with
+| #Error { path: [], kind: #NaN } => true
+| _ => false
+end
+"#,
+        &["zeros", "repeat", "supported", "explicit", "seeded", "nan"],
+        None,
+    );
+    assert_eq!(node, ["true"; 6]);
+    assert_eq!(interpreted, node);
+}
+
+#[test]
+fn structural_hashing_frames_records_arrays_and_recursive_variants() {
+    let (node, interpreted) = both(
+        r#"
+@private
+let hash = fn value => std::hash::hash value
+type Tree = #Leaf Nat | #Branch [Tree]
+@private
+let tree: Tree = #Branch [#Leaf 1n, #Branch [#Leaf 2n]]
+let recursive = std::result::is_ok (hash tree) and hash tree == hash tree
+let records = hash { z: [1n, 2n], a: "é" } == hash { a: "é", z: [1n, 2n] }
+let zeros = hash { points: [#Point -0.0] } == hash { points: [#Point 0.0] }
+let boundaries = hash ["ab", "c"] != hash ["a", "bc"]
+let order = hash [1n, 2n] != hash [2n, 1n]
+let length = hash [1n] != hash [1n, 0n]
+let names = hash { a: 1n } != hash { b: 1n }
+let cases = hash (#A 1n) != hash (#B 1n)
+@private
+let empty_array: [Nat] = []
+let empty = std::result::is_ok (hash ()) and std::result::is_ok (hash empty_array)
+"#,
+        &[
+            "recursive",
+            "records",
+            "zeros",
+            "boundaries",
+            "order",
+            "length",
+            "names",
+            "cases",
+            "empty",
+        ],
+        None,
+    );
+    assert_eq!(node, ["true"; 9]);
+    assert_eq!(interpreted, node);
+}
+
+#[test]
+fn structural_hashing_reports_paths_without_observing_opaque_values() {
+    let (node, interpreted) = both(
+        r#"
+@private
+let hash = fn value => std::hash::hash value
+let nested = match hash { items: [#Reading 1.0, #Reading (0 / 0)] } with
+| #Error { path: [#Field "items", #Index 1n, #Case "Reading"], kind: #NaN } => true
+| _ => false
+end
+@private
+let callback: Nat -> Nat = fn x => x
+let function = match hash { callback: callback } with
+| #Error { path: [#Field "callback"], kind: #Unsupported #Function } => true
+| _ => false
+end
+@private
+let empty_functions: [Nat -> Nat] = []
+type Choice = #Data Nat | #Callback (Nat -> Nat)
+@private
+let inactive: Choice = #Data 7n
+let unvisited = std::result::is_ok (hash empty_functions) and std::result::is_ok (hash inactive)
+@private
+let run = fn _ => do
+  let cell = mut 1n
+  let before = hash cell
+  _ = cell := 2n
+  return match (before, hash cell) with
+  | (#Error { path: [], kind: #Unsupported #Foreign }, #Error { path: [], kind: #Unsupported #Foreign }) => true
+  | _ => false
+  end
+end
+let cell = run ()
+@private
+let witness: Mirror Nat = std::reflect::mirror ()
+let mirror = match hash witness with
+| #Error { path: [], kind: #Unsupported #Mirror } => true
+| _ => false
+end
+type Boxed = hide 'a => { mirror: Mirror 'a, value: 'a }
+@private
+let boxed: Boxed = { mirror: std::reflect::mirror (), value: 42n }
+let hidden = match hash boxed with
+| #Error { path: [], kind: #Unsupported #Hidden } => true
+| _ => false
+end
+let opened = match boxed with
+| hide 'a { mirror, value } => std::hash::hash_with mirror std::hash::default_seed value == hash 42n
+end
+let foreign = match std::ffi::encode 1n with
+| #Some value => match hash value with
+  | #Error { path: [], kind: #Unsupported #Foreign } => true
+  | _ => false
+  end
+| #Error _ => false
+end
+"#,
+        &[
+            "nested",
+            "function",
+            "unvisited",
+            "cell",
+            "mirror",
+            "hidden",
+            "opened",
+            "foreign",
+        ],
+        None,
+    );
+    assert_eq!(node, ["true"; 8]);
+    assert_eq!(interpreted, node);
+}
+
+#[test]
+fn structural_hashing_preserves_fixed_width_values_across_target_domains() {
+    let source = r#"
+@private
+let hash = fn value => std::hash::hash value
+@private
+let results = [
+  hash 0n, hash 4294967295n, hash -2147483648i, hash 2147483647i,
+  hash 0n8, hash 255n8, hash 0n16, hash 65535n16,
+  hash 0n32, hash 4294967295n32, hash 0n64, hash 18446744073709551615n64,
+  hash -128i8, hash 127i8, hash -32768i16, hash 32767i16,
+  hash -2147483648i32, hash 2147483647i32,
+  hash -9223372036854775808i64, hash 9223372036854775807i64,
+  hash false, hash true, hash "", hash "é😀", hash (1 / 0), hash (-1 / 0),
+]
+let supported = std::array::all std::result::is_ok results
+let hashes = std::array::map
+  (fn result => std::nat::to_string64 (std::result::unwrap_or 0n64 result)) results
+let kinds = hash 1n != hash 1n64 and hash 1i8 != hash 1n8
+let extremes = hash -9223372036854775808i64 != hash 9223372036854775807i64
+let vectors = hash false == #Some 586857767355016009n64 and hash true == #Some 586856667843387798n64
+"#;
+    // FNV-1a known answers for the Boolean frames 04 00 and 04 01.
+    // Export hashes as decimal text so Node's JSON does not narrow BigInts.
+    let exports = ["supported", "hashes", "kinds", "extremes", "vectors"];
+    let (node, interpreted) = both(source, &exports, None);
+    assert_eq!(node[0], "true");
+    assert_eq!(&node[2..], ["true"; 3]);
+    assert_eq!(interpreted, node);
+    let (narrow_node, narrow_interpreted) = both(source, &exports, Some(32));
+    assert_eq!(narrow_node, node);
+    assert_eq!(narrow_interpreted, node);
+}
+
+#[test]
 fn real_partial_comparisons_make_nan_unordered_and_signed_zeros_equal() {
     let (node, interpreted) = both(
         r#"

@@ -1,0 +1,158 @@
+@doc "One step from the root value to a hashing error; array indices are zero-based."
+type PathElement = #Field String | #Case String | #Index Nat
+
+@doc "A shape whose value cannot be read through typed reflection. Cells use Foreign."
+type Unsupported = #Function | #Hidden | #Mirror | #Foreign
+
+@doc "Why hashing failed. NaNs are not equal to themselves; opaque values cannot be inspected. InvalidView indicates a reflected field or case could not be read."
+type ErrorKind = #NaN | #Unsupported Unsupported | #InvalidView
+
+@doc "A hashing failure, with its root-to-leaf location. No partial hash is returned."
+type Error = { path: [PathElement], kind: ErrorKind }
+
+@doc "The fixed FNV-1a 64 offset basis used by hash. A seed is accumulator initialization, not a secret-key security guarantee."
+let default_seed: Nat64 = 14695981039346656037n64
+
+@private
+extern xor64: fn(Nat64, Nat64) -> Nat64 = "$prim.nat.xor64"
+@private
+extern utf8_encode: fn(String) -> [Nat8] = "$prim.binary.utf8_encode"
+@private
+extern real_to_bits: fn(Real) -> Nat64 = "$prim.binary.real_to_bits"
+@private
+extern nat64_to_bytes: fn(Nat64) -> [Nat8] = "$prim.binary.nat64_to_bytes"
+
+@private
+let byte: Nat64 -> Nat8 -> Nat64 = fn state value =>
+  nat::multiply64 (xor64 state (nat::from_nat64 (nat::to_nat8 value))) 1099511628211n64
+
+@private
+let bytes: Nat64 -> [Nat8] -> Nat64 = fn state values => array::fold byte state values
+
+@private
+let count: Nat64 -> Nat -> Nat64 = fn state value =>
+  bytes state (nat64_to_bytes (nat::from_nat64 value))
+
+@private
+let text: Nat64 -> String -> Nat64 = fn state value => do
+  let encoded = utf8_encode value
+  return bytes (count state (array::len encoded)) encoded
+end
+
+@private
+let scalar: Nat8 -> String -> Nat64 -> Result Nat64 Error = fn tag value state =>
+  #Some (text (byte state tag) value)
+
+@private
+let unsupported: Unsupported -> Result Nat64 Error = fn shape =>
+  #Error { path: [], kind: #Unsupported shape }
+
+@private
+let at: PathElement -> Result Nat64 Error -> Result Nat64 Error = fn step result =>
+  result::map_error (fn error => { path: [step, ..error.path], kind: error.kind }) result
+
+@private
+let elements: Mirror 'a -> ['a] -> Nat -> Nat64 -> Result Nat64 Error =
+  fn mirror values index state => match array::get values index with
+  | #None => #Some state
+  | #Some value =>
+    match at (#Index index) (visit mirror state value) with
+    | #Error error => #Error error
+    | #Some next => elements mirror values (nat::add index 1n) next
+    end
+  end
+
+@private
+let field_name: reflect::SomeField 'a -> String = fn field => match field with
+| hide 'f { name, .. } => name
+end
+
+@private
+let fields: [reflect::SomeField 'a] -> Nat64 -> 'a -> Result Nat64 Error =
+  fn remaining state value => match remaining with
+  | [] => #Some state
+  | [field, ..tail] =>
+    match field with
+    | hide 'f { name, mirror, read, .. } =>
+      match read value with
+      | #None => #Error { path: [#Field name], kind: #InvalidView }
+      | #Some part =>
+        match at (#Field name) (visit mirror (text state name) part) with
+        | #Error error => #Error error
+        | #Some next => fields tail next value
+        end
+      end
+    end
+  end
+
+@private
+let cases: [reflect::SomeCase 'a] -> Nat64 -> 'a -> Result Nat64 Error =
+  fn remaining state value => match remaining with
+  | [] => #Error { path: [], kind: #InvalidView }
+  | [case, ..tail] =>
+    match case with
+    | hide 'p { name, mirror, project, .. } =>
+      match project value with
+      | #None => cases tail state value
+      | #Some payload => at (#Case name) (visit mirror (text state name) payload)
+      end
+    end
+  end
+
+-- Tags distinguish primitive kinds and structural constructors. Integers use exact decimal text,
+-- avoiding conversions through target-dependent Nat/Int.
+@private
+let visit: Mirror 'a -> Nat64 -> 'a -> Result Nat64 Error = fn mirror state value =>
+  match reflect::shape mirror with
+  | #Nat { read, .. } => scalar 0n8 (str::from_nat (read value)) state
+  | #Int { read, .. } => scalar 1n8 (str::from_int (read value)) state
+  | #Real { read, .. } => do
+    let number = read value
+    return
+      if real::is_nan number then #Error { path: [], kind: #NaN }
+      else
+        do
+          let normalized = if real::equal number 0 then 0 else number end
+          return #Some (bytes (byte state 2n8) (nat64_to_bytes (real_to_bits normalized)))
+        end
+      end
+  end
+  | #String { read, .. } => scalar 3n8 (read value) state
+  | #Bool { read, .. } => #Some (byte (byte state 4n8) (if read value then 1n8 else 0n8 end))
+  | #Nat8 { read, .. } => scalar 5n8 (nat::to_string8 (read value)) state
+  | #Nat16 { read, .. } => scalar 6n8 (nat::to_string16 (read value)) state
+  | #Nat32 { read, .. } => scalar 7n8 (nat::to_string32 (read value)) state
+  | #Nat64 { read, .. } => scalar 8n8 (nat::to_string64 (read value)) state
+  | #Int8 { read, .. } => scalar 9n8 (int::to_string8 (read value)) state
+  | #Int16 { read, .. } => scalar 10n8 (int::to_string16 (read value)) state
+  | #Int32 { read, .. } => scalar 11n8 (int::to_string32 (read value)) state
+  | #Int64 { read, .. } => scalar 12n8 (int::to_string64 (read value)) state
+  | #Array view =>
+    match view with
+    | hide 'e { element, read, .. } => do
+      let values = read value
+      return elements element values 0n (count (byte state 13n8) (array::len values))
+    end
+    end
+  | #Record view =>
+    fields
+      (array::sort_by (order::compare_by str::compare field_name) view.fields)
+      (count (byte state 14n8) (array::len view.fields))
+      value
+  | #Sum view => cases view.cases (byte state 15n8) value
+  | #Function _ => unsupported #Function
+  | #Hidden _ => unsupported #Hidden
+  | #Mirror _ => unsupported #Mirror
+  | #Foreign => unsupported #Foreign
+  end
+
+@doc "Hash through an explicit mirror and Nat64 seed. Traversal follows the value: empty arrays and inactive unsupported cases succeed. Unsupported values and NaNs fail at their path; signed zeros hash equally. Pure FNV-1a 64 hashing, without a persistence or hostile-collision guarantee."
+let hash_with: Mirror 'a -> Nat64 -> 'a -> Result Nat64 Error = fn mirror seed value =>
+  visit mirror seed value
+
+@doc "Hash at the value's inferred static type with an explicit seed. Equal supported values at a shared type produce equal hashes for the same seed."
+let hash_seeded: Nat64 -> 'a -> Result Nat64 Error = fn seed value =>
+  hash_with (reflect::mirror ()) seed value
+
+@doc "Hash at the value's inferred static type using default_seed. A collection must still compare keys when hashes match."
+let hash: 'a -> Result Nat64 Error = fn value => hash_seeded default_seed value

@@ -19,11 +19,13 @@ stdReference: true
 [ffi](ffi.md)\
 [fs](fs.md)\
 [function](function.md)\
+[hash](hash.md)\
 [http](http.md)\
 [int](int.md)\
 [io](io.md)\
 [js](js.md)\
 [json](json.md)\
+[map](map.md)\
 [nat](nat.md)\
 [option](option.md)\
 [order](order.md)\
@@ -33,6 +35,7 @@ stdReference: true
 [real](real.md)\
 [reflect](reflect.md)\
 [result](result.md)\
+[set](set.md)\
 [str](str.md)\
 [tuple](tuple.md)\
 [types](types.md)\
