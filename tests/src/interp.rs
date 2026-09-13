@@ -8,6 +8,62 @@ use std::{fs, path::Path, process::Command};
 
 use ruddy_interp::{Program, Value, render};
 
+#[test]
+fn randomness_sampling_and_primitive_contracts_match_across_backends() {
+    let source = format!(
+        "using std::*\n{}\nlet checked = handle do _ = randomness_primitives () _ = randomness_sampling () return true end with | std::test::!Assert _ => raise false end",
+        include_str!("../../std/tests/randomness_sampling.rud")
+    );
+    for integers in [Some(32), None] {
+        let (node, interpreted) = both(&source, &["checked"], integers);
+        assert_eq!(node, ["true"]);
+        assert_eq!(interpreted, node);
+    }
+    assert_eq!(json(&load(&source, true, Some(64)), "checked"), "true");
+}
+
+#[test]
+fn randomness_local_handlers_isolate_streams_and_forward_effects() {
+    let source = format!(
+        "using std::*\n{}\nlet checked = handle do _ = randomness_local_streams () return true end with | std::test::!Assert _ => raise false end",
+        include_str!("../../std/tests/randomness.rud")
+    );
+    let (node, interpreted) = both(&source, &["checked"], None);
+    assert_eq!(node, ["true"]);
+    assert_eq!(interpreted, node);
+}
+
+#[test]
+fn randomness_seeded_words_are_pure_and_match_reference_on_all_domains() {
+    let source = r#"
+let words = fn seed => std::random::with_seed seed (fn _ => do
+  let a = std::random::word64 ()
+  let b = std::random::word64 ()
+  let c = std::random::word64 ()
+  return std::array::map std::nat::to_string64 [a, b, c]
+end)
+let zero = words 0n64
+let one = words 1n64
+let maximum = words 18446744073709551615n64
+"#;
+    let expected = vec![
+        r#"["16294208416658607535","7960286522194355700","487617019471545679"]"#,
+        r#"["10451216379200822465","13757245211066428519","17911839290282890590"]"#,
+        r#"["16490336266968443936","16834447057089888969","4048727598324417001"]"#,
+    ];
+    for integers in [Some(32), None] {
+        let (node, interpreted) = both(source, &["zero", "one", "maximum"], integers);
+        assert_eq!(node, expected);
+        assert_eq!(interpreted, expected);
+    }
+    let program = load(source, true, Some(64));
+    let interpreted: Vec<_> = ["zero", "one", "maximum"]
+        .iter()
+        .map(|name| json(&program, name))
+        .collect();
+    assert_eq!(interpreted, expected);
+}
+
 /// A project with the given source, and the standard library when it is asked
 /// for, compiled and linked.
 fn project(

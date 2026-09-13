@@ -218,6 +218,7 @@ struct Scoping<'a> {
     promised: &'a Formula,
     rigids: &'a [u32],
     initializer_effects: &'a Row,
+    initializer_mutates: bool,
     ambient: &'a Row,
     inside: bool,
     value: &'a [Constraint],
@@ -479,6 +480,7 @@ impl Solve<'_> {
         {
             match &constraint.kind {
                 ConstraintKind::Isolate {
+                    mutations,
                     input,
                     output,
                     internal,
@@ -488,6 +490,53 @@ impl Solve<'_> {
                 } => {
                     let mut remaining = self.table.canon(internal);
                     let key = crate::types::mutation_effect().row_key();
+                    // A private allocation must not enter a callback's open effect
+                    // remainder: doing that first makes its region appear to escape
+                    // through the input, preventing isolation of an otherwise pure handler.
+                    let mut isolated = HashSet::new();
+                    for (at, region) in mutations {
+                        let resolved = self.table.resolve(region);
+                        if let Ty::Var(var) = &*resolved {
+                            let mut escaping = Vec::new();
+                            self.table.mentions_ty(input, &mut escaping);
+                            self.table.mentions_ty(output, &mut escaping);
+                            self.table.mentions_row(&remaining, &mut escaping);
+                            if self.table.levels[*var as usize] >= *level && !escaping.contains(var)
+                            {
+                                let id = u32::MAX - var;
+                                self.table.rigids.insert(id, *at);
+                                self.table.region_rigids.insert(id);
+                                isolated.insert(id);
+                                self.unify(
+                                    *at,
+                                    region,
+                                    &Arc::new(Ty::Rigid {
+                                        id,
+                                        name: "local region".into(),
+                                    }),
+                                );
+                                continue;
+                            }
+                        } else if let Ty::Rigid { id, .. } = &*resolved
+                            && isolated.contains(id)
+                        {
+                            continue;
+                        }
+                        let mutation = Row {
+                            labels: [(
+                                key.clone(),
+                                RowField::present(Arc::new(Ty::Struct(Row {
+                                    labels: [("0".into(), RowField::present(region.clone()))]
+                                        .into(),
+                                    rest: Rest::Closed,
+                                }))),
+                            )]
+                            .into(),
+                            rest: Rest::Closed,
+                        };
+                        self.relate_effects(*at, &mutation, &remaining, true, true);
+                        remaining = self.table.canon(&remaining);
+                    }
                     if let Some(field) = remaining.labels.get(&key)
                         && let Ty::Struct(arguments) = &*field.ty
                         && let Some(region) = arguments.labels.get("0")
@@ -592,6 +641,7 @@ impl Solve<'_> {
                     promised,
                     rigids,
                     initializer_effects,
+                    initializer_mutates,
                     ambient,
                     inside,
                     value,
@@ -605,6 +655,7 @@ impl Solve<'_> {
                         promised,
                         rigids,
                         initializer_effects,
+                        initializer_mutates: *initializer_mutates,
                         ambient,
                         inside: *inside,
                         value,
@@ -2056,6 +2107,7 @@ impl Solve<'_> {
             promised,
             rigids,
             initializer_effects,
+            initializer_mutates,
             ambient,
             inside,
             value,
@@ -2075,7 +2127,8 @@ impl Solve<'_> {
         self.table.close_handler_presences(&initializer, level);
         self.table.close_effects(&initializer, level);
         let immediate = self.table.canon(initializer_effects);
-        let pure = matches!(immediate.rest, Rest::Closed)
+        let pure = !initializer_mutates
+            && matches!(immediate.rest, Rest::Closed)
             && immediate
                 .labels
                 .values()

@@ -1281,6 +1281,8 @@ impl Subject {
 pub enum ConstraintKind {
     /// Publish a function's effects after checking whether its state is private.
     Isolate {
+        /// Direct mutation regions checked for escape before joining callback effects.
+        mutations: Vec<(Anchor, Arc<Ty>)>,
         /// Operations and callees contributing to this body's effect boundary.
         effect_origins: Vec<EffectSource>,
         input: Arc<Ty>,
@@ -1346,6 +1348,8 @@ pub enum ConstraintKind {
         /// written. See [`ErrorKind::RigidEscapes`].
         rigids: Vec<u32>,
         initializer_effects: Row,
+        /// Direct state access still restricts generalization while its region awaits isolation.
+        initializer_mutates: bool,
         ambient: Row,
         inside: bool,
         /// What the value requires, including that it match the annotation when
@@ -7049,6 +7053,7 @@ fn infer_group(
                 boundary_at: decl.name_at,
                 label_spans: IndexMap::new(),
             },
+            mutations: Vec::new(),
             answer: None,
             presence_guard: Formula::True,
         };
@@ -7804,7 +7809,16 @@ impl Table {
 
     fn constraint_reason_for(&mut self, id: ConstraintId, kind: &ConstraintKind) -> ReasonId {
         let roots: Vec<&Arc<Ty>> = match kind {
-            ConstraintKind::Isolate { input, output, .. } => vec![input, output],
+            ConstraintKind::Isolate {
+                input,
+                output,
+                mutations,
+                ..
+            } => {
+                let mut roots = vec![input, output];
+                roots.extend(mutations.iter().map(|(_, region)| region));
+                roots
+            }
             ConstraintKind::Project { base, result, .. } => vec![base, result],
             ConstraintKind::Spread {
                 operand, result, ..

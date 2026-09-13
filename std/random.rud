@@ -1,0 +1,86 @@
+@doc "Noncryptographic random primitives. Local handlers may supply each operation independently."
+effect Random = {
+  word64: () -> Nat64,
+  boolean: () -> Bool,
+  real: () -> Real,
+}
+
+@doc "Draws a Nat64, including both endpoints of its domain. Performs Random.word64."
+let word64 = !Random.word64
+
+@doc "Draws a boolean. Performs Random.boolean; built-in handlers consume one word and use its top bit."
+let boolean = !Random.boolean
+
+@doc "Draws a Real in [0, 1). Performs Random.real; built-in handlers consume one word and use its top 53 bits."
+let real = !Random.real
+
+@private
+extern xor64: fn(Nat64, Nat64) -> Nat64 = "$prim.nat.xor64"
+
+-- SplitMix64, https://prng.di.unimi.it/splitmix64.c (public domain). Advance before mixing,
+-- including for seed zero. All arithmetic wraps at 64 bits.
+@private
+let mix: Nat64 -> Nat64 = fn advanced => do
+  let first = nat::multiply64
+    (xor64 advanced (nat::divide64 advanced 1073741824n64))
+    13787848793156543929n64
+  let second = nat::multiply64
+    (xor64 first (nat::divide64 first 134217728n64))
+    10723151780598845931n64
+  return xor64 second (nat::divide64 second 2147483648n64)
+end
+
+@private
+let real_of_word = fn word => do
+  -- Convert 27 and 26 bits separately so even a 32-bit Nat preserves all 53 bits.
+  let high = real::from_nat (nat::to_nat64 (nat::divide64 word 137438953472n64))
+  let low = real::from_nat
+    (nat::to_nat64 (nat::remainder64 (nat::divide64 word 2048n64) 67108864n64))
+  return (high * 67108864 + low) / 9007199254740992
+end
+
+@private
+let with_source:
+  (() -> Nat64 + !Random (when 'outer) + ..'effects)
+  -> (() -> 'a + !Random + ..'effects)
+  -> 'a + !Random (when 'outer) + ..'effects =
+  fn source body => do
+    let state = mut source ()
+    return handle body () with
+    | !Random.word64 _ => mix (state := nat::add64 (~state) 11400714819323198485n64)
+    | !Random.boolean _ =>
+      nat::greater_than_or_equal64
+        (mix (state := nat::add64 (~state) 11400714819323198485n64))
+        9223372036854775808n64
+    | !Random.real _ => real_of_word (mix (state := nat::add64 (~state) 11400714819323198485n64))
+    end
+  end
+
+@doc "Runs a computation with fresh private SplitMix64 state. All primitive draws share a stream; identical seeds and ordered calls have stable results across backends. Consumes no outer randomness, preserves unrelated effects, and is noncryptographic."
+let with_seed = fn seed body => with_source (fn _ => seed) body
+
+@doc "Draws exactly one seed from the nearest outer Random.word64 before running the body with private state. Even empty or aborting bodies consume a seed. Later draws and nested local streams use private state. Assign seeds in stable order before concurrent work; callbacks establish their handler when invoked."
+let local = fn body => with_source (fn _ => word64 ()) body
+
+@private
+let draw_below: Nat64 -> Nat64 -> Nat64 + !Random = fn bound threshold => do
+  let word = word64 ()
+  return
+    if nat::less_than64 word threshold then draw_below bound threshold
+    else nat::remainder64 word bound
+    end
+end
+
+@doc "Samples below an exclusive Nat64 bound. Zero returns None; one returns Some 0n64; neither draws. Rejection sampling avoids modulo bias for uniform source words, with fewer than two expected draws. A custom source that always supplies rejected words may not terminate."
+let nat_below: Nat64 -> Option Nat64 + !Random = fn bound =>
+  if nat::is_zero64 bound then #None
+  else if nat::equal64 bound 1n64 then #Some 0n64
+  else #Some (draw_below bound (nat::remainder64 (nat::subtract64 0n64 bound) bound))
+  end
+
+@doc "Chooses an array position without changing the input. Empty arrays return None; singletons return their item; neither draws. Duplicate values retain their positional weight. Uses nat_below and accepts any element type."
+let choose: ['a] -> Option 'a + !Random = fn values =>
+  match nat_below (nat::from_nat64 (array::len values)) with
+  | #None => #None
+  | #Some index => array::get values (nat::to_nat64 index)
+  end

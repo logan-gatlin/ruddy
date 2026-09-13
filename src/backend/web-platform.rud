@@ -66,5 +66,14 @@ extern js_keys: ForeignValue -> #Some [String] | #Error js::Error = "$js.keys"
 extern js_snapshot: ForeignValue -> #Some ForeignValue | #Error js::Error = "$js.snapshot"
 extern js_apply: js::Call -> #Some ForeignValue | #Error js::Error = "$js.apply"
 
+effect Random = {
+  word64: () -> Nat64,
+  boolean: () -> Bool,
+  real: () -> Real,
+}
+extern random_word64: () -> Nat64 = "$random.word64"
+extern random_boolean: () -> Bool = "$random.boolean"
+extern random_real: () -> Real = "$random.real"
+
 effect Assert = String -> ()
 extern assertion_failed: String -> () = "message => { throw new Error(message); }"

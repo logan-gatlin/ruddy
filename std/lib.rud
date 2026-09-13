@@ -126,6 +126,18 @@ module int
 \\let quarter_turn = std::real::degrees_to_radians 90.0
 \\```
 module real
+@doc \\Noncryptographic random primitives and reproducible local streams.
+\\
+\\`local` draws one seed from its outer Random handler, then owns its stream.
+\\`with_seed` establishes a repeatable root without drawing an outer seed.
+\\Assign task seeds in stable order before scheduling concurrent work.
+\\
+\\```ruddy
+\\let roll = fn _ => std::random::with_seed 42n64 (fn _ =>
+\\  std::random::local (fn _ => std::random::nat_below 6n64)
+\\)
+\\```
+module random
 @doc \\`boolean` provides logical operations and ordering for `Bool` values.
 \\
 \\An implication can require a true conclusion only when its premise is true.

@@ -3064,8 +3064,17 @@ impl fmt::Display for ConstraintKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             ConstraintKind::Isolate {
-                internal, external, ..
-            } => write!(f, "isolate {internal} into {external}"),
+                internal,
+                external,
+                mutations,
+                ..
+            } => {
+                write!(f, "isolate {internal} into {external}")?;
+                for (_, region) in mutations {
+                    write!(f, "; state {region}")?;
+                }
+                Ok(())
+            }
             ConstraintKind::Project {
                 base,
                 field,
@@ -5000,6 +5009,7 @@ mod tests {
                 promised: Formula::True,
                 rigids: Vec::new(),
                 initializer_effects: Row::closed(),
+                initializer_mutates: false,
                 ambient: Row::closed(),
                 inside: true,
                 value: Vec::new(),
@@ -5017,6 +5027,7 @@ mod tests {
             promised: Formula::var(0).xor(Formula::var(1)),
             rigids: Vec::new(),
             initializer_effects: Row::closed(),
+            initializer_mutates: false,
             ambient: Row::closed(),
             inside: true,
             value: Vec::new(),

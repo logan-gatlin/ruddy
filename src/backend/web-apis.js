@@ -1,3 +1,16 @@
+// Noncryptographic host randomness. Keep the full word out of Number and draw
+// only on demand: importing a module never consumes host randomness.
+const $randomWord64 = () => {
+  const high = BigInt(Math.floor(Math.random() * 4294967296));
+  const low = BigInt(Math.floor(Math.random() * 4294967296));
+  return (high << 32n) | low;
+};
+const $random = {
+  word64: $randomWord64,
+  boolean: () => $randomWord64() >= 9223372036854775808n,
+  real: () => Number($randomWord64() >> 11n) / 9007199254740992,
+};
+
 // Native extern conversion snapshots arrays, records, and sums at the boundary.
 const $webPair = (a, b) => $record([["0", a], ["1", b]]);
 // A host string may hold an unpaired surrogate half, which is no Unicode

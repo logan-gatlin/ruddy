@@ -92,6 +92,72 @@ error in both directions. `json::encode_canonical` writes the named canonical
 profile, with members sorted by key and no whitespace, for hashes and
 signatures.
 
+## Randomness
+
+`std::random::Random` provides `word64`, `boolean`, and `real` operations.
+Node executables and Node/web library exports install a default host handler.
+`nat_below bound` samples below an exclusive Nat64 bound; zero returns `#None`.
+`choose values` chooses an array position, returning `#None` for an empty array.
+
+Create a reproducible root with `with_seed`, and use `local` to give a
+computation its own stream seeded by the next outer Random handler:
+
+```ruddy
+let rolls = fn _ => std::random::with_seed 42n64 (fn _ =>
+  std::random::local (fn _ => do
+    let first = std::random::nat_below 6n64
+    let second = std::random::nat_below 6n64
+    return (first, second)
+  end)
+)
+```
+
+Each `local` draws exactly one outer word before running its body, even if
+the body makes no draws or exits early. Its later draws use private state.
+Nested local scopes consume their seeds from their immediate parent.
+`with_seed` obtains nothing from an outer handler. Both handlers preserve
+unrelated effects and their state survives asynchronous suspension.
+
+For concurrent work, assign seeds to tasks in stable order **before** scheduling
+them. Each task then enters `with_seed` using its assigned seed when invoked.
+After that, interleaving between tasks does not change their individual streams.
+Calling `local` for the first time after tasks race to resume can assign seeds
+to different tasks. Constructing a callback inside a handler does not capture
+that handler: effects use the handler active at invocation.
+
+```ruddy
+-- Call this under a seeded root before scheduling either callback.
+let prepare = fn _ => do
+  let left_seed = std::random::word64 ()
+  let right_seed = std::random::word64 ()
+  return {
+    left: fn _ => std::random::with_seed left_seed std::random::word64,
+    right: fn _ => std::random::with_seed right_seed std::random::word64,
+  }
+end
+```
+
+These callbacks start fresh on each invocation. For repeatability across
+multiple invocations, allocate one seed per task invocation. A future threaded
+caller should give each task its own handler state; locking a shared stream
+would not make assignment of draws independent of scheduling.
+
+Built-in seeded handlers use SplitMix64 with stable cross-backend sequences.
+Each primitive consumes one word from the shared local stream. Booleans use
+its top bit; reals use its top 53 bits divided by 2^53, producing `[0, 1)`.
+Bounded sampling uses rejection to avoid modulo bias; bounds zero and one,
+and empty and singleton choices, consume no words. Duplicate array values
+retain their positional weight. Custom handlers can supply each primitive
+directly; bounded sampling expects uniform word draws and may keep retrying
+if a custom handler always supplies rejected values.
+
+The default host handler assembles two `Math.random` draws into a word, with
+approximately uniform, host-dependent quality and no sequence guarantee.
+This module is noncryptographic, including its local streams. It must not be
+used for passwords, tokens, or cryptographic keys. Derived seeds do not promise
+distinct or independent streams. The reference interpreter supports explicit
+seeds and caller-provided handlers, without a default ambient host source.
+
 ## Process
 
 `std::process::Process` exposes:

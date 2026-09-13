@@ -32,6 +32,7 @@ stdReference: true
 [path](path.md)\
 [prelude](prelude.md)\
 [process](process.md)\
+[random](random.md)\
 [real](real.md)\
 [reflect](reflect.md)\
 [result](result.md)\

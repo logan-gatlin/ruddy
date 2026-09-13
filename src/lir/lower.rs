@@ -2678,6 +2678,12 @@ impl Lower<'_> {
                     **name != crate::types::mutation_effect().row_key()
                         && possible(&field.presence)
                         && !definite(&field.presence)
+                        && used
+                            .labels
+                            .get(*name)
+                            .map_or(!matches!(used.rest, Rest::Closed), |field| {
+                                possible(&field.presence)
+                            })
                 })
                 .map(|(name, _)| name.clone())
                 .collect();
@@ -3029,7 +3035,7 @@ impl Lower<'_> {
             };
             let entries: IndexMap<String, Temp> = names
                 .iter()
-                .map(|name| {
+                .filter_map(|name| {
                     let evidence_owner = self
                         .frames
                         .iter()
@@ -3042,14 +3048,14 @@ impl Lower<'_> {
                             Span::default(),
                             Rep::Struct,
                             Op::Project {
-                                base: tail.expect(
-                                    "accepted conditional evidence is named or supplied by a tail",
-                                ),
+                                // A pure call can leave an optional capability
+                                // unconstrained without supplying evidence for it.
+                                base: tail?,
                                 field: FieldKey::named(name.clone()),
                             },
                         )
                     };
-                    (name.clone(), value)
+                    Some((name.clone(), value))
                 })
                 .collect();
             return self.emit(

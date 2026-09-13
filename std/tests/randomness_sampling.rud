@@ -1,0 +1,97 @@
+@test
+let randomness_primitives: () -> () + test::!Assert = fn _ => do
+  -- Seeds inverted from the SplitMix64 permutation and checked against its C reference.
+  _ =
+    test::assert (random::with_seed 7046029254386353131n64 random::real == 0) "Real lower endpoint"
+  _ = test::assert
+    (random::with_seed 3558559446808474027n64 random::real == 0.9999999999999999)
+    "Real upper endpoint"
+  _ = test::assert (not random::with_seed 7046029254386353131n64 random::boolean) "Boolean false"
+  _ = test::assert (random::with_seed 3558559446808474027n64 random::boolean) "Boolean true"
+  let mixed = random::with_seed
+    0n64
+    (fn _ => do
+      let truth = random::boolean ()
+      let fraction = random::real ()
+      let word = random::word64 ()
+      return (truth, fraction, word)
+    end)
+  _ = test::assert
+    (mixed == (true, 0.43152799704850997, 487617019471545679n64))
+    "Primitives share a stream"
+  let direct = handle (random::word64 (), random::boolean (), random::real ()) with
+  | random::!Random.word64 _ => 7n64
+  | random::!Random.boolean _ => true
+  | random::!Random.real _ => 0.25
+  end
+  return test::assert (direct == (7n64, true, 0.25)) "Each wrapper performs its own operation"
+end
+
+@test
+let randomness_sampling: () -> () + test::!Assert = fn _ => do
+  let draws = mut 0n
+  let empty_and_single = handle do
+    let empty: [Nat] = []
+    return (
+      random::nat_below 0n64,
+      random::nat_below 1n64,
+      random::choose empty,
+      random::choose [9n],
+    )
+  end with
+  | random::!Random.word64 _ => do
+    _ = draws := nat::add (~draws) 1n
+    return 0n64
+  end
+  | random::!Random.boolean _ => false
+  | random::!Random.real _ => 0
+  end
+  _ = test::assert (empty_and_single == (#None, #Some 0n64, #None, #Some 9n)) "Degenerate samples"
+  _ = test::assert (~draws == 0n) "Degenerate samples do not draw"
+  let bounded = handle random::nat_below 6n64 with
+  | random::!Random.word64 _ => do
+    let index = draws := nat::add (~draws) 1n
+    return if index == 1n then 0n64 else 11n64 end
+  end
+  | random::!Random.boolean _ => false
+  | random::!Random.real _ => 0
+  end
+  _ = test::assert
+    (bounded == #Some 5n64 and ~draws == 2n)
+    "Reject low words before taking the remainder"
+  let extremes = handle do
+    let power = random::nat_below 8n64
+    let large = random::nat_below 9223372036854775809n64
+    let maximum = random::nat_below 18446744073709551615n64
+    return (power, large, maximum)
+  end with
+  | random::!Random.word64 _ => 18446744073709551615n64
+  | random::!Random.boolean _ => false
+  | random::!Random.real _ => 0
+  end
+  _ = test::assert
+    (extremes == (#Some 7n64, #Some 9223372036854775806n64, #Some 0n64))
+    "Full-width bounds"
+  let values = ["first", "duplicate", "duplicate", "last"]
+  let selections = handle do
+    _ = draws := 0n
+    let first = random::choose values
+    let last = random::choose values
+    let duplicate = random::choose values
+    let callback = random::choose [fn _ => 42n]
+    return (first, last, duplicate, match callback with | #Some f => f () | #None => 0n end)
+  end with
+  | random::!Random.word64 _ => do
+    let index = draws := nat::add (~draws) 1n
+    return if index == 1n then 0n64 else if index == 2n then 3n64 else 2n64 end
+  end
+  | random::!Random.boolean _ => false
+  | random::!Random.real _ => 0
+  end
+  _ = test::assert
+    (selections == (#Some "first", #Some "last", #Some "duplicate", 42n))
+    "Generic positional selection"
+  return test::assert
+    (values == ["first", "duplicate", "duplicate", "last"] and ~draws == 3n)
+    "Selection leaves its input unchanged"
+end

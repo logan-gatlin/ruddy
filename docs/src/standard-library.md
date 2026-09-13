@@ -57,6 +57,7 @@ The same import style is used in the [FizzBuzz example](hello-world.md#try-fizzb
 | Module paths | Contents |
 | --- | --- |
 | `std::nat`, `std::int`, `std::real` | Arithmetic, conversions, and comparisons |
+| `std::random` | Random primitives, bounded sampling, and reproducible local streams |
 | `std::boolean` | Operations on `Bool` values |
 | `std::str` | String operations and conversions |
 | `std::array` | Operations on immutable arrays |

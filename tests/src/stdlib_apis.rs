@@ -1,5 +1,122 @@
 use std::{fs, path::Path, process::Command};
 
+#[test]
+fn randomness_host_primitives_and_local_seeding_work_on_node_and_web() {
+    for platform in ["node", "web"] {
+        let project = project(
+            r#"
+let word = std::random::word64
+let boolean = std::random::boolean
+let real = std::random::real
+let local: () -> [Nat64] + std::random::!Random = fn _ => std::random::local (fn _ => do
+  let first = std::random::word64 ()
+  let second = std::random::word64 ()
+  return [first, second]
+end)
+let seeded: () -> Nat64 = fn _ => std::random::with_seed 0n64 (fn _ => std::random::local std::random::word64)
+let overridden: () -> (Nat64, Bool, Real) = fn _ => handle (std::random::word64 (), std::random::boolean (), std::random::real ()) with
+| std::random::!Random.word64 _ => 17n64
+| std::random::!Random.boolean _ => true
+| std::random::!Random.real _ => 0.25
+end
+"#,
+            platform,
+            "library",
+        );
+        run_with_setup(
+            project.path(),
+            "Math.random = () => { throw new Error('import must not draw'); };",
+            r#"
+let draws = [];
+Math.random = () => { assert.ok(draws.length, 'unexpected host draw'); return draws.shift(); };
+draws = [0, 0]; assert.equal(await app.word({}), 0n);
+draws = [1 - 2 ** -32, 1 - 2 ** -32]; assert.equal(await app.word({}), 18446744073709551615n);
+draws = [0.5, 0.25]; assert.equal(await app.word({}), 9223372037928517632n);
+draws = [0, 0]; assert.equal(await app.boolean({}), false);
+draws = [0.5, 0]; assert.equal(await app.boolean({}), true);
+draws = [0, 0]; assert.equal(await app.real({}), 0);
+draws = [1 - 2 ** -32, 1 - 2 ** -32]; assert.equal(await app.real({}), 1 - 2 ** -53);
+draws = [0, 0]; assert.deepEqual(await app.local({}), [16294208416658607535n, 7960286522194355700n]);
+assert.equal(draws.length, 0);
+Math.random = () => { throw new Error('host randomness must not be used'); };
+assert.equal(typeof await app.seeded({}), 'bigint');
+const overridden = await app.overridden({});
+assert.equal(overridden[0], 17n); assert.equal(overridden[1], true); assert.equal(overridden[2], 0.25);
+"#,
+        );
+    }
+}
+
+#[test]
+fn randomness_local_streams_survive_opposite_async_completion_orders() {
+    for platform in ["node", "web"] {
+        let project = project(
+            r#"
+@private
+@async
+extern pause: Nat -> () + std::ffi::!Immediate = "key => new Promise(resolve => globalThis.randomWaiters.set(key, () => resolve({})))"
+let prepare: Nat64 -> { left: Nat64, right: Nat64 } = fn seed => std::random::with_seed seed (fn _ => do
+  let left = std::random::word64 ()
+  let right = std::random::word64 ()
+  return { left: left, right: right }
+end)
+let run: { seed: Nat64, key: Nat, extra: Bool } -> [Nat64] + std::ffi::!Immediate = fn request =>
+  std::random::with_seed request.seed (fn _ => std::random::local (fn _ => do
+    let first = std::random::word64 ()
+    _ = pause request.key
+    _ = if request.extra then std::random::word64 () else 0n64 end
+    let second = std::random::word64 ()
+    return [first, second]
+  end))
+"#,
+            platform,
+            "library",
+        );
+        run_with_setup(
+            project.path(),
+            "Math.random = () => { throw new Error('seeded tasks must not touch the host source'); };",
+            r#"
+const seeds = await app.prepare(0n);
+assert.equal(seeds.left, 16294208416658607535n);
+assert.equal(seeds.right, 7960286522194355700n);
+async function schedule(order, extra = false) {
+  globalThis.randomWaiters = new Map();
+  const left = app.run({ seed: seeds.left, key: 0, extra });
+  const right = app.run({ seed: seeds.right, key: 1, extra: false });
+  await new Promise(setImmediate);
+  assert.equal(randomWaiters.size, 2, 'both local bodies reached their suspension');
+  const tasks = [left, right];
+  for (const key of order) { randomWaiters.get(key)(); await tasks[key]; }
+  return await Promise.all(tasks);
+}
+const forward = await schedule([0, 1]);
+assert.deepEqual(await schedule([1, 0]), forward);
+const extra = await schedule([1, 0], true);
+assert.equal(extra[0][0], forward[0][0]);
+assert.deepEqual(extra[1], forward[1], 'sibling draws are unaffected');
+assert.notEqual(extra[0][1], forward[0][1], 'the extra draw advances only its own stream');
+"#,
+        );
+    }
+}
+
+#[test]
+fn randomness_is_installed_for_node_executables() {
+    let project = project(
+        r#"
+let main: () -> () + std::random::!Random + std::io::!IO = fn _ => do
+  let value = std::random::word64 ()
+  let truth = std::random::boolean ()
+  let fraction = std::random::real ()
+  return std::io::println (std::str::display (value, truth, fraction))
+end
+"#,
+        "node",
+        "executable",
+    );
+    run_with_setup(project.path(), "Math.random = () => 0;", "");
+}
+
 fn project(source: &str, platform: &str, kind: &str) -> tempfile::TempDir {
     let project = tempfile::tempdir().unwrap();
     let standard = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
@@ -23,10 +140,14 @@ fn domain_project(source: &str, integers: u32) -> tempfile::TempDir {
 }
 
 fn run(project: &Path, script: &str) {
+    run_with_setup(project, "", script);
+}
+
+fn run_with_setup(project: &Path, setup: &str, script: &str) {
     ruddy_cli::check_project(project).expect("API consumer checks");
     let artifact = ruddy_cli::build_project(project).expect("API consumer builds");
     let script = format!(
-        "import assert from 'node:assert/strict'; import {{pathToFileURL}} from 'node:url'; const app = await import(pathToFileURL({}));\n{script}",
+        "import assert from 'node:assert/strict'; import {{pathToFileURL}} from 'node:url'; {setup} const app = await import(pathToFileURL({}));\n{script}",
         serde_json::to_string(artifact.with_extension("js").to_str().unwrap()).unwrap()
     );
     let output = Command::new("node")

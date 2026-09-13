@@ -979,6 +979,25 @@ fn local_mutation_is_isolated_at_a_function_body() {
 }
 
 #[test]
+fn local_handler_state_does_not_constrain_callback_effect_remainders() {
+    let program = accepted(
+        "effect Random = { word: () -> Nat }
+        let seeded: Nat -> (() -> 'a + !Random + ..'effects) -> 'a + ..'effects = fn seed body => do
+          let state = mut seed
+          return handle body () with | !Random.word _ => ~state end
+        end
+        let pure = seeded 7n (fn _ => !Random.word ())
+        effect Log = Nat -> ()
+        let logged = fn _ => seeded 8n (fn _ => !Log (!Random.word ()))
+        let mutable = fn cell => seeded 9n (fn _ => cell := !Random.word ())",
+    );
+    assert_eq!(scheme(&program, "pure"), "Nat");
+    assert!(scheme(&program, "logged").contains("!Log"));
+    assert!(!scheme(&program, "logged").contains("!mut"));
+    assert!(scheme(&program, "mutable").contains("!mut"));
+}
+
+#[test]
 fn mutation_signatures_forward_region_kinds_through_aliases() {
     let program = accepted(
         "type cell 'r = mut 'r Nat

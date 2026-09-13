@@ -1,0 +1,60 @@
+@test
+let randomness_local_streams: () -> () + test::!Assert = fn _ => do
+  let run = fn extra => random::with_seed
+    0n64
+    (fn _ => do
+      let child = random::local
+        (fn _ => do
+          let first = random::word64 ()
+          _ = if extra then random::word64 () else 0n64 end
+          return first
+        end)
+      let sibling = random::local random::word64
+      let parent = random::word64 ()
+      return (child, sibling, parent)
+    end)
+  _ = test::assert (run false == run true) "Child draws must not advance siblings or parent"
+  let (_, _, parent) = run false
+  _ = test::assert (parent == 487617019471545679n64) "Each local consumes exactly one parent seed"
+  let calls = mut 0n
+  let observed = handle do
+    _ = random::local (fn _ => ())
+    _ = random::local
+      (fn _ => do
+        _ = random::boolean ()
+        _ = random::real ()
+        return random::local random::word64
+      end)
+    _ = random::with_seed 0n64 random::word64
+    return random::local
+      (fn _ => do
+        _ = effects::!Halt ()
+        return false
+      end)
+  end with
+  | random::!Random.word64 _ => do
+    _ = calls := nat::add (~calls) 1n
+    return 0n64
+  end
+  | random::!Random.boolean _ => do
+    _ = test::fail "A child boolean reached its parent"
+    return false
+  end
+  | random::!Random.real _ => do
+    _ = test::fail "A child real reached its parent"
+    return 0
+  end
+  | effects::!Halt _ => raise true
+  end
+  _ = test::assert observed "Unrelated effects must reach the outer handler"
+  _ =
+    test::assert (~calls == 3n) "Empty and aborting scopes consume a seed; explicit seeds do not"
+  let caller_state = mut 0n
+  _ = random::with_seed
+    0n64
+    (fn _ => do
+      _ = caller_state := 7n
+      return random::word64 ()
+    end)
+  return test::assert (~caller_state == 7n) "Caller mutation remains observable"
+end
