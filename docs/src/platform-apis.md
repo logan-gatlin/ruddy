@@ -99,6 +99,12 @@ Node executables and Node/web library exports install a default host handler.
 `nat_below bound` samples below an exclusive Nat64 bound; zero returns `#None`.
 `choose values` chooses an array position, returning `#None` for an empty array.
 
+Use the ambient handler for an ordinary draw:
+
+```ruddy
+let coin = fn _ => std::random::boolean ()
+```
+
 Create a reproducible root with `with_seed`, and use `local` to give a
 computation its own stream seeded by the next outer Random handler:
 
@@ -117,6 +123,18 @@ the body makes no draws or exits early. Its later draws use private state.
 Nested local scopes consume their seeds from their immediate parent.
 `with_seed` obtains nothing from an outer handler. Both handlers preserve
 unrelated effects and their state survives asynchronous suspension.
+
+A custom handler can supply the primitive operations independently:
+
+```ruddy
+let fixed = fn _ => handle
+  (std::random::word64 (), std::random::boolean (), std::random::real ())
+with
+| std::random::!Random.word64 _ => 17n64
+| std::random::!Random.boolean _ => true
+| std::random::!Random.real _ => 0.25
+end
+```
 
 For concurrent work, assign seeds to tasks in stable order **before** scheduling
 them. Each task then enters `with_seed` using its assigned seed when invoked.

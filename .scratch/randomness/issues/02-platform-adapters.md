@@ -1,6 +1,6 @@
 # Default Node and web randomness handlers
 
-Status: needs-triage
+Status: resolved
 Blocked by: 01
 
 Implement the default adapter described in [the spec](../spec.md), including
@@ -17,3 +17,11 @@ completion orders to verify local handler state survives suspension and fixed
 child seed assignment isolates per-child results from sibling interleaving.
 Run Rust tests only
 via `just test`.
+
+## Answer
+
+Installed structural Random handlers for Node entry points and Node/web
+library exports. Controlled host tests pass for all primitives, exact chunk
+assembly, import purity, explicit overrides, and one-word local seeding.
+Opposite async completion schedules preserve each child stream with stable seed
+assignment. See [review](../review.md) for validation.

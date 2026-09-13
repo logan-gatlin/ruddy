@@ -1,6 +1,6 @@
 # Standard-library randomness
 
-Status: implementing
+Status: implemented
 
 Add `std::random` for ordinary randomized application behavior and repeatable
 tests. User-directed requirements: expose several primitive operations on the

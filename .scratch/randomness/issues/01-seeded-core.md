@@ -1,6 +1,6 @@
 # Primitive Random operations and parent-seeded local handlers
 
-Status: needs-triage
+Status: resolved
 
 Implement the public interface and deterministic semantics in
 [the spec](../spec.md). Add the std module export. Keep SplitMix64 state private;
@@ -14,3 +14,11 @@ scripted rejection cases, numeric endpoints, generic array choices, nested
 handlers, exact parent seed consumption (including empty and aborting bodies),
 effect forwarding, and interpreter/JavaScript agreement. This ticket
 must work without the ambient host adapter. Run Rust tests only via `just test`.
+
+## Answer
+
+Implemented `std::random`, SplitMix64 scopes, primitive operations, rejection
+sampling, and generic array choice. Reference vectors, numeric endpoints,
+parent seed counts, nested/aborting scopes, effect forwarding, and supported
+backend/domain combinations pass focused tests. Compiler prerequisites and
+validation are recorded in [the spec](../spec.md) and [review](../review.md).
