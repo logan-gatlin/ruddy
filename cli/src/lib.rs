@@ -37,6 +37,8 @@ pub use git::{LOCKFILE, LockedGit, LockedSelector, Lockfile, ruddy_home};
 const MANIFEST: &str = "Ruddy.toml";
 const ROOT: &str = "src/main.rud";
 pub const DEFAULT_STD_GIT: &str = "https://github.com/logan-gatlin/ruddy.git";
+/// Source commit of this compiler; empty for builds without revision metadata.
+pub const BUILD_REVISION: &str = env!("RUDDY_BUILD_REVISION");
 
 const GITIGNORE: &str = ".gitignore";
 const BUILD_DIRECTORY: &str = "build";
@@ -47,6 +49,7 @@ const INITIAL_VERSION: &str = "0.1.0";
 #[command(
     name = "ruddy",
     version,
+    long_version = env!("RUDDY_LONG_VERSION"),
     about = "The compiler and project manager for Ruddy",
     subcommand_required = true
 )]
@@ -1862,13 +1865,19 @@ fn dependency_specs(
     let mut specifications = Vec::new();
     match std {
         StdConfig::Default => {
+            if BUILD_REVISION.is_empty() {
+                return Err(CompileError::report(
+                    "compiler-revision-unavailable",
+                    "this compiler was built without a source revision; its matching std cannot be selected",
+                ).with_help("rebuild with RUDDY_BUILD_REVISION set to the full compiler source commit, configure [dependencies].std explicitly, or set it to false"));
+            }
             let specification = DependencySpec::Detailed(DependencyDetail {
                 bundle: None,
                 path: None,
                 git: Some(DEFAULT_STD_GIT.into()),
                 branch: None,
                 tag: None,
-                rev: None,
+                rev: Some(BUILD_REVISION.into()),
             });
             specifications.push(("std".to_string(), specification, true));
         }
@@ -2426,7 +2435,9 @@ fn canonical_project_in(directory: &Path, sandbox: Option<&Path>) -> Result<Path
 
 fn default_std_error(error: CompileError) -> CompileError {
     error.map_diagnostics(|diagnostic| {
-        diagnostic.with_help("check access to `https://github.com/logan-gatlin/ruddy.git`, configure `[dependencies].std` to use another project, or set it to `false`")
+        diagnostic
+            .with_note(format!("implicit std is pinned to compiler commit `{BUILD_REVISION}`; that commit must be available from `{DEFAULT_STD_GIT}` unless already cached"))
+            .with_help("check repository access and that the compiler commit has been published, configure `[dependencies].std` to use a matching local checkout, or set it to `false`")
     })
 }
 

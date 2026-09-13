@@ -87,7 +87,7 @@ A library uses `kind = "library"` and needs no executable entry point.
 
 ## Dependencies
 
-Omitting `std` from the dependencies selects the default standard library.
+Omitting `std` from the dependencies selects the standard library at the compiler's source commit, shown by `ruddy --version`. Upgrading the compiler updates this implicit pin on the next successful compilation; an older lockfile or global cache cannot override it. Explicit overrides use normal dependency locking.
 `std = false` disables both that dependency and its prelude.
 An explicit local path can select a different library source:
 

@@ -498,7 +498,7 @@ fn cached_standard_library_child() {
     let scratch = std::path::PathBuf::from(std::env::var_os("RUDDY_TEST_STD_SCRATCH").unwrap());
     let app = scratch.join("app");
     fs::create_dir_all(&app).unwrap();
-    let standard = crate::git_fixture::cache_std(&home, "let installed = 1n\n");
+    let standard = crate::git_fixture::cache_std(&home);
     let request = CompileRequest {
         kind: ruddy::artifact::Kind::Library,
         target: None,
@@ -510,7 +510,7 @@ fn cached_standard_library_child() {
         document: "app".into(),
         files: vec![FileSpec {
             path: ROOT.into(),
-            source: "let main = std::installed\n".into(),
+            source: "let main = std::str::is_empty \"\"\n".into(),
         }],
         std: StdConfig::Default,
         dependencies: IndexMap::new(),
@@ -523,7 +523,7 @@ fn cached_standard_library_child() {
         .iter()
         .find(|stage| stage.id == "dependencies")
         .unwrap();
-    assert_eq!(dependencies.nodes[0].children[0].text, "std@1.0.0");
+    assert_eq!(dependencies.nodes[0].children[0].text, "std@0.1.0");
     assert!(
         dependencies.nodes[0].children[0]
             .fields

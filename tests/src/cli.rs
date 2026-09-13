@@ -559,7 +559,23 @@ fn automatic_std_environment_child() {
     match mode.as_str() {
         "default" | "relative" => {
             let home = ruddy_cli::ruddy_home().unwrap();
-            let standard = crate::git_fixture::cache_std(&home, "let value = 0n\n");
+            let legacy = crate::git_fixture::cache_legacy_std(&home, "let stale = missing\n");
+            let standard = crate::git_fixture::cache_std(&home);
+            let old_commit = legacy.file_name().unwrap().to_str().unwrap();
+            // Cover both a legacy floating lock and a previous compiler pin.
+            let selector = if mode == "relative" {
+                format!("rev = {old_commit:?}\n")
+            } else {
+                String::new()
+            };
+            fs::write(
+                root.join("Ruddy.lock"),
+                format!(
+                    "version = 1\n[[git]]\nurl = {:?}\ncommit = {old_commit:?}\n{selector}",
+                    ruddy_cli::DEFAULT_STD_GIT
+                ),
+            )
+            .unwrap();
             assert!(standard.is_absolute());
             fs::write(
                 root.join("Ruddy.toml"),
@@ -583,8 +599,14 @@ fn automatic_std_environment_child() {
             assert!(!home.join("std").exists());
             let lock: Lockfile =
                 toml::from_str(&fs::read_to_string(root.join("Ruddy.lock")).unwrap()).unwrap();
+            assert_eq!(lock.entries.len(), 1);
             assert_eq!(lock.entries[0].url, ruddy_cli::DEFAULT_STD_GIT);
-            // A new project reuses the selection and checkout without a lockfile.
+            assert_eq!(lock.entries[0].commit, ruddy_cli::BUILD_REVISION);
+            assert_eq!(
+                lock.entries[0].selector.rev.as_deref(),
+                Some(ruddy_cli::BUILD_REVISION)
+            );
+            // A new project also ignores the stale floating selection.
             fs::remove_file(root.join("Ruddy.lock")).unwrap();
             compile(&root).unwrap();
             assert!(root.join("Ruddy.lock").exists());
@@ -633,7 +655,7 @@ fn automatic_std_is_independent_transitive_deduplicated_and_cycle_checked() {
 fn automatic_std_graph_child() {
     let root = PathBuf::from(std::env::var_os("RUDDY_TEST_STD_ROOT").unwrap());
     let home = PathBuf::from(std::env::var_os("RUDDY_HOME").unwrap());
-    let standard = crate::git_fixture::cache_std(&home, "let value = 0n\n");
+    let standard = crate::git_fixture::cache_std(&home);
 
     let dedup = root.join("dedup");
     write_project(&dedup.join("dep"), "dep", "1.0.0", &[]);
@@ -694,16 +716,16 @@ fn automatic_std_graph_child() {
         .filter(|project| project.artifact.header().identity.name == "std")
         .map(|project| project.artifact.header().identity.version.as_str())
         .collect::<Vec<_>>();
-    assert_eq!(std_versions, ["1.0.0", "2.0.0"]);
+    assert_eq!(std_versions, ["0.1.0", "2.0.0"]);
 
     fs::write(
         versions.join("std2/Ruddy.toml"),
-        "name = \"std\"\nversion = \"1.0.0\"\nkind = \"library\"\nroot = \"main.rud\"\n[dependencies]\nstd = false\n",
+        "name = \"std\"\nversion = \"0.1.0\"\nkind = \"library\"\nroot = \"main.rud\"\n[dependencies]\nstd = false\n",
     )
     .unwrap();
     let found = compile(&versions).unwrap_err().to_string();
     assert!(
-        found.contains("[project-identity-conflict] Error") && found.contains("`std@1.0.0`"),
+        found.contains("[project-identity-conflict] Error") && found.contains("`std@0.1.0`"),
         "{found}"
     );
 
@@ -2521,7 +2543,12 @@ fn clap_commands_support_aliases_help_and_strict_arguments() {
     }
 
     for arguments in [vec!["--help"], vec!["new", "--help"], vec!["--version"]] {
+        let version = arguments == ["--version"];
         let information = run(arguments, current.path()).unwrap_err();
+        if version {
+            assert!(!ruddy_cli::BUILD_REVISION.is_empty());
+            assert!(information.to_string().contains(ruddy_cli::BUILD_REVISION));
+        }
         assert!(information.is_success(), "{information}");
         assert_eq!(information.exit_code(), 0, "{information}");
         assert!(!information.is_usage(), "{information}");

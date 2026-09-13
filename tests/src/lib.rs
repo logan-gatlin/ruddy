@@ -11,6 +11,7 @@
 
 mod abi_plans;
 mod artifact;
+mod build_metadata;
 mod bundle;
 mod cli;
 mod compile;

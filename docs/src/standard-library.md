@@ -137,7 +137,7 @@ The functions `std::io::consumer` and `std::io::consumerln` repeatedly accept st
 
 ## Configuring the library
 
-Omitting `std` from `[dependencies]` in `Ruddy.toml` selects the default standard library.
+Omitting `std` from `[dependencies]` in `Ruddy.toml` selects the standard library at the same Git commit as the compiler. `ruddy --version` shows this revision. The implicit pin follows compiler upgrades rather than old lockfiles or cached branch selections.
 An explicit path selects another standard library, while `std = false` disables the dependency and its prelude.
 For example, a project that needs no standard library can disable it:
 

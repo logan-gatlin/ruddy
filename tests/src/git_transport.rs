@@ -85,6 +85,18 @@ fn check_transport(protocol: &str) {
         ],
     );
     let tip = git(&repo, &["rev-parse", "HEAD"]);
+    // Serve the real compiler commit as well as the synthetic moving branch.
+    // The default std must fetch this exact commit, not the branch tip.
+    let compiler_repo = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+    git(
+        &repo,
+        &[
+            "fetch",
+            "--quiet",
+            compiler_repo.to_str().unwrap(),
+            &format!("{}:refs/heads/compiler", ruddy_cli::BUILD_REVISION),
+        ],
+    );
     let mut server = Server(
         Command::new("python3")
             .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/git_https.py"))
@@ -156,8 +168,18 @@ fn shallow_git_child() {
         return;
     }
     for (name, setting, expected, shallow) in [
-        ("default", String::new(), tip.clone(), true),
-        ("shared", String::new(), tip.clone(), true),
+        (
+            "default",
+            String::new(),
+            ruddy_cli::BUILD_REVISION.to_owned(),
+            true,
+        ),
+        (
+            "shared",
+            String::new(),
+            ruddy_cli::BUILD_REVISION.to_owned(),
+            true,
+        ),
         (
             "branch",
             format!("std = {{ git = {url:?}, branch = \"main\" }}"),
@@ -185,7 +207,15 @@ fn shallow_git_child() {
     ] {
         let app = root.join(name);
         fs::create_dir(&app).unwrap();
-        fs::write(app.join("main.rud"), "let value = std::value\n").unwrap();
+        fs::write(
+            app.join("main.rud"),
+            if setting.is_empty() {
+                "let value = std::str::is_empty \"\"\n"
+            } else {
+                "let value = std::value\n"
+            },
+        )
+        .unwrap();
         fs::write(app.join("Ruddy.toml"), format!("name = \"app\"\nversion = \"1.0.0\"\nkind = \"library\"\nroot = \"main.rud\"\n[dependencies]\n{setting}\n")).unwrap();
         let graph =
             ruddy_cli::compile_graph(&app).unwrap_or_else(|error| panic!("{name}: {error}"));

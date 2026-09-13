@@ -19,12 +19,21 @@ ruddy fmt
 Use `ruddy --help` to see all CLI commands. `ruddy fmt` rewrites a bundle's
 sources in one canonical style (`--check` only reports what would change,
 `--stdin` formats one file from standard input); a file with syntax errors is
-formatted around them, and they are reported. The standard library is fetched automatically from `https://github.com/logan-gatlin/ruddy.git` and shared through the Git cache under `$RUDDY_HOME/cache/git` (normally `~/.ruddy/cache/git`).
+formatted around them, and they are reported. The standard library is fetched automatically from `https://github.com/logan-gatlin/ruddy.git` **at the compiler's source commit** and shared through the Git cache under `$RUDDY_HOME/cache/git` (normally `~/.ruddy/cache/git`). `ruddy --version` shows that commit. Upgrading the compiler updates its implicit `std` pin on the next successful compilation, even with an older lockfile or cached selection. Explicit `std` overrides retain normal dependency locking.
 
 Git dependencies use depth-one clones over Git protocol v2.
 Full commit hashes fetch the pinned commit directly; abbreviated revisions may require more history to resolve.
 Cached source selections are shared across projects, including projects without a lockfile.
 To refresh a cached branch or tag, remove its selection from `$RUDDY_HOME/cache/git/selections` and remove the project's `Ruddy.lock`; existing lockfiles keep their pinned revisions.
+
+Compiler builds embed the checkout's full Git SHA. Release builds should use a clean, published commit; when building from an archive without Git metadata, supply `RUDDY_BUILD_REVISION=<full-40-character-SHA>` at build time. Without revision metadata, the CLI requires an explicit `std` dependency (or `std = false`) rather than selecting a floating revision. An unpublished commit cannot be fetched on another machine.
+
+For uncommitted compiler/standard-library development, point consuming projects at the matching working tree:
+
+```toml
+[dependencies]
+std = { path = "../ruddy" }
+```
 
 The repository's `Ruddy.toml` defines the standard-library bundle, with `std/lib.rud` as its root source. Run `ruddy check` from the repository root to check it.
 
