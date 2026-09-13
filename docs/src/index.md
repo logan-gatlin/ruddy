@@ -64,18 +64,6 @@ Part V examines relationships that require richer types and explicit host contra
 14. [Hidden types, mirrors, and generic operations](book/reflection.md)
 15. [JavaScript interoperability](book/interoperability.md)
 
-## Game problems and type relationships
-
-| Problem | Technique | Example |
-| --- | --- | --- |
-| Move objects with different component fields | Open and shared rows | [Geometry and movement](book/types.md#following-a-requirement) |
-| Restrict operations to a known game state | Related field presences | [Pausing and resuming](book/rows.md#carrying-a-relationship-into-the-result) |
-| Keep component combinations consistent | Inferred presence constraints | [Velocity and AI inputs](book/rows.md#presence-is-inferred-from-program-shape) |
-| Restrict selections to equipped weapons | A row shared by a struct and a sum | [Loadouts](book/rows.md#rows-describe-entries-not-a-runtime-container) |
-| Make time-dependent rules reproducible | Effects handled with fixed inputs | [Clocks and pure wrappers](book/effects.md#a-pure-wrapper-around-an-effectful-function) |
-| Update actors with different private state | Hidden types with related operations | [Actor packages](book/reflection.md#different-actor-states-in-one-update-list) |
-| Replay combat and retain checkpoints | Pure rules and immutable updates | [Combat replay](book/report.md) |
-
 ## Appendices and reference
 
 - [A. Installation, editors, and CLI](book/tooling.md)
@@ -88,8 +76,6 @@ Part V examines relationships that require richer types and explicit host contra
 - [Detailed platform and representation contracts](platform-apis.md)
 - [Hello World and FizzBuzz walkthrough](hello-world.md)
 
-## About this draft
+## About this book
 
-This first draft draws on the teaching approach of Cornell's [OCaml Programming: Correct + Efficient + Beautiful](https://cs3110.github.io/textbook/cover.html): explicit evaluation and typing explanations, focused examples, and exercises for programmers learning functional ideas.
-Its prose and examples are written for Ruddy and its own language rules.
-The generated standard-library pages remain the API reference; the chapters link to those pages rather than maintain duplicate signature catalogs.
+This book draws on the teaching approach of Cornell's [OCaml Programming: Correct + Efficient + Beautiful](https://cs3110.github.io/textbook/cover.html): explicit evaluation and typing explanations, focused examples, and exercises for programmers learning functional ideas.
