@@ -694,7 +694,41 @@ impl fmt::Display for Ast<'_, TypeKind> {
                     row.as_ref().map(|row| row as &dyn fmt::Display),
                 )
             }
-            TypeKind::Struct { fields, tail } => {
+            TypeKind::Struct {
+                fields,
+                spreads,
+                tail,
+            } => {
+                if !spreads.is_empty() {
+                    let mut entries: Vec<_> = fields
+                        .iter()
+                        .map(|(name, field)| {
+                            let value = match field {
+                                TypeField::Written { when, value } => format!(
+                                    "{}{}: {}",
+                                    label(Shape::Struct, &name.tracked),
+                                    when_text(when, false),
+                                    Ast(&value.tracked)
+                                ),
+                                TypeField::Absent => {
+                                    format!("\\{}", label(Shape::Struct, &name.tracked))
+                                }
+                            };
+                            (name.span.start, value)
+                        })
+                        .collect();
+                    entries.extend(
+                        spreads
+                            .iter()
+                            .map(|spread| (spread.span.start, type_spread(&spread.value.tracked))),
+                    );
+                    entries.sort_by_key(|(start, _)| *start);
+                    let mut entries: Vec<_> = entries.into_iter().map(|(_, text)| text).collect();
+                    if let Some(tail) = tail {
+                        entries.push(format!("..{}", rest(&tail.of)));
+                    }
+                    return write!(f, "{{ {} }}", entries.join(", "));
+                }
                 if tail.is_none() && fields.is_empty() {
                     return f.write_str("()");
                 }
@@ -739,7 +773,44 @@ impl fmt::Display for Ast<'_, TypeKind> {
             // `+` that hangs one off an arrow. [`effect_row`] is what an
             // arrow's own goes through, so the two cannot drift apart.
             TypeKind::Effects(row) => effect_row(row).fmt(f),
-            TypeKind::Sum { cases, tail } => {
+            TypeKind::Sum {
+                cases,
+                spreads,
+                tail,
+            } => {
+                if !spreads.is_empty() {
+                    let mut entries: Vec<_> = cases
+                        .iter()
+                        .map(|(name, case)| {
+                            let value = match case {
+                                SumCase::Written { when, payload } => format!(
+                                    "{}{}{}",
+                                    label(Shape::Sum, &name.tracked),
+                                    when_text(when, true),
+                                    payload.as_ref().map_or(String::new(), |ty| format!(
+                                        " {}",
+                                        type_atom_text(&ty.tracked)
+                                    ))
+                                ),
+                                SumCase::Absent => {
+                                    format!("\\{}", label(Shape::Sum, &name.tracked))
+                                }
+                            };
+                            (name.span.start, value)
+                        })
+                        .collect();
+                    entries.extend(
+                        spreads
+                            .iter()
+                            .map(|spread| (spread.span.start, type_spread(&spread.value.tracked))),
+                    );
+                    entries.sort_by_key(|(start, _)| *start);
+                    let mut entries: Vec<_> = entries.into_iter().map(|(_, text)| text).collect();
+                    if let Some(tail) = tail {
+                        entries.push(format!("..{}", rest(&tail.of)));
+                    }
+                    return write!(f, "| {}", entries.join(" | "));
+                }
                 let cases = cases.iter().map(|(name, case)| match case {
                     SumCase::Written { when, payload } => Entry::Written {
                         name: &name.tracked,
@@ -1013,4 +1084,26 @@ where
     fields
         .iter()
         .map(|(name, value)| (&name.tracked, Ast(&value.tracked)))
+}
+
+fn type_atom_text(ty: &TypeKind) -> String {
+    let printed = Ast(ty).to_string();
+    if Ast(ty).prec() < Prec::Atom {
+        format!("({printed})")
+    } else {
+        printed
+    }
+}
+
+fn when_text(when: &Option<Box<When>>, grouped: bool) -> String {
+    match mark(when) {
+        Some(Mark::When(name)) if grouped => format!(" (when {name})"),
+        Some(Mark::When(name)) => format!(" when {name}"),
+        _ => String::new(),
+    }
+}
+
+/// A fixed row operand, including its dots and application grouping.
+pub fn type_spread(ty: &TypeKind) -> String {
+    format!("..{}", type_atom_text(ty))
 }

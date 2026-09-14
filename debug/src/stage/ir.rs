@@ -982,7 +982,7 @@ fn type_node(ids: &mut Ids, cx: &Cx, mint: &Mint, ty: &Type, scope: &[Variable])
         .child(type_node(ids, cx, mint, element, scope)),
         // The struct's row again about cases; see the arm below for what the
         // `Rest` child is.
-        TypeKind::Sum { cases, tail } => {
+        TypeKind::Sum { cases, tail, .. } => {
             let mut kids: Vec<Node> = cases
                 .iter()
                 .map(|(name, case)| match case {
@@ -1040,7 +1040,7 @@ fn type_node(ids: &mut Ids, cx: &Cx, mint: &Mint, ty: &Type, scope: &[Variable])
                 false => arrow,
             }
         }
-        TypeKind::Struct { fields, tail } => {
+        TypeKind::Struct { fields, tail, .. } => {
             let mut kids: Vec<Node> = fields
                 .iter()
                 .map(|(name, field)| match field {

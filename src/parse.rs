@@ -672,6 +672,7 @@ pub enum ExternTypeKind {
 pub enum TypeKind {
     Struct {
         fields: IndexMap<TrackedString, TypeField>,
+        spreads: Vec<TypeSpread>,
         /// The `..` ending the field list, when the struct type was written
         /// open. `None` means the type lists every field it allows.
         tail: Option<Tail>,
@@ -686,6 +687,7 @@ pub enum TypeKind {
     /// written absent.
     Sum {
         cases: IndexMap<TrackedString, SumCase>,
+        spreads: Vec<TypeSpread>,
         tail: Option<Tail>,
     },
     Arrow {
@@ -783,6 +785,13 @@ pub enum TypeKind {
         variable: TrackedString,
         body: Box<Type>,
     },
+}
+
+/// A fixed row operand, with the dots retained for source tooling.
+#[derive(Debug, Clone)]
+pub struct TypeSpread {
+    pub span: Span,
+    pub value: Type,
 }
 
 /// One field of a struct type: its type and the `when` clause it may wear, or
@@ -953,9 +962,9 @@ pub struct Tail {
 ///
 /// Two forms rather than three: a named tail is a variable, and whether that
 /// variable is the parameter of the declaration this type is the body of is a
-/// question about the scope around it rather than about the syntax. A bare name
-/// after the dots is no tail at all — it names something declared elsewhere, and
-/// nothing declared elsewhere is the rest of a row.
+/// question about the scope around it rather than about the syntax. A declared
+/// name after the dots is a fixed [`TypeSpread`], represented separately from
+/// the final open tail.
 #[derive(Debug, Clone)]
 pub enum Rest {
     /// `..` — anything at all, named by nothing and shared with no other tail.
@@ -4300,6 +4309,7 @@ impl Parser {
         }
 
         let mut cases = IndexMap::new();
+        let mut spreads = Vec::new();
         let mut tail = None;
         let mut span = match &bar {
             Some(bar) => bar.span,
@@ -4313,13 +4323,19 @@ impl Parser {
         let mut separator = None;
         loop {
             if let Some(dots) = self.eat_if(&Kind::DotDot) {
-                let of = self.rest_name();
-                let at = of.span().map_or(dots.span, |name| dots.span.merge(name));
-                span = span.merge(at);
-                tail = Some(Tail { span: at, of });
-                break;
-            }
-            if let Some(slash) = self.eat_if(&Kind::Backslash) {
+                if self.at_fixed_spread() {
+                    let value = self.type_atom()?;
+                    let at = dots.span.merge(value.span);
+                    span = span.merge(at);
+                    spreads.push(TypeSpread { span: at, value });
+                } else {
+                    let of = self.rest_name();
+                    let at = of.span().map_or(dots.span, |name| dots.span.merge(name));
+                    span = span.merge(at);
+                    tail = Some(Tail { span: at, of });
+                    break;
+                }
+            } else if let Some(slash) = self.eat_if(&Kind::Backslash) {
                 // A `\` promises a case, so anything but a tag after it is
                 // reported — the case keeps its `#`, spelled the same
                 // way present or absent. No payload and no `when` either;
@@ -4397,7 +4413,11 @@ impl Parser {
             }
         }
 
-        Some(span.track(TypeKind::Sum { cases, tail }))
+        Some(span.track(TypeKind::Sum {
+            cases,
+            spreads,
+            tail,
+        }))
     }
 
     /// `<atom> <atom>*` — a type applied to arguments, gathered flat.
@@ -4512,27 +4532,43 @@ impl Parser {
         }
     }
 
+    fn at_fixed_spread(&self) -> bool {
+        matches!(
+            self.peek().map(|token| &token.tracked),
+            Some(Kind::Identifier(_) | Kind::ColonColon | Kind::LeftParen)
+        )
+    }
+
     /// `{ <field> [when <a>]: <type> | \<field>, ..., [..[<name>]] }` with an
     /// optional trailing comma among the fields. A `when` names the presence
     /// variable that says whether the field is there; `\name` says it definitely
     /// is not, which takes no type and no `when` — whatever follows it but a
     /// comma or the brace is the
     /// unexpected token it looks like, since nothing here reads one. The `..`
-    /// tail, when present, comes last — the fields it stands for have no order
+    /// tail, when present, comes last. Fixed spreads are ordinary entries.
+    /// The open tail has no order
     /// among the named ones to claim — and takes no comma after it.
     fn struct_type(&mut self) -> Option<Type> {
         let open = self.eat(&Kind::LeftBrace).expect("the caller peeked `{`");
         let mut fields = IndexMap::new();
+        let mut spreads = Vec::new();
         let mut tail = None;
 
         while !self.at_type_field_boundary() {
             if let Some(dots) = self.eat_if(&Kind::DotDot) {
-                let of = self.rest_name();
-                let span = of.span().map_or(dots.span, |name| dots.span.merge(name));
-                tail = Some(Tail { span, of });
-                break;
-            }
-            if let Some(slash) = self.eat_if(&Kind::Backslash) {
+                if self.at_fixed_spread() {
+                    let value = self.type_atom()?;
+                    spreads.push(TypeSpread {
+                        span: dots.span.merge(value.span),
+                        value,
+                    });
+                } else {
+                    let of = self.rest_name();
+                    let span = of.span().map_or(dots.span, |name| dots.span.merge(name));
+                    tail = Some(Tail { span, of });
+                    break;
+                }
+            } else if let Some(slash) = self.eat_if(&Kind::Backslash) {
                 // The key's span is the whole `\name`, so a complaint about
                 // the entry — a repeat, a `\` in a closed struct — underlines
                 // the absence mark along with the name it marks.
@@ -4561,7 +4597,11 @@ impl Parser {
 
         let close = self.close_delimiter(open.span, &Kind::RightBrace)?;
         let span = open.span.merge(close.span);
-        Some(span.track(TypeKind::Struct { fields, tail }))
+        Some(span.track(TypeKind::Struct {
+            fields,
+            spreads,
+            tail,
+        }))
     }
 
     /// A grouped type or closed tuple type, using a comma as the discriminator

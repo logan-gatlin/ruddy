@@ -939,7 +939,11 @@ module.exports = grammar({
     // A row that is nothing but its tail is read as an effect row unless a
     // leading `|` says otherwise, which is why only this branch reaches `rest`
     // with no case in front of it.
-    _sum_body: $ => choice($.rest, $._sum_cases),
+    _sum_body: $ => choice(
+      $.rest,
+      $._sum_cases,
+      prec.right(seq($.fixed_type_spread, optional(seq('|', $._sum_body)))),
+    ),
 
     // Right-associative, so a sum written as an operation's signature takes
     // every `|` after it — `effect E = op : #A | #B` declares one operation
@@ -1025,10 +1029,13 @@ module.exports = grammar({
     _struct_type_body: $ => choice(
       $.rest,
       seq(
-        choice($.struct_type_field, $.absent_field),
+        choice($.struct_type_field, $.absent_field, $.fixed_type_spread),
         optional(seq(',', optional($._struct_type_body))),
       ),
     ),
+
+    /** A fixed named row; applications are parenthesized. */
+    fixed_type_spread: $ => seq('..', field('type', choice($.identifier, $.path, $.parenthesized_type))),
 
     struct_type_field: $ => seq(
       field('name', fieldLabel($)),

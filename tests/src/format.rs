@@ -55,6 +55,21 @@ fn printed_tree(source: &str) -> String {
 }
 
 #[test]
+fn fixed_type_spreads_preserve_order_grouping_and_comments() {
+    for source in [
+        "type Circle={..V2,radius:Real,..Metadata,}",
+        "type Located 'a 'r={..(Value 'a),x:Real,..'r}",
+        "type Choice=| ..Cases | #Extra Real | ..More",
+        "type Choice=| ..Cases | ..More",
+        "type Choice=#First | ..Cases | #Last",
+        "type Circle = {\n -- position\n ..V2,\n radius: Real, -- size\n ..Metadata,\n}",
+        "type Choice =\n | ..Cases -- first\n | #Extra\n | ..More",
+    ] {
+        fmt(source);
+    }
+}
+
+#[test]
 fn a_definition_is_printed_on_one_line_when_it_fits() {
     assert_eq!(fmt("let   x   =   1n"), "let x = 1n\n");
     assert_eq!(fmt("let x : Nat = 1n"), "let x: Nat = 1n\n");

@@ -766,7 +766,7 @@ impl fmt::Display for Show<'_, TypeKind> {
                 Some(row) => row.fmt(f),
                 None => f.write_str("<error>"),
             },
-            TypeKind::Sum { cases, tail } => {
+            TypeKind::Sum { cases, tail, .. } => {
                 let cases = cases.iter().map(|(name, case)| match case {
                     SumCase::Written { when, payload, .. } => Entry::Written {
                         name,
@@ -808,7 +808,7 @@ impl fmt::Display for Show<'_, TypeKind> {
                     row.as_ref().map(|row| row as &dyn fmt::Display),
                 )
             }
-            TypeKind::Struct { fields, tail } => {
+            TypeKind::Struct { fields, tail, .. } => {
                 if tail.is_none() && fields.is_empty() {
                     return f.write_str("()");
                 }

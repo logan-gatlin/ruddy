@@ -13130,7 +13130,7 @@ fn extern_annotation_sources(
                 work.push((to, lowered_to.clone()));
                 work.push((from, lowered_from.clone()));
             }
-            (ir::TypeKind::Struct { fields, tail }, Ty::Struct(row)) => {
+            (ir::TypeKind::Struct { fields, tail, .. }, Ty::Struct(row)) => {
                 let row = flatten_row(row);
                 source_tail(&mut sources, tail, &row.rest);
                 for (name, written) in fields.iter().rev() {
@@ -13143,7 +13143,7 @@ fn extern_annotation_sources(
                     }
                 }
             }
-            (ir::TypeKind::Sum { cases, tail }, Ty::Sum(row)) => {
+            (ir::TypeKind::Sum { cases, tail, .. }, Ty::Sum(row)) => {
                 let row = flatten_row(row);
                 source_tail(&mut sources, tail, &row.rest);
                 for (name, written) in cases.iter().rev() {
@@ -13485,7 +13485,7 @@ fn lower_scoped(
         // field written `\name` is [`Presence::Absent`] in the position it was
         // written, its type deliberately unconstrained — a field that is not
         // there has nothing to have a type.
-        TypeKind::Struct { fields, tail } => {
+        TypeKind::Struct { fields, tail, .. } => {
             let mut labels = IndexMap::new();
             for (name, field) in fields {
                 let lowered = match field {
@@ -13508,7 +13508,7 @@ fn lower_scoped(
         // — the same type `()` is, built here rather than in the tree so that
         // what the reader wrote and what the compiler means stay two separate
         // things. See [`ir::TermKind::Tag`](crate::ir::TermKind::Tag).
-        TypeKind::Sum { cases, tail } => {
+        TypeKind::Sum { cases, tail, .. } => {
             let mut labels = IndexMap::new();
             for (name, case) in cases {
                 let lowered = match case {

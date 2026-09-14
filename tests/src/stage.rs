@@ -643,6 +643,20 @@ fn the_tree_tabs_show_a_struct_spread_as_written() {
     }
 }
 
+#[test]
+fn fixed_type_spreads_have_source_spans_in_the_debugger() {
+    let source = "type V2 = { x: Real } type Circle = { ..V2, radius: Real }";
+    let tree = tab("ast", source);
+    let rows = flatten(&tree);
+    let spread = rows
+        .iter()
+        .find(|node| node.label == "Spread")
+        .expect("the fixed operand is shown");
+    let span = spread.at.expect("the spread has a source span");
+    assert_eq!(&source[span.start..span.start + span.width], "..V2");
+    assert_eq!(spread.text, "..V2");
+}
+
 /// The IR tab says what each variable turned out to stand for, which is the
 /// whole of what it adds over the AST's: the name is written as its uses spell
 /// it, and which of the three sorts it has follows from where the type uses it.

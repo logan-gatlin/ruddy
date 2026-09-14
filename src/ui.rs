@@ -1373,6 +1373,8 @@ impl ir::ErrorKind {
             ir::ErrorKind::OpenDeclaredType { .. } => "open-declared-type",
             ir::ErrorKind::ClauseInDeclaration => "declared-where-clause",
             ir::ErrorKind::VariableInDeclaration { .. } => "variable-in-declaration",
+            ir::ErrorKind::InvalidFixedSpread => "invalid-fixed-spread",
+            ir::ErrorKind::OpenFixedSpread => "open-fixed-spread",
             ir::ErrorKind::HoleInDeclaration => "hole-in-declaration",
             ir::ErrorKind::HoleInOperation => "hole-in-operation",
             // The name is not part of the code, only of the wording: what went
@@ -1608,6 +1610,12 @@ impl ir::Error {
             )
             .label("this name is not one of the type's parameters")
             .help(format!("add `'{name}` to the header, or use an existing parameter")),
+            E::InvalidFixedSpread => Diagnostic::new(code, "a fixed spread must name a type", span)
+                .label("this operand is not a named type or an application of one")
+                .help("write `..Name` or `..(Name Argument)`"),
+            E::OpenFixedSpread => Diagnostic::new(code, "a fixed spread must have a closed row", span)
+                .label("this type still has an open row tail")
+                .help("supply a closed row argument, or use the final generic spread"),
             E::HoleInDeclaration => {
                 Diagnostic::new(code, "a declared type cannot contain `_`", span)
                     .label("a declaration cannot leave its type open")
