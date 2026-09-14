@@ -9,7 +9,10 @@ use std::{
     collections::{HashMap, HashSet, VecDeque},
     path::PathBuf,
     sync::{Arc, Mutex},
+    time::{Duration, Instant},
 };
+
+const BACKGROUND_QUIET_INTERVAL: Duration = Duration::from_millis(150);
 use url::Url;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
@@ -118,6 +121,7 @@ pub fn serve(connection: Connection) -> Result<()> {
         sender: connection.sender,
         project_error: None,
         background: false,
+        background_due: None,
         background_errors: Vec::new(),
         published: None,
         published_closed: HashSet::new(),
@@ -164,10 +168,24 @@ pub fn serve(connection: Connection) -> Result<()> {
             && !worker.documents.is_empty()
             && receive.is_empty()
         {
+            if let Some(remaining) = worker
+                .background_due
+                .and_then(|due| due.checked_duration_since(Instant::now()))
+            {
+                match receive.recv_timeout(remaining) {
+                    Ok(envelope) => {
+                        pending.push_back(envelope);
+                        continue;
+                    }
+                    Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+                    Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+                }
+            }
             let token = worker.begin(None);
             if let Ok(errors) = token.run(|| worker.workspace.check_background()) {
                 worker.background_errors = errors;
                 worker.background = true;
+                worker.background_due = None;
                 worker.publish()?;
             }
             worker.end();
@@ -200,6 +218,7 @@ struct Worker {
     sender: Sender<Message>,
     project_error: Option<String>,
     background: bool,
+    background_due: Option<Instant>,
     background_errors: Vec<String>,
     published: Option<(u64, bool)>,
     published_closed: HashSet<String>,
@@ -301,9 +320,9 @@ impl Worker {
                         document.text = text;
                         document.version = version;
                         self.workspace.focus(&path);
-                        self.workspace
+                        self.dirty |= self
+                            .workspace
                             .set_overlay(&path, Some(document.text.clone()));
-                        self.dirty = true;
                     }
                 }
             }
@@ -320,8 +339,7 @@ impl Worker {
                             json!({"uri":document.uri,"diagnostics":[]}),
                         )))?;
                     }
-                    self.workspace.set_overlay(&path, None);
-                    self.dirty = true;
+                    self.dirty |= self.workspace.set_overlay(&path, None);
                 }
             }
             "workspace/didChangeWatchedFiles"
@@ -336,11 +354,17 @@ impl Worker {
         if !self.dirty {
             return;
         }
-        self.project_error = self
-            .workspace
-            .refresh()
-            .err()
-            .map(|error| error.messages().join("\n"));
+        match self.workspace.refresh() {
+            Ok(report) => {
+                self.project_error = None;
+                self.background_due =
+                    (report.background > 0).then(|| Instant::now() + BACKGROUND_QUIET_INTERVAL);
+            }
+            Err(error) => {
+                self.project_error = Some(error.messages().join("\n"));
+                self.background_due = None;
+            }
+        }
         *self.watched.lock().unwrap() = self.workspace.observed_files();
         self.background = false;
         self.background_errors.clear();
@@ -424,17 +448,45 @@ impl Worker {
         Ok(())
     }
 
-    fn answer(&self, request: &Request) -> std::result::Result<Value, String> {
+    fn answer(&mut self, request: &Request) -> std::result::Result<Value, String> {
         let path = request
             .params
             .pointer("/textDocument/uri")
             .and_then(Value::as_str)
             .and_then(file_path)
             .ok_or("expected a file URI")?;
+        if request.method == "textDocument/definition" {
+            let Some(source) = self
+                .workspace
+                .file(&path)
+                .map(|(project, logical)| project.analysis().sources[logical].clone())
+            else {
+                return Ok(Value::Null);
+            };
+            let at = request
+                .params
+                .get("position")
+                .and_then(|position| offset(&source, position))
+                .ok_or("invalid document position")?;
+            return Ok(self
+                .workspace
+                .definition(&path, at)
+                .and_then(|(path, span)| {
+                    let (target, logical) = self.workspace.file(&path)?;
+                    let uri = self
+                        .documents
+                        .get(&file_identity(&path))
+                        .map(|document| document.uri.clone())
+                        .or_else(|| Url::from_file_path(path).ok().map(|uri| uri.to_string()))?;
+                    Some(json!({"uri":uri,"range":range(&target.analysis().sources[logical],span)}))
+                })
+                .unwrap_or(Value::Null));
+        }
         let Some((project, logical)) = self.workspace.file(&path) else {
             return Ok(Value::Null);
         };
-        let source = &project.analysis.sources[logical];
+        let analysis = project.analysis();
+        let source = &analysis.sources[logical];
         // Formatting is whole-document and positionless: one edit replacing
         // everything, or none when the buffer is already formatted. Syntax
         // errors are formatted around, as the command line does.
@@ -478,7 +530,7 @@ impl Worker {
                 return Err("invalid action range".into());
             }
             let actions: Vec<_> = project
-                .analysis
+                .analysis()
                 .tail_recursion(logical)
                 .into_iter()
                 .filter(|fix| start <= fix.binding.end() && end >= fix.binding.start)
@@ -506,8 +558,8 @@ impl Worker {
             .and_then(|position| offset(source, position))
             .ok_or("invalid document position")?;
         Ok(match request.method.as_str() {
-            "textDocument/hover" => project.analysis.hover(logical, at).map(|hover| json!({"contents":{"kind":"markdown","value":format!("```ruddy\n{}\n```{}",hover.ty,hover.runtime_information.map(|note| format!("\n\n{note}")).unwrap_or_default())},"range":range(source, hover.span)})).unwrap_or(Value::Null),
-            "textDocument/completion" => Value::Array(project.analysis.completions(logical, at).into_iter().map(|item| {
+            "textDocument/hover" => analysis.hover(logical, at).map(|hover| json!({"contents":{"kind":"markdown","value":format!("```ruddy\n{}\n```{}",hover.ty,hover.runtime_information.map(|note| format!("\n\n{note}")).unwrap_or_default())},"range":range(source, hover.span)})).unwrap_or(Value::Null),
+            "textDocument/completion" => Value::Array(analysis.completions(logical, at).into_iter().map(|item| {
                 // LSP has no general type kind. Class and TypeParameter both
                 // misdescribe aliases and primitive types; name the category
                 // in the detail instead of making clients display either one.
@@ -523,12 +575,6 @@ impl Worker {
                 };
                 json!({"label":item.label,"detail":item.detail,"kind":kind})
             }).collect()),
-            "textDocument/definition" => self.workspace.definition(&path, at).and_then(|(path, span)| {
-                let (target, logical) = self.workspace.file(&path)?;
-                let uri = self.documents.get(&file_identity(&path)).map(|document| document.uri.clone())
-                    .or_else(|| Url::from_file_path(path).ok().map(|uri| uri.to_string()))?;
-                Some(json!({"uri":uri,"range":range(&target.analysis.sources[logical],span)}))
-            }).unwrap_or(Value::Null),
             _ => Value::Null,
         })
     }
@@ -560,7 +606,10 @@ impl Worker {
         if self.background {
             let mut current = HashSet::new();
             for project in &self.workspace.projects {
-                for (logical, text) in &project.analysis.sources {
+                let Some(analysis) = project.source_analysis() else {
+                    continue;
+                };
+                for (logical, text) in &analysis.sources {
                     let path = file_identity(&project.source_directory.join(logical));
                     if self.documents.contains_key(&path) {
                         continue;
@@ -599,22 +648,23 @@ fn diagnostics_for(
     logical: &str,
     text: &str,
 ) -> Vec<Value> {
-    let mut diagnostics: Vec<_> = project.analysis.diagnostics.iter().filter(|diagnostic| project.analysis.paths.get(&diagnostic.primary.span.file_id).is_some_and(|path| path == logical)).map(|diagnostic| {
+    let analysis = project.analysis();
+    let mut diagnostics: Vec<_> = analysis.diagnostics.iter().filter(|diagnostic| analysis.paths.get(&diagnostic.primary.span.file_id).is_some_and(|path| path == logical)).map(|diagnostic| {
                     let mut message = diagnostic.title.clone();
                     for detail in std::iter::once(&diagnostic.primary.message).chain(&diagnostic.notes).chain(&diagnostic.help) {
                         if !detail.is_empty() && detail != &diagnostic.title { message.push('\n'); message.push_str(detail); }
                     }
                     let related: Vec<_> = diagnostic.related.iter().filter_map(|annotation| {
-                        let logical = project.analysis.paths.get(&annotation.span.file_id)?;
+                        let logical = analysis.paths.get(&annotation.span.file_id)?;
                         let uri = Url::from_file_path(project.source_directory.join(logical)).ok()?;
-                        let source = project.analysis.sources.get(logical)?;
+                        let source = analysis.sources.get(logical)?;
                         Some(json!({"location":{"uri":uri.as_str(),"range":range(source,annotation.span)},"message":annotation.message}))
                     }).collect();
                     json!({"range":range(text,diagnostic.primary.span),"severity":1,"source":"ruddy","code":diagnostic.code,"message":message,"relatedInformation":related})
                 }).collect();
     diagnostics.extend(
         project
-            .analysis
+            .analysis()
             .tail_recursion(logical)
             .iter()
             .map(|fix| tail_diagnostic(text, fix)),

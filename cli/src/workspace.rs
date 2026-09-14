@@ -6,18 +6,21 @@ use ruddy::{
     artifact::{Artifact, Header},
     ir,
 };
+use std::collections::HashSet;
 
 pub struct ProjectAnalysis {
     pub directory: PathBuf,
     pub source_directory: PathBuf,
-    pub analysis: Analysis,
+    analysis: Option<Analysis>,
     pub interface: Header,
     build: Build,
     manifest_source: String,
     focus: Option<String>,
     dependencies: Vec<(String, PathBuf, u64)>,
     inputs: HashMap<PathBuf, Option<String>>,
-    revision: u64,
+    interface_revision: u64,
+    cache_key: u64,
+    cacheable: bool,
     artifact: Option<Artifact>,
 }
 
@@ -26,6 +29,8 @@ pub struct ProjectAnalysis {
 pub struct RefreshReport {
     pub rebuilt: usize,
     pub reused: usize,
+    /// Dependencies admitted from the persistent artifact cache.
+    pub cached: usize,
     /// Projects whose current analysis has not yet been lowered.
     pub background: usize,
 }
@@ -36,6 +41,16 @@ struct GitSelection {
     used: bool,
 }
 
+struct Visit {
+    directory: PathBuf,
+    cacheable: bool,
+}
+
+struct RefreshHistory<'a> {
+    previous: &'a mut HashMap<PathBuf, ProjectAnalysis>,
+    report: &'a mut RefreshReport,
+}
+
 pub struct Workspace {
     root: PathBuf,
     git_selections: Vec<GitSelection>,
@@ -44,12 +59,43 @@ pub struct Workspace {
     overlays: HashMap<PathBuf, String>,
     hosts: HashMap<PathBuf, Host>,
     pub projects: Vec<ProjectAnalysis>,
-    next_revision: u64,
+    next_interface_revision: u64,
+    cache: Option<crate::cache::ArtifactCache>,
+    cache_all_dependencies: bool,
+    source_required: HashSet<PathBuf>,
     observed: std::cell::RefCell<HashMap<PathBuf, Option<String>>>,
+}
+
+impl ProjectAnalysis {
+    pub fn analysis(&self) -> &Analysis {
+        self.analysis
+            .as_ref()
+            .expect("source analysis was requested before it was read")
+    }
+
+    pub(crate) fn source_analysis(&self) -> Option<&Analysis> {
+        self.analysis.as_ref()
+    }
 }
 
 impl Workspace {
     pub fn new(root: PathBuf) -> Self {
+        let cache = ruddy_home()
+            .ok()
+            .map(|home| crate::cache::ArtifactCache::at(home.join("cache").join("artifacts")));
+        Self::with_cache(root, cache, false)
+    }
+
+    /// Construct an editor workspace with an isolated persistent artifact cache.
+    pub fn with_artifact_cache(root: PathBuf, cache: PathBuf) -> Self {
+        Self::with_cache(root, Some(crate::cache::ArtifactCache::at(cache)), true)
+    }
+
+    fn with_cache(
+        root: PathBuf,
+        cache: Option<crate::cache::ArtifactCache>,
+        cache_all_dependencies: bool,
+    ) -> Self {
         Self {
             root: fs::canonicalize(&root).unwrap_or_else(|_| normalize(&root)),
             git_selections: Vec::new(),
@@ -58,26 +104,74 @@ impl Workspace {
             overlays: HashMap::new(),
             hosts: HashMap::new(),
             projects: Vec::new(),
-            next_revision: 0,
+            next_interface_revision: 0,
+            cache,
+            cache_all_dependencies,
+            source_required: HashSet::new(),
             observed: Default::default(),
         }
     }
 
+    /// Select a file for foreground analysis. Expanding an existing partial
+    /// analysis does not rebuild the project merely because the editor moved.
     pub fn focus(&mut self, path: &Path) {
-        self.focus = Some(file_identity(path));
+        let path = file_identity(path);
+        self.focus = Some(path.clone());
+        for project in &mut self.projects {
+            let Some(analysis) = project.analysis.as_mut() else {
+                if path.starts_with(&project.source_directory) {
+                    self.source_required.insert(project.directory.clone());
+                }
+                continue;
+            };
+            let Some(logical) = analysis
+                .sources
+                .keys()
+                .find(|logical| file_identity(&project.source_directory.join(logical)) == path)
+                .cloned()
+            else {
+                continue;
+            };
+            project.focus = Some(logical.clone());
+            let host = self
+                .hosts
+                .get_mut(&project.directory)
+                .expect("a current project host");
+            host.focus(Some(&logical));
+            if host.request_file(analysis, &logical) {
+                let kind = project.interface.kind;
+                let dependencies = project.interface.dependencies.clone();
+                let mut interface = analysis.interface();
+                interface.kind = kind;
+                interface.dependencies = dependencies;
+                if project.interface != interface {
+                    self.next_interface_revision += 1;
+                    project.interface_revision = self.next_interface_revision;
+                }
+                project.interface = interface;
+                project.artifact = None;
+            }
+            break;
+        }
     }
 
-    /// Closing a buffer removes the overlay; the next refresh reads disk.
-    pub fn set_overlay(&mut self, path: &Path, text: Option<String>) {
+    /// Set or remove an open-buffer overlay, returning whether the effective
+    /// source changed. Transport revisions whose text is identical need not
+    /// invalidate semantic work.
+    pub fn set_overlay(&mut self, path: &Path, text: Option<String>) -> bool {
         let path = file_identity(path);
+        let disk = fs::read_to_string(&path).ok();
+        let before = self.overlays.get(&path).cloned().or_else(|| disk.clone());
         match text {
             Some(text) => {
-                self.overlays.insert(path, text);
+                self.overlays.insert(path.clone(), text);
             }
             None => {
                 self.overlays.remove(&path);
             }
         }
+        let after = self.overlays.get(&path).cloned().or(disk);
+        before != after
     }
 
     fn read(&self, path: &Path) -> Option<String> {
@@ -119,14 +213,20 @@ impl Workspace {
         let mut active = Vec::new();
         let mut projects = Vec::new();
         let mut report = RefreshReport::default();
+        let mut history = RefreshHistory {
+            previous: &mut previous,
+            report: &mut report,
+        };
         self.visit(
-            self.root.clone(),
+            Visit {
+                directory: self.root.clone(),
+                cacheable: false,
+            },
             build,
             &mut resolver,
             &mut active,
             &mut projects,
-            &mut previous,
-            &mut report,
+            &mut history,
         )?;
         let reachable: std::collections::HashSet<_> = projects
             .iter()
@@ -198,15 +298,18 @@ impl Workspace {
 
     fn visit(
         &mut self,
-        directory: PathBuf,
+        visit: Visit,
         build: Build,
         resolver: &mut Option<git::Resolver>,
         active: &mut Vec<PathBuf>,
         projects: &mut Vec<ProjectAnalysis>,
-        previous: &mut HashMap<PathBuf, ProjectAnalysis>,
-        report: &mut RefreshReport,
+        history: &mut RefreshHistory<'_>,
     ) -> Result<usize, CompileError> {
         ruddy::cancellation::checkpoint();
+        let Visit {
+            directory,
+            cacheable,
+        } = visit;
         let directory = fs::canonicalize(&directory).map_err(|error| {
             CompileError::report(
                 "project-unavailable",
@@ -243,7 +346,7 @@ impl Workspace {
                 .map(|(alias, spec)| (alias.clone(), spec.clone())),
         )?;
         let mut dependencies = Vec::new();
-        for (alias, spec, _default_std) in specifications {
+        for (alias, spec, default_std) in specifications {
             if !source_identifier(&alias) {
                 return Err(invalid_dependency_alias(&alias));
             }
@@ -269,7 +372,17 @@ impl Workspace {
                     format!("executable bundle `{expected}` cannot be a dependency"),
                 ));
             }
-            let at = self.visit(child, build, resolver, active, projects, previous, report)?;
+            let at = self.visit(
+                Visit {
+                    directory: child,
+                    cacheable: default_std || self.cache_all_dependencies,
+                },
+                build,
+                resolver,
+                active,
+                projects,
+                history,
+            )?;
             dependencies.push((alias, at));
         }
         if projects.iter().any(|project| {
@@ -300,6 +413,106 @@ impl Workspace {
                 "project root is not a source filename",
             )
         })?;
+        let focus = self
+            .focus
+            .as_ref()
+            .and_then(|path| path.strip_prefix(&source_directory).ok())
+            .map(|path| path.to_string_lossy().into_owned())
+            .or_else(|| {
+                history
+                    .previous
+                    .get(&directory)
+                    .and_then(|project| project.focus.clone())
+            });
+        let dependency_interfaces: Vec<_> = dependencies
+            .iter()
+            .map(|(alias, at)| {
+                (
+                    alias.clone(),
+                    projects[*at].directory.clone(),
+                    projects[*at].interface_revision,
+                )
+            })
+            .collect();
+        if history.previous.get(&directory).is_some_and(|project| {
+            project.build == build
+                && project.manifest_source == manifest_source
+                && project.source_directory == source_directory
+                && (project.analysis.is_some() || !self.source_required.contains(&directory))
+                && project.dependencies == dependency_interfaces
+                && project
+                    .inputs
+                    .iter()
+                    .all(|(path, source)| self.read(path) == *source)
+        }) {
+            active.pop();
+            let at = projects.len();
+            projects.push(
+                history
+                    .previous
+                    .remove(&directory)
+                    .expect("the reusable project is present"),
+            );
+            history.report.reused += 1;
+            return Ok(at);
+        }
+        let dependency_keys: Vec<_> = dependencies
+            .iter()
+            .map(|(_, at)| projects[*at].cache_key)
+            .collect();
+        let cache_key = crate::cache::key(&directory, &dependency_keys, build);
+        let may_use_cache = cacheable
+            && directory != self.root
+            && focus.is_none()
+            && !self.source_required.contains(&directory)
+            && !self
+                .overlays
+                .keys()
+                .any(|path| path.starts_with(&source_directory));
+        if may_use_cache
+            && let Some(artifact) = self
+                .cache
+                .as_ref()
+                .and_then(|cache| cache.load(cache_key, &manifest.name))
+        {
+            let mut inputs = HashMap::new();
+            for path in crate::cache::input_paths(std::slice::from_ref(&directory)) {
+                let source = fs::read_to_string(&path).ok();
+                self.observed
+                    .borrow_mut()
+                    .insert(path.clone(), source.clone());
+                inputs.insert(path, source);
+            }
+            let interface = artifact.header().clone();
+            let interface_revision = history
+                .previous
+                .get(&directory)
+                .filter(|project| project.interface == interface)
+                .map(|project| project.interface_revision)
+                .unwrap_or_else(|| {
+                    self.next_interface_revision += 1;
+                    self.next_interface_revision
+                });
+            active.pop();
+            let at = projects.len();
+            projects.push(ProjectAnalysis {
+                directory,
+                source_directory,
+                analysis: None,
+                interface,
+                build,
+                manifest_source,
+                focus,
+                dependencies: dependency_interfaces,
+                inputs,
+                interface_revision,
+                cache_key,
+                cacheable,
+                artifact: Some(artifact),
+            });
+            history.report.cached += 1;
+            return Ok(at);
+        }
         struct Sources<'a> {
             directory: &'a Path,
             overlays: &'a HashMap<PathBuf, String>,
@@ -339,43 +552,6 @@ impl Workspace {
             })
             .collect();
         let linked: Vec<_> = projects.iter().map(|project| &project.interface).collect();
-        let focus = (directory == self.root)
-            .then(|| {
-                self.focus.as_ref().map(|path| {
-                    path.strip_prefix(&source_directory)
-                        .unwrap_or(path)
-                        .to_string_lossy()
-                        .into_owned()
-                })
-            })
-            .flatten();
-        let dependency_revisions: Vec<_> = dependencies
-            .iter()
-            .map(|(alias, at)| {
-                (
-                    alias.clone(),
-                    projects[*at].directory.clone(),
-                    projects[*at].revision,
-                )
-            })
-            .collect();
-        if let Some(project) = previous.remove(&directory)
-            && project.build == build
-            && project.manifest_source == manifest_source
-            && project.source_directory == source_directory
-            && project.focus == focus
-            && project.dependencies == dependency_revisions
-            && project
-                .inputs
-                .iter()
-                .all(|(path, source)| self.read(path) == *source)
-        {
-            active.pop();
-            let at = projects.len();
-            projects.push(project);
-            report.reused += 1;
-            return Ok(at);
-        }
         let host = self.hosts.entry(directory.clone()).or_default();
         host.focus(focus.as_deref());
         let analysis = host.analyze_from_files(
@@ -398,23 +574,33 @@ impl Workspace {
                 }
             })
             .collect();
+        let interface_revision = history
+            .previous
+            .get(&directory)
+            .filter(|project| project.interface == interface)
+            .map(|project| project.interface_revision)
+            .unwrap_or_else(|| {
+                self.next_interface_revision += 1;
+                self.next_interface_revision
+            });
         active.pop();
-        self.next_revision += 1;
         let at = projects.len();
         projects.push(ProjectAnalysis {
             directory,
             source_directory,
-            analysis,
+            analysis: Some(analysis),
             interface,
             build,
             manifest_source,
             focus,
-            dependencies: dependency_revisions,
+            dependencies: dependency_interfaces,
             inputs: inputs.into_inner(),
-            revision: self.next_revision,
+            interface_revision,
+            cache_key,
+            cacheable,
             artifact: None,
         });
-        report.rebuilt += 1;
+        history.report.rebuilt += 1;
         Ok(at)
     }
 
@@ -432,18 +618,26 @@ impl Workspace {
                 continue;
             }
             ruddy::cancellation::checkpoint();
+            let analysis = project
+                .analysis
+                .as_mut()
+                .expect("an uncached project has source analysis");
             self.hosts
                 .get_mut(&project.directory)
                 .expect("a current project host")
-                .complete(&mut project.analysis);
-            let mut interface = project.analysis.interface();
+                .complete(analysis);
+            let mut interface = analysis.interface();
             interface.kind = project.interface.kind;
             interface.dependencies = project.interface.dependencies.clone();
+            if project.interface != interface {
+                self.next_interface_revision += 1;
+                project.interface_revision = self.next_interface_revision;
+            }
             project.interface = interface;
         }
         let mut errors = Vec::new();
         let mut extra = vec![Vec::new(); self.projects.len()];
-        for at in 0..self.projects.len() {
+        for (at, new_diagnostics) in extra.iter_mut().enumerate() {
             ruddy::cancellation::checkpoint();
             let (dependencies, current) = self.projects.split_at_mut(at);
             let project = &mut current[0];
@@ -452,8 +646,12 @@ impl Workspace {
                 .filter_map(|project| project.artifact.as_ref())
                 .collect();
             if project.artifact.is_none() {
-                let (artifact, diagnostics) = project.analysis.lower(&linked);
-                extra[at] = diagnostics;
+                let (artifact, diagnostics) = project
+                    .analysis
+                    .as_ref()
+                    .expect("an uncached project has source analysis")
+                    .lower(&linked);
+                *new_diagnostics = diagnostics;
                 let Some(artifact) = artifact else {
                     continue;
                 };
@@ -467,6 +665,11 @@ impl Workspace {
                         }
                     },
                 };
+                if project.cacheable
+                    && let (Some(cache), Some(artifact)) = (&mut self.cache, &project.artifact)
+                {
+                    cache.store(project.cache_key, artifact);
+                }
             }
             if project.build.target == Target::Js
                 && let Some(artifact) = &project.artifact
@@ -484,19 +687,22 @@ impl Workspace {
             (self.projects.last(), artifacts.split_last())
             && project.build.target == Target::Js
             && artifacts.len() == self.projects.len()
-        {
-            if let Err(error) = ruddy::backend::js::check_exports(
+            && let Err(error) = ruddy::backend::js::check_exports(
                 root,
                 dependencies,
                 project.build.platform.backend(),
-            ) {
-                errors.push(error.to_string());
-            }
+            )
+        {
+            errors.push(error.to_string());
         }
         for (project, diagnostics) in self.projects.iter_mut().zip(extra) {
             for diagnostic in diagnostics {
-                if !project.analysis.diagnostics.contains(&diagnostic) {
-                    project.analysis.diagnostics.push(diagnostic);
+                let analysis = project
+                    .analysis
+                    .as_mut()
+                    .expect("background diagnostics belong to analyzed projects");
+                if !analysis.diagnostics.contains(&diagnostic) {
+                    analysis.diagnostics.push(diagnostic);
                 }
             }
         }
@@ -506,8 +712,10 @@ impl Workspace {
     pub fn request_file(&mut self, path: &Path) -> bool {
         let path = file_identity(path);
         for project in &mut self.projects {
-            let logical = project
-                .analysis
+            let Some(analysis) = project.analysis.as_mut() else {
+                continue;
+            };
+            let logical = analysis
                 .sources
                 .keys()
                 .find(|logical| file_identity(&project.source_directory.join(logical)) == path)
@@ -517,7 +725,7 @@ impl Workspace {
                     .hosts
                     .get_mut(&project.directory)
                     .expect("current host")
-                    .request_file(&mut project.analysis, &logical);
+                    .request_file(analysis, &logical);
             }
         }
         false
@@ -528,6 +736,7 @@ impl Workspace {
         self.projects.iter().find_map(|project| {
             project
                 .analysis
+                .as_ref()?
                 .sources
                 .keys()
                 .find(|logical| file_identity(&project.source_directory.join(logical)) == path)
@@ -535,18 +744,32 @@ impl Workspace {
         })
     }
 
-    pub fn definition(&self, path: &Path, offset: usize) -> Option<(PathBuf, Span)> {
-        let (project, logical) = self.file(path)?;
-        if let Some(span) = project.analysis.definition(logical, offset) {
-            let path = project.analysis.paths.get(&span.file_id)?;
-            return Some((normalize(&project.source_directory.join(path)), span));
+    pub fn definition(&mut self, path: &Path, offset: usize) -> Option<(PathBuf, Span)> {
+        let target = {
+            let (project, logical) = self.file(path)?;
+            let analysis = project.analysis();
+            if let Some(span) = analysis.definition(logical, offset) {
+                let path = analysis.paths.get(&span.file_id)?;
+                return Some((normalize(&project.source_directory.join(path)), span));
+            }
+            let symbol = analysis.referenced_symbol(logical, offset)?;
+            analysis.mint().external(symbol)?.to_owned()
+        };
+        let cached: Vec<_> = self
+            .projects
+            .iter()
+            .filter(|project| project.analysis.is_none())
+            .map(|project| project.directory.clone())
+            .collect();
+        if !cached.is_empty() {
+            self.source_required.extend(cached);
+            self.refresh().ok()?;
         }
-        let symbol = project.analysis.referenced_symbol(logical, offset)?;
-        let qualified = project.analysis.mint().external(symbol)?;
         self.projects.iter().find_map(|project| {
-            let symbol = project.analysis.symbol_named(qualified)?;
-            let span = project.analysis.binding_span(symbol)?;
-            let path = project.analysis.paths.get(&span.file_id)?;
+            let analysis = project.analysis.as_ref()?;
+            let symbol = analysis.symbol_named(&target)?;
+            let span = analysis.binding_span(symbol)?;
+            let path = analysis.paths.get(&span.file_id)?;
             Some((normalize(&project.source_directory.join(path)), span))
         })
     }

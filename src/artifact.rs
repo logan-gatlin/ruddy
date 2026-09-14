@@ -2116,30 +2116,36 @@ fn lower_lir(mint: &Mint, output: &lir::Output) -> Lir {
         functions: output
             .functions
             .iter()
-            .map(|f| Function {
-                suspension: f.suspension,
-                name: f.name.clone(),
-                params: f.params.iter().map(param).collect(),
-                continuation: f.continuation,
-                entry: f.entry as u64,
-                blocks: f
-                    .blocks
-                    .iter()
-                    .map(|b| Block {
-                        params: b.params.iter().map(param).collect(),
-                        result: b.result,
-                        instrs: b
-                            .instrs
-                            .iter()
-                            .map(|i| Instr {
-                                temp: i.temp,
-                                rep: rep(i.rep),
-                                op: op(mint, &i.op),
-                            })
-                            .collect(),
-                        end: end(&b.end.kind),
-                    })
-                    .collect(),
+            .map(|f| {
+                crate::cancellation::checkpoint();
+                Function {
+                    suspension: f.suspension,
+                    name: f.name.clone(),
+                    params: f.params.iter().map(param).collect(),
+                    continuation: f.continuation,
+                    entry: f.entry as u64,
+                    blocks: f
+                        .blocks
+                        .iter()
+                        .map(|b| {
+                            crate::cancellation::checkpoint();
+                            Block {
+                                params: b.params.iter().map(param).collect(),
+                                result: b.result,
+                                instrs: b
+                                    .instrs
+                                    .iter()
+                                    .map(|i| Instr {
+                                        temp: i.temp,
+                                        rep: rep(i.rep),
+                                        op: op(mint, &i.op),
+                                    })
+                                    .collect(),
+                                end: end(&b.end.kind),
+                            }
+                        })
+                        .collect(),
+                }
             })
             .collect(),
     }

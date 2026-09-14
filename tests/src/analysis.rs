@@ -254,6 +254,95 @@ fn workspace_refresh_reuses_an_unchanged_dependency_after_a_root_edit() {
 }
 
 #[test]
+fn setting_an_overlay_reports_whether_the_effective_source_changed() {
+    let tree = tempfile::tempdir().unwrap();
+    std::fs::write(tree.path().join("main.rud"), "let value = 1n").unwrap();
+    let mut workspace = ruddy_cli::workspace::Workspace::new(tree.path().to_path_buf());
+
+    assert!(!workspace.set_overlay(&tree.path().join("main.rud"), Some("let value = 1n".into()),));
+    assert!(workspace.set_overlay(&tree.path().join("main.rud"), Some("let value = 2n".into()),));
+    assert!(workspace.set_overlay(&tree.path().join("main.rud"), None));
+}
+
+#[test]
+fn workspace_reuses_consumers_when_a_dependency_interface_is_unchanged() {
+    let tree = tempfile::tempdir().unwrap();
+    let dep = tree.path().join("dep");
+    let root = tree.path().join("root");
+    std::fs::create_dir_all(&dep).unwrap();
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(dep.join("Ruddy.toml"), "name = \"dep\"\nversion = \"0.0.0\"\nkind = \"library\"\nroot = \"main.rud\"\n[dependencies]\nstd = false\n").unwrap();
+    std::fs::write(root.join("Ruddy.toml"), "name = \"root\"\nversion = \"0.0.0\"\nkind = \"library\"\nroot = \"main.rud\"\n[dependencies]\nstd = false\ndep = \"../dep\"\n").unwrap();
+    std::fs::write(dep.join("main.rud"), "let identity = fn value => value").unwrap();
+    std::fs::write(root.join("main.rud"), "let answer = dep::identity 1n").unwrap();
+    let mut workspace = ruddy_cli::workspace::Workspace::new(root.clone());
+
+    assert_eq!(workspace.refresh().unwrap().rebuilt, 2);
+    assert!(workspace.check_background().is_empty());
+    workspace.set_overlay(
+        &dep.join("main.rud"),
+        Some("let identity = fn renamed => renamed".into()),
+    );
+
+    let edited = workspace.refresh().unwrap();
+    assert_eq!((edited.rebuilt, edited.reused), (1, 1));
+    assert_eq!(edited.background, 1);
+}
+
+#[test]
+fn a_fresh_workspace_reuses_cached_dependency_artifacts() {
+    let tree = tempfile::tempdir().unwrap();
+    let cache = tree.path().join("cache");
+    let dep = tree.path().join("dep");
+    let root = tree.path().join("root");
+    std::fs::create_dir_all(&dep).unwrap();
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(dep.join("Ruddy.toml"), "name = \"dep\"\nversion = \"0.0.0\"\nkind = \"library\"\nroot = \"main.rud\"\n[dependencies]\nstd = false\n").unwrap();
+    std::fs::write(root.join("Ruddy.toml"), "name = \"root\"\nversion = \"0.0.0\"\nkind = \"library\"\nroot = \"main.rud\"\n[dependencies]\nstd = false\ndep = \"../dep\"\n").unwrap();
+    std::fs::write(dep.join("main.rud"), "let identity = fn value => value").unwrap();
+    std::fs::write(root.join("main.rud"), "let answer = dep::identity 1n").unwrap();
+    let mut first =
+        ruddy_cli::workspace::Workspace::with_artifact_cache(root.clone(), cache.clone());
+    first.focus(&root.join("main.rud"));
+    assert_eq!(first.refresh().unwrap().rebuilt, 2);
+    assert!(first.check_background().is_empty());
+
+    let mut fresh = ruddy_cli::workspace::Workspace::with_artifact_cache(root.clone(), cache);
+    fresh.focus(&root.join("main.rud"));
+    let refresh = fresh.refresh().unwrap();
+
+    assert_eq!(refresh.cached, 1);
+    assert_eq!(refresh.rebuilt, 1);
+    let (project, logical) = fresh.file(&root.join("main.rud")).unwrap();
+    assert_eq!(project.analysis().hover(logical, 5).unwrap().ty, "Nat");
+    let (target, _) = fresh.definition(&root.join("main.rud"), 19).unwrap();
+    assert_eq!(target, dep.join("main.rud"));
+}
+
+#[test]
+fn changing_focus_without_changing_source_reuses_current_projects() {
+    let tree = tempfile::tempdir().unwrap();
+    let dep = tree.path().join("dep");
+    let root = tree.path().join("root");
+    std::fs::create_dir_all(&dep).unwrap();
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(dep.join("Ruddy.toml"), "name = \"dep\"\nversion = \"0.0.0\"\nkind = \"library\"\nroot = \"main.rud\"\n[dependencies]\nstd = false\n").unwrap();
+    std::fs::write(root.join("Ruddy.toml"), "name = \"root\"\nversion = \"0.0.0\"\nkind = \"library\"\nroot = \"main.rud\"\n[dependencies]\nstd = false\ndep = \"../dep\"\n").unwrap();
+    std::fs::write(dep.join("main.rud"), "let value = 1n").unwrap();
+    std::fs::write(root.join("main.rud"), "let answer = dep::value").unwrap();
+    let mut workspace = ruddy_cli::workspace::Workspace::new(root.clone());
+    workspace.focus(&root.join("main.rud"));
+    assert_eq!(workspace.refresh().unwrap().rebuilt, 2);
+    assert!(workspace.check_background().is_empty());
+
+    workspace.focus(&dep.join("main.rud"));
+    let focused = workspace.refresh().unwrap();
+
+    assert_eq!((focused.rebuilt, focused.reused), (0, 2));
+    assert_eq!(focused.background, 0);
+}
+
+#[test]
 fn workspace_tracks_unsaved_local_dependencies_and_navigation() {
     let tree = tempfile::tempdir().unwrap();
     let dep = tree.path().join("dep");
@@ -268,7 +357,7 @@ fn workspace_tracks_unsaved_local_dependencies_and_navigation() {
     let initial = workspace.refresh().unwrap();
     assert_eq!((initial.rebuilt, initial.reused), (2, 0));
     let (project, logical) = workspace.file(&root.join("main.rud")).unwrap();
-    assert_eq!(project.analysis.hover(logical, 5).unwrap().ty, "Nat");
+    assert_eq!(project.analysis().hover(logical, 5).unwrap().ty, "Nat");
     let (target, span) = workspace.definition(&root.join("main.rud"), 19).unwrap();
     assert_eq!(target, dep.join("main.rud"));
     assert_eq!(span.start, 4);
@@ -276,7 +365,7 @@ fn workspace_tracks_unsaved_local_dependencies_and_navigation() {
     let edited = workspace.refresh().unwrap();
     assert_eq!((edited.rebuilt, edited.reused), (2, 0));
     let (project, logical) = workspace.file(&root.join("main.rud")).unwrap();
-    assert_eq!(project.analysis.hover(logical, 5).unwrap().ty, "Bool");
+    assert_eq!(project.analysis().hover(logical, 5).unwrap().ty, "Bool");
 }
 
 #[test]
@@ -634,8 +723,8 @@ fn symlinked_document_paths_share_unsaved_source_identity() {
     workspace.set_overlay(&link.join("Added.rud"), Some("let answer = false".into()));
     workspace.refresh().unwrap();
     let (project, logical) = workspace.file(&link.join("main.rud")).unwrap();
-    assert_eq!(project.analysis.hover(logical, 17).unwrap().ty, "Bool");
-    assert!(project.analysis.diagnostics.is_empty());
+    assert_eq!(project.analysis().hover(logical, 17).unwrap().ty, "Bool");
+    assert!(project.analysis().diagnostics.is_empty());
     assert!(workspace.file(&real.join("Added.rud")).is_some());
     assert!(workspace.definition(&link.join("main.rud"), 31).is_some());
 }

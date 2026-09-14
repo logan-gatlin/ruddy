@@ -115,16 +115,7 @@ pub(crate) fn key(directory: &Path, dependencies: &[u64], build: Build) -> u64 {
 /// an editor that rewrites a file with the same text within one timestamp
 /// tick is the case timestamps get wrong.
 pub fn fingerprint(paths: &[PathBuf]) -> u64 {
-    let mut files = Vec::new();
-    for path in paths {
-        if path.is_dir() {
-            collect(path, &mut files);
-        } else {
-            files.push(path.clone());
-        }
-    }
-    files.sort();
-    files.dedup();
+    let files = input_paths(paths);
     let mut bytes = Vec::new();
     for file in &files {
         bytes.extend_from_slice(file.to_string_lossy().as_bytes());
@@ -136,6 +127,21 @@ pub fn fingerprint(paths: &[PathBuf]) -> u64 {
         bytes.push(0);
     }
     XxHash3_64::oneshot(&bytes)
+}
+
+/// The files contributing to an artifact key, in digest order.
+pub(crate) fn input_paths(paths: &[PathBuf]) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    for path in paths {
+        if path.is_dir() {
+            collect(path, &mut files);
+        } else {
+            files.push(path.clone());
+        }
+    }
+    files.sort();
+    files.dedup();
+    files
 }
 
 /// Every file under `dir` the compiler could have read, skipping hidden

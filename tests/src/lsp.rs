@@ -318,6 +318,91 @@ fn positions_use_utf16_and_respect_crlf() {
 }
 
 #[test]
+fn background_analysis_waits_for_a_quiet_editing_interval() {
+    let tree = tempfile::tempdir().unwrap();
+    std::fs::write(tree.path().join("Ruddy.toml"), "name = \"editor\"\nversion = \"0.0.0\"\nkind = \"library\"\nroot = \"main.rud\"\n[dependencies]\nstd = false").unwrap();
+    std::fs::write(tree.path().join("main.rud"), "let value = 1n").unwrap();
+    let root = format!("file://{}", tree.path().display());
+    let uri = format!("{root}/main.rud");
+    let (server, client) = Connection::memory();
+    let worker = std::thread::spawn(move || ruddy_cli::lsp::serve(server).unwrap());
+    client
+        .sender
+        .send(Message::Request(Request::new(
+            1.into(),
+            "initialize".into(),
+            json!({"rootUri":root,"capabilities":{}}),
+        )))
+        .unwrap();
+    client
+        .receiver
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap();
+    client
+        .sender
+        .send(Message::Notification(Notification::new(
+            "initialized".into(),
+            json!({}),
+        )))
+        .unwrap();
+    client.sender.send(Message::Notification(Notification::new("textDocument/didOpen".into(), json!({"textDocument":{"uri":uri,"languageId":"ruddy","version":1,"text":"let value = 1n"}})))).unwrap();
+    loop {
+        if let Message::Notification(note) = client
+            .receiver
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            && note.method == "textDocument/publishDiagnostics"
+        {
+            break;
+        }
+    }
+    assert!(
+        client
+            .receiver
+            .recv_timeout(Duration::from_millis(75))
+            .is_err(),
+        "background diagnostics should not begin between consecutive keystrokes"
+    );
+    loop {
+        if let Message::Notification(note) = client
+            .receiver
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            && note.method == "textDocument/publishDiagnostics"
+        {
+            break;
+        }
+    }
+    client
+        .sender
+        .send(Message::Request(Request::new(
+            2.into(),
+            "shutdown".into(),
+            json!(null),
+        )))
+        .unwrap();
+    loop {
+        if matches!(
+            client
+                .receiver
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap(),
+            Message::Response(_)
+        ) {
+            break;
+        }
+    }
+    client
+        .sender
+        .send(Message::Notification(Notification::new(
+            "exit".into(),
+            json!(null),
+        )))
+        .unwrap();
+    worker.join().unwrap();
+}
+
+#[test]
 fn rapid_changes_publish_current_diagnostics_and_disk_creation_is_observed() {
     let tree = tempfile::tempdir().unwrap();
     std::fs::write(tree.path().join("Ruddy.toml"), "name = \"editor\"\nversion = \"0.0.0\"\nkind = \"library\"\nroot = \"main.rud\"\n[dependencies]\nstd = false").unwrap();

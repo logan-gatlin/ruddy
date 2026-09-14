@@ -444,6 +444,7 @@ impl Output {
     /// writes.
     pub fn apply_types(&self, program: &mut Program) {
         for (symbol, decl) in &self.semantics.typed {
+            crate::cancellation::checkpoint();
             program.terms.insert(*symbol, decl.clone());
         }
     }

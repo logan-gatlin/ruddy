@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Generate a fixed 10,000-line source workspace and measure the stdio LSP.
-Run: python3 scripts/bench-lsp.py [target/release/ruddy] [iterations=100]
-No downloaded dependencies. Includes a source path dependency, structural
+Run: python3 scripts/bench-lsp.py [target/release/ruddy] [iterations=100] [std|no-std]
+The default downloads nothing and disables std. `std` measures the installed
+standard-library path as well. Includes a source path dependency, structural
 records/effects, higher-order functions and mutually recursive groups.
 """
 import hashlib
@@ -16,6 +17,7 @@ import threading
 import time
 binary = pathlib.Path(sys.argv[1] if len(sys.argv) > 1 else 'target/release/ruddy').resolve()
 iterations = int(sys.argv[2]) if len(sys.argv) > 2 else 100
+standard = len(sys.argv) > 3 and sys.argv[3] == 'std'
 
 def module(dependency=False):
     source = ['effect Log = { write: Real -> () }', 'type Item = { value: Real, label: String }', 'let first = fn x => second x', 'let second = fn x => first x']
@@ -33,7 +35,8 @@ def benchmark(directory):
     dep = tree / 'dep'
     root.mkdir()
     dep.mkdir()
-    manifest = 'name = "{}"\nversion = "0.0.0"\nkind = "library"\nroot = "main.rud"\n[dependencies]\nstd = false\n'
+    std = '' if standard else 'std = false\n'
+    manifest = 'name = "{}"\nversion = "0.0.0"\nkind = "library"\nroot = "main.rud"\n[dependencies]\n' + std
     (dep / 'Ruddy.toml').write_text(manifest.format('dep'))
     (root / 'Ruddy.toml').write_text(manifest.format('root') + 'dep = "../dep"\n')
     corpus = {dep / 'main.rud': module(True), root / 'main.rud': '\n'.join([f'module M{i}' for i in range(98)] + ['let selected = M0::compute0 { value: 1.0, label: "x" }', 'let dependency = dep::compute0 selected']) + '\n'}
@@ -145,7 +148,7 @@ def benchmark(directory):
     send({'method': 'exit', 'params': None})
     proc.stdin.close()
     proc.wait(timeout=10)
-    print(json.dumps({'machine': platform.platform(), 'cpu': next((line.split(':', 1)[1].strip() for line in pathlib.Path('/proc/cpuinfo').read_text().splitlines() if line.startswith('model name')), ''), 'profile': 'release', 'benchmark_project': str(tree), 'corpus_lines': 10000, 'corpus_sha256': digest, 'dependencies': 'one local path dependency; std disabled; no downloads', 'iterations': iterations, 'samples_ms': timings, 'cold_ms': round(cold, 3), 'initial_background_ms': round(initial_background, 3), 'interface_edit_ms': {'hover': round(wide_hover, 3), 'background': round(wide_diagnostics[-1], 3)}, 'p95_ms': {key: percentile(values) for key, values in timings.items()}, 'rss_peak_mib': round(peak_rss / 1048576, 2), 'rss_max_mib': round(max(rss) / 1048576, 2), 'rss_first_mib': round(rss[0] / 1048576, 2), 'rss_last_mib': round(rss[-1] / 1048576, 2)}, indent=2))
+    print(json.dumps({'machine': platform.platform(), 'cpu': next((line.split(':', 1)[1].strip() for line in pathlib.Path('/proc/cpuinfo').read_text().splitlines() if line.startswith('model name')), ''), 'profile': 'release', 'benchmark_project': str(tree), 'corpus_lines': 10000, 'corpus_sha256': digest, 'dependencies': 'one local path dependency; installed std enabled' if standard else 'one local path dependency; std disabled; no downloads', 'iterations': iterations, 'samples_ms': timings, 'cold_ms': round(cold, 3), 'initial_background_ms': round(initial_background, 3), 'interface_edit_ms': {'hover': round(wide_hover, 3), 'background': round(wide_diagnostics[-1], 3)}, 'p95_ms': {key: percentile(values) for key, values in timings.items()}, 'rss_peak_mib': round(peak_rss / 1048576, 2), 'rss_max_mib': round(max(rss) / 1048576, 2), 'rss_first_mib': round(rss[0] / 1048576, 2), 'rss_last_mib': round(rss[-1] / 1048576, 2)}, indent=2))
 
 # Retain every generated workspace for manual inspection and editor testing.
 # A new directory per run avoids overwriting edits made to an earlier corpus.
