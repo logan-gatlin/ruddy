@@ -50,6 +50,14 @@ let choose: ['a] -> Option 'a + !Random
 
 Chooses an array position without changing the input. Empty arrays return None; singletons return their item; neither draws. Duplicate values retain their positional weight. Uses nat_below and accepts any element type.
 
+### generate
+
+```ruddy
+let generate: Nat -> Mirror 'a -> 'a + !Random
+```
+
+Generates a value using explicit construction evidence and a shared expansion budget. Each generated position spends one unit; exhausted positions use finite pure construction without drawing. Arrays and printable-ASCII strings have lengths 0 through 8. Integer kinds sample their exact domain, reals use Random.real, booleans use Random.boolean, and realizable sum cases are chosen uniformly. This is not uniform sampling over all values of a type. Rejection sampling retains nat_below's source-liveness assumptions; the budget bounds randomized expansion, not total output size.
+
 ### local
 
 ```ruddy
@@ -65,6 +73,14 @@ let nat_below: Nat64 -> Option Nat64 + !Random
 ```
 
 Samples below an exclusive Nat64 bound. Zero returns None; one returns Some 0n64; neither draws. Rejection sampling avoids modulo bias for uniform source words, with fewer than two expected draws. A custom source that always supplies rejected words may not terminate.
+
+### random
+
+```ruddy
+let random: () -> 'a + !Random
+```
+
+Generates a value of the inferred type with an expansion budget of 64. Requires constructive Mirror evidence and returns the value directly.
 
 ### real
 

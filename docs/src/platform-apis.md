@@ -179,6 +179,37 @@ used for passwords, tokens, or cryptographic keys. Derived seeds do not promise
 distinct or independent streams. The reference interpreter supports explicit
 seeds and caller-provided handlers, without a default ambient host source.
 
+### Generating a value from its type
+
+`std::random::random ()` infers its result type and returns a value directly.
+It requires constructive `Mirror` evidence, so empty result types and types with
+unavailable constructors are rejected at compilation.
+
+```ruddy
+type Terrain = #Water | #Land { height: Nat8, trees: [Bool] }
+let terrain: Terrain = std::random::with_seed 42n64 std::random::random
+let small_terrain: Terrain = std::random::with_seed 42n64 (fn _ =>
+  std::random::generate 8n (std::reflect::mirror ()))
+```
+
+`generate budget mirror` accepts explicit evidence and shares one expansion
+budget across the entire generation. `random ()` uses 64. Each position spends
+one unit; after exhaustion, that position uses `reflect::construct` without
+further random draws. This gives recursive types a finite fallback. Zero budget
+uses the pure construction immediately. The budget bounds randomized expansion,
+not the size of a type's required finite construction.
+
+Records generate their fields, sums choose uniformly among realizable cases, and
+empty-only arrays stay empty. Arrays and printable-ASCII strings choose lengths
+from zero through eight. Integer kinds sample their exact domain; booleans and
+reals use their respective `Random` operations. These bounded choices do not
+provide a uniform distribution over every value of an arbitrary type. Rejection
+sampling has the same source-liveness assumptions as `nat_below`.
+
+Generation works inside `with_seed` and `local`; identical seeds and ordered calls
+agree across backends. `choose` and `nat_below` still return `Option` because their
+inputs can be empty or invalid.
+
 ## Process
 
 `std::process::Process` exposes:

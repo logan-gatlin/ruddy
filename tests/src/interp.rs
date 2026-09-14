@@ -9,6 +9,158 @@ use std::{fs, path::Path, process::Command};
 use ruddy_interp::{Program, Value, render};
 
 #[test]
+fn randomness_generation_requires_construction_evidence() {
+    let consumer = project("", true, None, false);
+    for requested in ["|", "() -> Nat", "[() -> Nat]"] {
+        fs::write(
+            consumer.path().join("main.rud"),
+            format!("let value: {requested} = std::random::with_seed 0n64 std::random::random"),
+        )
+        .unwrap();
+        let error = ruddy_cli::check_project(consumer.path())
+            .expect_err("unsupported generation is rejected at compilation");
+        assert!(
+            error.to_string().contains("construction"),
+            "{requested}: {error}"
+        );
+    }
+    fs::write(consumer.path().join("main.rud"),
+        "let info: TypeInfo Nat = std::reflect::type_info ()\nlet value = std::random::with_seed 0n64 (fn _ => std::random::generate 0n info)"
+    ).unwrap();
+    assert!(
+        ruddy_cli::check_project(consumer.path()).is_err(),
+        "descriptive evidence cannot authorize generation"
+    );
+}
+
+#[test]
+fn randomness_generation_builds_structures_with_a_shared_budget() {
+    let source = r#"
+type Void = { impossible: |, callback: () -> Nat }
+type Product = { choice: #Dead Void | #Value Nat, empty: [Void], items: [Nat], maybe: Option Void, number: Nat, pair: (Nat8, Int64), text: String, truth: Bool }
+type Tree = #Branch { left: Tree, right: Tree } | #Leaf Nat
+@private let sample = fn budget => handle std::random::generate budget (std::reflect::mirror ()) with
+| std::random::!Random.word64 _ => 128n64
+| std::random::!Random.boolean _ => true
+| std::random::!Random.real _ => 0.25
+end
+@private let product: Product = sample 64n
+let fields = product == { choice: #Value 128n, empty: [], items: [128n, 128n], maybe: #None, number: 128n, pair: (128n8, 128i64), text: "AA", truth: true }
+@private let count: Tree -> Nat = fn tree => match tree with
+| #Leaf _ => 0n
+| #Branch { left, right } => std::nat::add 1n (std::nat::add (count left) (count right))
+end
+let branches = count (sample 6n)
+let pure_fallback = handle do
+  let tree: Tree = std::random::generate 0n (std::reflect::mirror ())
+  let scalar: Nat64 = std::random::generate 0n (std::reflect::mirror ())
+  let unit: () = std::random::generate 4n (std::reflect::mirror ())
+  return (tree, scalar, unit) == (#Leaf 0n, 0n64, ())
+end with
+| std::random::!Random.word64 _ => raise false
+| std::random::!Random.boolean _ => raise false
+| std::random::!Random.real _ => raise false
+end
+@private let first: Product = std::random::with_seed 77n64 std::random::random
+@private let second: Product = std::random::with_seed 77n64 std::random::random
+let repeated = first == second
+@private let isolate: Bool -> Product = fn extra => std::random::with_seed 77n64 (fn _ => do
+  _ = std::random::local (fn _ => do
+    let value: Product = std::random::random ()
+    _ = if extra then std::random::word64 () else 0n64 end
+    return value
+  end)
+  return std::random::local std::random::random
+end)
+let local_isolated = isolate false == isolate true
+"#;
+    let (node, interpreted) = both(
+        source,
+        &[
+            "fields",
+            "branches",
+            "pure_fallback",
+            "repeated",
+            "local_isolated",
+        ],
+        None,
+    );
+    assert_eq!(node, interpreted);
+    assert_eq!(node, ["true", "3", "true", "true", "true"]);
+}
+
+#[test]
+fn randomness_generation_preserves_integer_domains() {
+    let source = r#"
+@private let sample = fn word => handle std::random::random () with
+| std::random::!Random.word64 _ => word
+| std::random::!Random.boolean _ => false
+| std::random::!Random.real _ => 0
+end
+@private let n8: Nat8 = sample 18446744073709551615n64
+@private let n16: Nat16 = sample 18446744073709551615n64
+@private let n32: Nat32 = sample 18446744073709551615n64
+@private let n64: Nat64 = sample 18446744073709551615n64
+@private let i8: Int8 = sample 18446744073709551615n64
+@private let i16: Int16 = sample 18446744073709551615n64
+@private let i32: Int32 = sample 18446744073709551615n64
+@private let i64: Int64 = sample 18446744073709551615n64
+@private let minimum: Int64 = sample 9223372036854775808n64
+let fixed = (n8, n16, n32, n64, i8, i16, i32, i64, minimum)
+  == (255n8, 65535n16, 4294967295n32, 18446744073709551615n64, -1i8, -1i16, -1i32, -1i64, -9223372036854775808i64)
+let natural = std::str::from_nat (sample 18446744073709551615n64)
+let signed_low = std::str::from_int (sample 18014398509481983n64)
+let signed_high = std::str::from_int (sample 18014398509481982n64)
+"#;
+    for (bits, expected) in [
+        (32, ["true", "\"4294967295\"", "\"-1\"", "\"-2\""]),
+        (
+            53,
+            [
+                "true",
+                "\"9007199254740991\"",
+                "\"-9007199254740991\"",
+                "\"9007199254740991\"",
+            ],
+        ),
+    ] {
+        let (node, interpreted) = both(
+            source,
+            &["fixed", "natural", "signed_low", "signed_high"],
+            Some(bits),
+        );
+        assert_eq!(node, interpreted);
+        assert_eq!(node, expected);
+    }
+    let program = load(source, true, Some(64));
+    assert_eq!(json(&program, "fixed"), "true");
+    assert_eq!(json(&program, "natural"), "\"18446744073709551615\"");
+    assert_eq!(json(&program, "signed_low"), "\"18014398509481983\"");
+    assert_eq!(json(&program, "signed_high"), "\"18014398509481982\"");
+}
+
+#[test]
+fn randomness_inferred_generation_returns_values() {
+    let source = r#"
+@private let draw: () -> Nat64 + std::random::!Random = std::random::random
+let word = std::nat::to_string64 (std::random::with_seed 0n64 draw)
+let boolean: Bool = handle std::random::random () with
+| std::random::!Random.word64 _ => 0n64
+| std::random::!Random.boolean _ => true
+| std::random::!Random.real _ => 0.25
+end
+let real: Real = handle std::random::random () with
+| std::random::!Random.word64 _ => 0n64
+| std::random::!Random.boolean _ => false
+| std::random::!Random.real _ => 0.25
+end
+"#;
+    let (node, interpreted) = both(source, &["word", "boolean", "real"], None);
+    assert_eq!(node, interpreted);
+    assert_eq!(node, ["\"16294208416658607535\"", "true", "0.25"]);
+}
+
+#[test]
 fn descriptive_evidence_cannot_recover_forgotten_constructor_authority() {
     let source = r#"
 @private let strong: Mirror Nat = std::reflect::mirror ()

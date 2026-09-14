@@ -84,3 +84,136 @@ let choose: ['a] -> Option 'a + !Random = fn values =>
   | #None => #None
   | #Some index => array::get values (nat::to_nat64 index)
   end
+
+@private
+extern word_bytes: fn(Nat64) -> [Nat8] = "$prim.binary.nat64_to_bytes"
+
+@private
+extern signed_bytes: fn([Nat8]) -> Int64 = "$prim.binary.int64_from_bytes"
+
+@private
+let signed_word = fn word => signed_bytes (word_bytes word)
+
+@private
+let target_bits = do
+  let description = reflect::describe (reflect::type_of 0n)
+  return match array::get description.nodes description.root with
+  | #Some (#Nat { bits, .. }) => bits
+  | _ => 32n
+  end
+end
+
+@private
+let power_of_two: Nat -> Nat64 = fn bits =>
+  if nat::is_zero bits then 1n64
+  else nat::multiply64 2n64 (power_of_two (nat::subtract bits 1n))
+  end
+
+@private
+let small_word = fn bound => nat::to_nat64 (nat::remainder64 (word64 ()) bound)
+
+@private
+let natural = fn _ =>
+  if target_bits == 64n then nat::to_nat64 (word64 ())
+  else small_word (power_of_two target_bits)
+  end
+
+@private
+let integer = fn _ =>
+  if target_bits == 64n then int::to_int64 (signed_word (word64 ()))
+  else if target_bits == 32n then int::to_int32 (int::from_nat32 (small_word 4294967296n64))
+  else
+    do
+      -- The 53-bit signed domain is symmetric, with 2^54 - 1 values. 2^64 mod (2^54 - 1) = 1024.
+      -- The offset fits Int64 exactly.
+      let offset = signed_word (draw_below 18014398509481983n64 1024n64)
+      return int::to_int64 (int::subtract64 offset 9007199254740991i64)
+    end
+  end
+
+@private
+extern character: fn(Nat) -> String = "$prim.json.char_from_code"
+
+@private
+let below = fn bound => match nat_below (nat::from_nat64 bound) with
+| #Some index => nat::to_nat64 index
+| #None => 0n
+end
+
+@private
+let text: Nat -> String + !Random = fn length =>
+  if nat::is_zero length then ""
+  else str::concat (character (nat::add 32n (below 95n))) (text (nat::subtract length 1n))
+  end
+
+@private
+let elements:
+  (() -> Bool + !Random + ..'effects) -> Mirror 'a -> Nat -> ['a] + !Random + ..'effects =
+  fn spend mirror length =>
+    if nat::is_zero length then []
+    else [generate_at spend mirror, ..elements spend mirror (nat::subtract length 1n)]
+    end
+
+@private
+let generate_at:
+  (() -> Bool + !Random + ..'effects) -> Mirror 'a -> 'a + !Random + ..'effects =
+  fn spend mirror =>
+    if not spend () then reflect::construct mirror
+    else
+      match reflect::shape mirror with
+      | #Nat { make, .. } => make (natural ())
+      | #Int { make, .. } => make (integer ())
+      | #Nat8 { make, .. } => make (nat::from_nat8 (small_word 256n64))
+      | #Nat16 { make, .. } => make (nat::from_nat16 (small_word 65536n64))
+      | #Nat32 { make, .. } => make (nat::from_nat32 (small_word 4294967296n64))
+      | #Nat64 { make, .. } => make (word64 ())
+      | #Int8 { make, .. } => make (int::from_nat8 (small_word 256n64))
+      | #Int16 { make, .. } => make (int::from_nat16 (small_word 65536n64))
+      | #Int32 { make, .. } => make (int::from_nat32 (small_word 4294967296n64))
+      | #Int64 { make, .. } => make (signed_word (word64 ()))
+      | #Bool { make, .. } => make (boolean ())
+      | #Real { make, .. } => make (real ())
+      | #String { make, .. } => make (text (below 9n))
+      | #EmptyArray { make, .. } => make []
+      | #Array view =>
+        match view with
+        | hide 'element { element, make, .. } => make (elements spend element (below 9n))
+        end
+      | #Record { fields, build, .. } =>
+        match build
+          (array::map
+            (fn field => match field with
+            | hide 'field { mirror, bind, .. } => bind (generate_at spend mirror)
+            end)
+            fields) with
+        | #Some record => record
+        | #Error _ => reflect::construct mirror
+        end
+      | #Sum { cases, .. } =>
+        match choose cases with
+        | #Some case =>
+          match case with
+          | hide 'payload { mirror, inject, .. } => inject (generate_at spend mirror)
+          end
+        | #None => reflect::construct mirror
+        end
+      end
+    end
+
+@doc "Generates a value using explicit construction evidence and a shared expansion budget. Each generated position spends one unit; exhausted positions use finite pure construction without drawing. Arrays and printable-ASCII strings have lengths 0 through 8. Integer kinds sample their exact domain, reals use Random.real, booleans use Random.boolean, and realizable sum cases are chosen uniformly. This is not uniform sampling over all values of a type. Rejection sampling retains nat_below's source-liveness assumptions; the budget bounds randomized expansion, not total output size."
+let generate: Nat -> Mirror 'a -> 'a + !Random = fn budget mirror => do
+  let remaining = mut budget
+  return generate_at
+    (fn _ =>
+      if nat::is_zero (~remaining) then false
+      else
+        do
+          _ = remaining := nat::subtract (~remaining) 1n
+          return true
+        end
+      end)
+    mirror
+end
+
+@doc "Generates a value of the inferred type with an expansion budget of 64. Requires constructive Mirror evidence and returns the value directly."
+let random: () -> 'a + !Random = fn _ => generate 64n (reflect::mirror ())
