@@ -27,7 +27,7 @@ let entries: Table 'k 'v -> [Entry 'k 'v] = fn table => node_entries table.node
 let empty: () -> Table 'k 'v = fn _ => { size: 0n, node: #Empty }
 
 @private
-let equal: Mirror 'k -> 'k -> 'k -> Bool = fn mirror left right =>
+let equal: TypeInfo 'k -> 'k -> 'k -> Bool = fn mirror left right =>
   match order::compare_with mirror left right with | #Equal => true | _ => false end
 
 @private
@@ -77,7 +77,7 @@ let remove_at: Nat -> ['a] -> ['a] = fn index values => match values with
 end
 
 @private
-let lookup_bucket: Mirror 'k -> 'k -> [('k, 'v)] -> Option 'v =
+let lookup_bucket: TypeInfo 'k -> 'k -> [('k, 'v)] -> Option 'v =
   fn mirror key entries => match entries with
   | [] => #None
   | [(stored, value), ..tail] =>
@@ -85,7 +85,7 @@ let lookup_bucket: Mirror 'k -> 'k -> [('k, 'v)] -> Option 'v =
   end
 
 @private
-let get_node: Mirror 'k -> Nat64 -> 'k -> Nat -> Node 'k 'v -> Option 'v =
+let get_node: TypeInfo 'k -> Nat64 -> 'k -> Nat -> Node 'k 'v -> Option 'v =
   fn mirror hash key depth node => match node with
   | #Empty => #None
   | #Bucket bucket =>
@@ -103,11 +103,11 @@ let get_node: Mirror 'k -> Nat64 -> 'k -> Nat -> Node 'k 'v -> Option 'v =
   end
   end
 
-let get: Mirror 'k -> Nat64 -> 'k -> Table 'k 'v -> Option 'v =
+let get: TypeInfo 'k -> Nat64 -> 'k -> Table 'k 'v -> Option 'v =
   fn mirror hash key table => get_node mirror hash key 0n table.node
 
 @private
-let put_bucket: Mirror 'k -> 'k -> 'v -> [('k, 'v)] -> { entries: [('k, 'v)], added: Bool } =
+let put_bucket: TypeInfo 'k -> 'k -> 'v -> [('k, 'v)] -> { entries: [('k, 'v)], added: Bool } =
   fn mirror key value entries => match entries with
   | [] => { entries: [(key, value)], added: true }
   | [(stored, previous), ..tail] =>
@@ -144,7 +144,7 @@ let join: Nat -> Nat64 -> Node 'k 'v -> Nat64 -> Node 'k 'v -> Node 'k 'v =
 
 @private
 let put_node:
-  Mirror 'k -> Nat64 -> 'k -> 'v -> Nat -> Node 'k 'v -> { node: Node 'k 'v, added: Bool } =
+  TypeInfo 'k -> Nat64 -> 'k -> 'v -> Nat -> Node 'k 'v -> { node: Node 'k 'v, added: Bool } =
   fn mirror hash key value depth node => match node with
   | #Empty => { node: #Bucket { hash: hash, entries: [(key, value)] }, added: true }
   | #Bucket bucket =>
@@ -194,7 +194,7 @@ let put_node:
   end
   end
 
-let insert: Mirror 'k -> Nat64 -> 'k -> 'v -> Table 'k 'v -> Table 'k 'v =
+let insert: TypeInfo 'k -> Nat64 -> 'k -> 'v -> Table 'k 'v -> Table 'k 'v =
   fn mirror hash key value table => do
     return match put_node mirror hash key value 0n table.node with
     | next => { size: nat::add table.size (if next.added then 1n else 0n end), node: next.node }
@@ -202,7 +202,7 @@ let insert: Mirror 'k -> Nat64 -> 'k -> 'v -> Table 'k 'v -> Table 'k 'v =
   end
 
 @private
-let remove_bucket: Mirror 'k -> 'k -> [('k, 'v)] -> { entries: [('k, 'v)], removed: Bool } =
+let remove_bucket: TypeInfo 'k -> 'k -> [('k, 'v)] -> { entries: [('k, 'v)], removed: Bool } =
   fn mirror key entries => match entries with
   | [] => { entries: [], removed: false }
   | [(stored, value), ..tail] =>
@@ -226,7 +226,7 @@ end
 
 @private
 let remove_node:
-  Mirror 'k -> Nat64 -> 'k -> Nat -> Node 'k 'v -> { node: Node 'k 'v, removed: Bool } =
+  TypeInfo 'k -> Nat64 -> 'k -> Nat -> Node 'k 'v -> { node: Node 'k 'v, removed: Bool } =
   fn mirror hash key depth node => match node with
   | #Empty => { node: node, removed: false }
   | #Bucket bucket =>
@@ -274,7 +274,7 @@ let remove_node:
   end
   end
 
-let remove: Mirror 'k -> Nat64 -> 'k -> Table 'k 'v -> Table 'k 'v =
+let remove: TypeInfo 'k -> Nat64 -> 'k -> Table 'k 'v -> Table 'k 'v =
   fn mirror hash key table => do
     return match remove_node mirror hash key 0n table.node with
     | next =>

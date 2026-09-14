@@ -457,6 +457,7 @@ pub(super) fn validate(lir: &Lir) -> Result<(), String> {
             {
                 return error("continuation result must be the final parameter");
             }
+            let mut descriptors = HashMap::new();
             for i in &b.instrs {
                 if i.op.uses().iter().any(|t| !available.contains_key(t)) {
                     return error("instruction uses an unavailable temporary");
@@ -493,6 +494,9 @@ pub(super) fn validate(lir: &Lir) -> Result<(), String> {
                         if i.rep != Rep::TypeDescriptor {
                             return error("runtime type descriptor has the wrong representation");
                         }
+                        if arguments.is_empty() {
+                            descriptors.insert(i.temp, template);
+                        }
                     }
                     Op::NativePlan {
                         template,
@@ -517,6 +521,15 @@ pub(super) fn validate(lir: &Lir) -> Result<(), String> {
                         if available[descriptor] != Rep::TypeDescriptor {
                             return error("reflection requires a runtime type descriptor");
                         }
+                        if matches!(
+                            kind,
+                            crate::reification::Intrinsic::Mirror
+                                | crate::reification::Intrinsic::TypeOf
+                        ) && let Some(template) = descriptors.get(descriptor)
+                        {
+                            crate::reification::construction::Construction::analyze(template)
+                                .review(template)?;
+                        }
                         match kind {
                             crate::reification::Intrinsic::Decode
                                 if available[value] != Rep::HostValue || i.rep != Rep::Sum =>
@@ -528,6 +541,9 @@ pub(super) fn validate(lir: &Lir) -> Result<(), String> {
                             }
                             crate::reification::Intrinsic::Mirror
                             | crate::reification::Intrinsic::TypeOf
+                            | crate::reification::Intrinsic::TypeInfo
+                            | crate::reification::Intrinsic::InfoOf
+                            | crate::reification::Intrinsic::MirrorInfo
                                 if i.rep != Rep::TypeDescriptor =>
                             {
                                 return error(
@@ -535,20 +551,29 @@ pub(super) fn validate(lir: &Lir) -> Result<(), String> {
                                 );
                             }
                             crate::reification::Intrinsic::Describe
+                            | crate::reification::Intrinsic::DescribeInfo
                                 if available[value] != Rep::TypeDescriptor
                                     || i.rep != Rep::Struct =>
                             {
                                 return error("describing requires a mirror and yields a struct");
                             }
                             crate::reification::Intrinsic::Shape
+                            | crate::reification::Intrinsic::ShapeInfo
                                 if available[value] != Rep::TypeDescriptor || i.rep != Rep::Sum =>
                             {
                                 return error("a shape requires a mirror and yields a sum");
                             }
                             crate::reification::Intrinsic::Same
+                            | crate::reification::Intrinsic::SameInfo
                                 if available[value] != Rep::Struct || i.rep != Rep::Sum =>
                             {
                                 return error("comparing mirrors takes a pair and yields Option");
+                            }
+                            crate::reification::Intrinsic::Construct
+                            | crate::reification::Intrinsic::MirrorInfo
+                                if available[value] != Rep::TypeDescriptor =>
+                            {
+                                return error("construction operations require a mirror");
                             }
                             _ => {}
                         }
@@ -755,7 +780,7 @@ pub(super) fn validate(lir: &Lir) -> Result<(), String> {
             }
         }
     }
-    Ok(())
+    validate_construction(lir)
 }
 fn compatible(want: Rep, have: Rep) -> bool {
     want == have || want == Rep::Any || have == Rep::Any
@@ -763,6 +788,209 @@ fn compatible(want: Rep, have: Rep) -> bool {
 
 /// A callable proof follows a value's identity through block environments.
 /// Unknown parameters and computed results cannot certify synchronous calls.
+/// Follow construction demands through statically known calls and captures.
+/// Unknown dynamic descriptors are checked when the intrinsic executes; a
+/// known impossible descriptor must be rejected at the artifact boundary.
+fn validate_construction(lir: &Lir) -> Result<(), String> {
+    use crate::reification::{
+        Intrinsic,
+        construction::{Construction, Facts},
+    };
+    use std::collections::{HashMap, HashSet};
+    // Resolve statically assembled descriptors without demanding constructors
+    // for every argument: an empty element still permits an empty array.
+    let mut known = HashMap::<(usize, Temp), Facts>::new();
+    for (f, function) in lir.functions.iter().enumerate() {
+        for block in &function.blocks {
+            let mut local = std::collections::BTreeMap::<Temp, Facts>::new();
+            for i in &block.instrs {
+                if let Op::TypeDescriptor {
+                    template,
+                    arguments,
+                } = &i.op
+                {
+                    let facts: Option<std::collections::BTreeMap<_, _>> = arguments
+                        .iter()
+                        .enumerate()
+                        .map(|(index, argument)| {
+                            local
+                                .get(argument)
+                                .cloned()
+                                .map(|facts| (index as u32, facts))
+                        })
+                        .collect();
+                    if let Some(arguments) = facts {
+                        let parameters: Vec<_> = (0..arguments.len() as u32).collect();
+                        let template = Facts::template(template, &parameters);
+                        let facts = template.substitute(&arguments);
+                        local.insert(i.temp, facts.clone());
+                        known.insert((f, i.temp), facts);
+                    }
+                }
+            }
+        }
+    }
+    let mut demanded = HashSet::new();
+    let mut closures = HashMap::new();
+    let mut globals = HashMap::new();
+    for global in &lir.globals {
+        let function = &lir.functions[global.initializer as usize];
+        if function.blocks.len() == 1
+            && let End::Continue { value, .. } = function.blocks[0].end
+            && let Some((target, count)) =
+                function.blocks[0].instrs.iter().find_map(|i| match &i.op {
+                    Op::Closure { func, captures } if i.temp == value => {
+                        Some((*func as usize, captures.len()))
+                    }
+                    _ => None,
+                })
+        {
+            globals.insert(&global.name, (target, count));
+        }
+    }
+    for (f, function) in lir.functions.iter().enumerate() {
+        for i in function.blocks.iter().flat_map(|b| &b.instrs) {
+            match &i.op {
+                Op::Reflect {
+                    kind: Intrinsic::Mirror | Intrinsic::TypeOf,
+                    descriptor,
+                    ..
+                } => {
+                    demanded.insert((f, *descriptor));
+                }
+                Op::Closure { func, captures } => {
+                    closures.insert((f, i.temp), (*func as usize, captures.len()));
+                }
+                Op::Global { target, .. } => {
+                    if let Some(target) = globals.get(target) {
+                        closures.insert((f, i.temp), *target);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    // A code object created at one closure site has unambiguous captured
+    // callable identities. Do not specialize shared higher-order parameters
+    // from just one of their callers.
+    let mut sites = HashMap::<usize, Vec<(usize, &Vec<Temp>)>>::new();
+    let mut direct = HashSet::new();
+    for (f, function) in lir.functions.iter().enumerate() {
+        for block in &function.blocks {
+            for i in &block.instrs {
+                if let Op::Closure { func, captures } = &i.op {
+                    sites.entry(*func as usize).or_default().push((f, captures));
+                }
+            }
+            if let End::Call {
+                callee: Callee::Direct(target),
+                ..
+            } = block.end
+            {
+                direct.insert(target as usize);
+            }
+        }
+    }
+    loop {
+        let before = closures.len();
+        for (target, locations) in &sites {
+            if locations.len() != 1 || direct.contains(target) {
+                continue;
+            }
+            let (source, captures) = locations[0];
+            for (param, capture) in lir.functions[*target].params.iter().zip(captures) {
+                if let Some(known) = closures.get(&(source, *capture)).copied() {
+                    closures.insert((*target, param.temp), known);
+                }
+            }
+        }
+        if before == closures.len() {
+            break;
+        }
+    }
+    loop {
+        let before = demanded.len();
+        for (f, function) in lir.functions.iter().enumerate() {
+            for block in &function.blocks {
+                for i in &block.instrs {
+                    match &i.op {
+                        Op::Closure { func, captures } => {
+                            for (param, capture) in
+                                lir.functions[*func as usize].params.iter().zip(captures)
+                            {
+                                if demanded.contains(&(*func as usize, param.temp)) {
+                                    demanded.insert((f, *capture));
+                                }
+                            }
+                        }
+                        Op::Continuation { code, captures } => {
+                            for (param, capture) in lir.functions[code.function as usize].blocks
+                                [code.block as usize]
+                                .params
+                                .iter()
+                                .zip(captures)
+                            {
+                                if demanded.contains(&(code.function as usize, param.temp)) {
+                                    demanded.insert((f, *capture));
+                                }
+                            }
+                        }
+                        Op::TypeDescriptor {
+                            template,
+                            arguments,
+                        } if demanded.contains(&(f, i.temp)) => {
+                            if arguments.is_empty() {
+                                Construction::analyze(template).review(template)?;
+                            } else if known
+                                .get(&(f, i.temp))
+                                .is_some_and(|facts| facts.constructible.is_false())
+                            {
+                                return Err("assembled descriptor lacks finite accessible construction evidence".into());
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                if let End::Call { callee, args, .. } = &block.end {
+                    let target = match callee {
+                        Callee::Direct(target) => Some((*target as usize, 0)),
+                        Callee::Indirect(temp) => closures.get(&(f, *temp)).copied(),
+                    };
+                    if let Some((target, captures)) = target {
+                        for (param, argument) in
+                            lir.functions[target].params.iter().skip(captures).zip(args)
+                        {
+                            if demanded.contains(&(target, param.temp)) {
+                                demanded.insert((f, *argument));
+                            }
+                        }
+                    }
+                }
+                let edges: Vec<_> = match &block.end {
+                    End::Jump(edge) => vec![edge],
+                    End::Branch { yes, no, .. } => vec![yes, no],
+                    End::Enter { body, .. } => vec![body],
+                    _ => Vec::new(),
+                };
+                for edge in edges {
+                    for (param, argument) in function.blocks[edge.block as usize]
+                        .params
+                        .iter()
+                        .zip(&edge.args)
+                    {
+                        if demanded.contains(&(f, param.temp)) {
+                            demanded.insert((f, *argument));
+                        }
+                    }
+                }
+            }
+        }
+        if before == demanded.len() {
+            return Ok(());
+        }
+    }
+}
+
 fn callable_proofs(
     lir: &Lir,
     function_id: usize,

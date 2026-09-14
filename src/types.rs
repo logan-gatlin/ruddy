@@ -616,6 +616,7 @@ pub enum Ty {
     /// types they mirror are. Its values are the runtime type information the
     /// compiler already passes as hidden evidence, made a first-class value.
     Mirror(Arc<Ty>),
+    TypeInfo(Arc<Ty>),
     /// A cell with a fixed region and invariant element type.
     Mut(Arc<Ty>, Arc<Ty>),
     /// A structural record and its true field-row tail.
@@ -973,7 +974,7 @@ fn take_ty_children(ty: &mut Ty, types: &mut Vec<Arc<Ty>>, rows: &mut Vec<Arc<Ro
             types.push(std::mem::replace(region, Arc::new(Ty::Undecided)));
             types.push(std::mem::replace(element, Arc::new(Ty::Undecided)));
         }
-        Ty::Array(element) | Ty::Mirror(element) => {
+        Ty::Array(element) | Ty::Mirror(element) | Ty::TypeInfo(element) => {
             types.push(std::mem::replace(element, Arc::new(Ty::Undecided)));
         }
         Ty::Struct(row) | Ty::Sum(row) => take_row_children(row, types, rows),
@@ -1191,7 +1192,9 @@ pub(crate) fn same_finite_syntax_metered(
                         pending.push(Pair::Ty(a, c, env.clone()));
                         pending.push(Pair::Ty(b, d, env));
                     }
-                    (Ty::Array(left), Ty::Array(right)) | (Ty::Mirror(left), Ty::Mirror(right)) => {
+                    (Ty::Array(left), Ty::Array(right))
+                    | (Ty::Mirror(left), Ty::Mirror(right))
+                    | (Ty::TypeInfo(left), Ty::TypeInfo(right)) => {
                         pending.push(Pair::Ty(left, right, env))
                     }
                     (Ty::Struct(left), Ty::Struct(right)) | (Ty::Sum(left), Ty::Sum(right)) => {
@@ -1291,6 +1294,7 @@ pub fn open_hidden(body: &Arc<Ty>, binder: u32, replacement: &Arc<Ty>) -> Arc<Ty
         Unshadow,
         Array,
         Mirror,
+        TypeInfo,
         Mut,
         Struct,
         Sum,
@@ -1344,6 +1348,10 @@ pub fn open_hidden(body: &Arc<Ty>, binder: u32, replacement: &Arc<Ty>) -> Arc<Ty
                 }
                 Ty::Mirror(element) => {
                     work.push(Work::Mirror);
+                    work.push(Work::Ty(element));
+                }
+                Ty::TypeInfo(element) => {
+                    work.push(Work::TypeInfo);
                     work.push(Work::Ty(element));
                 }
                 Ty::Mut(region, element) => {
@@ -1415,6 +1423,10 @@ pub fn open_hidden(body: &Arc<Ty>, binder: u32, replacement: &Arc<Ty>) -> Arc<Ty
             Work::Mirror => {
                 let element = types.pop().expect("mirror postorder");
                 types.push(Arc::new(Ty::Mirror(element)));
+            }
+            Work::TypeInfo => {
+                let element = types.pop().expect("mirror postorder");
+                types.push(Arc::new(Ty::TypeInfo(element)));
             }
             Work::Mut => {
                 let element = types.pop().expect("cell element");
@@ -1757,7 +1769,7 @@ fn existential_outside_package(body: &Arc<Ty>, existentials: &IndexSet<u32>) -> 
             Work::Ty(ty, packaged) => match &*ty {
                 Ty::Package(inner) => work.push(Work::Ty(inner.clone(), true)),
                 Ty::Hidden { body, .. } => work.push(Work::Ty(body.clone(), packaged)),
-                Ty::Array(element) | Ty::Mirror(element) => {
+                Ty::Array(element) | Ty::Mirror(element) | Ty::TypeInfo(element) => {
                     work.push(Work::Ty(element.clone(), packaged))
                 }
                 Ty::Mut(region, element) => {
@@ -1817,7 +1829,7 @@ fn partition_package_formula(
                     work.push(Work::Ty(inner.clone(), Some(here)));
                 }
                 Ty::Hidden { body, .. } => work.push(Work::Ty(body.clone(), owner)),
-                Ty::Array(element) | Ty::Mirror(element) => {
+                Ty::Array(element) | Ty::Mirror(element) | Ty::TypeInfo(element) => {
                     work.push(Work::Ty(element.clone(), owner))
                 }
                 Ty::Mut(region, element) => {

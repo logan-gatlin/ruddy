@@ -79,7 +79,7 @@ Formats a value on one line using the same reflection, ordering, escaping, numer
 let display: 'a -> String
 ```
 
-Pretty prints a value through reflection using Ruddy-like syntax. Nonempty arrays, tuples, and records use newlines, four-space indentation, and trailing commas; there is no final newline or truncation. Named fields use alphabetical Unicode scalar order, tuples use positional order, and unit prints as `()`. Strings are quoted and escaped; integer suffixes and negative real zero are preserved. Non-finite reals print as `NaN`, `Infinity`, or `-Infinity`. Functions, hidden packages, mirrors, and foreign values (including cells) print as `<function>`, `<hidden>`, `<mirror>`, and `<foreign>`.
+Pretty prints a value through reflection using Ruddy-like syntax. Nonempty arrays, tuples, and records use newlines, four-space indentation, and trailing commas; there is no final newline or truncation. Named fields use alphabetical Unicode scalar order, tuples use positional order, and unit prints as `()`. Strings are quoted and escaped; integer suffixes and negative real zero are preserved. Non-finite reals print as `NaN`, `Infinity`, or `-Infinity`. Functions, hidden packages, mirrors, descriptive evidence, and foreign values (including cells) print as `<function>`, `<hidden>`, `<mirror>`, `<type-info>`, and `<foreign>`.
 
 ### drop
 

@@ -817,6 +817,7 @@ fn wire_explanation(
             T::DeclaredType => "declared-type",
             T::Hidden => "hidden",
             T::Mirror => "mirror",
+            T::TypeInfo => "type information",
             T::ForeignValue => "foreign-value",
             T::Undecided => "undecided",
         }

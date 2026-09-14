@@ -11710,7 +11710,7 @@ type Node = #Nat Domain | #Int Domain | #Real | #String | #Bool | #Foreign\n\
   | #Function { argument: Nat, result: Nat, effects: [Field] }\n\
   | #Effects [Field] | #Record [Field] | #Sum [Field] | #Alias Nat\n\
   | #Extend { base: Nat, rest: Nat }\n\
-  | #Parameter Nat | #Mirror Nat | #Hidden Nat | #Variable Nat\n";
+  | #Parameter Nat | #Mirror Nat | #TypeInfo Nat | #Hidden Nat | #Variable Nat\n";
     let accepted = [
         "extern mirror: () -> Mirror 'a = \"$mirror\"",
         "extern type_of: 'a -> Mirror 'a = \"$typeOf\"",
@@ -11745,9 +11745,9 @@ type Node = #Nat Domain | #Int Domain | #Real | #String | #Bool | #Foreign\n\
         "extern describe: Mirror 'a -> { root: Nat, nodes: Node } = \"$describe\"",
         "extern describe: Mirror 'a -> { root: Nat, nodes: [Nat] } = \"$describe\"",
         "type Thin = #Nat Domain | #Record [Field]\nextern describe: Mirror 'a -> { root: Nat, nodes: [Thin] } = \"$describe\"",
-        "type Wide = #Nat Domain | #Int Domain | #Real | #String | #Bool | #Foreign | #Fixed Domain | #Array Nat | #Cell { region: Nat, element: Nat } | #Function { argument: Nat, result: Nat, effects: [Field] } | #Effects [Field] | #Record [Field] | #Sum [Field] | #Alias Nat | #Extend { base: Nat, rest: Nat } | #Parameter Nat | #Mirror Nat | #Hidden Nat | #Variable Nat | #Extra\nextern describe: Mirror 'a -> { root: Nat, nodes: [Wide] } = \"$describe\"",
-        "type Loose = #Nat Domain | #Int Domain | #Real | #String | #Bool | #Foreign | #Fixed Domain | #Array String | #Cell { region: Nat, element: Nat } | #Function { argument: Nat, result: Nat, effects: [Field] } | #Effects [Field] | #Record [Field] | #Sum [Field] | #Alias Nat | #Extend { base: Nat, rest: Nat } | #Parameter Nat | #Mirror Nat | #Hidden Nat | #Variable Nat\nextern describe: Mirror 'a -> { root: Nat, nodes: [Loose] } = \"$describe\"",
-        "type Half = { bits: Nat, signed: Bool }\ntype Short = #Nat Half | #Int Half | #Real | #String | #Bool | #Foreign | #Fixed Half | #Array Nat | #Cell { region: Nat, element: Nat } | #Function { argument: Nat, result: Nat, effects: [Field] } | #Effects [Field] | #Record [Field] | #Sum [Field] | #Alias Nat | #Extend { base: Nat, rest: Nat } | #Parameter Nat | #Mirror Nat | #Hidden Nat | #Variable Nat\nextern describe: Mirror 'a -> { root: Nat, nodes: [Short] } = \"$describe\"",
+        "type Wide = #Nat Domain | #Int Domain | #Real | #String | #Bool | #Foreign | #Fixed Domain | #Array Nat | #Cell { region: Nat, element: Nat } | #Function { argument: Nat, result: Nat, effects: [Field] } | #Effects [Field] | #Record [Field] | #Sum [Field] | #Alias Nat | #Extend { base: Nat, rest: Nat } | #Parameter Nat | #Mirror Nat | #TypeInfo Nat | #Hidden Nat | #Variable Nat | #Extra\nextern describe: Mirror 'a -> { root: Nat, nodes: [Wide] } = \"$describe\"",
+        "type Loose = #Nat Domain | #Int Domain | #Real | #String | #Bool | #Foreign | #Fixed Domain | #Array String | #Cell { region: Nat, element: Nat } | #Function { argument: Nat, result: Nat, effects: [Field] } | #Effects [Field] | #Record [Field] | #Sum [Field] | #Alias Nat | #Extend { base: Nat, rest: Nat } | #Parameter Nat | #Mirror Nat | #TypeInfo Nat | #Hidden Nat | #Variable Nat\nextern describe: Mirror 'a -> { root: Nat, nodes: [Loose] } = \"$describe\"",
+        "type Half = { bits: Nat, signed: Bool }\ntype Short = #Nat Half | #Int Half | #Real | #String | #Bool | #Foreign | #Fixed Half | #Array Nat | #Cell { region: Nat, element: Nat } | #Function { argument: Nat, result: Nat, effects: [Field] } | #Effects [Field] | #Record [Field] | #Sum [Field] | #Alias Nat | #Extend { base: Nat, rest: Nat } | #Parameter Nat | #Mirror Nat | #TypeInfo Nat | #Hidden Nat | #Variable Nat\nextern describe: Mirror 'a -> { root: Nat, nodes: [Short] } = \"$describe\"",
         "extern same: Nat -> Option { forward: 'a -> 'b, backward: 'b -> 'a } = \"$sameMirror\"",
         "extern same: (Nat, Mirror 'b) -> Option { forward: 'a -> 'b, backward: 'b -> 'a } = \"$sameMirror\"",
         "extern same: (Mirror Nat, Mirror 'b) -> Option { forward: 'a -> 'b, backward: 'b -> 'a } = \"$sameMirror\"",
@@ -11832,6 +11832,7 @@ type Node =\n\
   | #Extend { base: Nat, rest: Nat }\n\
   | #Parameter Nat\n\
   | #Mirror Nat\n\
+  | #TypeInfo Nat\n\
   | #Hidden Nat\n\
   | #Variable Nat\n\
 type Presence = #Required | #Optional\n\
@@ -11852,17 +11853,15 @@ type Shape 'a =\n\
   | #Array (ArrayView 'a)\n\
   | #Record (RecordView 'a)\n\
   | #Sum (SumView 'a)\n\
-  | #Function Description\n\
-  | #Hidden Description\n\
-  | #Mirror Description\n\
-  | #Foreign\n\
+  | #EmptyArray (EmptyArrayView 'a)\n\
+type EmptyArrayView 'array = { element: Description, read: 'array -> [|], make: [|] -> 'array }\n\
 type ArrayView 'array = hide 'element => { element: Mirror 'element, read: 'array -> ['element], make: ['element] -> 'array }\n\
 type RecordView 'record = { mirror: Mirror 'record, fields: [SomeField 'record], build: [Binding 'record] -> Result 'record BuildError }\n\
 type SomeField 'record = hide 'field => { name: String, mirror: Mirror 'field, presence: Presence, read: 'record -> Option 'field, bind: 'field -> Binding 'record }\n\
 type Binding 'record = hide 'field => { record: Mirror 'record, name: String, mirror: Mirror 'field, value: 'field }\n\
 type BuildError = #Missing String | #Duplicate String | #Unknown String | #Foreign String | #Mismatched String\n\
 type SumView 'sum = { mirror: Mirror 'sum, cases: [SomeCase 'sum] }\n\
-type SomeCase 'sum = hide 'payload => { name: String, mirror: Mirror 'payload, project: 'sum -> Option 'payload, inject: Option ('payload -> 'sum) }\n";
+type SomeCase 'sum = hide 'payload => { name: String, mirror: Mirror 'payload, project: 'sum -> Option 'payload, inject: 'payload -> 'sum }\n";
 
 #[test]
 fn the_shape_intrinsic_is_reviewed_against_its_cases() {
@@ -11910,10 +11909,7 @@ fn the_shape_intrinsic_is_reviewed_against_its_cases() {
         "#Array (Bad 'a)",
         "#Record (RecordView 'a)",
         "#Sum (SumView 'a)",
-        "#Function Description",
-        "#Hidden Description",
-        "#Mirror Description",
-        "#Foreign",
+        "#EmptyArray (EmptyArrayView 'a)",
     ];
     let with_case = |at: usize, case: &str, helper: &str| {
         let mut written: Vec<String> = cases.iter().map(|case| (*case).to_string()).collect();
@@ -12087,20 +12083,20 @@ fn an_introduction_waits_for_its_term_type_and_passes_an_undecided_one_through()
 }
 
 #[test]
-fn function_mirrors_need_a_decided_closed_effect_row() {
+fn function_type_information_needs_a_decided_closed_effect_row() {
     let prelude =
-        "effect Tick = () -> ()\n@private extern type_of: 'a -> Mirror 'a = \"$typeOf\"\n";
+        "effect Tick = () -> ()\n@private extern type_of: 'a -> TypeInfo 'a = \"$infoOf\"\n";
     let (_, _, output) = infer_src(&format!(
-        "{prelude}let closed: (() -> Nat + !Tick) -> Mirror (() -> Nat + !Tick) = fn f => type_of f"
+        "{prelude}let closed: (() -> Nat + !Tick) -> TypeInfo (() -> Nat + !Tick) = fn f => type_of f"
     ));
     assert!(output.errors().is_empty(), "{:#?}", output.errors());
     for (case, message) in [
         (
-            "let open: (() -> Nat + ..'e) -> Mirror (() -> Nat + ..'e) = fn f => type_of f",
+            "let open: (() -> Nat + ..'e) -> TypeInfo (() -> Nat + ..'e) = fn f => type_of f",
             "closed effect row",
         ),
         (
-            "let undecided: (() -> Nat + !Tick (when 'p)) -> Mirror (() -> Nat + !Tick (when 'p)) = fn f => type_of f",
+            "let undecided: (() -> Nat + !Tick (when 'p)) -> TypeInfo (() -> Nat + !Tick (when 'p)) = fn f => type_of f",
             "decided effect row",
         ),
     ] {

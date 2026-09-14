@@ -76,6 +76,9 @@ the structural codec of any type made of primitives, arrays, records, sums, and
 regular recursion; it interprets the mirror's views, so a recursive type is
 handled one level at a time. A custom codec bypasses derivation and speaks the
 protocol itself, and a misordered or incomplete session is a protocol error.
+`derive_encoder` accepts `TypeInfo` and needs no constructors; unsupported live
+parts produce derivation errors. `derive_decoder` accepts `Mirror`. Both preserve
+the full schema while skipping proven-impossible positions during traversal.
 
 `std::binary` runs the same codecs over a positional binary format: no names
 or tags on the wire, only what the decoder's schema says comes next, with
@@ -91,6 +94,121 @@ A wire identity never manufactures a mirror, so an unregistered type is an
 error in both directions. `json::encode_canonical` writes the named canonical
 profile, with members sorted by key and no whitespace, for hashes and
 signatures.
+
+## Randomness
+
+`std::random::Random` provides `word64`, `boolean`, and `real` operations.
+Node executables and Node/web library exports install a default host handler.
+`nat_below bound` samples below an exclusive Nat64 bound; zero returns `#None`.
+`choose values` chooses an array position, returning `#None` for an empty array.
+
+Use the ambient handler for an ordinary draw:
+
+```ruddy
+let coin = fn _ => std::random::boolean ()
+```
+
+Create a reproducible root with `with_seed`, and use `local` to give a
+computation its own stream seeded by the next outer Random handler:
+
+```ruddy
+let rolls = fn _ => std::random::with_seed 42n64 (fn _ =>
+  std::random::local (fn _ => do
+    let first = std::random::nat_below 6n64
+    let second = std::random::nat_below 6n64
+    return (first, second)
+  end)
+)
+```
+
+Each `local` draws exactly one outer word before running its body, even if
+the body makes no draws or exits early. Its later draws use private state.
+Nested local scopes consume their seeds from their immediate parent.
+`with_seed` obtains nothing from an outer handler. Both handlers preserve
+unrelated effects and their state survives asynchronous suspension.
+
+A custom handler can supply the primitive operations independently:
+
+```ruddy
+let fixed = fn _ => handle
+  (std::random::word64 (), std::random::boolean (), std::random::real ())
+with
+| std::random::!Random.word64 _ => 17n64
+| std::random::!Random.boolean _ => true
+| std::random::!Random.real _ => 0.25
+end
+```
+
+For concurrent work, assign seeds to tasks in stable order **before** scheduling
+them. Each task then enters `with_seed` using its assigned seed when invoked.
+After that, interleaving between tasks does not change their individual streams.
+Calling `local` for the first time after tasks race to resume can assign seeds
+to different tasks. Constructing a callback inside a handler does not capture
+that handler: effects use the handler active at invocation.
+
+```ruddy
+-- Call this under a seeded root before scheduling either callback.
+let prepare = fn _ => do
+  let left_seed = std::random::word64 ()
+  let right_seed = std::random::word64 ()
+  return {
+    left: fn _ => std::random::with_seed left_seed std::random::word64,
+    right: fn _ => std::random::with_seed right_seed std::random::word64,
+  }
+end
+```
+
+These callbacks start fresh on each invocation. For repeatability across
+multiple invocations, allocate one seed per task invocation. A future threaded
+caller should give each task its own handler state; locking a shared stream
+would not make assignment of draws independent of scheduling.
+
+Built-in seeded handlers use SplitMix64 with stable cross-backend sequences.
+Each primitive consumes one word from the shared local stream. Booleans use
+its top bit; reals use its top 53 bits divided by 2^53, producing `[0, 1)`.
+Bounded sampling uses rejection to avoid modulo bias; bounds zero and one,
+and empty and singleton choices, consume no words. Duplicate array values
+retain their positional weight. Custom handlers can supply each primitive
+directly; bounded sampling expects uniform word draws and may keep retrying
+if a custom handler always supplies rejected values.
+
+The default host handler assembles two `Math.random` draws into a word, with
+approximately uniform, host-dependent quality and no sequence guarantee.
+This module is noncryptographic, including its local streams. It must not be
+used for passwords, tokens, or cryptographic keys. Derived seeds do not promise
+distinct or independent streams. The reference interpreter supports explicit
+seeds and caller-provided handlers, without a default ambient host source.
+
+### Generating a value from its type
+
+`std::random::random ()` infers its result type and returns a value directly.
+It requires constructive `Mirror` evidence, so empty result types and types with
+unavailable constructors are rejected at compilation.
+
+```ruddy
+type Terrain = #Water | #Land { height: Nat8, trees: [Bool] }
+let terrain: Terrain = std::random::with_seed 42n64 std::random::random
+let small_terrain: Terrain = std::random::with_seed 42n64 (fn _ =>
+  std::random::generate 8n (std::reflect::mirror ()))
+```
+
+`generate budget mirror` accepts explicit evidence and shares one expansion
+budget across the entire generation. `random ()` uses 64. Each position spends
+one unit; after exhaustion, that position uses `reflect::construct` without
+further random draws. This gives recursive types a finite fallback. Zero budget
+uses the pure construction immediately. The budget bounds randomized expansion,
+not the size of a type's required finite construction.
+
+Records generate their fields, sums choose uniformly among realizable cases, and
+empty-only arrays stay empty. Arrays and printable-ASCII strings choose lengths
+from zero through eight. Integer kinds sample their exact domain; booleans and
+reals use their respective `Random` operations. These bounded choices do not
+provide a uniform distribution over every value of an arbitrary type. Rejection
+sampling has the same source-liveness assumptions as `nat_below`.
+
+Generation works inside `with_seed` and `local`; identical seeds and ordered calls
+agree across backends. `choose` and `nat_below` still return `Option` because their
+inputs can be empty or invalid.
 
 ## Process
 
@@ -224,65 +342,67 @@ The host contracts follow the official
 [Fetch](https://developer.mozilla.org/en-US/docs/Web/API/Window/fetch), and
 [URL](https://developer.mozilla.org/en-US/docs/Web/API/URL) documentation.
 
-## Mirrors
+## Mirrors and descriptive evidence
 
-`std::reflect` works with `Mirror 'a`, a builtin type whose values are the
-compiler's own evidence for a type. `reflect::mirror : () -> Mirror 'a` makes
-one at whatever type the position is inferred at, and `reflect::type_of : 'a ->
-Mirror 'a` makes one for a value's static type without inspecting the value.
-A mirror cannot be built from data: foreign code cannot forge one, and
-`ffi::decode` accepts only a mirror the compiler made.
+`std::reflect` exposes two authenticated builtin types. `Mirror T` grants exact
+identity, typed structural constructors, and a finite pure construction of `T`.
+`TypeInfo T` grants description, typed observation, and exact identity without
+constructor authority. Ordinary `Description` records grant neither capability.
+Foreign conversion accepts only authentic evidence of exactly the requested type.
 
-`reflect::describe : Mirror 'a -> Description` renders a mirror as an ordinary
-finite graph of nodes, so a program can inspect a type's primitives, fields,
-tags, and function shapes. `reflect::same : Mirror 'a -> Mirror 'b -> Option {
-forward: 'a -> 'b, backward: 'b -> 'a }` decides whether two mirrors are exactly
-one type, and on success supplies the two identity functions that let a value
-cross between the names. A function's mirror carries its effect contract,
-so a function that performs an effect is never the same type as one that
-performs none.
+`reflect::mirror ()` remains inferred from an annotation, use, or generic caller.
+`reflect::type_of value` requests the same constructive evidence for the value's
+static type; possessing a value does not bypass the requirement. Generic wrappers,
+partial applications, captures, and compiled interfaces preserve that requirement.
+Empty types and unavailable constructors cause compile errors at the calling use.
 
-Together with [hidden types](dictionary.md#hidden-type) this recovers a value's
-type at runtime; the standard `Any` is defined exactly this way, as
-`hide 'a => { mirror: Mirror 'a, value: 'a }`, with `any::upcast` packaging a
-value and `any::downcast` opening one:
+`reflect::construct mirror` executes a finite pure construction. Supported
+immutable primitives produce zero, false, or empty text; unit and records construct
+their fields; arrays are empty; variants choose a case of minimum construction
+height, with ties broken by canonical case order. Recursive types need a finite
+base case. Functions, resources, mutable cells, hidden packages, and evidence types
+have no automatic constructors.
+
+`reflect::shape mirror` exposes constructive typed views. An ordinary array view
+carries an element mirror; `[|]` instead yields `#EmptyArray`, with descriptive
+element information and `read`/`make` operations on `[|]`. Sum views omit proven
+impossible cases and expose direct `inject` functions. An unavailable constructor
+for a potentially inhabited field, element, or case prevents obtaining the mirror;
+it never silently removes a valid case. Record builders still return checked
+errors for missing, duplicate, unknown, mismatched, or foreign bindings.
+
+`reflect::describe mirror` preserves the complete exact type graph, including
+impossible cases. Constructive filtering does not change type identity, codec
+schema identities, or binary case indices. Malformed codec input remains fallible.
+
+Use `reflect::type_info ()` for an inferred descriptive request and
+`reflect::info_of value` for a value's static type. `reflect::info mirror` forgets
+construction authority. `reflect::describe_info` returns ordinary description data,
+`reflect::shape_info` exposes typed readers, and `reflect::same_info` returns exact
+identity conversions. Function identity includes effect contracts. These operations
+remain available for empty, callable, and opaque types within their valid scopes.
+
+[Any](std/any.md) packages values with `TypeInfo`, preserving function packaging
+and exact checked casts:
 
 ```ruddy
-type Dynamic = hide 'a => { value: 'a, evidence: Mirror 'a }
+type Dynamic = hide 'a => { value: 'a, evidence: TypeInfo 'a }
 let as_nat: Dynamic -> Option Nat = fn item => match item with
-| hide 'x { value, evidence } => match std::reflect::same evidence (std::reflect::mirror ()) with
+| hide 'x { value, evidence } => match std::reflect::same_info evidence (std::reflect::type_info ()) with
   | #Some { forward, .. } => #Some (forward value)
   | #None => #None
   end
 end
 ```
 
-Inside the arm, a mirror the pattern bound is evidence for the opened type, so
-`std::reflect::type_of value` and generic foreign calls on `value` work there.
+The opened evidence authorizes observation of `'x`, not construction. A producer
+can instead carry an existing `Mirror 'x` to authorize construction after opening.
+Neither an edited description nor an arbitrary user factory can fabricate a mirror.
+The [reflection chapter](book/reflection.md) gives construction and migration examples.
 
-`reflect::shape : Mirror 'a -> Shape 'a` gives a mirror's outermost structure
-as typed views. Primitive cases carry `read : 'a -> Nat` and `make : Nat -> 'a`
-and their like, so a generic library converts without a cast; `#Array`,
-`#Record`, and `#Sum` carry views whose parts each hide their own type:
-
-```ruddy
-type SomeField 'record = hide 'field => {
-  name: String,
-  mirror: Mirror 'field,
-  presence: Presence,
-  read: 'record -> Option 'field,
-  bind: 'field -> Binding 'record,
-}
-```
-
-Opening a field with `hide 'f { mirror, read, bind, .. }` gives one scoped type
-shared by the mirror, what `read` observes, and what `bind` accepts, so a
-generic printer, validator, or decoder can work on a field's value and hand a
-new one back without knowing the field's type. A record view's `build` takes
-such bindings and rejects a missing, duplicate, unknown, or mismatched field,
-or one bound for another record. A sum case's `project` observes its payload
-and `inject` makes the case; functions, hidden types (`Any` among them),
-mirrors, and foreign values are described only.
+The debugger's reification view distinguishes descriptive slots, construction
+predicates, and demands supplied by callbacks. Artifacts use `artifact-v2`; older
+bundles must be recompiled because their mirrors had a weaker contract.
 
 ## ABI plans
 

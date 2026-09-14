@@ -143,6 +143,24 @@ impl Conversion<'_> {
                 }
                 _ => Err(Failure::at(path, "an authentic mirror")),
             },
+            Node::TypeInfo(indexed) => match value {
+                Value::Type(descriptor) if descriptor.info.get() => {
+                    if !self.outgoing {
+                        let wanted = crate::types::at(self.plan, *indexed);
+                        if !decided(&wanted) {
+                            return Err(Failure::at(
+                                path,
+                                "type information of a type settled here",
+                            ));
+                        }
+                        if !crate::types::same(descriptor, &wanted) {
+                            return Err(Failure::at(path, "type information of this type"));
+                        }
+                    }
+                    Ok(value.clone())
+                }
+                _ => Err(Failure::at(path, "authentic type information")),
+            },
             Node::Hidden(_) => {
                 let sealed = crate::types::at(self.plan, shape);
                 if !self.outgoing && !decided(&sealed) {

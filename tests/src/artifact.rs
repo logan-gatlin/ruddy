@@ -48,6 +48,102 @@ fn built(source: &str) -> Artifact {
 }
 
 #[test]
+fn assembled_artifact_descriptors_require_construction_evidence() {
+    let original = built(
+        r#"@private extern mirror: () -> Mirror 'a = "$mirror"
+let value: Mirror Nat = mirror ()"#,
+    );
+    let mut changed = original.to_unchecked();
+    let mut replaced = false;
+    for function in &mut changed.lir.functions {
+        let fresh = function
+            .blocks
+            .iter()
+            .flat_map(|block| &block.instrs)
+            .map(|i| i.temp)
+            .max()
+            .unwrap_or(0)
+            + 1;
+        for block in &mut function.blocks {
+            if let Some(at) = block.instrs.iter().position(|i| matches!(&i.op, Op::TypeDescriptor { template, arguments } if arguments.is_empty() && template.nodes == [ruddy::reification::Node::Nat])) {
+                block.instrs[at].op = Op::TypeDescriptor {
+                    template: ruddy::reification::Descriptor { nodes: vec![ruddy::reification::Node::Array(1), ruddy::reification::Node::Parameter(0)] },
+                    arguments: vec![fresh],
+                };
+                block.instrs.insert(at, Instr { temp: fresh, rep: Rep::TypeDescriptor, op: Op::TypeDescriptor {
+                    template: ruddy::reification::Descriptor { nodes: vec![ruddy::reification::Node::ForeignValue] }, arguments: vec![],
+                } });
+                replaced = true;
+            }
+        }
+    }
+    assert!(replaced);
+    assert!(
+        changed.clone().validate().is_err(),
+        "an assembled array of foreign values has no construction evidence"
+    );
+    for instruction in changed
+        .lir
+        .functions
+        .iter_mut()
+        .flat_map(|function| &mut function.blocks)
+        .flat_map(|block| &mut block.instrs)
+    {
+        if let Op::TypeDescriptor {
+            template,
+            arguments,
+        } = &mut instruction.op
+            && arguments.is_empty()
+            && template.nodes == [ruddy::reification::Node::ForeignValue]
+        {
+            template.nodes = vec![ruddy::reification::Node::Sum(Vec::new())];
+        }
+    }
+    assert!(
+        changed.validate().is_ok(),
+        "an assembled array of empty values permits the empty array"
+    );
+}
+
+#[test]
+fn artifacts_reject_legacy_and_impossible_mirror_evidence() {
+    let original = built(
+        r#"@private extern mirror: () -> Mirror 'a = "$mirror"
+let value: Mirror Nat = mirror ()"#,
+    );
+    let legacy = original.print().replacen("(artifact-v2", "(artifact", 1);
+    assert!(
+        Artifact::try_parse(&legacy).is_err(),
+        "legacy mirrors require recompilation"
+    );
+    let mut changed = original.to_unchecked();
+    let mut replaced = false;
+    for instruction in changed
+        .lir
+        .functions
+        .iter_mut()
+        .flat_map(|function| &mut function.blocks)
+        .flat_map(|block| &mut block.instrs)
+    {
+        if let Op::TypeDescriptor {
+            template,
+            arguments,
+        } = &mut instruction.op
+            && arguments.is_empty()
+            && template.nodes == [ruddy::reification::Node::Nat]
+        {
+            template.nodes = vec![ruddy::reification::Node::Sum(Vec::new())];
+            replaced = true;
+        }
+    }
+    assert!(replaced);
+    assert!(
+        changed.clone().validate().is_err(),
+        "a constant empty descriptor cannot authorize a mirror: {changed:#?}"
+    );
+}
+
+#[test]
 fn shared_rows_round_trip_and_import_with_their_exclusions() {
     let dependency = built(
         "type Sum 'r = | ..'r\n\
@@ -1099,7 +1195,7 @@ fn a_compiled_bundle_round_trips_through_canonical_text() {
 
     let printed = assert_round_trip(&artifact);
     assert!(
-        printed.starts_with("(artifact\n  (header"),
+        printed.starts_with("(artifact-v2\n  (header"),
         "artifact should use the canonical pretty layout:\n{printed}"
     );
     assert!(
@@ -1180,7 +1276,7 @@ fn canonical_pretty_layout_is_pinned_at_its_unicode_width_boundary() {
     assert_eq!(
         empty("界".repeat(12)).print(),
         format!(
-            "(artifact\n\
+            "(artifact-v2\n\
          \x20 (header\n\
          \x20   (kind library)\n\
          \x20   (identity \"界界界界界界界界界界界界\" \"1\")\n\
@@ -1197,7 +1293,7 @@ fn canonical_pretty_layout_is_pinned_at_its_unicode_width_boundary() {
     assert_eq!(
         empty("界".repeat(13)).print(),
         format!(
-            "(artifact\n\
+            "(artifact-v2\n\
          \x20 (header\n\
          \x20   (kind library)\n\
          \x20   (identity \"界界界界界界界界界界界界界\" \"1\")\n\
@@ -1436,10 +1532,10 @@ fn fallible_parse_errors_distinguish_syntax_from_structure() {
     assert_eq!(syntax.offset(), Some(0));
     assert_eq!(syntax.to_string(), "truncated artifact text at byte 0");
 
-    let structure = Artifact::try_parse("(artifact)").unwrap_err();
-    assert_eq!(structure.message(), "bad `artifact` arity");
+    let structure = Artifact::try_parse("(artifact-v2)").unwrap_err();
+    assert_eq!(structure.message(), "bad `artifact-v2` arity");
     assert_eq!(structure.offset(), None);
-    assert_eq!(structure.to_string(), "bad `artifact` arity");
+    assert_eq!(structure.to_string(), "bad `artifact-v2` arity");
 }
 
 /// The length dispatch, the element and slice reads, and the join a spread
@@ -1490,23 +1586,23 @@ fn malformed_text_returns_errors_while_trusted_api_panics() {
         "(",
         ")",
         "\"",
-        "(artifact)",
-        "(artifact (header) (lir))",
-        "(artifact (header (kind library) (identity \"x\" \"1\") (compiler \"0000000000000000\") (dependencies) (values) (types) (effects)) (lir (functions) (globals)) trailing)",
-        "(artifact (header (kind library) (identity \"x\" \"1\") (compiler \"0000000000000000\") (dependencies) (values) (types) (effects)) (lir (functions) (globals)) extra",
-        "(artifact (header (kind library) (identity \"\\u001\" \"1\") (compiler \"0000000000000000\") (dependencies) (values) (types) (effects)) (lir (functions) (globals)))",
-        "(artifact (header (kind library) (identity \"\\u00gg\" \"1\") (compiler \"0000000000000000\") (dependencies) (values) (types) (effects)) (lir (functions) (globals)))",
-        "(artifact (header (kind library) (identity \"\\u0041\" \"1\") (compiler \"0000000000000000\") (dependencies) (values) (types) (effects)) (lir (functions) (globals)))",
-        "(artifact (header (kind library) (identity \"\\u000a\" \"1\") (compiler \"0000000000000000\") (dependencies) (values) (types) (effects)) (lir (functions) (globals)))",
-        "(artifact (header (kind library) (identity \"\\ud800\" \"1\") (compiler \"0000000000000000\") (dependencies) (values) (types) (effects)) (lir (functions) (globals)))",
-        "(artifact (header (kind library) (identity \"\\q\" \"1\") (compiler \"0000000000000000\") (dependencies) (values) (types) (effects)) (lir (functions) (globals)))",
+        "(artifact-v2)",
+        "(artifact-v2 (header) (lir))",
+        "(artifact-v2 (header (kind library) (identity \"x\" \"1\") (compiler \"0000000000000000\") (dependencies) (values) (types) (effects)) (lir (functions) (globals)) trailing)",
+        "(artifact-v2 (header (kind library) (identity \"x\" \"1\") (compiler \"0000000000000000\") (dependencies) (values) (types) (effects)) (lir (functions) (globals)) extra",
+        "(artifact-v2 (header (kind library) (identity \"\\u001\" \"1\") (compiler \"0000000000000000\") (dependencies) (values) (types) (effects)) (lir (functions) (globals)))",
+        "(artifact-v2 (header (kind library) (identity \"\\u00gg\" \"1\") (compiler \"0000000000000000\") (dependencies) (values) (types) (effects)) (lir (functions) (globals)))",
+        "(artifact-v2 (header (kind library) (identity \"\\u0041\" \"1\") (compiler \"0000000000000000\") (dependencies) (values) (types) (effects)) (lir (functions) (globals)))",
+        "(artifact-v2 (header (kind library) (identity \"\\u000a\" \"1\") (compiler \"0000000000000000\") (dependencies) (values) (types) (effects)) (lir (functions) (globals)))",
+        "(artifact-v2 (header (kind library) (identity \"\\ud800\" \"1\") (compiler \"0000000000000000\") (dependencies) (values) (types) (effects)) (lir (functions) (globals)))",
+        "(artifact-v2 (header (kind library) (identity \"\\q\" \"1\") (compiler \"0000000000000000\") (dependencies) (values) (types) (effects)) (lir (functions) (globals)))",
     ] {
         assert_malformed(text);
     }
     assert_malformed(&"(".repeat(257));
 
     for (from, to) in [
-        ("(artifact ", "(bundle "),
+        ("(artifact-v2 ", "(bundle "),
         ("(header ", "(heading "),
         ("(identity ", "(owner "),
         ("(dependencies ", "(requires "),
@@ -1548,7 +1644,7 @@ fn malformed_text_returns_errors_while_trusted_api_panics() {
     }
 
     for (from, to) in [
-        ("(artifact ", "(artifact extra "),
+        ("(artifact-v2 ", "(artifact-v2 extra "),
         ("(identity \"bundle\" \"1.0.0\")", "(identity \"bundle\")"),
         ("(dependency \"base\" \"2.1.0\")", "(dependency \"base\")"),
         ("(scheme 15 7", "(scheme 15"),
@@ -2112,7 +2208,7 @@ fn valid_deep_artifact_parses_and_drops_on_a_small_stack() {
         serde_json::to_string(r#"{"externs":[],"functions":[],"globals":[]}"#).unwrap()
     );
     let valid = format!(
-        "(artifact (header (kind library) (identity \"deep\" \"1\") (compiler \"0000000000000000\") (domains 53) (dependencies) \
+        "(artifact-v2 (header (kind library) (identity \"deep\" \"1\") (compiler \"0000000000000000\") (domains 53) (dependencies) \
          (values (value \"deep@1::value\" (scheme 0 0 (existentials) {formula} (ty nat)) (metadata))) \
          (types) (effects) (modules)) {empty_lir})"
     );
@@ -2154,9 +2250,9 @@ fn balanced_malformed_deep_values_fail_on_a_small_stack() {
     // Both exercise destruction of fully built parser data on semantic error.
     let malformed = [
         format!(
-            "(artifact (header (kind library) (identity \"deep\" \"1\") (dependencies (dependency {nested} \"1\")) (values) (types) (effects)) {lir})"
+            "(artifact-v2 (header (kind library) (identity \"deep\" \"1\") (dependencies (dependency {nested} \"1\")) (values) (types) (effects)) {lir})"
         ),
-        format!("(artifact {header} {lir} {nested})"),
+        format!("(artifact-v2 {header} {lir} {nested})"),
     ];
     let handle = std::thread::Builder::new()
         .stack_size(256 * 1024)
@@ -2174,7 +2270,7 @@ fn rejected_deep_semantic_model_is_destroyed_on_a_small_stack() {
     const DEPTH: usize = 30_000;
     let formula = format!("{}true{}", "(not ".repeat(DEPTH), ")".repeat(DEPTH));
     let malformed = format!(
-        "(artifact (header (kind library) (identity \"deep\" \"1\") (compiler \"0000000000000000\") (domains 53) (dependencies) \
+        "(artifact-v2 (header (kind library) (identity \"deep\" \"1\") (compiler \"0000000000000000\") (domains 53) (dependencies) \
          (values (value \"deep@1::value\" (scheme 0 0 (existentials) {formula} (ty (struct (row (labels) closed)))) (metadata))) \
          (types) (effects) (modules)) (cps-lir wrong))"
     );
@@ -3014,6 +3110,7 @@ fn reification_artifacts_reject_changed_published_callable_contracts() {
                         root: 0,
                         nodes: vec![Node::Value],
                         ports: vec![],
+                        construction: Default::default(),
                     })
                 }
                 _ => {
@@ -3240,7 +3337,7 @@ fn effect_rows_in_descriptors_validate_their_references() {
     let artifact = built(
         r#"
 effect Tick = () -> ()
-@private extern type_of: 'a -> Mirror 'a = "$typeOf"
+@private extern type_of: 'a -> TypeInfo 'a = "$infoOf"
 let ticking: () -> Nat + !Tick = fn _ => do _ = !Tick () return 2n end
 let mirror = type_of ticking
 "#,

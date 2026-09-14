@@ -66,6 +66,8 @@ pub struct Constrain<'a> {
     /// larger one, and every other form passes what it was given down
     /// unchanged.
     pub ambient: Ambient,
+    /// Direct cell operations, held apart from callback effect remainders until isolation.
+    pub mutations: Vec<(Anchor, Arc<Ty>)>,
     /// The answer type of the innermost handler arm enclosing the walk, or
     /// `None` where no arm does.
     ///
@@ -633,9 +635,11 @@ impl Constrain<'_> {
                 // the stack, which is why lowering refuses a `raise` here at
                 // all. The two rules mirror each other rather than one leaning
                 // on the other having run.
+                let outer_mutations = std::mem::take(&mut self.mutations);
                 let held = self.answer.take();
                 self.infer_term(body);
                 self.answer = held;
+                let mutations = std::mem::replace(&mut self.mutations, outer_mutations);
                 self.leave(outer);
                 let external = Row::of(self.table.fresh_row_for(Subject::AmbientEffects));
                 self.emit(
@@ -643,6 +647,7 @@ impl Constrain<'_> {
                     ConstraintOrigin::Binding,
                     ConstraintSubjects::one(Subject::AmbientEffects),
                     ConstraintKind::Isolate {
+                        mutations,
                         effect_origins: Vec::new(),
                         input: param.clone(),
                         output: body.ty.clone(),
@@ -1440,7 +1445,9 @@ impl Constrain<'_> {
             row: initializer_effects.clone(),
             ..self.ambient.clone()
         });
+        let mutation_start = self.mutations.len();
         self.check_term(value, &bound, expected_subject, expected_span);
+        let initializer_mutates = self.mutations.len() != mutation_start;
         self.leave(enclosing);
         let required = std::mem::replace(&mut self.out, outer);
 
@@ -1469,6 +1476,7 @@ impl Constrain<'_> {
                 promised,
                 rigids,
                 initializer_effects,
+                initializer_mutates,
                 ambient: self.ambient.row.clone(),
                 inside: self.ambient.inside,
                 value: required,
@@ -1822,15 +1830,18 @@ impl Constrain<'_> {
                     boundary_at: term.at,
                     label_spans: IndexMap::new(),
                 });
+                let outer_mutations = std::mem::take(&mut self.mutations);
                 let held = self.answer.take();
                 self.check_term(body, &to, expected_subject, expected_span);
                 self.answer = held;
+                let mutations = std::mem::replace(&mut self.mutations, outer_mutations);
                 self.leave(outer);
                 self.emit(
                     term.at,
                     ConstraintOrigin::ApplicationEffects,
                     ConstraintSubjects::one(Subject::AmbientEffects),
                     ConstraintKind::Isolate {
+                        mutations,
                         effect_origins: Vec::new(),
                         input: from,
                         output: to,
@@ -2007,6 +2018,10 @@ impl Constrain<'_> {
 impl Constrain<'_> {
     /// Require access to the cell region at this expression.
     fn mutation(&mut self, span: Anchor, region: Arc<Ty>) {
+        if self.ambient.inside {
+            self.mutations.push((span, region));
+            return;
+        }
         let performed = Row {
             labels: [(
                 crate::types::mutation_effect().row_key(),

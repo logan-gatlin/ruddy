@@ -1,5 +1,122 @@
 use std::{fs, path::Path, process::Command};
 
+#[test]
+fn randomness_host_primitives_and_local_seeding_work_on_node_and_web() {
+    for platform in ["node", "web"] {
+        let project = project(
+            r#"
+let word = std::random::word64
+let boolean = std::random::boolean
+let real = std::random::real
+let local: () -> [Nat64] + std::random::!Random = fn _ => std::random::local (fn _ => do
+  let first = std::random::word64 ()
+  let second = std::random::word64 ()
+  return [first, second]
+end)
+let seeded: () -> Nat64 = fn _ => std::random::with_seed 0n64 (fn _ => std::random::local std::random::word64)
+let overridden: () -> (Nat64, Bool, Real) = fn _ => handle (std::random::word64 (), std::random::boolean (), std::random::real ()) with
+| std::random::!Random.word64 _ => 17n64
+| std::random::!Random.boolean _ => true
+| std::random::!Random.real _ => 0.25
+end
+"#,
+            platform,
+            "library",
+        );
+        run_with_setup(
+            project.path(),
+            "Math.random = () => { throw new Error('import must not draw'); };",
+            r#"
+let draws = [];
+Math.random = () => { assert.ok(draws.length, 'unexpected host draw'); return draws.shift(); };
+draws = [0, 0]; assert.equal(await app.word({}), 0n);
+draws = [1 - 2 ** -32, 1 - 2 ** -32]; assert.equal(await app.word({}), 18446744073709551615n);
+draws = [0.5, 0.25]; assert.equal(await app.word({}), 9223372037928517632n);
+draws = [0, 0]; assert.equal(await app.boolean({}), false);
+draws = [0.5, 0]; assert.equal(await app.boolean({}), true);
+draws = [0, 0]; assert.equal(await app.real({}), 0);
+draws = [1 - 2 ** -32, 1 - 2 ** -32]; assert.equal(await app.real({}), 1 - 2 ** -53);
+draws = [0, 0]; assert.deepEqual(await app.local({}), [16294208416658607535n, 7960286522194355700n]);
+assert.equal(draws.length, 0);
+Math.random = () => { throw new Error('host randomness must not be used'); };
+assert.equal(typeof await app.seeded({}), 'bigint');
+const overridden = await app.overridden({});
+assert.equal(overridden[0], 17n); assert.equal(overridden[1], true); assert.equal(overridden[2], 0.25);
+"#,
+        );
+    }
+}
+
+#[test]
+fn randomness_local_streams_survive_opposite_async_completion_orders() {
+    for platform in ["node", "web"] {
+        let project = project(
+            r#"
+@private
+@async
+extern pause: Nat -> () + std::ffi::!Immediate = "key => new Promise(resolve => globalThis.randomWaiters.set(key, () => resolve({})))"
+let prepare: Nat64 -> { left: Nat64, right: Nat64 } = fn seed => std::random::with_seed seed (fn _ => do
+  let left = std::random::word64 ()
+  let right = std::random::word64 ()
+  return { left: left, right: right }
+end)
+let run: { seed: Nat64, key: Nat, extra: Bool } -> [Nat64] + std::ffi::!Immediate = fn request =>
+  std::random::with_seed request.seed (fn _ => std::random::local (fn _ => do
+    let first = std::random::word64 ()
+    _ = pause request.key
+    _ = if request.extra then std::random::word64 () else 0n64 end
+    let second = std::random::word64 ()
+    return [first, second]
+  end))
+"#,
+            platform,
+            "library",
+        );
+        run_with_setup(
+            project.path(),
+            "Math.random = () => { throw new Error('seeded tasks must not touch the host source'); };",
+            r#"
+const seeds = await app.prepare(0n);
+assert.equal(seeds.left, 16294208416658607535n);
+assert.equal(seeds.right, 7960286522194355700n);
+async function schedule(order, extra = false) {
+  globalThis.randomWaiters = new Map();
+  const left = app.run({ seed: seeds.left, key: 0, extra });
+  const right = app.run({ seed: seeds.right, key: 1, extra: false });
+  await new Promise(setImmediate);
+  assert.equal(randomWaiters.size, 2, 'both local bodies reached their suspension');
+  const tasks = [left, right];
+  for (const key of order) { randomWaiters.get(key)(); await tasks[key]; }
+  return await Promise.all(tasks);
+}
+const forward = await schedule([0, 1]);
+assert.deepEqual(await schedule([1, 0]), forward);
+const extra = await schedule([1, 0], true);
+assert.equal(extra[0][0], forward[0][0]);
+assert.deepEqual(extra[1], forward[1], 'sibling draws are unaffected');
+assert.notEqual(extra[0][1], forward[0][1], 'the extra draw advances only its own stream');
+"#,
+        );
+    }
+}
+
+#[test]
+fn randomness_is_installed_for_node_executables() {
+    let project = project(
+        r#"
+let main: () -> () + std::random::!Random + std::io::!IO = fn _ => do
+  let value = std::random::word64 ()
+  let truth = std::random::boolean ()
+  let fraction = std::random::real ()
+  return std::io::println (std::str::display (value, truth, fraction))
+end
+"#,
+        "node",
+        "executable",
+    );
+    run_with_setup(project.path(), "Math.random = () => 0;", "");
+}
+
 fn project(source: &str, platform: &str, kind: &str) -> tempfile::TempDir {
     let project = tempfile::tempdir().unwrap();
     let standard = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
@@ -23,10 +140,14 @@ fn domain_project(source: &str, integers: u32) -> tempfile::TempDir {
 }
 
 fn run(project: &Path, script: &str) {
+    run_with_setup(project, "", script);
+}
+
+fn run_with_setup(project: &Path, setup: &str, script: &str) {
     ruddy_cli::check_project(project).expect("API consumer checks");
     let artifact = ruddy_cli::build_project(project).expect("API consumer builds");
     let script = format!(
-        "import assert from 'node:assert/strict'; import {{pathToFileURL}} from 'node:url'; const app = await import(pathToFileURL({}));\n{script}",
+        "import assert from 'node:assert/strict'; import {{pathToFileURL}} from 'node:url'; {setup} const app = await import(pathToFileURL({}));\n{script}",
         serde_json::to_string(artifact.with_extension("js").to_str().unwrap()).unwrap()
     );
     let output = Command::new("node")
@@ -364,24 +485,24 @@ let join: [String] -> String = fn parts => match parts with
 | [head, ..tail] => concat head (concat ", " (join tail))
 end
 @private
-let print: Mirror 'a -> 'a -> String = fn mirror value => match std::reflect::shape mirror with
-| #Nat { read, make } => std::str::from_nat (read value)
-| #Int { read, make } => std::str::from_int (read value)
-| #Real { read, make } => std::str::from_real (read value)
-| #String { read, make } => concat "\"" (concat (read value) "\"")
-| #Bool { read, make } => std::str::from_boolean (read value)
+let print: TypeInfo 'a -> 'a -> String = fn mirror value => match std::reflect::shape_info mirror with
+| #Nat { read } => std::str::from_nat (read value)
+| #Int { read } => std::str::from_int (read value)
+| #Real { read } => std::str::from_real (read value)
+| #String { read } => concat "\"" (concat (read value) "\"")
+| #Bool { read } => std::str::from_boolean (read value)
 | #Array view => match view with
-  | hide 'element { element, read, make } =>
+  | hide 'element { element, read } =>
     concat "[" (concat (join (std::array::map (print element) (read value))) "]")
   end
 | #Record view => concat "{" (concat (join (std::array::map (fn field => match field with
-    | hide 'field { name, mirror, read, bind, presence } => match read value with
+    | hide 'field { name, mirror, read, presence } => match read value with
       | #Some inner => concat name (concat ": " (print mirror inner))
       | #None => concat name ": absent"
       end
     end) view.fields)) "}")
 | #Sum view => match std::array::filter_map (fn case => match case with
-    | hide 'payload { name, mirror, project, inject } => match project value with
+    | hide 'payload { name, mirror, project } => match project value with
       | #Some payload => #Some (concat "#" (concat name (concat " " (print mirror payload))))
       | #None => #None
       end
@@ -392,6 +513,7 @@ let print: Mirror 'a -> 'a -> String = fn mirror value => match std::reflect::sh
 | #Function description => "<function>"
 | #Hidden description => "<hidden>"
 | #Mirror description => "<mirror>"
+| #TypeInfo description => "<type-info>"
 | #Foreign => "<foreign>"
 | _ => "<fixed>"
 end
@@ -399,19 +521,20 @@ let person_mirror: Mirror Person = std::reflect::mirror ()
 let role_mirror: Mirror Role = std::reflect::mirror ()
 @private
 let ada = { name: "Ada", age: 36n, tags: ["x", "y"], role: #User 3n }
-let printed = print person_mirror ada
-let printed_unit = print (std::reflect::type_of ()) ()
+let printed = print (std::reflect::info person_mirror) ada
+let printed_unit = print (std::reflect::info_of ()) ()
 @private
 let identity: Nat -> Nat = fn x => x
-let printed_function = print (std::reflect::type_of identity) identity
+let printed_function = print (std::reflect::info_of identity) identity
 let boxed: Box = { value: 1n }
-let printed_hidden = print (std::reflect::type_of boxed) boxed
-let printed_mirror = print (std::reflect::type_of person_mirror) person_mirror
+let printed_hidden = print (std::reflect::info_of boxed) boxed
+let printed_info = print (std::reflect::info_of (std::reflect::info person_mirror)) (std::reflect::info person_mirror)
+let printed_mirror = print (std::reflect::info_of person_mirror) person_mirror
 let any = std::any::upcast 1n
-let printed_any = print (std::reflect::type_of any) any
+let printed_any = print (std::reflect::info_of any) any
 @private
 extern host: ForeignValue = "1"
-let printed_foreign = print (std::reflect::type_of host) host
+let printed_foreign = print (std::reflect::info_of host) host
 @private
 let bindings_of: Mirror 'a -> 'a -> [std::reflect::Binding 'a] = fn mirror value =>
   match std::reflect::shape mirror with
@@ -427,7 +550,7 @@ let bindings_of: Mirror 'a -> 'a -> [std::reflect::Binding 'a] = fn mirror value
 let build_with: Mirror 'a -> [std::reflect::Binding 'a] -> String = fn mirror bindings =>
   match std::reflect::shape mirror with
   | #Record view => match view.build bindings with
-    | #Some rebuilt => concat "built " (print mirror rebuilt)
+    | #Some rebuilt => concat "built " (print (std::reflect::info mirror) rebuilt)
     | #Error (#Missing name) => concat "missing " name
     | #Error (#Duplicate name) => concat "duplicate " name
     | #Error (#Unknown name) => concat "unknown " name
@@ -450,7 +573,7 @@ let make_admin: Mirror Role -> Option Role = fn mirror => match std::reflect::sh
 | #Sum view => match std::array::filter_map (fn case => match case with
     | hide 'payload { name, mirror, inject, .. } =>
       match (name, inject, std::reflect::same (std::reflect::type_of ()) mirror) with
-      | ("Admin", #Some make, #Some { forward, .. }) => #Some (make (forward ()))
+      | ("Admin", make, #Some { forward, .. }) => #Some (make (forward ()))
       | _ => #None
       end
     end) view.cases with
@@ -459,7 +582,7 @@ let make_admin: Mirror Role -> Option Role = fn mirror => match std::reflect::sh
   end
 | _ => #None
 end
-let admin = match make_admin role_mirror with | #Some role => print role_mirror role | #None => "none" end
+let admin = match make_admin role_mirror with | #Some role => print (std::reflect::info role_mirror) role | #None => "none" end
 @private
 let reversed: Mirror 'a -> 'a -> 'a = fn mirror value => match std::reflect::shape mirror with
 | #Array view => match view with
@@ -481,6 +604,7 @@ assert.equal(app.printed_unit, '{}');
 assert.equal(app.printed_function, '<function>');
 assert.equal(app.printed_hidden, '<hidden>');
 assert.equal(app.printed_mirror, '<mirror>');
+assert.equal(app.printed_info, '<type-info>');
 assert.equal(app.printed_any, '<hidden>');
 assert.equal(app.printed_foreign, '<foreign>');
 assert.equal(app.rebuilt, 'built {age: 36, name: "Ada", role: #User 3, tags: ["x", "y"]}');
@@ -495,6 +619,14 @@ assert.deepEqual(app.backwards, ['y', 'x']);
 
 #[test]
 fn codecs_derive_json_round_trips_and_report_paths() {
+    let unsupported = project(
+        "let decode_any: String -> Result Any std::json::Error = std::json::decode",
+        "node",
+        "library",
+    );
+    let error = ruddy_cli::check_project(unsupported.path())
+        .expect_err("default decoding requires construction authority");
+    assert!(error.to_string().contains("construction"), "{error:?}");
     let project = project(
         r##"
 type Role = #Admin | #User Nat
@@ -513,7 +645,6 @@ let decode_small: String -> Result Int8 std::json::Error = std::json::decode
 let decode_real: String -> Result Real std::json::Error = std::json::decode
 let encode_real: Real -> Result String std::json::Error = std::json::encode
 let encode_function: (Nat -> Nat) -> Result String std::json::Error = std::json::encode
-let decode_any: String -> Result Any std::json::Error = std::json::decode
 let encode_nats: [Nat] -> Result String std::json::Error = std::json::encode
 let parse = std::json::parse
 let stringify = std::json::stringify
@@ -616,8 +747,6 @@ const tree = sum('Node', { left: sum('Leaf', {}), value: -5, right: sum('Node', 
 const treeText = some(await app.encode_tree(tree));
 assert.deepEqual(norm(some(await app.decode_tree(treeText))), norm(tree));
 assert.deepEqual(error(await app.encode_function(x => x)), sum('Derive', { path: [], reason: 'a function has no default codec' }));
-assert.deepEqual(error(await app.decode_any('1')).value.path, [sum('Field', 'value')].slice(0, 0));
-assert.equal(error(await app.decode_any('1')).tag, 'Derive');
 assert.equal(some(await app.encode_nats([1, 2, 3])), '[1,2,3]');
 const doc = some(await app.parse('{"a":1,"a":2.50,"b":[true,null,"s\\u0041\\n"]}'));
 assert.deepEqual(norm(doc), sum('Object', [
@@ -949,9 +1078,9 @@ effect Tick = () -> ()
 let ticking: () -> Nat + !Tick = fn _ => do _ = !Tick () return 2n end
 @private
 let pure: () -> Nat = fn _ => 1n
-let described = std::reflect::describe (std::reflect::type_of ticking)
-let described_pure = std::reflect::describe (std::reflect::type_of pure)
-let same_as_pure = match std::reflect::same (std::reflect::type_of ticking) (std::reflect::type_of pure) with
+let described = std::reflect::describe_info (std::reflect::info_of ticking)
+let described_pure = std::reflect::describe_info (std::reflect::info_of pure)
+let same_as_pure = match std::reflect::same_info (std::reflect::info_of ticking) (std::reflect::info_of pure) with
 | #Some _ => true
 | #None => false
 end

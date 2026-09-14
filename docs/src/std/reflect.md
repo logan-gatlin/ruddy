@@ -72,6 +72,18 @@ type Domain = { bits: Nat, signed: Bool, min: String, max: String }
 
 The exact domain of an integer kind: its precision in bits, its signedness, and its least and greatest values as decimal text, exact even where this target's own integers could not hold them.
 
+### EmptyArrayView
+
+```ruddy
+type EmptyArrayView 'array = {
+  element: Description,
+  read: 'array -> [|],
+  make: [|] -> 'array,
+}
+```
+
+An array whose element type is proven empty. Its sole value is the empty array; the element description grants no constructor.
+
 ### Field
 
 ```ruddy
@@ -79,6 +91,90 @@ type Field = { name: String, node: Nat }
 ```
 
 A named position of a record or sum node.
+
+### InfoArrayView
+
+```ruddy
+type InfoArrayView 'array = hide 'element => {
+  element: TypeInfo 'element,
+  read: 'array -> ['element],
+}
+```
+
+An array's descriptive element evidence and read operation.
+
+### InfoRecordView
+
+```ruddy
+type InfoRecordView 'record = {
+  mirror: TypeInfo 'record,
+  fields: [InfoSomeField 'record],
+}
+```
+
+A record's descriptive field views.
+
+### InfoShape
+
+```ruddy
+type InfoShape 'a =
+  | #Nat { read: 'a -> Nat }
+  | #Int { read: 'a -> Int }
+  | #Real { read: 'a -> Real }
+  | #String { read: 'a -> String }
+  | #Bool { read: 'a -> Bool }
+  | #Nat8 { read: 'a -> Nat8 }
+  | #Nat16 { read: 'a -> Nat16 }
+  | #Nat32 { read: 'a -> Nat32 }
+  | #Nat64 { read: 'a -> Nat64 }
+  | #Int8 { read: 'a -> Int8 }
+  | #Int16 { read: 'a -> Int16 }
+  | #Int32 { read: 'a -> Int32 }
+  | #Int64 { read: 'a -> Int64 }
+  | #Array (InfoArrayView 'a)
+  | #Record (InfoRecordView 'a)
+  | #Sum (InfoSumView 'a)
+  | #Function Description
+  | #Hidden Description
+  | #Mirror Description
+  | #TypeInfo Description
+  | #Foreign
+```
+
+Typed observation without construction authority.
+
+### InfoSomeCase
+
+```ruddy
+type InfoSomeCase 'sum = hide 'payload => {
+  name: String,
+  mirror: TypeInfo 'payload,
+  project: 'sum -> Option 'payload,
+}
+```
+
+A case's descriptive payload evidence and projection, without injection authority.
+
+### InfoSomeField
+
+```ruddy
+type InfoSomeField 'record = hide 'field => {
+  name: String,
+  mirror: TypeInfo 'field,
+  presence: Presence,
+  read: 'record -> Option 'field,
+}
+```
+
+A field's descriptive evidence and read operation, sharing one hidden field type.
+
+### InfoSumView
+
+```ruddy
+type InfoSumView 'sum = { mirror: TypeInfo 'sum, cases: [InfoSomeCase 'sum] }
+```
+
+Every described case, including cases with impossible payloads.
 
 ### Node
 
@@ -101,6 +197,7 @@ type Node =
   | #Extend { base: Nat, rest: Nat }
   | #Parameter Nat
   | #Mirror Nat
+  | #TypeInfo Nat
   | #Hidden Nat
   | #Variable Nat
 ```
@@ -145,15 +242,12 @@ type Shape 'a =
   | #Int32 { read: 'a -> Int32, make: Int32 -> 'a }
   | #Int64 { read: 'a -> Int64, make: Int64 -> 'a }
   | #Array (ArrayView 'a)
+  | #EmptyArray (EmptyArrayView 'a)
   | #Record (RecordView 'a)
   | #Sum (SumView 'a)
-  | #Function Description
-  | #Hidden Description
-  | #Mirror Description
-  | #Foreign
 ```
 
-The outermost structure of a mirrored type, as views whose operations read and make values of that type. Cells use the opaque Foreign shape and expose no read or write operations. Primitive cases carry the typed conversions; the descriptive cases carry the type's description and no way to make one.
+Constructive structural views: primitives, records, arrays, empty-only arrays, and sums. Nested mirrors satisfy the same construction contract. Functions, cells, foreign values, hidden packages, and evidence types have no automatic constructors; inspect them with `InfoShape` instead.
 
 ### SomeCase
 
@@ -162,11 +256,11 @@ type SomeCase 'sum = hide 'payload => {
   name: String,
   mirror: Mirror 'payload,
   project: 'sum -> Option 'payload,
-  inject: Option ('payload -> 'sum),
+  inject: 'payload -> 'sum,
 }
 ```
 
-One case of a sum with its payload type hidden. `project` observes the payload when the value is this case; `inject` makes the case, when the mirror proves it may be made.
+One realizable case, with its payload type hidden. `project` observes the payload and `inject` constructs the case directly. Proven impossible cases are omitted here and retained in `describe`; unsupported but possibly inhabited cases prevent obtaining the mirror.
 
 ### SomeField
 
@@ -192,6 +286,14 @@ A sum's cases, each with its own hidden payload type.
 
 ## Values
 
+### construct
+
+```ruddy
+extern construct: Mirror 'a -> 'a
+```
+
+Executes the mirror's finite pure construction. Primitive values are zero, false, or empty; records construct every field, arrays are empty, and variants choose a case of minimum construction height, breaking ties by canonical case order.
+
 ### describe
 
 ```ruddy
@@ -200,13 +302,37 @@ extern describe: Mirror 'a -> Description
 
 A mirror's structure as ordinary data. Editing the description grants nothing: it cannot be turned back into a mirror.
 
+### describe_info
+
+```ruddy
+extern describe_info: TypeInfo 'a -> Description
+```
+
+The complete type description, including impossible cases and opaque positions.
+
+### info
+
+```ruddy
+extern info: Mirror 'a -> TypeInfo 'a
+```
+
+A constructive mirror's descriptive evidence.
+
+### info_of
+
+```ruddy
+extern info_of: 'a -> TypeInfo 'a
+```
+
+Descriptive evidence for a value's static type. Does not capture the value or grant constructors.
+
 ### mirror
 
 ```ruddy
 extern mirror: () -> Mirror 'a
 ```
 
-Authentic evidence for the type this position is inferred at. The compiler supplies it: an annotation, a use, or a caller decides the type, never a runtime value.
+Authentic construction evidence for an inferred type. An annotation, use, or caller selects the type. The compiler requires accessible constructors for every potentially inhabited part and a finite pure construction; empty types and unsupported constructors are compile errors. Generic callers retain this requirement.
 
 ### same
 
@@ -216,6 +342,14 @@ let same: Mirror 'a -> Mirror 'b -> Option { forward: 'a -> 'b, backward: 'b -> 
 
 Whether two mirrors are one type, exactly: equal structure, primitives, and effect contracts. On success the two functions convert nothing and return their argument unchanged.
 
+### same_info
+
+```ruddy
+let same_info: TypeInfo 'a -> TypeInfo 'b -> Option { forward: 'a -> 'b, backward: 'b -> 'a }
+```
+
+Exact type equality from authenticated descriptive evidence; converts no values and grants no constructors.
+
 ### shape
 
 ```ruddy
@@ -224,12 +358,28 @@ extern shape: Mirror 'a -> Shape 'a
 
 The outermost structure of a mirror, with typed operations on values of its type. Nested types are reached through the mirrors the views carry, one level per call, so a recursive type is inspected as far as a program looks.
 
+### shape_info
+
+```ruddy
+extern shape_info: TypeInfo 'a -> InfoShape 'a
+```
+
+Read-only typed structure. Observing a type does not grant construction authority.
+
+### type_info
+
+```ruddy
+extern type_info: () -> TypeInfo 'a
+```
+
+Authenticated descriptive evidence for an inferred static type, without construction authority.
+
 ### type_of
 
 ```ruddy
 extern type_of: 'a -> Mirror 'a
 ```
 
-The mirror of a value's static type at this use. It does not inspect the value.
+A constructive mirror of a value's static type. It requires the same construction evidence as `mirror`; the value grants no constructor authority. Use `info_of` for observation alone.
 
 <!-- Generated by ruddy doc for std. -->

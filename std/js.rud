@@ -57,7 +57,7 @@ let read: Value -> Result 'a Error = fn value =>
   else refused "reading this value would run host code, so it is not read here"
   end
 
-@doc "The structural adapter for the type this use site infers, made from the mirror the compiler supplies there. No direction carries a function contract."
+@doc "The structural adapter for the type this use site infers, made from the runtime type information the compiler supplies there. No direction carries a function contract."
 let adapter: () -> Adapter 'a = fn _ => { lower: lower, lift: lift, read: read }
 
 -- Callbacks

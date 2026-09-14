@@ -216,10 +216,15 @@ let matched = match restored with | #Some _ => true | #None => false end
         .push(ruddy::reification::Node::Struct(vec![fields[0].clone()]));
     descriptor
         .nodes
-        .push(ruddy::reification::Node::Struct(vec![fields[1].clone()]));
+        .push(ruddy::reification::Node::Sum(vec![fields[1].clone()]));
     let artifact = artifact
         .validate()
         .expect("a concrete guarded row extension is valid");
+    let interpreted = ruddy_interp::Program::load(&artifact).unwrap();
+    assert_eq!(
+        ruddy_interp::render::json(&interpreted.export("matched").unwrap()),
+        "true"
+    );
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("rows.mjs");
     fs::write(&path, js::generate(&artifact).unwrap()).unwrap();
@@ -232,6 +237,80 @@ let matched = match restored with | #Some _ => true | #None => false end
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+#[test]
+fn construction_row_extensions_use_the_enclosing_constructor() {
+    use ruddy::reification::Node;
+    let original = compiled(
+        r#"
+@private extern mirror: () -> Mirror 'a = "$mirror"
+@private extern construct: Mirror 'a -> 'a = "$construct"
+let value: #Dead (|) | #Live Nat = construct (mirror ())
+"#,
+    );
+    for record in [false, true] {
+        let mut changed = original.to_unchecked();
+        let descriptor = changed
+            .lir
+            .functions
+            .iter_mut()
+            .flat_map(|f| &mut f.blocks)
+            .flat_map(|b| &mut b.instrs)
+            .find_map(|instruction| match &mut instruction.op {
+                artifact::Op::TypeDescriptor {
+                    template,
+                    arguments,
+                } if arguments.is_empty()
+                    && matches!(&template.nodes[0], Node::Sum(fields) if fields.len() == 2) =>
+                {
+                    Some(template)
+                }
+                _ => None,
+            })
+            .unwrap();
+        let Node::Sum(fields) = descriptor.nodes[0].clone() else {
+            unreachable!()
+        };
+        let base = descriptor.nodes.len() as u32;
+        descriptor.nodes[0] = Node::Extend([base, base + 1]);
+        descriptor.nodes.push(if record {
+            Node::Struct(vec![])
+        } else {
+            Node::Sum(vec![])
+        });
+        descriptor.nodes.push(if record {
+            Node::Sum(fields)
+        } else {
+            Node::Struct(fields)
+        });
+        let checked = changed.validate();
+        if record {
+            assert!(
+                checked.is_err(),
+                "a required empty field makes the extended record empty"
+            );
+            continue;
+        }
+        let artifact = checked.expect("the extended sum retains its live case");
+        let interpreted = ruddy_interp::Program::load(&artifact).unwrap();
+        assert_eq!(
+            ruddy_interp::render::json(&interpreted.export("value").unwrap()),
+            r#"{"tag":"Live","value":0}"#
+        );
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("rows.mjs");
+        fs::write(&path, js::generate(&artifact).unwrap()).unwrap();
+        let output = Command::new("node").args(["--input-type=module", "--eval", &format!(
+            "import assert from 'node:assert/strict'; import * as app from {}; assert.equal(app.value.tag, 'Live'); assert.equal(app.value.value, 0);",
+            serde_json::to_string(path.to_str().unwrap()).unwrap(),
+        )]).output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 }
 
 #[test]
@@ -303,8 +382,16 @@ end
 let field = match product with | #Some p => p.A | #None => 0n end
 let payload = match choice with | #Some (#A n) => n | #None => 0n end
 let distinct = match wrong with | #Some _ => false | #None => true end
+@private extern info: () -> TypeInfo 'a = "$typeInfo"
+@private extern construct: Mirror 'a -> 'a = "$construct"
+@private let sum_default: TypeInfo { ..'r } -> (| ..'r) = fn _ => construct (mirror ())
+@private let record_default: TypeInfo (| ..'r) -> { ..'r } = fn _ => construct (mirror ())
+@private let sum_fields: TypeInfo { Live: Nat, Dead: | } = info ()
+@private let record_fields: TypeInfo (|) = info ()
+let generated_sum = sum_default sum_fields
+let generated_record = record_default record_fields
 "#,
-        "assert.equal(app.field, 7); assert.equal(app.payload, 8); assert.equal(app.distinct, true);",
+        "assert.equal(app.field, 7); assert.equal(app.payload, 8); assert.equal(app.distinct, true); assert.equal(app.generated_sum.tag, 'Live'); assert.equal(app.generated_sum.value, 0); assert.deepEqual(Reflect.ownKeys(app.generated_record), []);",
     );
 }
 
@@ -525,7 +612,7 @@ fn reification_imported_recursive_descriptors_close_forwarding_arguments_and_rej
         let producer = changed
             .validate()
             .expect("a structurally checked portable alias graph");
-        let source = "type Option 'a = #Some 'a | #None\ntype Any = hide 'a => { mirror: Mirror 'a, value: 'a }\n@private extern type_of: 'a -> Mirror 'a = \"$typeOf\"\n@private extern mirror: () -> Mirror 'a = \"$mirror\"\n@private extern same_pair: (Mirror 'a, Mirror 'b) -> Option { forward: 'a -> 'b, backward: 'b -> 'a } = \"$sameMirror\"\n@private let box: 'a -> Any = fn value => { mirror: type_of value, value: value }\nlet wrap: dep::Loop Nat -> Any = fn x => box x";
+        let source = "type Option 'a = #Some 'a | #None\ntype Any = hide 'a => { mirror: TypeInfo 'a, value: 'a }\n@private extern type_of: 'a -> TypeInfo 'a = \"$infoOf\"\n@private extern mirror: () -> TypeInfo 'a = \"$typeInfo\"\n@private extern same_pair: (TypeInfo 'a, TypeInfo 'b) -> Option { forward: 'a -> 'b, backward: 'b -> 'a } = \"$sameInfo\"\n@private let box: 'a -> Any = fn value => { mirror: type_of value, value: value }\nlet wrap: dep::Loop Nat -> Any = fn x => box x";
         let mut files = FileManager::new();
         let file = files.register_new_file("consumer.rud".into(), source.into());
         let parsed = parse::parse(token::lex(source, file).tokens);
@@ -673,10 +760,10 @@ let label = match text with | #Some s => s | #None => "failed" end
 fn reification_structural_rows_recursive_aliases_and_callable_payloads() {
     execute_reification(
         r#"
-type Any = hide 'a => { mirror: Mirror 'a, value: 'a }
-@private extern type_of: 'a -> Mirror 'a = "$typeOf"
-@private extern fresh_mirror: () -> Mirror 'a = "$mirror"
-@private extern same_pair: (Mirror 'a, Mirror 'b) -> Option { forward: 'a -> 'b, backward: 'b -> 'a } = "$sameMirror"
+type Any = hide 'a => { mirror: TypeInfo 'a, value: 'a }
+@private extern type_of: 'a -> TypeInfo 'a = "$infoOf"
+@private extern fresh_mirror: () -> TypeInfo 'a = "$typeInfo"
+@private extern same_pair: (TypeInfo 'a, TypeInfo 'b) -> Option { forward: 'a -> 'b, backward: 'b -> 'a } = "$sameInfo"
 type Option 'a = #Some 'a | #None
 type Left = #Cons (Nat, Left) | #Nil
 type Right = #Cons (Nat, Right) | #Nil
@@ -743,10 +830,10 @@ let c = match third with | #Some n => n | #None => 0n end
 fn reification_js_exports_require_concrete_interfaces() {
     for source in [
         r#"type Option 'a = #Some 'a | #None
-type Any = hide 'a => { mirror: Mirror 'a, value: 'a }
-@private extern type_of: 'a -> Mirror 'a = "$typeOf"
-@private extern mirror: () -> Mirror 'a = "$mirror"
-@private extern same_pair: (Mirror 'a, Mirror 'b) -> Option { forward: 'a -> 'b, backward: 'b -> 'a } = "$sameMirror"
+type Any = hide 'a => { mirror: TypeInfo 'a, value: 'a }
+@private extern type_of: 'a -> TypeInfo 'a = "$infoOf"
+@private extern mirror: () -> TypeInfo 'a = "$typeInfo"
+@private extern same_pair: (TypeInfo 'a, TypeInfo 'b) -> Option { forward: 'a -> 'b, backward: 'b -> 'a } = "$sameInfo"
 @private let upcast: 'a -> Any = fn value => { mirror: type_of value, value: value }
 let box = fn value => upcast value"#,
         "let identity = fn value => value",
@@ -765,10 +852,10 @@ let box = fn value => upcast value"#,
     execute_reification(
         r#"
 type Option 'a = #Some 'a | #None
-type Any = hide 'a => { mirror: Mirror 'a, value: 'a }
-@private extern type_of: 'a -> Mirror 'a = "$typeOf"
-@private extern mirror: () -> Mirror 'a = "$mirror"
-@private extern same_pair: (Mirror 'a, Mirror 'b) -> Option { forward: 'a -> 'b, backward: 'b -> 'a } = "$sameMirror"
+type Any = hide 'a => { mirror: TypeInfo 'a, value: 'a }
+@private extern type_of: 'a -> TypeInfo 'a = "$infoOf"
+@private extern mirror: () -> TypeInfo 'a = "$typeInfo"
+@private extern same_pair: (TypeInfo 'a, TypeInfo 'b) -> Option { forward: 'a -> 'b, backward: 'b -> 'a } = "$sameInfo"
 @private let upcast: 'a -> Any = fn value => { mirror: type_of value, value: value }
 let dynamic: ForeignValue -> Any = fn value => upcast value
 let native: [Nat] -> [Nat] = fn value => value
@@ -1512,10 +1599,10 @@ let result = apply { first: [7n, 8n], second: "kept" }
 fn reification_generic_callable_payloads_seal_their_evidence_layout() {
     execute_reification(
         r#"
-type Any = hide 'a => { mirror: Mirror 'a, value: 'a }
-@private extern type_of: 'a -> Mirror 'a = "$typeOf"
-@private extern fresh_mirror: () -> Mirror 'a = "$mirror"
-@private extern same_pair: (Mirror 'a, Mirror 'b) -> Option { forward: 'a -> 'b, backward: 'b -> 'a } = "$sameMirror"
+type Any = hide 'a => { mirror: TypeInfo 'a, value: 'a }
+@private extern type_of: 'a -> TypeInfo 'a = "$infoOf"
+@private extern fresh_mirror: () -> TypeInfo 'a = "$typeInfo"
+@private extern same_pair: (TypeInfo 'a, TypeInfo 'b) -> Option { forward: 'a -> 'b, backward: 'b -> 'a } = "$sameInfo"
 type Option 'a = #Some 'a | #None
 @private let box: 'a -> Any = fn value => { mirror: type_of value, value: value }
 @private let downcast: Any -> Option 'a = fn any => match any with
@@ -1986,9 +2073,9 @@ assert.equal(app.round_trip, 'kept');
 fn mirrors_and_hidden_types_have_exact_identities_through_any() {
     execute_reification(
         r#"
-type Any = hide 'a => { mirror: Mirror 'a, value: 'a }
-@private extern fresh_mirror: () -> Mirror 'a = "$mirror"
-@private extern same_pair: (Mirror 'a, Mirror 'b) -> Option { forward: 'a -> 'b, backward: 'b -> 'a } = "$sameMirror"
+type Any = hide 'a => { mirror: TypeInfo 'a, value: 'a }
+@private extern fresh_mirror: () -> TypeInfo 'a = "$typeInfo"
+@private extern same_pair: (TypeInfo 'a, TypeInfo 'b) -> Option { forward: 'a -> 'b, backward: 'b -> 'a } = "$sameInfo"
 type Option 'a = #Some 'a | #None
 @private let box: 'a -> Any = fn value => { mirror: type_of value, value: value }
 @private let unbox: Any -> Option 'a = fn any => match any with
@@ -1997,12 +2084,14 @@ type Option 'a = #Some 'a | #None
   | #None => #None
   end
 end
-@private extern type_of: 'a -> Mirror 'a = "$typeOf"
+@private extern type_of: 'a -> TypeInfo 'a = "$infoOf"
 type Shown = hide 'a => { value: 'a, show: 'a -> String }
 type Renamed = hide 'item => { value: 'item, show: 'item -> String }
 type Wider = hide 'a => { value: 'a, show: 'a -> String, extra: Nat }
 extern show_nat: fn(Nat) -> String = "n => String(n)"
-let boxed_mirror = box (type_of 1n)
+@private extern strong: () -> Mirror 'a = "$mirror"
+@private let original_mirror: Mirror Nat = strong ()
+let boxed_mirror = box original_mirror
 let mirror_of_nat: Option (Mirror Nat) = unbox boxed_mirror
 let mirror_of_string: Option (Mirror String) = unbox boxed_mirror
 let mirror_recovered = match mirror_of_nat with | #Some _ => true | #None => false end
@@ -2033,16 +2122,16 @@ assert.equal(app.wider_rejected, true);
 }
 
 #[test]
-fn function_mirrors_carry_their_effect_contracts() {
+fn function_type_information_carries_effect_contracts() {
     execute_reification(
         r#"
 type Option 'a = #Some 'a | #None
-type Any = hide 'a => { mirror: Mirror 'a, value: 'a }
+type Any = hide 'a => { mirror: TypeInfo 'a, value: 'a }
 effect Tick = () -> ()
 effect Ask 'a = () -> 'a
-@private extern type_of: 'a -> Mirror 'a = "$typeOf"
-@private extern fresh_mirror: () -> Mirror 'a = "$mirror"
-@private extern same_pair: (Mirror 'a, Mirror 'b) -> Option { forward: 'a -> 'b, backward: 'b -> 'a } = "$sameMirror"
+@private extern type_of: 'a -> TypeInfo 'a = "$infoOf"
+@private extern fresh_mirror: () -> TypeInfo 'a = "$typeInfo"
+@private extern same_pair: (TypeInfo 'a, TypeInfo 'b) -> Option { forward: 'a -> 'b, backward: 'b -> 'a } = "$sameInfo"
 @private let box: 'a -> Any = fn value => { mirror: type_of value, value: value }
 @private let unbox: Any -> Option 'a = fn any => match any with
 | hide 'x { mirror, value } => match same_pair (mirror, fresh_mirror ()) with

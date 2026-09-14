@@ -38,6 +38,8 @@ end
 
 module arrays
 module cells
+module randomness
+module randomness_sampling
 module primitives
 module functional
 

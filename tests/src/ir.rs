@@ -2174,6 +2174,37 @@ fn fixed_type_spreads_resolve_imported_rows() {
 }
 
 #[test]
+fn fixed_type_spreads_preserve_type_information() {
+    let mut dependency = effect_artifact("dep", "empty");
+    dependency.header.types = vec![a::DeclaredType {
+        exported: true,
+        metadata: Default::default(),
+        name: "dep@1.0.0::Record".into(),
+        params: Vec::new(),
+        scheme: artifact_scheme(artifact_struct(vec![(
+            "info".into(),
+            a::RowField {
+                presence: a::Presence::Present,
+                ty: a::Type::TypeInfo(Box::new(a::Type::Nat)),
+            },
+        )])),
+    }];
+    let (mint, out) = build_imported(
+        "type Base = { value: Nat }
+         type Local = TypeInfo { ..Base }
+         let local: Local -> TypeInfo { value: Nat } = fn x => x
+         let reverse: TypeInfo { value: Nat } -> Local = fn x => x
+         type Imported = { ..dep::Record }
+         let imported: Imported -> { info: TypeInfo Nat } = fn x => x",
+        "dep",
+        &dependency,
+    );
+    assert!(out.errors.is_empty(), "{:?}", out.errors);
+    let inferred = inference::infer(&mint, &out.program, inference::Trace::Complete);
+    assert!(inferred.errors().is_empty(), "{:?}", inferred.errors());
+}
+
+#[test]
 fn fixed_type_spreads_preserve_deep_imported_payloads() {
     let mut payload = a::Type::Nat;
     for _ in 0..300 {

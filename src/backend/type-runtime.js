@@ -25,6 +25,7 @@ const $instantiateType = ($template, $arguments, $partial = false) => {
       else if ("Cell" in $node) $nodes.push({ Cell: $node.Cell.map($child => $child + $offset) });
       else if ("Array" in $node) $nodes.push({ Array: $node.Array + $offset });
       else if ("Mirror" in $node) $nodes.push({ Mirror: $node.Mirror + $offset });
+      else if ("TypeInfo" in $node) $nodes.push({ TypeInfo: $node.TypeInfo + $offset });
       else if ("Hidden" in $node) $nodes.push({ Hidden: $node.Hidden + $offset });
       else if ("Alias" in $node) $nodes.push({ Alias: $node.Alias + $offset });
       else if ("Arrow" in $node) $nodes.push({ Arrow: $node.Arrow.map($index => $index + $offset) });
@@ -77,6 +78,7 @@ const $typeAt = ($descriptor, $index) => ({ nodes: [
     if ("Cell" in $node) return { Cell: $node.Cell.map($child => $child + 1) };
     if ("Array" in $node) return { Array: $node.Array + 1 };
     if ("Mirror" in $node) return { Mirror: $node.Mirror + 1 };
+    if ("TypeInfo" in $node) return { TypeInfo: $node.TypeInfo + 1 };
     if ("Hidden" in $node) return { Hidden: $node.Hidden + 1 };
     if ("Arrow" in $node) return { Arrow: $node.Arrow.map($child => $child + 1) };
     if ("Effects" in $node) return { Effects: $node.Effects.map($effect => ({ identity: $effect.identity, payload: $effect.payload + 1, args: $effect.args.map($arg => $arg + 1) })) };
@@ -143,7 +145,7 @@ const $nativeSlots = ($descriptor, $index) => {
     if (typeof $node === "string" || "Fixed" in $node || "HiddenBound" in $node) continue;
     if ("Parameter" in $node) { $slots.add($node.Parameter); continue; }
     if ($defer && "Arrow" in $node) continue;
-    const $children = "Alias" in $node ? [$node.Alias] : "Array" in $node ? [$node.Array] : "Mirror" in $node ? [$node.Mirror] : "Hidden" in $node ? [$node.Hidden] : "Arrow" in $node ? $node.Arrow : "Cell" in $node ? $node.Cell : "Extend" in $node ? $node.Extend : "Effects" in $node ? $node.Effects.flatMap($effect => [$effect.payload, ...$effect.args]) : Object.values($node)[0].map($field => $field[1]);
+    const $children = "Alias" in $node ? [$node.Alias] : "Array" in $node ? [$node.Array] : "TypeInfo" in $node ? [$node.TypeInfo] : "Mirror" in $node ? [$node.Mirror] : "Hidden" in $node ? [$node.Hidden] : "Arrow" in $node ? $node.Arrow : "Cell" in $node ? $node.Cell : "Extend" in $node ? $node.Extend : "Effects" in $node ? $node.Effects.flatMap($effect => [$effect.payload, ...$effect.args]) : Object.values($node)[0].map($field => $field[1]);
     for (const $child of $children) $work.push([$child, $defer]);
   }
   return [...$slots].sort(($a, $b) => $a - $b);
@@ -172,7 +174,7 @@ const $sameType = ($left, $right) => {
     if ($kind !== Object.keys($y)[0]) return false;
     if ($kind === "Fixed" || $kind === "Parameter" || $kind === "HiddenBound") {
       if ($x[$kind] !== $y[$kind]) return false;
-    } else if ($kind === "Array" || $kind === "Mirror" || $kind === "Hidden") {
+    } else if ($kind === "Array" || $kind === "Mirror" || $kind === "TypeInfo" || $kind === "Hidden") {
       $work.push([$x[$kind], $y[$kind]]);
     } else if ($kind === "Arrow") {
       $work.push([$x.Arrow[0], $y.Arrow[0]], [$x.Arrow[1], $y.Arrow[1]], [$x.Arrow[2], $y.Arrow[2]]);
@@ -215,13 +217,99 @@ const $scalarText = $value => {
   }
   return true;
 };
+const $typeInfos = new WeakSet();
+const $typeInfo = ($descriptor, $value) => {
+  if (!$descriptor) throw new TypeError("missing runtime type information");
+  const $info = { nodes: $descriptor.nodes };
+  $typeInfos.add($info);
+  return $info;
+};
 const $mirrors = new WeakSet();
 const $mirror = ($descriptor, $value) => {
   if (!$descriptor) throw new TypeError("missing runtime type information for a mirror");
+  $construction($descriptor);
   $mirrors.add($descriptor);
   return $descriptor;
 };
 const $typeOf = $mirror;
+const $constructionPlans = new WeakMap();
+const $construction = $of => {
+  if ($constructionPlans.has($of)) return $constructionPlans.get($of);
+  const $possible = $of.nodes.map(() => false), $rank = $of.nodes.map(() => undefined);
+  const $parents = $of.nodes.map(() => []);
+  $of.nodes.forEach(($n, $at) => {
+    if (typeof $n === "string") return;
+    const $children = "Alias" in $n ? [$n.Alias] : "Array" in $n ? [$n.Array] : "Struct" in $n ? $n.Struct.map($f => $f[1]) : "Sum" in $n ? $n.Sum.map($f => $f[1]) : [];
+    for (const $child of $children) $parents[$child].push($at);
+  });
+  const $queue = $of.nodes.map(($n, $at) => $at), $queued = $of.nodes.map(() => true);
+  for (let $cursor = 0; $cursor < $queue.length; $cursor++) {
+    const $at = $queue[$cursor], $n = $of.nodes[$at];
+    $queued[$at] = false;
+    let $p = true, $r;
+    if (typeof $n === "string") {
+      if (["Nat", "Int", "Real", "String", "Bool"].includes($n)) $r = 0;
+    } else if ("Fixed" in $n || "Array" in $n) $r = 0;
+    else if ("Alias" in $n) { $p = $possible[$n.Alias]; $r = $rank[$n.Alias]; }
+    else if ("Struct" in $n) {
+      $p = $n.Struct.every($f => $possible[$f[1]]);
+      if ($n.Struct.every($f => $rank[$f[1]] !== undefined)) $r = $n.Struct.reduce(($r, $f) => Math.max($r, $rank[$f[1]] + 1), 0);
+    } else if ("Sum" in $n) {
+      $p = $n.Sum.some($f => $possible[$f[1]]);
+      for (const $f of $n.Sum) if ($rank[$f[1]] !== undefined) $r = Math.min($r ?? Infinity, $rank[$f[1]] + 1);
+    }
+    if ($possible[$at] !== $p || $rank[$at] !== $r) {
+      $possible[$at] = $p; $rank[$at] = $r;
+      for (const $parent of $parents[$at]) if (!$queued[$parent]) { $queued[$parent] = true; $queue.push($parent); }
+    }
+  }
+  const $pending = [0], $seen = new Set();
+  while ($pending.length) {
+    const $at = $pending.pop();
+    if ($seen.has($at) || !$possible[$at]) continue;
+    $seen.add($at);
+    const $n = $of.nodes[$at];
+    if (typeof $n === "string") {
+      if (!["Nat", "Int", "Real", "String", "Bool"].includes($n)) throw new TypeError("missing construction evidence");
+    } else if ("Fixed" in $n) continue;
+    else if ("Alias" in $n) $pending.push($n.Alias);
+    else if ("Array" in $n) $pending.push($n.Array);
+    else if ("Struct" in $n || "Sum" in $n) $pending.push(...($n.Struct ?? $n.Sum).map($f => $f[1]));
+    else throw new TypeError("missing construction evidence");
+  }
+  if (!$possible[0] || $rank[0] === undefined) throw new TypeError("missing finite construction evidence");
+  const $plan = { possible: $possible, rank: $rank };
+  $constructionPlans.set($of, $plan);
+  return $plan;
+};
+const $construct = ($descriptor, $of) => {
+  if (!$mirrors.has($of)) throw new TypeError("construction requires an authentic mirror");
+  const $plan = $construction($of), $values = [], $work = [{ node: 0 }];
+  while ($work.length) {
+    const $task = $work.pop();
+    if ("fields" in $task) {
+      const $fields = $values.splice($values.length - $task.fields.length);
+      $values.push($record($task.fields.map(($name, $at) => [$name, $fields[$at]])));
+    } else if ("tag" in $task) {
+      const $value = $values.pop();
+      $values.push($sum($task.tag, $value && Object.getPrototypeOf($value) === null && Reflect.ownKeys($value).length === 0 ? undefined : $value));
+    } else {
+      const $n = $of.nodes[$typeIndex($of, $task.node)];
+      if (typeof $n === "string") $values.push($n === "String" ? "" : $n === "Bool" ? false : 0);
+      else if ("Fixed" in $n) $values.push($n.Fixed.endsWith("64") ? 0n : 0);
+      else if ("Array" in $n) $values.push($array([]));
+      else if ("Struct" in $n) {
+        $work.push({ fields: $n.Struct.map($f => $f[0]) });
+        for (let $i = $n.Struct.length - 1; $i >= 0; $i--) $work.push({ node: $n.Struct[$i][1] });
+      } else if ("Sum" in $n) {
+        let $chosen;
+        for (const $f of $n.Sum) if ($plan.rank[$f[1]] !== undefined && (!$chosen || $plan.rank[$f[1]] < $plan.rank[$chosen[1]])) $chosen = $f;
+        $work.push({ tag: $chosen[0] }, { node: $chosen[1] });
+      }
+    }
+  }
+  return $values.pop();
+};
 // A Ruddy function implemented here: it is handed the value as it is and
 // hands back what it makes, with nothing converted in either direction.
 const $nativeType = { nodes: [{ Arrow: [1, 1, 2] }, "ForeignValue", { Effects: [] }] };
@@ -237,9 +325,9 @@ const $native = $function => {
 const $passThrough = () => $native($x => $x);
 // A mirror of one node of a mirror's graph: the field, element, or payload
 // type, authentic because the whole was.
-const $mirrorAt = ($of, $index) => {
+const $evidenceAt = ($of, $index, $constructive) => {
   const $part = $typeAt($of, $index);
-  $mirrors.add($part);
+  ($constructive ? $mirrors : $typeInfos).add($part);
   return $part;
 };
 const $sameMirror = ($descriptor, $pair) => $sameType($pair["0"], $pair["1"])
@@ -275,6 +363,7 @@ const $describe = ($descriptor, $of) => {
     if ("Extend" in $n) return $sum("Extend", $record([["base", $n.Extend[0]], ["rest", $n.Extend[1]]]));
     if ("Parameter" in $n) return $sum("Parameter", $n.Parameter);
     if ("Mirror" in $n) return $sum("Mirror", $n.Mirror);
+    if ("TypeInfo" in $n) return $sum("TypeInfo", $n.TypeInfo);
     if ("Hidden" in $n) return $sum("Hidden", $n.Hidden);
     return $sum("Variable", $n.HiddenBound);
   };
@@ -284,23 +373,27 @@ const $describe = ($descriptor, $of) => {
 // operations read and make values of the mirrored type. The mirror proves
 // the type, so the operations convert nothing; they only take values apart
 // and put them together.
-const $shape = ($descriptor, $of) => {
+const $shapeImpl = ($of, $constructive) => {
+  if ($constructive && !$mirrors.has($of)) throw new TypeError("construction requires an authentic mirror");
+  const $plan = $constructive ? $construction($of) : null;
+  const $viewRecord = $fields => $record($constructive ? $fields : $fields.filter(([$name]) => !["make", "bind", "build", "inject"].includes($name)));
   const $node = $of.nodes[$typeIndex($of, 0)];
-  const $typed = $name => $sum($name, $record([["read", $passThrough()], ["make", $passThrough()]]));
+  const $typed = $name => $sum($name, $viewRecord([["read", $passThrough()], ["make", $passThrough()]]));
   if (typeof $node === "string") {
     return $node === "ForeignValue" ? $sum("Foreign", undefined) : $typed($node);
   }
   if ("Fixed" in $node) return $typed($node.Fixed);
   if ("Array" in $node) {
-    return $sum("Array", $record([["element", $mirrorAt($of, $node.Array)], ["read", $passThrough()], ["make", $passThrough()]]));
+    if ($plan && !$plan.possible[$node.Array]) return $sum("EmptyArray", $viewRecord([["element", $describe($of, $typeAt($of, $node.Array))], ["read", $passThrough()], ["make", $passThrough()]]));
+    return $sum("Array", $viewRecord([["element", $evidenceAt($of, $node.Array, $constructive)], ["read", $passThrough()], ["make", $passThrough()]]));
   }
   if ("Struct" in $node) {
     const $fields = $node.Struct.map(([$name, $index]) => {
-      const $field = $mirrorAt($of, $index);
-      return $record([
+      const $field = $evidenceAt($of, $index, $constructive);
+      return $viewRecord([
         ["name", $name], ["mirror", $field], ["presence", $sum("Required", undefined)],
         ["read", $native($value => $sum("Some", $value[$name]))],
-        ["bind", $native($value => $record([["record", $of], ["name", $name], ["mirror", $field], ["value", $value]]))],
+        ["bind", $native($value => $viewRecord([["record", $of], ["name", $name], ["mirror", $field], ["value", $value]]))],
       ]);
     });
     // A binding is accepted on what it proves, not where it came from: an
@@ -318,26 +411,29 @@ const $shape = ($descriptor, $of) => {
       }
       const $missing = $node.Struct.find(([$name]) => !$bound.has($name));
       if ($missing) return $sum("Error", $sum("Missing", $missing[0]));
-      return $sum("Some", $record($node.Struct.map(([$name]) => [$name, $bound.get($name)])));
+      return $sum("Some", $viewRecord($node.Struct.map(([$name]) => [$name, $bound.get($name)])));
     });
-    return $sum("Record", $record([["mirror", $of], ["fields", $array($fields)], ["build", $build]]));
+    return $sum("Record", $viewRecord([["mirror", $of], ["fields", $array($fields)], ["build", $build]]));
   }
   if ("Sum" in $node) {
-    const $cases = $node.Sum.map(([$name, $index]) => $record([
-      ["name", $name], ["mirror", $mirrorAt($of, $index)],
+    const $cases = $node.Sum.filter(([$name, $index]) => !$plan || $plan.possible[$index]).map(([$name, $index]) => $viewRecord([
+      ["name", $name], ["mirror", $evidenceAt($of, $index, $constructive)],
       ["project", $native($value => $value[$tag] === $name
-        ? $sum("Some", $value[$payload] === undefined ? $record([]) : $value[$payload])
+        ? $sum("Some", $value[$payload] === undefined ? $viewRecord([]) : $value[$payload])
         : $sum("None", undefined))],
-      ["inject", $sum("Some", $native($value => $sum($name, $value)))],
+      ["inject", $native($value => $sum($name, $value))],
     ]));
-    return $sum("Sum", $record([["mirror", $of], ["cases", $array($cases)]]));
+    return $sum("Sum", $viewRecord([["mirror", $of], ["cases", $array($cases)]]));
   }
   if ("Cell" in $node) return $sum("Foreign", undefined);
   if ("Arrow" in $node) return $sum("Function", $describe($of, $of));
   if ("Hidden" in $node) return $sum("Hidden", $describe($of, $of));
   if ("Mirror" in $node) return $sum("Mirror", $describe($of, $of));
+  if ("TypeInfo" in $node) return $sum("TypeInfo", $describe($of, $of));
   throw new TypeError("unknown runtime type node");
 };
+const $shape = ($descriptor, $of) => $shapeImpl($of, true);
+const $shapeInfo = ($descriptor, $of) => $shapeImpl($of, false);
 
 // Conversion uses an explicit work stack, including leave tasks for cycle
 // detection. A repeated sibling reference is copied; a cyclic path is rejected.
@@ -398,6 +494,22 @@ const $convertType = ($descriptor, $value, $outgoing, $rootIndex = 0, $callable 
       if (!$mirrors.has($input)) $fail($path, "an authentic mirror");
       if (!$outgoing) {
         const $mirrored = $typeAt($descriptor, $node.Mirror);
+        if (!$decided($mirrored)) $fail($path, "a mirror of a type settled here");
+        if (!$sameType($input, $mirrored)) $fail($path, "a mirror of this type");
+      }
+      $put($input);
+      continue;
+    }
+    if ("TypeInfo" in $node) {
+      // Authentic says the descriptor came from this program. It does not say
+      // which type it mirrors, and coming in, the type here is the one the
+      // program is about to read the value under, so the two are held
+      // together. Going out the program is handing over its own mirror, and
+      // the plan it crosses under describes types under the host's policy
+      // rather than the exact one a mirror carries.
+      if (!$typeInfos.has($input)) $fail($path, "authentic type information");
+      if (!$outgoing) {
+        const $mirrored = $typeAt($descriptor, $node.TypeInfo);
         if (!$decided($mirrored)) $fail($path, "a mirror of a type settled here");
         if (!$sameType($input, $mirrored)) $fail($path, "a mirror of this type");
       }

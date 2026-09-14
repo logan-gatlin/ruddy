@@ -218,6 +218,7 @@ struct Scoping<'a> {
     promised: &'a Formula,
     rigids: &'a [u32],
     initializer_effects: &'a Row,
+    initializer_mutates: bool,
     ambient: &'a Row,
     inside: bool,
     value: &'a [Constraint],
@@ -479,6 +480,7 @@ impl Solve<'_> {
         {
             match &constraint.kind {
                 ConstraintKind::Isolate {
+                    mutations,
                     input,
                     output,
                     internal,
@@ -488,6 +490,53 @@ impl Solve<'_> {
                 } => {
                     let mut remaining = self.table.canon(internal);
                     let key = crate::types::mutation_effect().row_key();
+                    // A private allocation must not enter a callback's open effect
+                    // remainder: doing that first makes its region appear to escape
+                    // through the input, preventing isolation of an otherwise pure handler.
+                    let mut isolated = HashSet::new();
+                    for (at, region) in mutations {
+                        let resolved = self.table.resolve(region);
+                        if let Ty::Var(var) = &*resolved {
+                            let mut escaping = Vec::new();
+                            self.table.mentions_ty(input, &mut escaping);
+                            self.table.mentions_ty(output, &mut escaping);
+                            self.table.mentions_row(&remaining, &mut escaping);
+                            if self.table.levels[*var as usize] >= *level && !escaping.contains(var)
+                            {
+                                let id = u32::MAX - var;
+                                self.table.rigids.insert(id, *at);
+                                self.table.region_rigids.insert(id);
+                                isolated.insert(id);
+                                self.unify(
+                                    *at,
+                                    region,
+                                    &Arc::new(Ty::Rigid {
+                                        id,
+                                        name: "local region".into(),
+                                    }),
+                                );
+                                continue;
+                            }
+                        } else if let Ty::Rigid { id, .. } = &*resolved
+                            && isolated.contains(id)
+                        {
+                            continue;
+                        }
+                        let mutation = Row {
+                            labels: [(
+                                key.clone(),
+                                RowField::present(Arc::new(Ty::Struct(Row {
+                                    labels: [("0".into(), RowField::present(region.clone()))]
+                                        .into(),
+                                    rest: Rest::Closed,
+                                }))),
+                            )]
+                            .into(),
+                            rest: Rest::Closed,
+                        };
+                        self.relate_effects(*at, &mutation, &remaining, true, true);
+                        remaining = self.table.canon(&remaining);
+                    }
                     if let Some(field) = remaining.labels.get(&key)
                         && let Ty::Struct(arguments) = &*field.ty
                         && let Some(region) = arguments.labels.get("0")
@@ -592,6 +641,7 @@ impl Solve<'_> {
                     promised,
                     rigids,
                     initializer_effects,
+                    initializer_mutates,
                     ambient,
                     inside,
                     value,
@@ -605,6 +655,7 @@ impl Solve<'_> {
                         promised,
                         rigids,
                         initializer_effects,
+                        initializer_mutates: *initializer_mutates,
                         ambient,
                         inside: *inside,
                         value,
@@ -960,6 +1011,7 @@ impl Solve<'_> {
             | Ty::Arrow(..)
             | Ty::Array(_)
             | Ty::Mirror(_)
+            | Ty::TypeInfo(_)
             | Ty::Mut(..)
             | Ty::Sum(_) => {
                 self.not_a_struct(operand_span, exposed, super::StructDemand::Spread, result)
@@ -1169,6 +1221,7 @@ impl Solve<'_> {
             Hidden(*const Ty, Arc<Ty>),
             Array(*const Ty, Arc<Ty>),
             Mirror(*const Ty, Arc<Ty>),
+            TypeInfo(*const Ty, Arc<Ty>),
             Mut(*const Ty, Arc<Ty>),
             Struct(*const Ty, Arc<Ty>),
             Sum(*const Ty, Arc<Ty>),
@@ -1283,6 +1336,11 @@ impl Solve<'_> {
                                     work.push(FingerprintWork::Type(inner.clone()));
                                     continue;
                                 }
+                                Ty::TypeInfo(inner) => {
+                                    work.push(FingerprintWork::TypeInfo(key, ty.clone()));
+                                    work.push(FingerprintWork::Type(inner.clone()));
+                                    continue;
+                                }
                                 Ty::Struct(row) => {
                                     work.push(FingerprintWork::Struct(key, ty.clone()));
                                     work.push(FingerprintWork::Row(row.clone()));
@@ -1332,6 +1390,14 @@ impl Solve<'_> {
                         FingerprintWork::Mirror(key, ty) => {
                             let inner = values.pop().expect("family mirror fingerprint type");
                             let hash = tagged(54, [inner]);
+                            self.types.insert(key, (ty, hash));
+                            values.push(hash);
+                        }
+                        FingerprintWork::TypeInfo(key, ty) => {
+                            let inner = values
+                                .pop()
+                                .expect("family type information fingerprint type");
+                            let hash = tagged(55, [inner]);
                             self.types.insert(key, (ty, hash));
                             values.push(hash);
                         }
@@ -2056,6 +2122,7 @@ impl Solve<'_> {
             promised,
             rigids,
             initializer_effects,
+            initializer_mutates,
             ambient,
             inside,
             value,
@@ -2075,7 +2142,8 @@ impl Solve<'_> {
         self.table.close_handler_presences(&initializer, level);
         self.table.close_effects(&initializer, level);
         let immediate = self.table.canon(initializer_effects);
-        let pure = matches!(immediate.rest, Rest::Closed)
+        let pure = !initializer_mutates
+            && matches!(immediate.rest, Rest::Closed)
             && immediate
                 .labels
                 .values()
@@ -2404,6 +2472,10 @@ impl Solve<'_> {
                             self.step(span, Rule::Array, goal, Effect::Decomposed);
                             work.push(SolveWork::Ty(element.clone(), other.clone(), depth + 1));
                         }
+                        (Ty::TypeInfo(inner), Ty::TypeInfo(other)) => {
+                            self.step(span, Rule::TypeInfo, goal, Effect::Decomposed);
+                            work.push(SolveWork::Ty(inner.clone(), other.clone(), depth + 1));
+                        }
                         (Ty::Mirror(inner), Ty::Mirror(other)) => {
                             self.step(span, Rule::Mirror, goal, Effect::Decomposed);
                             work.push(SolveWork::Ty(inner.clone(), other.clone(), depth + 1));
@@ -2704,7 +2776,7 @@ impl Solve<'_> {
                         Ty::Package(body) | Ty::Hidden { body, .. } => {
                             work.push(Work::Ty(body.clone()))
                         }
-                        Ty::Array(element) | Ty::Mirror(element) => {
+                        Ty::Array(element) | Ty::Mirror(element) | Ty::TypeInfo(element) => {
                             work.push(Work::Ty(element.clone()))
                         }
                         Ty::Mut(region, element) => {
@@ -4141,7 +4213,7 @@ impl Solve<'_> {
                     Ty::Package(body) | Ty::Hidden { body, .. } => {
                         work.push(Work::Type(body.clone()))
                     }
-                    Ty::Array(element) | Ty::Mirror(element) => {
+                    Ty::Array(element) | Ty::Mirror(element) | Ty::TypeInfo(element) => {
                         work.push(Work::Type(element.clone()))
                     }
                     Ty::Mut(region, element) => {
@@ -4412,7 +4484,7 @@ fn region_in(table: &super::Table, ty: &Arc<Ty>) -> Option<Arc<Ty>> {
         }
         match &*ty {
             Ty::Mut(..) => return Some(ty.clone()),
-            Ty::Array(inner) | Ty::Package(inner) | Ty::Mirror(inner) => {
+            Ty::Array(inner) | Ty::Package(inner) | Ty::Mirror(inner) | Ty::TypeInfo(inner) => {
                 work.push(table.resolve(inner));
             }
             Ty::Hidden { body, .. } => work.push(table.resolve(body)),

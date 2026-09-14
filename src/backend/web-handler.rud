@@ -8,3 +8,6 @@
   | !Host.apply request => js_apply request
   | !Host.text value => js_text value
   | !Assert message => assertion_failed message
+  | !Random.word64 _ => random_word64 ()
+  | !Random.boolean _ => random_boolean ()
+  | !Random.real _ => random_real ()

@@ -27,6 +27,20 @@ use ruddy::{
 };
 use ruddy_debug::print;
 
+#[test]
+fn isolation_constraints_show_deferred_state_regions() {
+    let constraint = ConstraintKind::Isolate {
+        mutations: vec![(Anchor::GENERATED, Arc::new(Ty::Bound(0)))],
+        effect_origins: Vec::new(),
+        input: Arc::new(Ty::unit()),
+        output: Arc::new(Ty::Nat),
+        internal: Row::closed(),
+        external: Row::closed(),
+        level: 1,
+    };
+    assert!(constraint.to_string().contains("; state"));
+}
+
 /// One value of every inference error variant. Shared by the inventory and the
 /// structured-diagnostic audit so those two hand-maintained checks cannot
 /// silently drift apart.
@@ -3224,6 +3238,7 @@ fn a_printer_reports_a_writer_that_refuses_it() {
             promised: Formula::var(0),
             rigids: Vec::new(),
             initializer_effects: Row::closed(),
+            initializer_mutates: false,
             ambient: Row::closed(),
             inside: true,
             value: Vec::new(),
@@ -3952,6 +3967,7 @@ fn no_two_kinds_of_constraint_are_coded_the_same() {
             promised: Formula::True,
             rigids: Vec::new(),
             initializer_effects: Row::closed(),
+            initializer_mutates: false,
             ambient: Row::closed(),
             inside: true,
             value: Vec::new(),

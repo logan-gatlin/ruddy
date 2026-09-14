@@ -52,7 +52,7 @@ let at: PathElement -> Result Nat64 Error -> Result Nat64 Error = fn step result
   result::map_error (fn error => { path: [step, ..error.path], kind: error.kind }) result
 
 @private
-let elements: Mirror 'a -> ['a] -> Nat -> Nat64 -> Result Nat64 Error =
+let elements: TypeInfo 'a -> ['a] -> Nat -> Nat64 -> Result Nat64 Error =
   fn mirror values index state => match array::get values index with
   | #None => #Some state
   | #Some value =>
@@ -63,12 +63,12 @@ let elements: Mirror 'a -> ['a] -> Nat -> Nat64 -> Result Nat64 Error =
   end
 
 @private
-let field_name: reflect::SomeField 'a -> String = fn field => match field with
+let field_name: reflect::InfoSomeField 'a -> String = fn field => match field with
 | hide 'f { name, .. } => name
 end
 
 @private
-let fields: [reflect::SomeField 'a] -> Nat64 -> 'a -> Result Nat64 Error =
+let fields: [reflect::InfoSomeField 'a] -> Nat64 -> 'a -> Result Nat64 Error =
   fn remaining state value => match remaining with
   | [] => #Some state
   | [field, ..tail] =>
@@ -86,7 +86,7 @@ let fields: [reflect::SomeField 'a] -> Nat64 -> 'a -> Result Nat64 Error =
   end
 
 @private
-let cases: [reflect::SomeCase 'a] -> Nat64 -> 'a -> Result Nat64 Error =
+let cases: [reflect::InfoSomeCase 'a] -> Nat64 -> 'a -> Result Nat64 Error =
   fn remaining state value => match remaining with
   | [] => #Error { path: [], kind: #InvalidView }
   | [case, ..tail] =>
@@ -102,8 +102,8 @@ let cases: [reflect::SomeCase 'a] -> Nat64 -> 'a -> Result Nat64 Error =
 -- Tags distinguish primitive kinds and structural constructors. Integers use exact decimal text,
 -- avoiding conversions through target-dependent Nat/Int.
 @private
-let visit: Mirror 'a -> Nat64 -> 'a -> Result Nat64 Error = fn mirror state value =>
-  match reflect::shape mirror with
+let visit: TypeInfo 'a -> Nat64 -> 'a -> Result Nat64 Error = fn mirror state value =>
+  match reflect::shape_info mirror with
   | #Nat { read, .. } => scalar 0n8 (str::from_nat (read value)) state
   | #Int { read, .. } => scalar 1n8 (str::from_int (read value)) state
   | #Real { read, .. } => do
@@ -143,16 +143,17 @@ let visit: Mirror 'a -> Nat64 -> 'a -> Result Nat64 Error = fn mirror state valu
   | #Function _ => unsupported #Function
   | #Hidden _ => unsupported #Hidden
   | #Mirror _ => unsupported #Mirror
+  | #TypeInfo _ => unsupported #Mirror
   | #Foreign => unsupported #Foreign
   end
 
-@doc "Hash through an explicit mirror and Nat64 seed. Traversal follows the value: empty arrays and inactive unsupported cases succeed. Unsupported values and NaNs fail at their path; signed zeros hash equally. Pure FNV-1a 64 hashing, without a persistence or hostile-collision guarantee."
-let hash_with: Mirror 'a -> Nat64 -> 'a -> Result Nat64 Error = fn mirror seed value =>
+@doc "Hash through explicit descriptive type information and Nat64 seed. Traversal follows the value: empty arrays and inactive unsupported cases succeed. Unsupported values and NaNs fail at their path; signed zeros hash equally. Pure FNV-1a 64 hashing, without a persistence or hostile-collision guarantee."
+let hash_with: TypeInfo 'a -> Nat64 -> 'a -> Result Nat64 Error = fn mirror seed value =>
   visit mirror seed value
 
 @doc "Hash at the value's inferred static type with an explicit seed. Equal supported values at a shared type produce equal hashes for the same seed."
 let hash_seeded: Nat64 -> 'a -> Result Nat64 Error = fn seed value =>
-  hash_with (reflect::mirror ()) seed value
+  hash_with (reflect::type_info ()) seed value
 
 @doc "Hash at the value's inferred static type using default_seed. A collection must still compare keys when hashes match."
 let hash: 'a -> Result Nat64 Error = fn value => hash_seeded default_seed value

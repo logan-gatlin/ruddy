@@ -2849,7 +2849,7 @@ fn only_the_stages_that_own_a_phase_report_a_time() {
         artifact
             .text
             .as_ref()
-            .is_some_and(|text| text.starts_with("(artifact\n  (header"))
+            .is_some_and(|text| text.starts_with("(artifact-v2\n  (header"))
     );
 }
 
