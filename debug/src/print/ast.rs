@@ -700,7 +700,7 @@ impl fmt::Display for Ast<'_, TypeKind> {
                 tail,
             } => {
                 if !spreads.is_empty() {
-                    let mut entries: Vec<_> = fields
+                    let entries: Vec<_> = fields
                         .iter()
                         .map(|(name, field)| {
                             let value = match field {
@@ -717,16 +717,7 @@ impl fmt::Display for Ast<'_, TypeKind> {
                             (name.span.start, value)
                         })
                         .collect();
-                    entries.extend(
-                        spreads
-                            .iter()
-                            .map(|spread| (spread.span.start, type_spread(&spread.value.tracked))),
-                    );
-                    entries.sort_by_key(|(start, _)| *start);
-                    let mut entries: Vec<_> = entries.into_iter().map(|(_, text)| text).collect();
-                    if let Some(tail) = tail {
-                        entries.push(format!("..{}", rest(&tail.of)));
-                    }
+                    let entries = spread_entries(entries, spreads, tail.as_ref());
                     return write!(f, "{{ {} }}", entries.join(", "));
                 }
                 if tail.is_none() && fields.is_empty() {
@@ -779,7 +770,7 @@ impl fmt::Display for Ast<'_, TypeKind> {
                 tail,
             } => {
                 if !spreads.is_empty() {
-                    let mut entries: Vec<_> = cases
+                    let entries: Vec<_> = cases
                         .iter()
                         .map(|(name, case)| {
                             let value = match case {
@@ -799,16 +790,7 @@ impl fmt::Display for Ast<'_, TypeKind> {
                             (name.span.start, value)
                         })
                         .collect();
-                    entries.extend(
-                        spreads
-                            .iter()
-                            .map(|spread| (spread.span.start, type_spread(&spread.value.tracked))),
-                    );
-                    entries.sort_by_key(|(start, _)| *start);
-                    let mut entries: Vec<_> = entries.into_iter().map(|(_, text)| text).collect();
-                    if let Some(tail) = tail {
-                        entries.push(format!("..{}", rest(&tail.of)));
-                    }
+                    let entries = spread_entries(entries, spreads, tail.as_ref());
                     return write!(f, "| {}", entries.join(" | "));
                 }
                 let cases = cases.iter().map(|(name, case)| match case {
@@ -1084,6 +1066,24 @@ where
     fields
         .iter()
         .map(|(name, value)| (&name.tracked, Ast(&value.tracked)))
+}
+
+fn spread_entries(
+    mut entries: Vec<(usize, String)>,
+    spreads: &[ruddy::parse::TypeSpread],
+    tail: Option<&ruddy::parse::Tail>,
+) -> Vec<String> {
+    entries.extend(
+        spreads
+            .iter()
+            .map(|spread| (spread.span.start, type_spread(&spread.value.tracked))),
+    );
+    entries.sort_by_key(|(start, _)| *start);
+    let mut entries: Vec<_> = entries.into_iter().map(|(_, text)| text).collect();
+    if let Some(tail) = tail {
+        entries.push(format!("..{}", rest(&tail.of)));
+    }
+    entries
 }
 
 fn type_atom_text(ty: &TypeKind) -> String {

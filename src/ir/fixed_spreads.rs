@@ -138,7 +138,6 @@ impl<'a> Expander<'a> {
                     &vec![Symbol::GENERATED; *arity],
                     &mut |namespace, name| self.symbols.get(&(namespace, name.to_owned())).copied(),
                     &self.effect_rows,
-                    0,
                 ),
                 None => return Ok(Anchor::GENERATED.anchor(TypeKind::Error)),
             },
@@ -287,6 +286,11 @@ impl<'a> Expander<'a> {
         let mut ty = argument.ty.clone();
         self.substitute(&mut ty, &argument.environment)?;
         match ty.anchored {
+            TypeKind::Sum {
+                ref cases,
+                tail: None,
+                ..
+            } if cases.is_empty() => row.tail = None,
             TypeKind::Effects(more) => {
                 for (id, label) in more.effects {
                     if row.effects.contains_key(&id) {

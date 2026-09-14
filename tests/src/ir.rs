@@ -2091,6 +2091,37 @@ fn fixed_type_spreads_report_invalid_row_arguments_once() {
 }
 
 #[test]
+fn fixed_type_spreads_preserve_generic_payload_rows() {
+    for source in [
+        "type Action 'e = { run: () -> () + ..'e } type Wrapper 'e = { ..(Action 'e) }",
+        "type Payload 'r = { value: { ..'r } } type Wrapper 'r = { ..(Payload 'r) }",
+    ] {
+        let (mint, out) = build_src(source);
+        assert!(out.errors.is_empty(), "{source}: {:?}", out.errors);
+        let inferred = inference::infer(&mint, &out.program, inference::Trace::Complete);
+        assert!(
+            inferred.errors().is_empty(),
+            "{source}: {:?}",
+            inferred.errors()
+        );
+    }
+}
+
+#[test]
+fn fixed_type_spreads_validate_payload_arguments_and_closed_absence() {
+    for source in [
+        r"type Missing = | \#X type Record = { ..Missing } type Cases = | ..Record",
+        "effect Log type Action 'e = { run: () -> () + !Log + ..'e } type Bad = { ..(Action (!Log)) }",
+        "type Action 'e = { run: () -> () + ..'e } type Bad = { ..(Action Real) }",
+        "type Value 'a = { value: 'a } type Bad = { ..Value }",
+        "type Value 'a = { value: 'a } type Bad = { ..(Value Real Real) }",
+    ] {
+        let (_, out) = build_src(source);
+        assert!(!out.errors.is_empty(), "accepted {source}");
+    }
+}
+
+#[test]
 fn fixed_type_spreads_resolve_imported_rows() {
     let mut dependency = effect_artifact("dep", "empty");
     dependency.header.types = vec![a::DeclaredType {
@@ -2140,6 +2171,200 @@ fn fixed_type_spreads_resolve_imported_rows() {
     assert!(out.errors.is_empty(), "{:?}", out.errors);
     let inferred = inference::infer(&mint, &out.program, inference::Trace::Complete);
     assert!(inferred.errors().is_empty(), "{:?}", inferred.errors());
+}
+
+#[test]
+fn fixed_type_spreads_preserve_deep_imported_payloads() {
+    let mut payload = a::Type::Nat;
+    for _ in 0..300 {
+        payload = a::Type::Array(Box::new(payload));
+    }
+    let mut dependency = effect_artifact("dep", "empty");
+    dependency.header.types = vec![a::DeclaredType {
+        exported: true,
+        metadata: Default::default(),
+        name: "dep@1.0.0::Deep".into(),
+        params: Vec::new(),
+        scheme: artifact_scheme(artifact_struct(vec![(
+            "payload".into(),
+            a::RowField {
+                presence: a::Presence::Present,
+                ty: payload,
+            },
+        )])),
+    }];
+    let (mint, out) = build_imported("type Expanded = { ..dep::Deep }", "dep", &dependency);
+    assert!(out.errors.is_empty(), "{:?}", out.errors);
+    let inferred = inference::infer(&mint, &out.program, inference::Trace::Complete);
+    assert!(inferred.errors().is_empty());
+    let ty = inferred.semantics().aliases()[&type_symbol(&mint, &out, "Expanded")].body();
+    let Ty::Struct(row) = ty.as_ref() else {
+        panic!("expected a struct");
+    };
+    let mut payload = row.labels["payload"].ty.as_ref();
+    for _ in 0..300 {
+        let Ty::Array(element) = payload else {
+            panic!("the imported payload was truncated");
+        };
+        payload = element;
+    }
+    assert!(matches!(payload, Ty::Nat));
+}
+
+#[test]
+fn fixed_type_spreads_preserve_composed_imported_effect_rows() {
+    let mut dependency = effect_artifact("dep", "empty");
+    dependency.header.types = vec![a::DeclaredType {
+        exported: true,
+        metadata: Default::default(),
+        name: "dep@1.0.0::Action".into(),
+        params: Vec::new(),
+        scheme: artifact_scheme(artifact_struct(vec![(
+            "run".into(),
+            a::RowField {
+                presence: a::Presence::Present,
+                ty: a::Type::Arrow(
+                    Box::new(artifact_unit()),
+                    Box::new(artifact_unit()),
+                    a::Row {
+                        labels: Vec::new(),
+                        rest: a::Rest::More(Box::new(a::Row {
+                            labels: vec![(
+                                ruddy::types::EffectId::structural("IO".into(), "empty".into())
+                                    .row_key(),
+                                a::RowField {
+                                    presence: a::Presence::Present,
+                                    ty: artifact_unit(),
+                                },
+                            )],
+                            rest: a::Rest::Closed,
+                        })),
+                    },
+                ),
+            },
+        )])),
+    }];
+    let (mint, out) = build_imported("type Expanded = { ..dep::Action }", "dep", &dependency);
+    assert!(out.errors.is_empty(), "{:?}", out.errors);
+    let inferred = inference::infer(&mint, &out.program, inference::Trace::Complete);
+    assert!(inferred.errors().is_empty(), "{:?}", inferred.errors());
+    let ty = inferred.semantics().aliases()[&type_symbol(&mint, &out, "Expanded")].body();
+    let Ty::Struct(row) = ty.as_ref() else {
+        panic!("expected a struct");
+    };
+    let Ty::Arrow(_, _, effects) = row.labels["run"].ty.as_ref() else {
+        panic!("expected a function payload");
+    };
+    let key = out.program.effect_ids.values().next().unwrap().row_key();
+    assert_eq!(effects.labels.len(), 1);
+    assert!(effects.labels.contains_key(&key));
+    assert!(matches!(effects.rest, ruddy::types::Rest::Closed));
+}
+
+#[test]
+fn fixed_type_spreads_preserve_imported_argument_senses() {
+    let field = |ty| a::RowField {
+        presence: a::Presence::Present,
+        ty,
+    };
+    let parameter = |sense| a::Parameter {
+        sense,
+        lacks: Vec::new(),
+        relevant: true,
+    };
+    let function = |row| a::Type::Arrow(Box::new(artifact_unit()), Box::new(artifact_unit()), row);
+    let io = || a::Row {
+        labels: vec![(
+            ruddy::types::EffectId::structural("IO".into(), "empty".into()).row_key(),
+            field(artifact_unit()),
+        )],
+        rest: a::Rest::Closed,
+    };
+    let mut dependency = effect_artifact("dep", "empty");
+    for (name, sense) in [("Use", a::Sense::Type), ("Wrap", a::Sense::Effects)] {
+        dependency.header.effects.push(a::DeclaredEffect {
+            exported: true,
+            metadata: Default::default(),
+            name: format!("dep@1.0.0::{name}"),
+            params: vec![parameter(sense)],
+            identity: Some(a::EffectIdentity {
+                name: name.into(),
+                interface: "generic".into(),
+            }),
+            kind: a::EffectKind::Operations(Vec::new()),
+        });
+    }
+    let application = |name: &str, argument| {
+        function(a::Row {
+            labels: vec![(
+                ruddy::types::EffectId::structural(name.into(), "generic".into()).row_key(),
+                field(artifact_struct(vec![("0".into(), field(argument))])),
+            )],
+            rest: a::Rest::Closed,
+        })
+    };
+    dependency.header.types = vec![
+        a::DeclaredType {
+            exported: true,
+            metadata: Default::default(),
+            name: "dep@1.0.0::Action".into(),
+            params: vec![parameter(a::Sense::Effects)],
+            scheme: a::Scheme {
+                count: 1,
+                ..artifact_scheme(function(a::Row {
+                    labels: Vec::new(),
+                    rest: a::Rest::Bound(0),
+                }))
+            },
+        },
+        a::DeclaredType {
+            exported: true,
+            metadata: Default::default(),
+            name: "dep@1.0.0::Record".into(),
+            params: Vec::new(),
+            scheme: artifact_scheme(artifact_struct(vec![
+                (
+                    "ordinary".into(),
+                    field(application(
+                        "Use",
+                        function(a::Row {
+                            labels: Vec::new(),
+                            rest: a::Rest::Closed,
+                        }),
+                    )),
+                ),
+                (
+                    "effects".into(),
+                    field(application("Wrap", a::Type::Sum(io()))),
+                ),
+                (
+                    "named".into(),
+                    field(a::Type::Named {
+                        name: "dep@1.0.0::Action".into(),
+                        args: vec![a::Type::Sum(io())],
+                    }),
+                ),
+            ])),
+        },
+    ];
+    let (mint, out) = build_imported("type Expanded = { ..dep::Record }", "dep", &dependency);
+    assert!(out.errors.is_empty(), "{:?}", out.errors);
+    let inferred = inference::infer(&mint, &out.program, inference::Trace::Complete);
+    assert!(inferred.errors().is_empty(), "{:?}", inferred.errors());
+    let ty = inferred.semantics().aliases()[&type_symbol(&mint, &out, "Expanded")].body();
+    let Ty::Struct(row) = ty.as_ref() else {
+        panic!("expected struct")
+    };
+    let Ty::Arrow(_, _, effects) = row.labels["ordinary"].ty.as_ref() else {
+        panic!("expected function")
+    };
+    let Ty::Struct(arguments) = effects.labels.values().next().unwrap().ty.as_ref() else {
+        panic!("expected effect arguments")
+    };
+    assert!(matches!(
+        arguments.labels.values().next().unwrap().ty.as_ref(),
+        Ty::Arrow(_, _, _)
+    ));
 }
 
 #[test]

@@ -45,3 +45,18 @@ source-program compiler tests, formatter round trips, and tree-sitter corpus.
 Run Rust tests exclusively through `just test`; run the full suite once at the
 end. Review both repository standards and this spec, then commit on the current
 branch. The starting commit is `749292651f5d5ba79cdd7cb4e62d7ec6abb31188`.
+
+## Validation results
+
+- Full instrumented Rust suite: 2,052 passed, 10 ignored, run through `just test`
+  with `RUST_TEST_THREADS=2`. Default concurrency hit the 4 GiB memory cap;
+  the serial retry hit the runner's 30-minute limit.
+- All 18 fixed-spread compiler, formatter, and debugger tests pass, including
+  two additional coverage-driven cases added after the full run.
+- Tree-sitter: 138 corpus cases pass; spread highlighting has 9 passing assertions.
+- Formatting passes. Clippy completes with warnings, including three enum-size
+  warnings from the additional type syntax and existing CLI warnings.
+- Compiler coverage: 96.29% lines, 88.75% branches. The repository's required
+  100% coverage is not met; gaps include both changed and unchanged modules.
+- Standards review: no remaining code findings; coverage requirement remains
+  unmet. Spec review: all reported findings resolved.

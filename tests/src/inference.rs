@@ -252,6 +252,17 @@ fn fixed_type_spreads_expand_inside_effect_alias_arguments() {
 }
 
 #[test]
+fn fixed_type_spreads_accept_pure_effect_arguments() {
+    let (mint, _, output) = inferred(
+        "type Action 'e = { run: () -> () + ..'e }
+         type Wrapper = { ..(Action (|)) }
+         let wrapper: Wrapper = { run: fn _ => () }
+         let run = wrapper.run",
+    );
+    assert_eq!(scheme(&mint, &output, "run"), "() -> ()");
+}
+
+#[test]
 fn arrays_infer_one_element_type_and_generalize_empty_literals() {
     let (mint, _, output) = inferred(
         "type ArrayOf 'a = ['a]\n\

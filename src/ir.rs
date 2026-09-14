@@ -3862,18 +3862,13 @@ fn imported_symbol(
     symbol
 }
 
-/// Whether a published type is the empty closed struct: what an effects
-/// argument's arrow goes from and to.
-fn is_unit(ty: &artifact::Type) -> bool {
-    matches!(ty, artifact::Type::Struct(row) if row.labels.is_empty() && matches!(row.rest, artifact::Rest::Closed))
-}
-
 /// A published type read back as the written type it stands for, so that an
 /// imported alias body can be substituted into and spliced exactly as a local
 /// one is. Bound positions become the alias's parameters, named types the
 /// imported declarations, and effect labels the imported effects; what has
 /// no written form — a solver variable, a rigid, an undecided type — absorbs
-/// as the error type. Bounded in depth, since an imported tree is data.
+/// as the error type. An explicit work stack preserves arbitrarily nested
+/// payloads without recursing through the imported tree.
 fn imported_syntax(
     mint: &mut Mint,
     ty: &artifact::Type,
@@ -3881,14 +3876,12 @@ fn imported_syntax(
     symbols: &mut HashMap<(Namespace, String), Symbol>,
     names: &mut IndexMap<Symbol, artifact::QualifiedName>,
     effect_rows: &ImportedEffectRows,
-    depth: usize,
 ) -> Type {
     imported_syntax_resolved(
         ty,
         params,
         &mut |namespace, name| Some(imported_symbol(mint, namespace, name, symbols, names)),
         effect_rows,
-        depth,
     )
 }
 
@@ -3915,250 +3908,288 @@ fn imported_syntax_resolved(
     params: &[Symbol],
     resolve: &mut impl FnMut(Namespace, &str) -> Option<Symbol>,
     effect_rows: &ImportedEffectRows,
-    depth: usize,
 ) -> Type {
-    let span = Anchor::GENERATED;
-    if depth > 256 {
-        return span.anchor(TypeKind::Error);
+    enum Work<'a> {
+        Read(&'a artifact::Type, bool),
+        Finish(usize, Box<dyn FnOnce(Vec<Type>) -> TypeKind + 'a>),
     }
+    fn queue<'a>(
+        work: &mut Vec<Work<'a>>,
+        children: Vec<(&'a artifact::Type, bool)>,
+        finish: impl FnOnce(Vec<Type>) -> TypeKind + 'a,
+    ) {
+        work.push(Work::Finish(children.len(), Box::new(finish)));
+        work.extend(
+            children
+                .into_iter()
+                .rev()
+                .map(|(ty, effects)| Work::Read(ty, effects)),
+        );
+    }
+    let at = Anchor::GENERATED;
     let tail_of = |rest: &artifact::Rest| match rest {
         artifact::Rest::Closed => None,
         artifact::Rest::Bound(index) => params.get(*index as usize).map(|symbol| Tail {
-            at: span,
+            at,
             of: Row::Param {
                 symbol: *symbol,
                 index: *index,
             },
         }),
         _ => Some(Tail {
-            at: span,
+            at,
             of: Row::Anything,
         }),
     };
-    let tracked = match ty {
-        artifact::Type::Nat => TypeKind::Prim(Prim::Nat),
-        artifact::Type::Int => TypeKind::Prim(Prim::Int),
-        artifact::Type::Fixed(kind) => TypeKind::Prim(Prim::Fixed(*kind)),
-        artifact::Type::Real => TypeKind::Prim(Prim::Real),
-        artifact::Type::String => TypeKind::Prim(Prim::String),
-        artifact::Type::Bool => TypeKind::Prim(Prim::Bool),
-        artifact::Type::ForeignValue => TypeKind::Prim(Prim::ForeignValue),
-        artifact::Type::Bound(index) => match params.get(*index as usize) {
-            Some(symbol) => TypeKind::Param {
-                symbol: *symbol,
-                index: *index,
-            },
-            None => TypeKind::Error,
-        },
-        artifact::Type::Package(body) => {
-            return imported_syntax_resolved(body, params, resolve, effect_rows, depth + 1);
-        }
-        artifact::Type::Hidden { binder, name, body } => TypeKind::Hidden {
-            id: *binder,
-            name: name.clone(),
-            body: Box::new(imported_syntax_resolved(
-                body,
-                params,
-                resolve,
-                effect_rows,
-                depth + 1,
-            )),
-        },
-        artifact::Type::HiddenVar { binder, name } => TypeKind::Scoped {
-            id: *binder,
-            name: name.clone(),
-        },
-        artifact::Type::Mut(region, element) => TypeKind::Mut(
-            Box::new(imported_syntax_resolved(
-                region,
-                params,
-                resolve,
-                effect_rows,
-                depth + 1,
-            )),
-            Box::new(imported_syntax_resolved(
-                element,
-                params,
-                resolve,
-                effect_rows,
-                depth + 1,
-            )),
-        ),
-        artifact::Type::Mirror(element) => TypeKind::Mirror(Box::new(imported_syntax_resolved(
-            element,
-            params,
-            resolve,
-            effect_rows,
-            depth + 1,
-        ))),
-        artifact::Type::Array(element) => TypeKind::Array(Box::new(imported_syntax_resolved(
-            element,
-            params,
-            resolve,
-            effect_rows,
-            depth + 1,
-        ))),
-        artifact::Type::Named { name, args } => {
-            let head = resolve(Namespace::Types, name).unwrap_or(Symbol::GENERATED);
-            match args.is_empty() {
-                true => TypeKind::Ident(head),
-                false => TypeKind::Apply {
-                    head,
-                    head_at: span,
-                    args: args
-                        .iter()
-                        .map(|arg| {
-                            imported_syntax_resolved(arg, params, resolve, effect_rows, depth + 1)
-                        })
-                        .collect(),
-                },
+    let mut work = vec![Work::Read(ty, false)];
+    let mut values: Vec<Type> = Vec::new();
+    while let Some(next) = work.pop() {
+        let (ty, is_effects) = match next {
+            Work::Finish(count, finish) => {
+                let children = values.split_off(values.len() - count);
+                values.push(at.anchor(finish(children)));
+                continue;
             }
-        }
-        artifact::Type::Struct(row) => {
+            Work::Read(ty, effects) => (ty, effects),
+        };
+        if is_effects && let artifact::Type::Sum(row) | artifact::Type::Arrow(_, _, row) = ty {
             let (entries, rest) = imported_row_entries(row);
-            let mut fields = IndexMap::new();
-            for (name, field) in entries {
-                let field = match field.presence {
-                    artifact::Presence::Present => TypeField::Written {
-                        name_at: span,
-                        when: None,
-                        value: imported_syntax_resolved(
-                            &field.ty,
-                            params,
-                            resolve,
-                            effect_rows,
-                            depth + 1,
-                        ),
-                    },
-                    artifact::Presence::Absent => TypeField::Absent { name_at: span },
-                    _ => return span.anchor(TypeKind::Error),
-                };
-                fields.insert(name.clone(), field);
-            }
-            TypeKind::Struct {
-                fields,
-                spreads: Vec::new(),
-                tail: tail_of(rest),
-            }
-        }
-        artifact::Type::Sum(row) => {
-            let (entries, rest) = imported_row_entries(row);
-            let mut cases = IndexMap::new();
-            for (name, field) in entries {
-                let case = match field.presence {
-                    artifact::Presence::Present => SumCase::Written {
-                        name_at: span,
-                        when: None,
-                        payload: Some(imported_syntax_resolved(
-                            &field.ty,
-                            params,
-                            resolve,
-                            effect_rows,
-                            depth + 1,
-                        )),
-                    },
-                    artifact::Presence::Absent => SumCase::Absent { name_at: span },
-                    _ => return span.anchor(TypeKind::Error),
-                };
-                cases.insert(name.clone(), case);
-            }
-            TypeKind::Sum {
-                cases,
-                spreads: Vec::new(),
-                tail: tail_of(rest),
-            }
-        }
-        artifact::Type::Arrow(from, to, row) => {
-            let mut effects = IndexMap::new();
-            for (label, field) in &row.labels {
+            let tail = tail_of(rest);
+            let mut labels = Vec::new();
+            let mut children = Vec::new();
+            for (label, field) in entries {
                 let key = effect_rows.label(label);
-                let Some(symbol) = effect_rows
+                let Some((qualified, _)) = effect_rows
                     .identities
                     .iter()
                     .find(|(_, identity)| identity.row_key() == key)
-                    .and_then(|(qualified, _)| resolve(Namespace::Effects, qualified))
                 else {
                     continue;
                 };
-                let args = match &field.ty {
-                    artifact::Type::Struct(payload) => payload
-                        .labels
-                        .iter()
-                        .map(|(_, arg)| match &arg.ty {
-                            // An effects argument: the row its arrow carries,
-                            // read back as the row of effects it was.
-                            artifact::Type::Arrow(from, to, _) if is_unit(from) && is_unit(to) => {
-                                let arrow = imported_syntax_resolved(
-                                    &arg.ty,
-                                    params,
-                                    resolve,
-                                    effect_rows,
-                                    depth + 1,
-                                );
-                                match arrow.anchored {
-                                    TypeKind::Arrow { effects, .. } => {
-                                        span.anchor(TypeKind::Effects(effects))
-                                    }
-                                    other => span.anchor(other),
-                                }
-                            }
-                            _ => imported_syntax_resolved(
-                                &arg.ty,
-                                params,
-                                resolve,
-                                effect_rows,
-                                depth + 1,
-                            ),
-                        })
-                        .collect(),
-                    _ => Vec::new(),
+                let Some(symbol) = resolve(Namespace::Effects, qualified) else {
+                    continue;
                 };
-                let lowered = match field.presence {
-                    artifact::Presence::Absent => EffectLabel::Absent {
-                        name_at: span,
-                        symbol,
-                        args,
-                        expanded: false,
-                    },
-                    _ => EffectLabel::Written {
-                        name_at: span,
-                        symbol,
-                        args,
-                        expanded: false,
-                        when: None,
-                    },
-                };
-                effects.insert(EffectId::pending(symbol), lowered);
+                let mut count = 0;
+                if let artifact::Type::Struct(payload) = &field.ty {
+                    let (arguments, _) = imported_row_entries(payload);
+                    for (index, arg) in arguments.values().enumerate() {
+                        children.push((&arg.ty, effect_rows.argument_is_effects(qualified, index)));
+                        count += 1;
+                    }
+                }
+                labels.push((
+                    symbol,
+                    matches!(field.presence, artifact::Presence::Absent),
+                    count,
+                ));
             }
-            let written = !effects.is_empty() || !matches!(row.rest, artifact::Rest::Closed);
-            TypeKind::Arrow {
-                from: Box::new(imported_syntax_resolved(
-                    from,
-                    params,
-                    resolve,
-                    effect_rows,
-                    depth + 1,
-                )),
-                to: Box::new(imported_syntax_resolved(
-                    to,
-                    params,
-                    resolve,
-                    effect_rows,
-                    depth + 1,
-                )),
-                effects: Box::new(EffectRow {
-                    at: span,
-                    written,
+            queue(&mut work, children, move |children| {
+                let mut children = children.into_iter();
+                let mut effects = IndexMap::new();
+                for (symbol, absent, count) in labels {
+                    let args = children.by_ref().take(count).collect();
+                    let label = if absent {
+                        EffectLabel::Absent {
+                            name_at: at,
+                            symbol,
+                            args,
+                            expanded: false,
+                        }
+                    } else {
+                        EffectLabel::Written {
+                            name_at: at,
+                            symbol,
+                            args,
+                            expanded: false,
+                            when: None,
+                        }
+                    };
+                    effects.insert(EffectId::pending(symbol), label);
+                }
+                TypeKind::Effects(Box::new(EffectRow {
+                    at,
+                    written: !effects.is_empty() || tail.is_some(),
                     effects,
-                    tail: tail_of(&row.rest),
-                }),
+                    tail,
+                }))
+            });
+            continue;
+        }
+        let leaf = match ty {
+            artifact::Type::Nat => TypeKind::Prim(Prim::Nat),
+            artifact::Type::Int => TypeKind::Prim(Prim::Int),
+            artifact::Type::Fixed(kind) => TypeKind::Prim(Prim::Fixed(*kind)),
+            artifact::Type::Real => TypeKind::Prim(Prim::Real),
+            artifact::Type::String => TypeKind::Prim(Prim::String),
+            artifact::Type::Bool => TypeKind::Prim(Prim::Bool),
+            artifact::Type::ForeignValue => TypeKind::Prim(Prim::ForeignValue),
+            artifact::Type::Bound(index) => {
+                params
+                    .get(*index as usize)
+                    .map_or(TypeKind::Error, |symbol| TypeKind::Param {
+                        symbol: *symbol,
+                        index: *index,
+                    })
             }
-        }
-        artifact::Type::Var(_) | artifact::Type::Rigid { .. } | artifact::Type::Undecided => {
-            TypeKind::Error
-        }
-    };
-    span.anchor(tracked)
+            artifact::Type::HiddenVar { binder, name } => TypeKind::Scoped {
+                id: *binder,
+                name: name.clone(),
+            },
+            artifact::Type::Package(body) => {
+                work.push(Work::Read(body, is_effects));
+                continue;
+            }
+            artifact::Type::Hidden { binder, name, body } => {
+                let (id, name) = (*binder, name.clone());
+                queue(&mut work, vec![(body, false)], move |mut children| {
+                    TypeKind::Hidden {
+                        id,
+                        name,
+                        body: Box::new(children.pop().unwrap()),
+                    }
+                });
+                continue;
+            }
+            artifact::Type::Array(element) => {
+                queue(&mut work, vec![(element, false)], |mut children| {
+                    TypeKind::Array(Box::new(children.pop().unwrap()))
+                });
+                continue;
+            }
+            artifact::Type::Mirror(element) => {
+                queue(&mut work, vec![(element, false)], |mut children| {
+                    TypeKind::Mirror(Box::new(children.pop().unwrap()))
+                });
+                continue;
+            }
+            artifact::Type::Mut(region, element) => {
+                queue(
+                    &mut work,
+                    vec![(region, false), (element, false)],
+                    |mut children| {
+                        let element = children.pop().unwrap();
+                        TypeKind::Mut(Box::new(children.pop().unwrap()), Box::new(element))
+                    },
+                );
+                continue;
+            }
+            artifact::Type::Named { name, args } => {
+                let head = resolve(Namespace::Types, name).unwrap_or(Symbol::GENERATED);
+                if args.is_empty() {
+                    TypeKind::Ident(head)
+                } else {
+                    queue(
+                        &mut work,
+                        args.iter()
+                            .enumerate()
+                            .map(|(index, arg)| (arg, effect_rows.argument_is_effects(name, index)))
+                            .collect(),
+                        move |args| TypeKind::Apply {
+                            head,
+                            head_at: at,
+                            args,
+                        },
+                    );
+                    continue;
+                }
+            }
+            artifact::Type::Struct(row) | artifact::Type::Sum(row) => {
+                let sum = matches!(ty, artifact::Type::Sum(_));
+                let (entries, rest) = imported_row_entries(row);
+                let tail = tail_of(rest);
+                if entries.values().any(|field| {
+                    !matches!(
+                        field.presence,
+                        artifact::Presence::Present | artifact::Presence::Absent
+                    )
+                }) {
+                    TypeKind::Error
+                } else {
+                    let mut labels = Vec::new();
+                    let mut children = Vec::new();
+                    for (name, field) in entries {
+                        let present = matches!(field.presence, artifact::Presence::Present);
+                        labels.push((name.clone(), present));
+                        if present {
+                            children.push((&field.ty, false));
+                        }
+                    }
+                    queue(&mut work, children, move |children| {
+                        let mut children = children.into_iter();
+                        if sum {
+                            let cases = labels
+                                .into_iter()
+                                .map(|(name, present)| {
+                                    (
+                                        name,
+                                        if present {
+                                            SumCase::Written {
+                                                name_at: at,
+                                                when: None,
+                                                payload: Some(children.next().unwrap()),
+                                            }
+                                        } else {
+                                            SumCase::Absent { name_at: at }
+                                        },
+                                    )
+                                })
+                                .collect();
+                            TypeKind::Sum {
+                                cases,
+                                spreads: Vec::new(),
+                                tail,
+                            }
+                        } else {
+                            let fields = labels
+                                .into_iter()
+                                .map(|(name, present)| {
+                                    (
+                                        name,
+                                        if present {
+                                            TypeField::Written {
+                                                name_at: at,
+                                                when: None,
+                                                value: children.next().unwrap(),
+                                            }
+                                        } else {
+                                            TypeField::Absent { name_at: at }
+                                        },
+                                    )
+                                })
+                                .collect();
+                            TypeKind::Struct {
+                                fields,
+                                spreads: Vec::new(),
+                                tail,
+                            }
+                        }
+                    });
+                    continue;
+                }
+            }
+            artifact::Type::Arrow(from, to, _) => {
+                queue(
+                    &mut work,
+                    vec![(from, false), (to, false), (ty, true)],
+                    |children| {
+                        let mut children = children.into_iter();
+                        let from = Box::new(children.next().unwrap());
+                        let to = Box::new(children.next().unwrap());
+                        let TypeKind::Effects(effects) = children.next().unwrap().anchored else {
+                            unreachable!("the arrow's row was converted as effects");
+                        };
+                        TypeKind::Arrow { from, to, effects }
+                    },
+                );
+                continue;
+            }
+            artifact::Type::Var(_) | artifact::Type::Rigid { .. } | artifact::Type::Undecided => {
+                TypeKind::Error
+            }
+        };
+        values.push(at.anchor(leaf));
+    }
+    values.pop().expect("one imported type leaves one result")
 }
 
 fn import_scheme(
@@ -10477,13 +10508,23 @@ impl<'a> Builder<'a> {
                 );
                 effect_rows.insert_identity(&declaration.name, identity);
             }
-            for declaration in &dependency.types {
-                if dependency_path(dependency, &declaration.name).is_none() {
+            for (name, params) in dependency
+                .types
+                .iter()
+                .map(|decl| (&decl.name, &decl.params))
+                .chain(
+                    dependency
+                        .effects
+                        .iter()
+                        .map(|decl| (&decl.name, &decl.params)),
+                )
+            {
+                if dependency_path(dependency, name).is_none() {
                     continue;
                 }
                 effect_rows.arguments.insert(
-                    declaration.name.clone(),
-                    declaration.params.iter().map(|param| param.sense).collect(),
+                    name.clone(),
+                    params.iter().map(|param| param.sense).collect(),
                 );
             }
         }
@@ -10791,7 +10832,6 @@ impl<'a> Builder<'a> {
                                         &mut symbols,
                                         &mut program.external_names,
                                         &effect_rows,
-                                        0,
                                     )
                                 })
                                 .collect();
