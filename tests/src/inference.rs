@@ -177,6 +177,92 @@ fn inferred(src: &str) -> (Mint, ir::Output, inference::Output) {
 }
 
 #[test]
+fn fixed_type_spreads_expand_struct_fields() {
+    inferred(
+        "type V2 = { x: Real, y: Real }
+         type Circle = { ..V2, radius: Real }
+         let circle: Circle = { x: 1, y: 2, radius: 3 }
+         let expanded: { x: Real, y: Real, radius: Real } = circle",
+    );
+}
+
+#[test]
+fn fixed_type_spreads_compose_aliases_and_a_generic_tail() {
+    inferred(
+        "type Identity 'a = 'a
+         type Value 'a = { value: 'a }
+         type V2 = { x: Real, y: Real }
+         type Empty = {}
+         type Located 'a 'r = { ..(Identity (Identity V2)), ..Empty, ..(Value 'a), ..'r }
+         type Circle = Located Real { radius: Real }
+         let circle: Circle = { x: 1, y: 2, value: 3, radius: 4 }
+         let copy: { ..Circle, } = circle",
+    );
+}
+
+#[test]
+fn fixed_type_spreads_follow_forwarded_applications() {
+    inferred(
+        "type Forward 'a = Identity 'a
+         type Identity 'a = 'a
+         type V2 = { x: Real, y: Real }
+         type Circle = { ..(Forward (Forward V2)), radius: Real }
+         let circle: Circle = { x: 1, y: 2, radius: 3 }",
+    );
+}
+
+#[test]
+fn fixed_type_spreads_substitute_effect_parameters_in_payloads() {
+    let (mint, _, output) = inferred(
+        "effect Log = { log: Real -> () }
+         type Action 'e = { run: () -> () + ..'e }
+         type Wrapper = { ..(Action (!Log)) }
+         let wrapper: Wrapper = { run: fn _ => !Log.log 1 }
+         let run = wrapper.run",
+    );
+    assert_eq!(scheme(&mint, &output, "run"), "() -> () + !Log");
+}
+
+#[test]
+fn fixed_type_spreads_share_struct_and_sum_rows_and_preserve_recursion() {
+    inferred(
+        "type Extended = | ..Cases | #Extra Real | ..Empty
+         type Cases = #A Real | #B
+         type Empty = |
+         type Product = { ..Cases, extra: Real }
+         type Value 'a = { value: 'a }
+         type Node 'a = { ..(Value 'a), next: #End | #More (Node 'a) }
+         let a: Extended = #A 1
+         let b: { ..Product } = { A: 1, B: (), extra: 2 }
+         let node: Node Real = { value: 1, next: #End }
+         let again: Node Real = { value: 2, next: #More node }
+         let open: { ..(Value { x: Real, .. }) } = { value: { x: 1, y: 2 } }
+         let nested = do let x: { ..Product } = b return x end",
+    );
+}
+
+#[test]
+fn fixed_type_spreads_expand_inside_effect_alias_arguments() {
+    inferred(
+        "type V = { x: Nat }
+         effect Take 'r = { take: { ..'r } -> Nat }
+         effect Via = !Take { ..V }
+         let f: () -> Nat + !Via = fn _ => !Take.take { x: 1n }",
+    );
+}
+
+#[test]
+fn fixed_type_spreads_accept_pure_effect_arguments() {
+    let (mint, _, output) = inferred(
+        "type Action 'e = { run: () -> () + ..'e }
+         type Wrapper = { ..(Action (|)) }
+         let wrapper: Wrapper = { run: fn _ => () }
+         let run = wrapper.run",
+    );
+    assert_eq!(scheme(&mint, &output, "run"), "() -> ()");
+}
+
+#[test]
 fn arrays_infer_one_element_type_and_generalize_empty_literals() {
     let (mint, _, output) = inferred(
         "type ArrayOf 'a = ['a]\n\

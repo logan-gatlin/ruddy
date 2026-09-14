@@ -793,7 +793,11 @@ fn type_node(ids: &mut Ids, ty: &Type) -> Node {
         // A row written where a type goes, shown as the row it is: the same
         // node an arrow's own row gets, so the two read alike on the page.
         TypeKind::Effects(effects) => effects_node(ids, effects),
-        TypeKind::Struct { fields, tail } => {
+        TypeKind::Struct {
+            fields,
+            spreads,
+            tail,
+        } => {
             let mut kids: Vec<Node> = fields
                 .iter()
                 .map(|(name, field)| match field {
@@ -822,6 +826,18 @@ fn type_node(ids: &mut Ids, ty: &Type) -> Node {
                 .collect();
             // The tail is a row of its own: it stands for the fields not
             // named, so it is shown beside them rather than folded into one.
+            for spread in spreads {
+                kids.push(
+                    Node::new(
+                        ids.next(),
+                        "Spread",
+                        print::ast::type_spread(&spread.value.tracked),
+                    )
+                    .at(spread.span)
+                    .child(type_node(ids, &spread.value)),
+                );
+            }
+            kids.sort_by_key(|node| node.at.map(|span| span.start));
             if let Some(tail) = tail {
                 kids.push(Node::new(ids.next(), "Rest", rest_text(&tail.of)).at(tail.span));
             }
@@ -833,7 +849,11 @@ fn type_node(ids: &mut Ids, ty: &Type) -> Node {
         }
         // The struct's row shown again about cases: one child per case, the
         // payload under it, and the tail beside them.
-        TypeKind::Sum { cases, tail } => {
+        TypeKind::Sum {
+            cases,
+            spreads,
+            tail,
+        } => {
             let mut kids: Vec<Node> = cases
                 .iter()
                 .map(|(name, case)| match case {
@@ -863,6 +883,18 @@ fn type_node(ids: &mut Ids, ty: &Type) -> Node {
                     .at(name.span),
                 })
                 .collect();
+            for spread in spreads {
+                kids.push(
+                    Node::new(
+                        ids.next(),
+                        "Spread",
+                        print::ast::type_spread(&spread.value.tracked),
+                    )
+                    .at(spread.span)
+                    .child(type_node(ids, &spread.value)),
+                );
+            }
+            kids.sort_by_key(|node| node.at.map(|span| span.start));
             if let Some(tail) = tail {
                 kids.push(Node::new(ids.next(), "Rest", rest_text(&tail.of)).at(tail.span));
             }

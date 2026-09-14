@@ -301,6 +301,32 @@ In `Both`, the struct and sum share the same row, so constraints from either use
 A row must exclude every label already named beside any of its uses.
 Empty structs and empty sums supply the same empty row.
 
+A fixed spread copies the known fields or cases of a named type into another
+struct or sum type:
+
+```ruddy
+type V2 = { x: Real, y: Real }
+type Circle = { ..V2, radius: Real }
+type Value 'a = { value: 'a }
+type Located 'a 'r = { ..V2, ..(Value 'a), ..'r }
+type Choice = | ..V2 | #Other
+```
+
+Fixed spreads may appear anywhere among the entries, and a type may contain
+several. Applications require parentheses after the dots. Each operand must
+resolve to a closed outer row, although its payload types may contain type
+parameters or open rows. Alias chains, forward references, and empty rows work
+as usual; cycles through spread expansion are errors.
+
+Duplicate labels are errors, even when their payload types agree. A single
+generic tail may follow the fixed spreads and explicit entries, last, and must
+exclude all their labels. Fixed struct spreads allow an ordinary trailing
+comma; generic tails keep their existing delimiter rules. Fixed spreads also
+work in annotations, subject to the annotation's usual rules.
+
+Expansion has exactly the meaning of writing each contributed entry explicitly.
+It does not introduce inheritance or change closed-record compatibility.
+
 Struct and sum values remain distinct types.
 A row parameter accepts the fields or cases of a supplied type; it does not convert values.
 A parameter cannot stand for both a whole type and a row, and effect rows remain a separate kind.

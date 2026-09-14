@@ -622,7 +622,7 @@ fn unit_is_the_empty_struct() {
         out.program.types[&type_symbol(&mint, &out, "T")]
             .value
             .anchored,
-        TypeKind::Struct { ref fields, tail: None } if fields.is_empty()
+        TypeKind::Struct { ref fields, tail: None, .. } if fields.is_empty()
     ));
     assert_eq!(mint.symbols().count(), 1);
     assert_eq!(
@@ -637,7 +637,7 @@ fn unit_is_the_empty_struct() {
         out.program.types[&type_symbol(&mint, &out, "T")]
             .value
             .anchored,
-        TypeKind::Struct { ref fields, tail: None } if fields.is_empty()
+        TypeKind::Struct { ref fields, tail: None, .. } if fields.is_empty()
     ));
 
     // The unit *value* folds the same way: `()` the value and `()` the type
@@ -1822,7 +1822,7 @@ fn lowers_a_sum_type() {
     let src = "type Option 'T = #Some 'T | #None";
     let (mint, out) = built(src);
     let decl = &out.program.types[&type_symbol(&mint, &out, "Option")];
-    let TypeKind::Sum { cases, tail } = &decl.value.anchored else {
+    let TypeKind::Sum { cases, tail, .. } = &decl.value.anchored else {
         panic!("expected a sum, got {:#?}", decl.value.anchored);
     };
     assert_eq!(cases.keys().collect::<Vec<_>>(), vec!["Some", "None"]);
@@ -2021,6 +2021,350 @@ fn shared_rows_combine_exclusions_across_every_use() {
     }
     built("type Cases 'r = #A Nat | ..'r type Good = Cases { y: Nat }");
     built("type WithX 'r = { x: Nat, ..'r } type Good = WithX (#A Nat)");
+}
+
+#[test]
+fn fixed_type_spreads_reject_collisions_open_rows_and_invalid_operands() {
+    for source in [
+        "type V = { x: Real } type Bad = { ..V, x: Real }",
+        "type V = { x: Real } type Bad = { x: Nat, ..V }",
+        "type V = { x: Real } type Bad = { ..V, ..V }",
+        "type V = #X Real type Bad = | ..V | #X Real",
+        "type V = { x: Real } type G 'r = { ..V, ..'r } type Bad = G V",
+    ] {
+        let (_, out) = build_src(source);
+        assert!(
+            out.errors
+                .iter()
+                .any(|error| matches!(error.kind, ErrorKind::RepeatedRowField { .. })),
+            "{source}: {:?}",
+            out.errors
+        );
+    }
+    for source in [
+        "type G 'r = { ..'r } type Bad 'r = { ..(G 'r) }",
+        "type G 'r = | ..'r type Bad 'r = | ..(G 'r)",
+    ] {
+        let (_, out) = build_src(source);
+        assert!(
+            out.errors
+                .iter()
+                .any(|error| matches!(error.kind, ErrorKind::OpenFixedSpread)),
+            "{source}: {:?}",
+            out.errors
+        );
+    }
+    for source in [
+        "type Bad = { ..Real }",
+        "type Bad = { ..Missing }",
+        "type Bad = { ..({ x: Real }) }",
+        "type Bad = | ..(Real -> Real)",
+    ] {
+        let (_, out) = build_src(source);
+        assert!(!out.errors.is_empty(), "accepted {source}");
+    }
+}
+
+#[test]
+fn fixed_type_spreads_reject_expansion_cycles() {
+    for source in [
+        "type A = { ..A }",
+        "type A = { ..B } type B = { ..A }",
+        "type A = B type B = A type Bad = { ..A }",
+        "type Forward 'r = { ..'r } type A = Forward A type Bad = { ..A }",
+        "type Forward 'a = 'a type A = Forward A type Bad = { ..A }",
+    ] {
+        let (_, out) = build_src(source);
+        assert!(!out.errors.is_empty(), "accepted {source}");
+    }
+}
+
+#[test]
+fn fixed_type_spreads_report_invalid_row_arguments_once() {
+    for source in [
+        "type G 'r = { x: Real, ..'r } type Bad = { ..(G { x: Real }) }",
+        "type G 'r = { ..'r } type Bad = { ..(G Real) }",
+    ] {
+        let (_, out) = build_src(source);
+        assert_eq!(out.errors.len(), 1, "{source}: {:?}", out.errors);
+    }
+}
+
+#[test]
+fn fixed_type_spreads_preserve_generic_payload_rows() {
+    for source in [
+        "type Action 'e = { run: () -> () + ..'e } type Wrapper 'e = { ..(Action 'e) }",
+        "type Payload 'r = { value: { ..'r } } type Wrapper 'r = { ..(Payload 'r) }",
+    ] {
+        let (mint, out) = build_src(source);
+        assert!(out.errors.is_empty(), "{source}: {:?}", out.errors);
+        let inferred = inference::infer(&mint, &out.program, inference::Trace::Complete);
+        assert!(
+            inferred.errors().is_empty(),
+            "{source}: {:?}",
+            inferred.errors()
+        );
+    }
+}
+
+#[test]
+fn fixed_type_spreads_validate_payload_arguments_and_closed_absence() {
+    for source in [
+        r"type Missing = | \#X type Record = { ..Missing } type Cases = | ..Record",
+        "effect Log type Action 'e = { run: () -> () + !Log + ..'e } type Bad = { ..(Action (!Log)) }",
+        "type Action 'e = { run: () -> () + ..'e } type Bad = { ..(Action Real) }",
+        "type Value 'a = { value: 'a } type Bad = { ..Value }",
+        "type Value 'a = { value: 'a } type Bad = { ..(Value Real Real) }",
+    ] {
+        let (_, out) = build_src(source);
+        assert!(!out.errors.is_empty(), "accepted {source}");
+    }
+}
+
+#[test]
+fn fixed_type_spreads_resolve_imported_rows() {
+    let mut dependency = effect_artifact("dep", "empty");
+    dependency.header.types = vec![a::DeclaredType {
+        exported: true,
+        metadata: Default::default(),
+        name: "dep@1.0.0::Record".into(),
+        params: Vec::new(),
+        scheme: artifact_scheme(a::Type::Struct(a::Row {
+            labels: Vec::new(),
+            rest: a::Rest::More(Box::new(a::Row {
+                labels: vec![(
+                    "y".into(),
+                    a::RowField {
+                        presence: a::Presence::Present,
+                        ty: a::Type::Nat,
+                    },
+                )],
+                rest: a::Rest::Closed,
+            })),
+        })),
+    }];
+    dependency.header.types.push(a::DeclaredType {
+        exported: true,
+        metadata: Default::default(),
+        name: "dep@1.0.0::Value".into(),
+        params: vec![a::Parameter {
+            sense: a::Sense::Type,
+            lacks: Vec::new(),
+            relevant: true,
+        }],
+        scheme: a::Scheme {
+            count: 1,
+            ..artifact_scheme(artifact_struct(vec![(
+                "value".into(),
+                a::RowField {
+                    presence: a::Presence::Present,
+                    ty: a::Type::Bound(0),
+                },
+            )]))
+        },
+    });
+    let (mint, out) = build_imported(
+        "type Extended 'a = { ..dep::Record, ..(dep::Value 'a), x: Nat } let value: Extended Nat = { y: 1n, x: 2n, value: 3n }",
+        "dep",
+        &dependency,
+    );
+    assert!(out.errors.is_empty(), "{:?}", out.errors);
+    let inferred = inference::infer(&mint, &out.program, inference::Trace::Complete);
+    assert!(inferred.errors().is_empty(), "{:?}", inferred.errors());
+}
+
+#[test]
+fn fixed_type_spreads_preserve_deep_imported_payloads() {
+    let mut payload = a::Type::Nat;
+    for _ in 0..300 {
+        payload = a::Type::Array(Box::new(payload));
+    }
+    let mut dependency = effect_artifact("dep", "empty");
+    dependency.header.types = vec![a::DeclaredType {
+        exported: true,
+        metadata: Default::default(),
+        name: "dep@1.0.0::Deep".into(),
+        params: Vec::new(),
+        scheme: artifact_scheme(artifact_struct(vec![(
+            "payload".into(),
+            a::RowField {
+                presence: a::Presence::Present,
+                ty: payload,
+            },
+        )])),
+    }];
+    let (mint, out) = build_imported("type Expanded = { ..dep::Deep }", "dep", &dependency);
+    assert!(out.errors.is_empty(), "{:?}", out.errors);
+    let inferred = inference::infer(&mint, &out.program, inference::Trace::Complete);
+    assert!(inferred.errors().is_empty());
+    let ty = inferred.semantics().aliases()[&type_symbol(&mint, &out, "Expanded")].body();
+    let Ty::Struct(row) = ty.as_ref() else {
+        panic!("expected a struct");
+    };
+    let mut payload = row.labels["payload"].ty.as_ref();
+    for _ in 0..300 {
+        let Ty::Array(element) = payload else {
+            panic!("the imported payload was truncated");
+        };
+        payload = element;
+    }
+    assert!(matches!(payload, Ty::Nat));
+}
+
+#[test]
+fn fixed_type_spreads_preserve_composed_imported_effect_rows() {
+    let mut dependency = effect_artifact("dep", "empty");
+    dependency.header.types = vec![a::DeclaredType {
+        exported: true,
+        metadata: Default::default(),
+        name: "dep@1.0.0::Action".into(),
+        params: Vec::new(),
+        scheme: artifact_scheme(artifact_struct(vec![(
+            "run".into(),
+            a::RowField {
+                presence: a::Presence::Present,
+                ty: a::Type::Arrow(
+                    Box::new(artifact_unit()),
+                    Box::new(artifact_unit()),
+                    a::Row {
+                        labels: Vec::new(),
+                        rest: a::Rest::More(Box::new(a::Row {
+                            labels: vec![(
+                                ruddy::types::EffectId::structural("IO".into(), "empty".into())
+                                    .row_key(),
+                                a::RowField {
+                                    presence: a::Presence::Present,
+                                    ty: artifact_unit(),
+                                },
+                            )],
+                            rest: a::Rest::Closed,
+                        })),
+                    },
+                ),
+            },
+        )])),
+    }];
+    let (mint, out) = build_imported("type Expanded = { ..dep::Action }", "dep", &dependency);
+    assert!(out.errors.is_empty(), "{:?}", out.errors);
+    let inferred = inference::infer(&mint, &out.program, inference::Trace::Complete);
+    assert!(inferred.errors().is_empty(), "{:?}", inferred.errors());
+    let ty = inferred.semantics().aliases()[&type_symbol(&mint, &out, "Expanded")].body();
+    let Ty::Struct(row) = ty.as_ref() else {
+        panic!("expected a struct");
+    };
+    let Ty::Arrow(_, _, effects) = row.labels["run"].ty.as_ref() else {
+        panic!("expected a function payload");
+    };
+    let key = out.program.effect_ids.values().next().unwrap().row_key();
+    assert_eq!(effects.labels.len(), 1);
+    assert!(effects.labels.contains_key(&key));
+    assert!(matches!(effects.rest, ruddy::types::Rest::Closed));
+}
+
+#[test]
+fn fixed_type_spreads_preserve_imported_argument_senses() {
+    let field = |ty| a::RowField {
+        presence: a::Presence::Present,
+        ty,
+    };
+    let parameter = |sense| a::Parameter {
+        sense,
+        lacks: Vec::new(),
+        relevant: true,
+    };
+    let function = |row| a::Type::Arrow(Box::new(artifact_unit()), Box::new(artifact_unit()), row);
+    let io = || a::Row {
+        labels: vec![(
+            ruddy::types::EffectId::structural("IO".into(), "empty".into()).row_key(),
+            field(artifact_unit()),
+        )],
+        rest: a::Rest::Closed,
+    };
+    let mut dependency = effect_artifact("dep", "empty");
+    for (name, sense) in [("Use", a::Sense::Type), ("Wrap", a::Sense::Effects)] {
+        dependency.header.effects.push(a::DeclaredEffect {
+            exported: true,
+            metadata: Default::default(),
+            name: format!("dep@1.0.0::{name}"),
+            params: vec![parameter(sense)],
+            identity: Some(a::EffectIdentity {
+                name: name.into(),
+                interface: "generic".into(),
+            }),
+            kind: a::EffectKind::Operations(Vec::new()),
+        });
+    }
+    let application = |name: &str, argument| {
+        function(a::Row {
+            labels: vec![(
+                ruddy::types::EffectId::structural(name.into(), "generic".into()).row_key(),
+                field(artifact_struct(vec![("0".into(), field(argument))])),
+            )],
+            rest: a::Rest::Closed,
+        })
+    };
+    dependency.header.types = vec![
+        a::DeclaredType {
+            exported: true,
+            metadata: Default::default(),
+            name: "dep@1.0.0::Action".into(),
+            params: vec![parameter(a::Sense::Effects)],
+            scheme: a::Scheme {
+                count: 1,
+                ..artifact_scheme(function(a::Row {
+                    labels: Vec::new(),
+                    rest: a::Rest::Bound(0),
+                }))
+            },
+        },
+        a::DeclaredType {
+            exported: true,
+            metadata: Default::default(),
+            name: "dep@1.0.0::Record".into(),
+            params: Vec::new(),
+            scheme: artifact_scheme(artifact_struct(vec![
+                (
+                    "ordinary".into(),
+                    field(application(
+                        "Use",
+                        function(a::Row {
+                            labels: Vec::new(),
+                            rest: a::Rest::Closed,
+                        }),
+                    )),
+                ),
+                (
+                    "effects".into(),
+                    field(application("Wrap", a::Type::Sum(io()))),
+                ),
+                (
+                    "named".into(),
+                    field(a::Type::Named {
+                        name: "dep@1.0.0::Action".into(),
+                        args: vec![a::Type::Sum(io())],
+                    }),
+                ),
+            ])),
+        },
+    ];
+    let (mint, out) = build_imported("type Expanded = { ..dep::Record }", "dep", &dependency);
+    assert!(out.errors.is_empty(), "{:?}", out.errors);
+    let inferred = inference::infer(&mint, &out.program, inference::Trace::Complete);
+    assert!(inferred.errors().is_empty(), "{:?}", inferred.errors());
+    let ty = inferred.semantics().aliases()[&type_symbol(&mint, &out, "Expanded")].body();
+    let Ty::Struct(row) = ty.as_ref() else {
+        panic!("expected struct")
+    };
+    let Ty::Arrow(_, _, effects) = row.labels["ordinary"].ty.as_ref() else {
+        panic!("expected function")
+    };
+    let Ty::Struct(arguments) = effects.labels.values().next().unwrap().ty.as_ref() else {
+        panic!("expected effect arguments")
+    };
+    assert!(matches!(
+        arguments.labels.values().next().unwrap().ty.as_ref(),
+        Ty::Arrow(_, _, _)
+    ));
 }
 
 #[test]
@@ -2228,16 +2572,19 @@ fn applying_an_undeclared_name_is_an_undefined_type() {
     );
 }
 
-/// A `..` names a rest, and a rest is a variable: a declaration's parameter, or
-/// one of the annotation it is written in. A declared *type* of the same
-/// spelling has nothing to do with it, and cannot even be written there — a
-/// bare name after the dots is refused where it is read.
+/// A bare name now resolves as a fixed spread; the sigilled spelling remains
+/// a generic tail independent of any declared type with the same name.
 #[test]
-fn a_tail_naming_a_declared_type_is_not_a_rest() {
+fn a_named_fixed_spread_must_resolve_to_a_row() {
     let src = "type T = Nat  let f : { x: Nat, ..T } -> Nat = fn r => r.x";
-    let out = ruddy::parse::parse(ruddy::token::lex(src, FileID::GENERATED).tokens);
-    assert_eq!(out.errors.len(), 1, "errors: {:#?}", out.errors);
-    assert_eq!(out.errors[0].span.start, src.rfind('T').expect("the tail"));
+    let (_, out) = build_src(src);
+    assert!(
+        matches!(out.errors.as_slice(), [error] if matches!(error.kind, ErrorKind::NotARow { sense: Sense::Row }))
+    );
+    assert_eq!(
+        out.source.span(out.errors[0].at).start,
+        src.rfind('T').expect("the spread")
+    );
 
     // Written with its sigil it is a rest like any other, and the declaration
     // it shares a spelling with is untouched: a variable is not a name of
@@ -3754,7 +4101,7 @@ fn tuples_lower_to_canonical_structs() {
         .annotation
         .as_ref()
         .expect("the tuple type annotation");
-    let TypeKind::Struct { fields, tail } = &annotation.ty.anchored else {
+    let TypeKind::Struct { fields, tail, .. } = &annotation.ty.anchored else {
         panic!("a tuple type lowers to a struct type");
     };
     assert!(tail.is_none());
@@ -4565,7 +4912,7 @@ fn an_effect_declares_its_operations() {
     assert!(matches!(write.from.anchored, TypeKind::Prim(Prim::Nat)));
     assert!(matches!(
         write.to.anchored,
-        TypeKind::Struct { ref fields, tail: None } if fields.is_empty()
+        TypeKind::Struct { ref fields, tail: None, .. } if fields.is_empty()
     ));
 
     let (mint, out) = built("effect Nil");
@@ -5706,17 +6053,25 @@ fn an_undeclared_name_is_undefined_wherever_it_is_used() {
         );
     }
 
-    // A `..` and a `when` take no bare name at all: each stands for something
-    // the sigil introduces, so there is nothing there for a name to resolve to
-    // and the parser never builds one.
+    // A fixed spread resolves its named operand just like any type use.
     for src in [
         "let bad : { x: Nat, ..r } -> Nat = fn p => p.x",
         "let bad : (#A Nat | ..r) -> Nat = fn p => 0n",
-        "let bad : { x when a: Nat } -> Nat = fn p => 0n",
     ] {
-        let out = ruddy::parse::parse(ruddy::token::lex(src, FileID::GENERATED).tokens);
-        assert!(!out.errors.is_empty(), "{src}: {:#?}", out.errors);
+        let (_, out) = build_src(src);
+        assert!(
+            matches!(out.errors.as_slice(), [error] if matches!(&error.kind, ErrorKind::Undefined { name, namespace: Namespace::Types } if name == "r"))
+        );
     }
+    // Presence variables still require their sigil.
+    let parsed = parse::parse(
+        lex(
+            "let bad : { x when a: Nat } -> Nat = fn p => 0n",
+            FileID::GENERATED,
+        )
+        .tokens,
+    );
+    assert!(!parsed.errors.is_empty());
 
     // A sigilled name is a variable wherever it is written, and needs nothing.
     let (_, out) = build_src("let good : 'a -> { x: Nat, ..'r } -> Nat = fn x => fn p => p.x");

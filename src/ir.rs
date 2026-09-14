@@ -1,3 +1,5 @@
+mod fixed_spreads;
+
 use std::{
     collections::{HashMap, HashSet},
     hash::{Hash, Hasher},
@@ -742,6 +744,8 @@ pub enum TypeKind {
     Mut(Box<Type>, Box<Type>),
     Struct {
         fields: IndexMap<String, TypeField>,
+        /// Fixed operands retained for argument validation after their fields expand.
+        spreads: Vec<FixedSpread>,
         /// The `..` tail, when the struct type was written open. Inside a
         /// `type` declaration this is `Some` only for a tail naming a row
         /// parameter — see [`ErrorKind::OpenDeclaredType`].
@@ -754,6 +758,7 @@ pub enum TypeKind {
     /// that it is about fields.
     Sum {
         cases: IndexMap<String, SumCase>,
+        spreads: Vec<FixedSpread>,
         tail: Option<Tail>,
     },
     Arrow {
@@ -1162,7 +1167,7 @@ fn declaration_variances(
                             work.push((element, polarity));
                         }
                     }
-                    TypeKind::Struct { fields, tail } => {
+                    TypeKind::Struct { fields, tail, .. } => {
                         work.extend(fields.values().filter_map(|field| match field {
                             TypeField::Written { value, .. } => Some((value, positive)),
                             TypeField::Absent { .. } => None,
@@ -1175,7 +1180,7 @@ fn declaration_variances(
                             *out.entry((*owner, *index)).or_default() |= bit;
                         }
                     }
-                    TypeKind::Sum { cases, tail } => {
+                    TypeKind::Sum { cases, tail, .. } => {
                         work.extend(cases.values().filter_map(|case| match case {
                             SumCase::Written {
                                 payload: Some(value),
@@ -1386,6 +1391,14 @@ pub enum EffectLabel {
         args: Vec<Type>,
         expanded: bool,
     },
+}
+
+/// A fixed operand retained until argument validation finishes. Expansion is
+/// recorded because effect aliases may copy an already-expanded row template.
+#[derive(Debug, Clone)]
+pub struct FixedSpread {
+    pub value: Type,
+    pub expanded: bool,
 }
 
 /// The `..` tail of a struct type: what is said about the fields not named.
@@ -1642,6 +1655,10 @@ pub enum ErrorKind {
     /// of its own rather than that one because a hole is not a row's openness —
     /// there is no shape to word it in.
     HoleInDeclaration,
+    /// A fixed spread must have a closed outer row.
+    OpenFixedSpread,
+    /// A fixed spread operand is a named type or an application of one.
+    InvalidFixedSpread,
     /// A `_` in an operation signature. Operation signatures are fixed
     /// interfaces just like declared types, but this context is kept distinct
     /// so diagnostics do not describe the hole as part of a type declaration.
@@ -2215,6 +2232,10 @@ struct Builder<'a> {
     lifted_aliases: HashSet<Symbol>,
     // Private type declarations installed before kind inference.
     row_templates: IndexMap<Symbol, Decl<Type>>,
+    imported_row_sources: HashMap<Symbol, (&'a artifact::Type, usize)>,
+    imported_symbols: HashMap<(Namespace, String), Symbol>,
+    imported_effect_rows: ImportedEffectRows,
+    fixed_spreads: Option<fixed_spreads::Expander<'a>>,
     /// The aliases being expanded, innermost last: an alias met again while it
     /// is on this stack is a cycle.
     expanding: Vec<Symbol>,
@@ -2968,6 +2989,10 @@ pub fn build_with_interfaces(
         alias_bodies: HashMap::new(),
         lifted_aliases: HashSet::new(),
         row_templates: IndexMap::new(),
+        imported_row_sources: HashMap::new(),
+        imported_symbols: HashMap::new(),
+        imported_effect_rows: ImportedEffectRows::default(),
+        fixed_spreads: None,
         expanding: Vec::new(),
         cyclic: HashSet::new(),
         imported_aliases: HashSet::new(),
@@ -3197,6 +3222,14 @@ pub fn build_with_interfaces(
         b.alias_body(symbol);
     }
     program.types.extend(std::mem::take(&mut b.row_templates));
+    let mut fixed_spreads = fixed_spreads::Expander::new(
+        &program,
+        &b.imported_row_sources,
+        &b.imported_symbols,
+        &b.imported_effect_rows,
+    );
+    fixed_spreads.declarations(&mut program);
+    b.errors.append(&mut fixed_spreads.errors);
     // A loop of bare names is the one recursion that cannot be allowed, and it
     // is what mutual visibility just made writable. See [`ErrorKind::Circular`]
     // for why it means nothing, and [`Solve::unify`](crate::inference) for what
@@ -3329,6 +3362,7 @@ pub fn build_with_interfaces(
     );
     kinds.extend(b.imported_effect_params.clone());
     b.parameter_kinds = kinds.clone();
+    b.fixed_spreads = Some(fixed_spreads);
     // Every definition's name is bound before any definition's body is read —
     // the hoist the `type` half above already gets, and for the same reason.
     // That is the whole of what makes a definition able to name itself and two
@@ -3679,7 +3713,10 @@ fn array_intrinsic_signature(
     /// The two halves of a written pair `(A, B)`: the closed positional
     /// struct a tuple type lowers to, with no `when` on either field.
     fn pair(ty: &Type) -> Option<(&Type, &Type)> {
-        let TypeKind::Struct { fields, tail: None } = &ty.anchored else {
+        let TypeKind::Struct {
+            fields, tail: None, ..
+        } = &ty.anchored
+        else {
             return None;
         };
         match (fields.len(), fields.get("0"), fields.get("1")) {
@@ -3705,7 +3742,10 @@ fn array_intrinsic_signature(
             return None;
         };
         let declaration = declarations.get(head)?;
-        let TypeKind::Sum { cases, tail: None } = &declaration.value.anchored else {
+        let TypeKind::Sum {
+            cases, tail: None, ..
+        } = &declaration.value.anchored
+        else {
             return None;
         };
         let some = cases.get("Some")?;
@@ -3822,18 +3862,13 @@ fn imported_symbol(
     symbol
 }
 
-/// Whether a published type is the empty closed struct: what an effects
-/// argument's arrow goes from and to.
-fn is_unit(ty: &artifact::Type) -> bool {
-    matches!(ty, artifact::Type::Struct(row) if row.labels.is_empty() && matches!(row.rest, artifact::Rest::Closed))
-}
-
 /// A published type read back as the written type it stands for, so that an
 /// imported alias body can be substituted into and spliced exactly as a local
 /// one is. Bound positions become the alias's parameters, named types the
 /// imported declarations, and effect labels the imported effects; what has
 /// no written form — a solver variable, a rigid, an undecided type — absorbs
-/// as the error type. Bounded in depth, since an imported tree is data.
+/// as the error type. An explicit work stack preserves arbitrarily nested
+/// payloads without recursing through the imported tree.
 fn imported_syntax(
     mint: &mut Mint,
     ty: &artifact::Type,
@@ -3841,271 +3876,320 @@ fn imported_syntax(
     symbols: &mut HashMap<(Namespace, String), Symbol>,
     names: &mut IndexMap<Symbol, artifact::QualifiedName>,
     effect_rows: &ImportedEffectRows,
-    depth: usize,
 ) -> Type {
-    let span = Anchor::GENERATED;
-    if depth > 256 {
-        return span.anchor(TypeKind::Error);
+    imported_syntax_resolved(
+        ty,
+        params,
+        &mut |namespace, name| Some(imported_symbol(mint, namespace, name, symbols, names)),
+        effect_rows,
+    )
+}
+
+/// Flatten composed imported rows with the same outer-label precedence used
+/// by the semantic importer. An empty wrapper does not make a closed row open.
+fn imported_row_entries(
+    row: &artifact::Row,
+) -> (IndexMap<&String, &artifact::RowField>, &artifact::Rest) {
+    let mut entries = IndexMap::new();
+    let mut row = row;
+    loop {
+        for (name, field) in &row.labels {
+            entries.entry(name).or_insert(field);
+        }
+        match &row.rest {
+            artifact::Rest::More(more) => row = more,
+            rest => return (entries, rest),
+        }
     }
+}
+
+fn imported_syntax_resolved(
+    ty: &artifact::Type,
+    params: &[Symbol],
+    resolve: &mut impl FnMut(Namespace, &str) -> Option<Symbol>,
+    effect_rows: &ImportedEffectRows,
+) -> Type {
+    enum Work<'a> {
+        Read(&'a artifact::Type, bool),
+        Finish(usize, Box<dyn FnOnce(Vec<Type>) -> TypeKind + 'a>),
+    }
+    fn queue<'a>(
+        work: &mut Vec<Work<'a>>,
+        children: Vec<(&'a artifact::Type, bool)>,
+        finish: impl FnOnce(Vec<Type>) -> TypeKind + 'a,
+    ) {
+        work.push(Work::Finish(children.len(), Box::new(finish)));
+        work.extend(
+            children
+                .into_iter()
+                .rev()
+                .map(|(ty, effects)| Work::Read(ty, effects)),
+        );
+    }
+    let at = Anchor::GENERATED;
     let tail_of = |rest: &artifact::Rest| match rest {
         artifact::Rest::Closed => None,
         artifact::Rest::Bound(index) => params.get(*index as usize).map(|symbol| Tail {
-            at: span,
+            at,
             of: Row::Param {
                 symbol: *symbol,
                 index: *index,
             },
         }),
         _ => Some(Tail {
-            at: span,
+            at,
             of: Row::Anything,
         }),
     };
-    let tracked = match ty {
-        artifact::Type::Nat => TypeKind::Prim(Prim::Nat),
-        artifact::Type::Int => TypeKind::Prim(Prim::Int),
-        artifact::Type::Fixed(kind) => TypeKind::Prim(Prim::Fixed(*kind)),
-        artifact::Type::Real => TypeKind::Prim(Prim::Real),
-        artifact::Type::String => TypeKind::Prim(Prim::String),
-        artifact::Type::Bool => TypeKind::Prim(Prim::Bool),
-        artifact::Type::ForeignValue => TypeKind::Prim(Prim::ForeignValue),
-        artifact::Type::Bound(index) => match params.get(*index as usize) {
-            Some(symbol) => TypeKind::Param {
-                symbol: *symbol,
-                index: *index,
-            },
-            None => TypeKind::Error,
-        },
-        artifact::Type::Package(body) => {
-            return imported_syntax(mint, body, params, symbols, names, effect_rows, depth + 1);
-        }
-        artifact::Type::Hidden { binder, name, body } => TypeKind::Hidden {
-            id: *binder,
-            name: name.clone(),
-            body: Box::new(imported_syntax(
-                mint,
-                body,
-                params,
-                symbols,
-                names,
-                effect_rows,
-                depth + 1,
-            )),
-        },
-        artifact::Type::HiddenVar { binder, name } => TypeKind::Scoped {
-            id: *binder,
-            name: name.clone(),
-        },
-        artifact::Type::Mut(region, element) => TypeKind::Mut(
-            Box::new(imported_syntax(
-                mint,
-                region,
-                params,
-                symbols,
-                names,
-                effect_rows,
-                depth + 1,
-            )),
-            Box::new(imported_syntax(
-                mint,
-                element,
-                params,
-                symbols,
-                names,
-                effect_rows,
-                depth + 1,
-            )),
-        ),
-        artifact::Type::Mirror(element) => TypeKind::Mirror(Box::new(imported_syntax(
-            mint,
-            element,
-            params,
-            symbols,
-            names,
-            effect_rows,
-            depth + 1,
-        ))),
-        artifact::Type::Array(element) => TypeKind::Array(Box::new(imported_syntax(
-            mint,
-            element,
-            params,
-            symbols,
-            names,
-            effect_rows,
-            depth + 1,
-        ))),
-        artifact::Type::Named { name, args } => {
-            let head = imported_symbol(mint, Namespace::Types, name, symbols, names);
-            match args.is_empty() {
-                true => TypeKind::Ident(head),
-                false => TypeKind::Apply {
-                    head,
-                    head_at: span,
-                    args: args
-                        .iter()
-                        .map(|arg| {
-                            imported_syntax(
-                                mint,
-                                arg,
-                                params,
-                                symbols,
-                                names,
-                                effect_rows,
-                                depth + 1,
-                            )
-                        })
-                        .collect(),
-                },
+    let mut work = vec![Work::Read(ty, false)];
+    let mut values: Vec<Type> = Vec::new();
+    while let Some(next) = work.pop() {
+        let (ty, is_effects) = match next {
+            Work::Finish(count, finish) => {
+                let children = values.split_off(values.len() - count);
+                values.push(at.anchor(finish(children)));
+                continue;
             }
-        }
-        artifact::Type::Struct(row) => {
-            let mut fields = IndexMap::new();
-            for (name, field) in &row.labels {
-                let field = match field.presence {
-                    artifact::Presence::Present => TypeField::Written {
-                        name_at: span,
-                        when: None,
-                        value: imported_syntax(
-                            mint,
-                            &field.ty,
-                            params,
-                            symbols,
-                            names,
-                            effect_rows,
-                            depth + 1,
-                        ),
-                    },
-                    artifact::Presence::Absent => TypeField::Absent { name_at: span },
-                    _ => return span.anchor(TypeKind::Error),
-                };
-                fields.insert(name.clone(), field);
-            }
-            TypeKind::Struct {
-                fields,
-                tail: tail_of(&row.rest),
-            }
-        }
-        artifact::Type::Sum(row) => {
-            let mut cases = IndexMap::new();
-            for (name, field) in &row.labels {
-                let case = match field.presence {
-                    artifact::Presence::Present => SumCase::Written {
-                        name_at: span,
-                        when: None,
-                        payload: Some(imported_syntax(
-                            mint,
-                            &field.ty,
-                            params,
-                            symbols,
-                            names,
-                            effect_rows,
-                            depth + 1,
-                        )),
-                    },
-                    artifact::Presence::Absent => SumCase::Absent { name_at: span },
-                    _ => return span.anchor(TypeKind::Error),
-                };
-                cases.insert(name.clone(), case);
-            }
-            TypeKind::Sum {
-                cases,
-                tail: tail_of(&row.rest),
-            }
-        }
-        artifact::Type::Arrow(from, to, row) => {
-            let mut effects = IndexMap::new();
-            for (label, field) in &row.labels {
+            Work::Read(ty, effects) => (ty, effects),
+        };
+        if is_effects && let artifact::Type::Sum(row) | artifact::Type::Arrow(_, _, row) = ty {
+            let (entries, rest) = imported_row_entries(row);
+            let tail = tail_of(rest);
+            let mut labels = Vec::new();
+            let mut children = Vec::new();
+            for (label, field) in entries {
                 let key = effect_rows.label(label);
-                let Some(symbol) = effect_rows.symbol(&key, symbols) else {
+                let Some((qualified, _)) = effect_rows
+                    .identities
+                    .iter()
+                    .find(|(_, identity)| identity.row_key() == key)
+                else {
                     continue;
                 };
-                let args = match &field.ty {
-                    artifact::Type::Struct(payload) => payload
-                        .labels
-                        .iter()
-                        .map(|(_, arg)| match &arg.ty {
-                            // An effects argument: the row its arrow carries,
-                            // read back as the row of effects it was.
-                            artifact::Type::Arrow(from, to, _) if is_unit(from) && is_unit(to) => {
-                                let arrow = imported_syntax(
-                                    mint,
-                                    &arg.ty,
-                                    params,
-                                    symbols,
-                                    names,
-                                    effect_rows,
-                                    depth + 1,
-                                );
-                                match arrow.anchored {
-                                    TypeKind::Arrow { effects, .. } => {
-                                        span.anchor(TypeKind::Effects(effects))
-                                    }
-                                    other => span.anchor(other),
-                                }
-                            }
-                            _ => imported_syntax(
-                                mint,
-                                &arg.ty,
-                                params,
-                                symbols,
-                                names,
-                                effect_rows,
-                                depth + 1,
-                            ),
-                        })
-                        .collect(),
-                    _ => Vec::new(),
+                let Some(symbol) = resolve(Namespace::Effects, qualified) else {
+                    continue;
                 };
-                let lowered = match field.presence {
-                    artifact::Presence::Absent => EffectLabel::Absent {
-                        name_at: span,
-                        symbol,
-                        args,
-                        expanded: false,
-                    },
-                    _ => EffectLabel::Written {
-                        name_at: span,
-                        symbol,
-                        args,
-                        expanded: false,
-                        when: None,
-                    },
-                };
-                effects.insert(EffectId::pending(symbol), lowered);
+                let mut count = 0;
+                if let artifact::Type::Struct(payload) = &field.ty {
+                    let (arguments, _) = imported_row_entries(payload);
+                    for (index, arg) in arguments.values().enumerate() {
+                        children.push((&arg.ty, effect_rows.argument_is_effects(qualified, index)));
+                        count += 1;
+                    }
+                }
+                labels.push((
+                    symbol,
+                    matches!(field.presence, artifact::Presence::Absent),
+                    count,
+                ));
             }
-            let written = !effects.is_empty() || !matches!(row.rest, artifact::Rest::Closed);
-            TypeKind::Arrow {
-                from: Box::new(imported_syntax(
-                    mint,
-                    from,
-                    params,
-                    symbols,
-                    names,
-                    effect_rows,
-                    depth + 1,
-                )),
-                to: Box::new(imported_syntax(
-                    mint,
-                    to,
-                    params,
-                    symbols,
-                    names,
-                    effect_rows,
-                    depth + 1,
-                )),
-                effects: Box::new(EffectRow {
-                    at: span,
-                    written,
+            queue(&mut work, children, move |children| {
+                let mut children = children.into_iter();
+                let mut effects = IndexMap::new();
+                for (symbol, absent, count) in labels {
+                    let args = children.by_ref().take(count).collect();
+                    let label = if absent {
+                        EffectLabel::Absent {
+                            name_at: at,
+                            symbol,
+                            args,
+                            expanded: false,
+                        }
+                    } else {
+                        EffectLabel::Written {
+                            name_at: at,
+                            symbol,
+                            args,
+                            expanded: false,
+                            when: None,
+                        }
+                    };
+                    effects.insert(EffectId::pending(symbol), label);
+                }
+                TypeKind::Effects(Box::new(EffectRow {
+                    at,
+                    written: !effects.is_empty() || tail.is_some(),
                     effects,
-                    tail: tail_of(&row.rest),
-                }),
+                    tail,
+                }))
+            });
+            continue;
+        }
+        let leaf = match ty {
+            artifact::Type::Nat => TypeKind::Prim(Prim::Nat),
+            artifact::Type::Int => TypeKind::Prim(Prim::Int),
+            artifact::Type::Fixed(kind) => TypeKind::Prim(Prim::Fixed(*kind)),
+            artifact::Type::Real => TypeKind::Prim(Prim::Real),
+            artifact::Type::String => TypeKind::Prim(Prim::String),
+            artifact::Type::Bool => TypeKind::Prim(Prim::Bool),
+            artifact::Type::ForeignValue => TypeKind::Prim(Prim::ForeignValue),
+            artifact::Type::Bound(index) => {
+                params
+                    .get(*index as usize)
+                    .map_or(TypeKind::Error, |symbol| TypeKind::Param {
+                        symbol: *symbol,
+                        index: *index,
+                    })
             }
-        }
-        artifact::Type::Var(_) | artifact::Type::Rigid { .. } | artifact::Type::Undecided => {
-            TypeKind::Error
-        }
-    };
-    span.anchor(tracked)
+            artifact::Type::HiddenVar { binder, name } => TypeKind::Scoped {
+                id: *binder,
+                name: name.clone(),
+            },
+            artifact::Type::Package(body) => {
+                work.push(Work::Read(body, is_effects));
+                continue;
+            }
+            artifact::Type::Hidden { binder, name, body } => {
+                let (id, name) = (*binder, name.clone());
+                queue(&mut work, vec![(body, false)], move |mut children| {
+                    TypeKind::Hidden {
+                        id,
+                        name,
+                        body: Box::new(children.pop().unwrap()),
+                    }
+                });
+                continue;
+            }
+            artifact::Type::Array(element) => {
+                queue(&mut work, vec![(element, false)], |mut children| {
+                    TypeKind::Array(Box::new(children.pop().unwrap()))
+                });
+                continue;
+            }
+            artifact::Type::Mirror(element) => {
+                queue(&mut work, vec![(element, false)], |mut children| {
+                    TypeKind::Mirror(Box::new(children.pop().unwrap()))
+                });
+                continue;
+            }
+            artifact::Type::Mut(region, element) => {
+                queue(
+                    &mut work,
+                    vec![(region, false), (element, false)],
+                    |mut children| {
+                        let element = children.pop().unwrap();
+                        TypeKind::Mut(Box::new(children.pop().unwrap()), Box::new(element))
+                    },
+                );
+                continue;
+            }
+            artifact::Type::Named { name, args } => {
+                let head = resolve(Namespace::Types, name).unwrap_or(Symbol::GENERATED);
+                if args.is_empty() {
+                    TypeKind::Ident(head)
+                } else {
+                    queue(
+                        &mut work,
+                        args.iter()
+                            .enumerate()
+                            .map(|(index, arg)| (arg, effect_rows.argument_is_effects(name, index)))
+                            .collect(),
+                        move |args| TypeKind::Apply {
+                            head,
+                            head_at: at,
+                            args,
+                        },
+                    );
+                    continue;
+                }
+            }
+            artifact::Type::Struct(row) | artifact::Type::Sum(row) => {
+                let sum = matches!(ty, artifact::Type::Sum(_));
+                let (entries, rest) = imported_row_entries(row);
+                let tail = tail_of(rest);
+                if entries.values().any(|field| {
+                    !matches!(
+                        field.presence,
+                        artifact::Presence::Present | artifact::Presence::Absent
+                    )
+                }) {
+                    TypeKind::Error
+                } else {
+                    let mut labels = Vec::new();
+                    let mut children = Vec::new();
+                    for (name, field) in entries {
+                        let present = matches!(field.presence, artifact::Presence::Present);
+                        labels.push((name.clone(), present));
+                        if present {
+                            children.push((&field.ty, false));
+                        }
+                    }
+                    queue(&mut work, children, move |children| {
+                        let mut children = children.into_iter();
+                        if sum {
+                            let cases = labels
+                                .into_iter()
+                                .map(|(name, present)| {
+                                    (
+                                        name,
+                                        if present {
+                                            SumCase::Written {
+                                                name_at: at,
+                                                when: None,
+                                                payload: Some(children.next().unwrap()),
+                                            }
+                                        } else {
+                                            SumCase::Absent { name_at: at }
+                                        },
+                                    )
+                                })
+                                .collect();
+                            TypeKind::Sum {
+                                cases,
+                                spreads: Vec::new(),
+                                tail,
+                            }
+                        } else {
+                            let fields = labels
+                                .into_iter()
+                                .map(|(name, present)| {
+                                    (
+                                        name,
+                                        if present {
+                                            TypeField::Written {
+                                                name_at: at,
+                                                when: None,
+                                                value: children.next().unwrap(),
+                                            }
+                                        } else {
+                                            TypeField::Absent { name_at: at }
+                                        },
+                                    )
+                                })
+                                .collect();
+                            TypeKind::Struct {
+                                fields,
+                                spreads: Vec::new(),
+                                tail,
+                            }
+                        }
+                    });
+                    continue;
+                }
+            }
+            artifact::Type::Arrow(from, to, _) => {
+                queue(
+                    &mut work,
+                    vec![(from, false), (to, false), (ty, true)],
+                    |children| {
+                        let mut children = children.into_iter();
+                        let from = Box::new(children.next().unwrap());
+                        let to = Box::new(children.next().unwrap());
+                        let TypeKind::Effects(effects) = children.next().unwrap().anchored else {
+                            unreachable!("the arrow's row was converted as effects");
+                        };
+                        TypeKind::Arrow { from, to, effects }
+                    },
+                );
+                continue;
+            }
+            artifact::Type::Var(_) | artifact::Type::Rigid { .. } | artifact::Type::Undecided => {
+                TypeKind::Error
+            }
+        };
+        values.push(at.anchor(leaf));
+    }
+    values.pop().expect("one imported type leaves one result")
 }
 
 fn import_scheme(
@@ -4474,7 +4558,7 @@ fn formula_bounds_valid(formula: &crate::types::Formula, presences: u32) -> bool
 /// types which refer to them. Generated row labels still contain the published
 /// interface text, so carry the corresponding key rewrite and the published
 /// senses of named arguments through the stack-safe type importer.
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct ImportedEffectRows {
     labels: HashMap<String, String>,
     /// A leaf name with exactly one known structural declaration. This closes
@@ -4501,16 +4585,6 @@ impl ImportedEffectRows {
                 }
             }
         }
-    }
-
-    /// The imported effect an identity's row key names, when this bundle
-    /// imported one with that identity.
-    fn symbol(&self, key: &str, symbols: &HashMap<(Namespace, String), Symbol>) -> Option<Symbol> {
-        self.identities
-            .iter()
-            .find(|(_, identity)| identity.row_key() == key)
-            .and_then(|(qualified, _)| symbols.get(&(Namespace::Effects, qualified.clone())))
-            .copied()
     }
 
     fn label(&self, label: &str) -> String {
@@ -5420,7 +5494,7 @@ impl RegularType<'_> {
                         work.push(Work::Make("mirror".into(), vec!["of".into()]));
                         work.push(Work::Type(element, args));
                     }
-                    TypeKind::Struct { fields, tail } => {
+                    TypeKind::Struct { fields, tail, .. } => {
                         let labels = fields
                             .iter()
                             .map(|(name, field)| {
@@ -5444,7 +5518,7 @@ impl RegularType<'_> {
                         }
                         work.push(Work::CoreTail(tail, args));
                     }
-                    TypeKind::Sum { cases, tail } => {
+                    TypeKind::Sum { cases, tail, .. } => {
                         let labels = cases
                             .iter()
                             .map(|(name, case)| {
@@ -6700,14 +6774,22 @@ fn rekey_row(row: &mut EffectRow, ids: &IndexMap<Symbol, EffectId>, errors: &mut
 
 fn rekey_type(ty: &mut Type, ids: &IndexMap<Symbol, EffectId>, errors: &mut Vec<Error>) {
     match &mut ty.anchored {
-        TypeKind::Struct { fields, .. } => {
+        TypeKind::Struct {
+            fields, spreads, ..
+        } => {
+            for spread in spreads {
+                rekey_type(&mut spread.value, ids, errors);
+            }
             for field in fields.values_mut() {
                 if let TypeField::Written { value, .. } = field {
                     rekey_type(value, ids, errors);
                 }
             }
         }
-        TypeKind::Sum { cases, .. } => {
+        TypeKind::Sum { cases, spreads, .. } => {
+            for spread in spreads {
+                rekey_type(&mut spread.value, ids, errors);
+            }
             for case in cases.values_mut() {
                 if let SumCase::Written {
                     payload: Some(payload),
@@ -7798,7 +7880,11 @@ fn exact_demand(at: Anchor, fields: &[(AnchoredString, Calm)]) -> Annotation {
             (name.anchored.clone(), field)
         })
         .collect();
-    demand(at.anchor(TypeKind::Struct { fields, tail: None }))
+    demand(at.anchor(TypeKind::Struct {
+        fields,
+        tail: None,
+        spreads: Vec::new(),
+    }))
 }
 
 /// The demand a lone-rest array pattern makes of the value a `let` binds it
@@ -8748,7 +8834,14 @@ fn constrain(
             }
             constrain(element, summaries, out);
         }
-        TypeKind::Struct { fields, tail } => {
+        TypeKind::Struct {
+            fields,
+            spreads,
+            tail,
+        } => {
+            for spread in spreads {
+                constrain(&spread.value, summaries, out);
+            }
             for field in fields.values() {
                 if let Some(value) = field.value() {
                     constrain(value, summaries, out);
@@ -8768,7 +8861,14 @@ fn constrain(
         // The struct arm again, about cases: a payload is a type position, and
         // the cases written beside a tail — absent ones included — are what it
         // may not name.
-        TypeKind::Sum { cases, tail } => {
+        TypeKind::Sum {
+            cases,
+            spreads,
+            tail,
+        } => {
+            for spread in spreads {
+                constrain(&spread.value, summaries, out);
+            }
             for case in cases.values() {
                 if let Some(payload) = case.payload() {
                     constrain(payload, summaries, out);
@@ -8869,14 +8969,24 @@ fn row_arguments(program: &mut Program, kinds: &HashMap<Symbol, Vec<ParamKind>>)
                 walk(region, kinds, carries, rows, out);
                 walk(element, kinds, carries, rows, out);
             }
-            TypeKind::Struct { fields, .. } => {
+            TypeKind::Struct {
+                fields, spreads, ..
+            } => {
+                for spread in spreads.iter_mut() {
+                    walk(&mut spread.value, kinds, carries, rows, out);
+                }
+                spreads.clear();
                 for field in fields.values_mut() {
                     if let TypeField::Written { value, .. } = field {
                         walk(value, kinds, carries, rows, out);
                     }
                 }
             }
-            TypeKind::Sum { cases, .. } => {
+            TypeKind::Sum { cases, spreads, .. } => {
+                for spread in spreads.iter_mut() {
+                    walk(&mut spread.value, kinds, carries, rows, out);
+                }
+                spreads.clear();
                 for case in cases.values_mut() {
                     if let SumCase::Written {
                         payload: Some(payload),
@@ -8916,7 +9026,7 @@ fn row_arguments(program: &mut Program, kinds: &HashMap<Symbol, Vec<ParamKind>>)
             // effects with none — which is what a printed pure
             // effects argument reads back as.
             if matches!(kind, Some(kind) if kind.row().is_some_and(|(shape, _)| shape == Sense::Effects))
-                && matches!(&arg.anchored, TypeKind::Sum { cases, tail: None } if cases.is_empty())
+                && matches!(&arg.anchored, TypeKind::Sum { cases, tail: None, .. } if cases.is_empty())
             {
                 let span = arg.at;
                 *arg = span.anchor(TypeKind::Effects(Box::new(EffectRow {
@@ -9386,14 +9496,14 @@ fn row_summaries(
                     })),
                 },
                 Work::Artifact(ty) => match &ty.anchored {
-                    TypeKind::Struct { fields, tail } if shape == Sense::Row => {
+                    TypeKind::Struct { fields, tail, .. } if shape == Sense::Row => {
                         work.push(Work::Value(written_row_summary(
                             fields.keys().cloned(),
                             tail,
                             Shape::Struct,
                         )));
                     }
-                    TypeKind::Sum { cases, tail } if shape == Sense::Row => {
+                    TypeKind::Sum { cases, tail, .. } if shape == Sense::Row => {
                         work.push(Work::Value(written_row_summary(
                             cases.keys().cloned(),
                             tail,
@@ -9542,10 +9652,10 @@ fn written_summary(
 
 fn row_summary(ty: &Type, decls: &HashMap<Symbol, RowSummary>, shape: Sense) -> RowSummary {
     match &ty.anchored {
-        TypeKind::Struct { fields, tail } if shape == Sense::Row => {
+        TypeKind::Struct { fields, tail, .. } if shape == Sense::Row => {
             written_summary(fields.keys().cloned(), tail, Shape::Struct)
         }
-        TypeKind::Sum { cases, tail } if shape == Sense::Row => {
+        TypeKind::Sum { cases, tail, .. } if shape == Sense::Row => {
             written_summary(cases.keys().cloned(), tail, Shape::Sum)
         }
         TypeKind::Effects(effects) if shape == Sense::Effects => written_summary(
@@ -9739,7 +9849,7 @@ fn relevance(types: &IndexMap<Symbol, Decl<Type>>) -> HashSet<Slot> {
                 occurrences(region, under, out);
                 occurrences(element, under, out);
             }
-            TypeKind::Struct { fields, tail } => {
+            TypeKind::Struct { fields, tail, .. } => {
                 for field in fields.values() {
                     if let Some(value) = field.value() {
                         occurrences(value, under, out);
@@ -9753,7 +9863,7 @@ fn relevance(types: &IndexMap<Symbol, Decl<Type>>) -> HashSet<Slot> {
                     out(*index, under);
                 }
             }
-            TypeKind::Sum { cases, tail } => {
+            TypeKind::Sum { cases, tail, .. } => {
                 for case in cases.values() {
                     if let Some(payload) = case.payload() {
                         occurrences(payload, under, out);
@@ -9991,13 +10101,13 @@ fn mentions_a_parameter(ty: &Type) -> bool {
                 || mentions_a_parameter(to)
         }
         TypeKind::Effects(effects) => tails_a_parameter(&effects.tail),
-        TypeKind::Struct { fields, tail } => {
+        TypeKind::Struct { fields, tail, .. } => {
             tails_a_parameter(tail)
                 || fields
                     .values()
                     .any(|field| field.value().is_some_and(mentions_a_parameter))
         }
-        TypeKind::Sum { cases, tail } => {
+        TypeKind::Sum { cases, tail, .. } => {
             tails_a_parameter(tail)
                 || cases
                     .values()
@@ -10032,7 +10142,7 @@ fn unit_data(at: Anchor) -> Data {
     at.anchor(DataKind::Struct(IndexMap::new()))
 }
 
-impl Builder<'_> {
+impl<'a> Builder<'a> {
     /// The anchor of something written at `span` in the definition being
     /// lowered.
     fn anchor(&mut self, span: Span) -> Anchor {
@@ -10295,8 +10405,8 @@ impl Builder<'_> {
     /// use the same strict module lookup as source declarations.
     fn import_dependencies(
         &mut self,
-        dependencies: &[InterfaceImport<'_>],
-        linked: &[&artifact::Header],
+        dependencies: &[InterfaceImport<'a>],
+        linked: &[&'a artifact::Header],
         program: &mut Program,
     ) {
         let mut symbols: HashMap<(Namespace, String), Symbol> = HashMap::new();
@@ -10398,13 +10508,23 @@ impl Builder<'_> {
                 );
                 effect_rows.insert_identity(&declaration.name, identity);
             }
-            for declaration in &dependency.types {
-                if dependency_path(dependency, &declaration.name).is_none() {
+            for (name, params) in dependency
+                .types
+                .iter()
+                .map(|decl| (&decl.name, &decl.params))
+                .chain(
+                    dependency
+                        .effects
+                        .iter()
+                        .map(|decl| (&decl.name, &decl.params)),
+                )
+            {
+                if dependency_path(dependency, name).is_none() {
                     continue;
                 }
                 effect_rows.arguments.insert(
-                    declaration.name.clone(),
-                    declaration.params.iter().map(|param| param.sense).collect(),
+                    name.clone(),
+                    params.iter().map(|param| param.sense).collect(),
                 );
             }
         }
@@ -10566,6 +10686,8 @@ impl Builder<'_> {
                 );
                 let body = clamp_bounds(body, params.len(), 0);
                 let scheme = Scheme::new(params.len() as u32, body);
+                self.imported_row_sources
+                    .insert(symbol, (&declaration.scheme.body, params.len()));
                 self.arities.insert(symbol, params.len());
                 program.external_types.insert(
                     symbol,
@@ -10710,7 +10832,6 @@ impl Builder<'_> {
                                         &mut symbols,
                                         &mut program.external_names,
                                         &effect_rows,
-                                        0,
                                     )
                                 })
                                 .collect();
@@ -10820,6 +10941,8 @@ impl Builder<'_> {
                 },
             );
         }
+        self.imported_symbols = symbols;
+        self.imported_effect_rows = effect_rows;
     }
 
     /// [`declare`](Self::declare) in the module namespace, which has a door of
@@ -11161,8 +11284,13 @@ impl Builder<'_> {
                 TypeKind::Param { symbol, index } => {
                     captured.insert(*index, (*symbol, node.at));
                 }
-                TypeKind::Struct { fields, tail: rest } => {
+                TypeKind::Struct {
+                    fields,
+                    tail: rest,
+                    spreads,
+                } => {
                     pending.extend(fields.values().filter_map(TypeField::value));
+                    pending.extend(spreads.iter().map(|spread| &spread.value));
                     tail = rest.as_ref();
                     structural_tail |= matches!(
                         tail,
@@ -11172,8 +11300,13 @@ impl Builder<'_> {
                         })
                     );
                 }
-                TypeKind::Sum { cases, tail: rest } => {
+                TypeKind::Sum {
+                    cases,
+                    tail: rest,
+                    spreads,
+                } => {
                     pending.extend(cases.values().filter_map(SumCase::payload));
+                    pending.extend(spreads.iter().map(|spread| &spread.value));
                     tail = rest.as_ref();
                     structural_tail |= matches!(
                         tail,
@@ -11571,7 +11704,11 @@ impl Builder<'_> {
                     .cloned()
                     .unwrap_or_else(|| span.anchor(TypeKind::Error));
             }
-            TypeKind::Struct { fields, tail } => {
+            TypeKind::Struct {
+                fields,
+                spreads,
+                tail,
+            } => {
                 let mut fields: IndexMap<String, TypeField> = fields
                     .iter()
                     .map(|(name, field)| {
@@ -11600,6 +11737,7 @@ impl Builder<'_> {
                         Some(TypeKind::Struct {
                             fields: more,
                             tail: rest,
+                            ..
                         }) => {
                             for (name, field) in more {
                                 fields.entry(name.clone()).or_insert_with(|| field.clone());
@@ -11625,9 +11763,23 @@ impl Builder<'_> {
                         }
                     }
                 }
-                TypeKind::Struct { fields, tail }
+                TypeKind::Struct {
+                    fields,
+                    tail,
+                    spreads: spreads
+                        .iter()
+                        .map(|spread| FixedSpread {
+                            value: self.substituted(&spread.value, args),
+                            expanded: spread.expanded,
+                        })
+                        .collect(),
+                }
             }
-            TypeKind::Sum { cases, tail } => {
+            TypeKind::Sum {
+                cases,
+                spreads,
+                tail,
+            } => {
                 let mut cases: IndexMap<String, SumCase> = cases
                     .iter()
                     .map(|(name, case)| {
@@ -11658,6 +11810,7 @@ impl Builder<'_> {
                         Some(TypeKind::Sum {
                             cases: more,
                             tail: rest,
+                            ..
                         }) => {
                             for (name, case) in more {
                                 cases.entry(name.clone()).or_insert_with(|| case.clone());
@@ -11683,7 +11836,17 @@ impl Builder<'_> {
                         }
                     }
                 }
-                TypeKind::Sum { cases, tail }
+                TypeKind::Sum {
+                    cases,
+                    tail,
+                    spreads: spreads
+                        .iter()
+                        .map(|spread| FixedSpread {
+                            value: self.substituted(&spread.value, args),
+                            expanded: spread.expanded,
+                        })
+                        .collect(),
+                }
             }
             TypeKind::Arrow { from, to, effects } => TypeKind::Arrow {
                 from: Box::new(self.substituted(from, args)),
@@ -12966,6 +13129,48 @@ impl Builder<'_> {
     /// it passes through here as the string it was written as. See
     /// [`row`](Self::row).
     fn ty(&mut self, ty: parse::Type, place: Place) -> Type {
+        let mut ty = self.lower_type(ty, place);
+        if let Some(expander) = &mut self.fixed_spreads {
+            // An effect alias supplies types that were lowered before the
+            // declaration table was ready, rather than through this call.
+            if let TypeKind::Arrow { effects, .. } | TypeKind::Effects(effects) = &mut ty.anchored {
+                for label in effects.effects.values_mut() {
+                    for arg in label.args_mut() {
+                        expander.expand(arg);
+                    }
+                }
+            }
+            expander.expand_shallow(&mut ty);
+            self.errors.append(&mut expander.errors);
+        }
+        ty
+    }
+
+    fn type_spreads(&mut self, spreads: Vec<parse::TypeSpread>, place: Place) -> Vec<FixedSpread> {
+        spreads
+            .into_iter()
+            .map(|spread| {
+                let named = match &spread.value.tracked {
+                    parse::TypeKind::Ident { .. } => true,
+                    parse::TypeKind::Apply { head, .. } => {
+                        matches!(head.tracked, parse::TypeKind::Ident { .. })
+                    }
+                    _ => false,
+                };
+                let mut value = self.ty(spread.value, place);
+                if !named && !matches!(value.anchored, TypeKind::Error) {
+                    self.error(spread.span, ErrorKind::InvalidFixedSpread);
+                    value.anchored = TypeKind::Error;
+                }
+                FixedSpread {
+                    value,
+                    expanded: false,
+                }
+            })
+            .collect()
+    }
+
+    fn lower_type(&mut self, ty: parse::Type, place: Place) -> Type {
         let span = ty.span;
         let here = self.anchor(span);
         match ty.tracked {
@@ -12997,6 +13202,7 @@ impl Builder<'_> {
             // empty struct, `()` and `{}`, meet here as a closed empty row.
             parse::TypeKind::Unit => here.anchor(TypeKind::Struct {
                 fields: Default::default(),
+                spreads: Vec::new(),
                 tail: None,
             }),
             // A hole is a position left for inference to decide — except in a
@@ -13140,9 +13346,18 @@ impl Builder<'_> {
                         )
                     })
                     .collect();
-                here.anchor(TypeKind::Struct { fields, tail: None })
+                here.anchor(TypeKind::Struct {
+                    fields,
+                    tail: None,
+                    spreads: Vec::new(),
+                })
             }
-            parse::TypeKind::Struct { fields, tail } => {
+            parse::TypeKind::Struct {
+                fields,
+                spreads,
+                tail,
+            } => {
+                let spreads = self.type_spreads(spreads, place);
                 // The values are lowered before openness is judged, so a bad
                 // name inside an open declared type is still reported: the
                 // reader should not have to fix the `..` to be told about it.
@@ -13203,6 +13418,7 @@ impl Builder<'_> {
                 }
                 here.anchor(TypeKind::Struct {
                     fields: lowered,
+                    spreads,
                     tail,
                 })
             }
@@ -13211,7 +13427,12 @@ impl Builder<'_> {
             // re-keying is the same question, and openness is literally the
             // same check — so what differs is the two nouns and the payload a
             // case may not have.
-            parse::TypeKind::Sum { cases, tail } => {
+            parse::TypeKind::Sum {
+                cases,
+                spreads,
+                tail,
+            } => {
+                let spreads = self.type_spreads(spreads, place);
                 let lowered: IndexMap<String, SumCase> = self
                     .labels(
                         cases,
@@ -13264,6 +13485,7 @@ impl Builder<'_> {
                 }
                 here.anchor(TypeKind::Sum {
                     cases: lowered,
+                    spreads,
                     tail,
                 })
             }
@@ -13924,6 +14146,7 @@ impl Builder<'_> {
                 None => {
                     let unit = demand(span.anchor(TypeKind::Struct {
                         fields: IndexMap::new(),
+                        spreads: Vec::new(),
                         tail: None,
                     }));
                     let name = self.fresh("%unit", span);
@@ -14101,6 +14324,7 @@ impl Builder<'_> {
                 None => {
                     let unit = demand(span.anchor(TypeKind::Struct {
                         fields: IndexMap::new(),
+                        spreads: Vec::new(),
                         tail: None,
                     }));
                     let name = self.fresh("%unit", span);

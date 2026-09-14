@@ -2732,7 +2732,11 @@ impl<'a> Printer<'a> {
                 let doc = concat(parts);
                 if signal { broken(doc) } else { group(doc) }
             }
-            TypeKind::Struct { fields, tail } => {
+            TypeKind::Struct {
+                fields,
+                spreads,
+                tail,
+            } => {
                 let mut entries: Vec<(Span, Doc)> = fields
                     .iter()
                     .map(|(name, field)| match field {
@@ -2756,6 +2760,14 @@ impl<'a> Printer<'a> {
                         ),
                     })
                     .collect();
+                entries.extend(spreads.iter().map(|spread| {
+                    let doc = concat(vec![
+                        text(".."),
+                        self.ty_in(&spread.value, prec(&spread.value) < Prec::Atom),
+                    ]);
+                    (spread.span, self.with_comments(spread.span, doc))
+                }));
+                entries.sort_by_key(|(span, _)| span.start);
                 if let Some(tail) = tail {
                     entries.push((
                         tail.span,
@@ -2771,7 +2783,11 @@ impl<'a> Printer<'a> {
                     signal,
                 )
             }
-            TypeKind::Sum { cases, tail } => {
+            TypeKind::Sum {
+                cases,
+                spreads,
+                tail,
+            } => {
                 let mut entries: Vec<(Span, Doc)> = cases
                     .iter()
                     .map(|(name, case)| {
@@ -2794,6 +2810,14 @@ impl<'a> Printer<'a> {
                         (span, self.with_trailing(span, doc))
                     })
                     .collect();
+                entries.extend(spreads.iter().map(|spread| {
+                    let doc = concat(vec![
+                        text(".."),
+                        self.ty_in(&spread.value, prec(&spread.value) < Prec::Atom),
+                    ]);
+                    (spread.span, self.with_trailing(spread.span, doc))
+                }));
+                entries.sort_by_key(|(span, _)| span.start);
                 if let Some(tail) = tail {
                     entries.push((
                         tail.span,
@@ -2803,7 +2827,7 @@ impl<'a> Printer<'a> {
                 // The empty sum, and the sum that is nothing but its tail:
                 // neither writes a case, so neither reads back as a sum
                 // without the bar.
-                if cases.is_empty() {
+                if entries.is_empty() || (cases.is_empty() && spreads.is_empty()) {
                     let mut parts = vec![text("|")];
                     for (span, doc) in entries {
                         parts.push(Doc::Space);
@@ -2823,7 +2847,18 @@ impl<'a> Printer<'a> {
                     parts.extend(self.leading_docs(span));
                     parts.push(if_break(
                         text("| "),
-                        if at == 0 { nil() } else { text(" | ") },
+                        if at == 0 {
+                            if spreads
+                                .first()
+                                .is_some_and(|spread| spread.span.start == span.start)
+                            {
+                                text("| ")
+                            } else {
+                                nil()
+                            }
+                        } else {
+                            text(" | ")
+                        },
                     ));
                     parts.push(doc);
                 }
@@ -3447,7 +3482,11 @@ fn pattern_skeleton(pattern: &Pattern) -> Skel {
 
 fn type_skeleton(ty: &Type) -> Skel {
     match &ty.tracked {
-        TypeKind::Struct { fields, tail } => {
+        TypeKind::Struct {
+            fields,
+            spreads,
+            tail,
+        } => {
             let mut kids: Vec<Skel> = fields
                 .iter()
                 .map(|(name, field)| match field {
@@ -3458,12 +3497,22 @@ fn type_skeleton(ty: &Type) -> Skel {
                     TypeField::Absent => Skel::leaf(name.span),
                 })
                 .collect();
+            kids.extend(
+                spreads
+                    .iter()
+                    .map(|spread| Skel::new(spread.span, vec![type_skeleton(&spread.value)])),
+            );
+            kids.sort_by_key(|kid| kid.span.start);
             if let Some(tail) = tail {
                 kids.push(Skel::leaf(tail.span));
             }
             Skel::new(ty.span, kids).closed()
         }
-        TypeKind::Sum { cases, tail } => {
+        TypeKind::Sum {
+            cases,
+            spreads,
+            tail,
+        } => {
             let mut kids: Vec<Skel> = cases
                 .iter()
                 .map(|(name, case)| {
@@ -3477,6 +3526,12 @@ fn type_skeleton(ty: &Type) -> Skel {
                     )
                 })
                 .collect();
+            kids.extend(
+                spreads
+                    .iter()
+                    .map(|spread| Skel::new(spread.span, vec![type_skeleton(&spread.value)])),
+            );
+            kids.sort_by_key(|kid| kid.span.start);
             if let Some(tail) = tail {
                 kids.push(Skel::leaf(tail.span));
             }

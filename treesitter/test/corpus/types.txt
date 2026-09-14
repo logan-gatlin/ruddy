@@ -373,3 +373,39 @@ let h : hide 'a => hide 'b => ('a, 'b) = p
             (type_variable)
             (type_variable)))))
     (identifier)))
+
+================================================================================
+Fixed type spreads are entries before an optional generic tail
+================================================================================
+
+type Circle = { ..V2, radius: Real, ..Metadata, }
+type Applied 'a 'r = { ..(Value 'a), ..'r }
+type Choice = | ..Cases | #Extra | ..More
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (type_definition
+    (identifier)
+    (annotation
+      (struct_type
+        (fixed_type_spread (identifier))
+        (struct_type_field (identifier) (identifier))
+        (fixed_type_spread (identifier)))))
+  (type_definition
+    (identifier)
+    (type_variable)
+    (type_variable)
+    (annotation
+      (struct_type
+        (fixed_type_spread
+          (parenthesized_type
+            (type_application (identifier) (type_variable))))
+        (rest (type_variable)))))
+  (type_definition
+    (identifier)
+    (annotation
+      (sum_type
+        (fixed_type_spread (identifier))
+        (sum_case (tag))
+        (fixed_type_spread (identifier))))))
