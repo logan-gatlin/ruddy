@@ -1011,6 +1011,7 @@ impl Solve<'_> {
             | Ty::Arrow(..)
             | Ty::Array(_)
             | Ty::Mirror(_)
+            | Ty::TypeInfo(_)
             | Ty::Mut(..)
             | Ty::Sum(_) => {
                 self.not_a_struct(operand_span, exposed, super::StructDemand::Spread, result)
@@ -1220,6 +1221,7 @@ impl Solve<'_> {
             Hidden(*const Ty, Arc<Ty>),
             Array(*const Ty, Arc<Ty>),
             Mirror(*const Ty, Arc<Ty>),
+            TypeInfo(*const Ty, Arc<Ty>),
             Mut(*const Ty, Arc<Ty>),
             Struct(*const Ty, Arc<Ty>),
             Sum(*const Ty, Arc<Ty>),
@@ -1334,6 +1336,11 @@ impl Solve<'_> {
                                     work.push(FingerprintWork::Type(inner.clone()));
                                     continue;
                                 }
+                                Ty::TypeInfo(inner) => {
+                                    work.push(FingerprintWork::TypeInfo(key, ty.clone()));
+                                    work.push(FingerprintWork::Type(inner.clone()));
+                                    continue;
+                                }
                                 Ty::Struct(row) => {
                                     work.push(FingerprintWork::Struct(key, ty.clone()));
                                     work.push(FingerprintWork::Row(row.clone()));
@@ -1383,6 +1390,14 @@ impl Solve<'_> {
                         FingerprintWork::Mirror(key, ty) => {
                             let inner = values.pop().expect("family mirror fingerprint type");
                             let hash = tagged(54, [inner]);
+                            self.types.insert(key, (ty, hash));
+                            values.push(hash);
+                        }
+                        FingerprintWork::TypeInfo(key, ty) => {
+                            let inner = values
+                                .pop()
+                                .expect("family type information fingerprint type");
+                            let hash = tagged(55, [inner]);
                             self.types.insert(key, (ty, hash));
                             values.push(hash);
                         }
@@ -2457,6 +2472,10 @@ impl Solve<'_> {
                             self.step(span, Rule::Array, goal, Effect::Decomposed);
                             work.push(SolveWork::Ty(element.clone(), other.clone(), depth + 1));
                         }
+                        (Ty::TypeInfo(inner), Ty::TypeInfo(other)) => {
+                            self.step(span, Rule::TypeInfo, goal, Effect::Decomposed);
+                            work.push(SolveWork::Ty(inner.clone(), other.clone(), depth + 1));
+                        }
                         (Ty::Mirror(inner), Ty::Mirror(other)) => {
                             self.step(span, Rule::Mirror, goal, Effect::Decomposed);
                             work.push(SolveWork::Ty(inner.clone(), other.clone(), depth + 1));
@@ -2757,7 +2776,7 @@ impl Solve<'_> {
                         Ty::Package(body) | Ty::Hidden { body, .. } => {
                             work.push(Work::Ty(body.clone()))
                         }
-                        Ty::Array(element) | Ty::Mirror(element) => {
+                        Ty::Array(element) | Ty::Mirror(element) | Ty::TypeInfo(element) => {
                             work.push(Work::Ty(element.clone()))
                         }
                         Ty::Mut(region, element) => {
@@ -4194,7 +4213,7 @@ impl Solve<'_> {
                     Ty::Package(body) | Ty::Hidden { body, .. } => {
                         work.push(Work::Type(body.clone()))
                     }
-                    Ty::Array(element) | Ty::Mirror(element) => {
+                    Ty::Array(element) | Ty::Mirror(element) | Ty::TypeInfo(element) => {
                         work.push(Work::Type(element.clone()))
                     }
                     Ty::Mut(region, element) => {
@@ -4465,7 +4484,7 @@ fn region_in(table: &super::Table, ty: &Arc<Ty>) -> Option<Arc<Ty>> {
         }
         match &*ty {
             Ty::Mut(..) => return Some(ty.clone()),
-            Ty::Array(inner) | Ty::Package(inner) | Ty::Mirror(inner) => {
+            Ty::Array(inner) | Ty::Package(inner) | Ty::Mirror(inner) | Ty::TypeInfo(inner) => {
                 work.push(table.resolve(inner));
             }
             Ty::Hidden { body, .. } => work.push(table.resolve(body)),

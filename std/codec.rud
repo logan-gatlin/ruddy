@@ -101,9 +101,11 @@ let unsupported: [TypeStep] -> String -> Result 'a DeriveError = fn path reason 
 
 @private
 let check_node:
-  reflect::Description -> [TypeStep] -> [Nat] -> Nat -> Result [Nat] DeriveError =
-  fn description path visited index =>
-    if array::any (fn seen => nat::equal seen index) visited then #Some visited
+  reflect::Description -> [Bool] -> [TypeStep] -> [Nat] -> Nat -> Result [Nat] DeriveError =
+  fn description possible path visited index =>
+    if not option::unwrap_or true (array::get possible index)
+      or array::any (fn seen => nat::equal seen index) visited then
+      #Some visited
     else
       match array::get description.nodes index with
       | #None => unsupported path "the description has no such node"
@@ -117,16 +119,18 @@ let check_node:
           | #String => #Some seen
           | #Bool => #Some seen
           | #Fixed _ => #Some seen
-          | #Alias target => check_node description path seen target
-          | #Array element => check_node description [#Element, ..path] seen element
+          | #Alias target => check_node description possible path seen target
+          | #Array element => check_node description possible [#Element, ..path] seen element
           | #Record fields =>
             array::try_fold_result
-              (fn seen field => check_node description [#Field field.name, ..path] seen field.node)
+              (fn seen field =>
+                check_node description possible [#Field field.name, ..path] seen field.node)
               seen
               fields
           | #Sum cases =>
             array::try_fold_result
-              (fn seen case => check_node description [#Case case.name, ..path] seen case.node)
+              (fn seen case =>
+                check_node description possible [#Case case.name, ..path] seen case.node)
               seen
               cases
           | #Cell _ => unsupported path "a cell has no default codec"
@@ -134,6 +138,7 @@ let check_node:
           | #Effects _ => unsupported path "an effect row has no default codec"
           | #Hidden _ => unsupported path "a hidden type has no default codec"
           | #Mirror _ => unsupported path "a mirror has no default codec"
+          | #TypeInfo _ => unsupported path "type information has no default codec"
           | #Foreign => unsupported path "a foreign value has no default codec"
           | #Extend _ => unsupported path "an abstract row has no default codec"
           | #Parameter _ => unsupported path "an abstract type has no default codec"
@@ -143,9 +148,25 @@ let check_node:
       end
     end
 
-@doc "Whether a type has a default codec: primitives, arrays, records, sums, and regular recursion among them. Functions, cells, hidden types, mirrors, and foreign values do not, and the error says at which position."
+-- A least fixed point over the finite graph. Unsupported and abstract nodes remain possible: lack
+-- of a codec never proves a position impossible.
+@private
+let possible_nodes: reflect::Description -> [Bool] -> [Bool] = fn description previous => do
+  let possible = fn index => option::unwrap_or true (array::get previous index)
+  let next = array::map
+    (fn node => match node with
+    | #Alias target => possible target
+    | #Record fields => array::all (fn field => possible field.node) fields
+    | #Sum cases => array::any (fn case => possible case.node) cases
+    | _ => true
+    end)
+    description.nodes
+  return if next == previous then next else possible_nodes description next end
+end
+
+@doc "Conservatively check the full description for default codec support, including impossible positions. Functions, cells, hidden types, mirrors, and foreign values are reported with their position. Encoder derivation from authenticated type information instead checks only potentially inhabited parts."
 let validate: reflect::Description -> Result () DeriveError = fn description =>
-  result::map (fn _ => ()) (check_node description [] [] description.root)
+  result::map (fn _ => ()) (check_node description [] [] [] description.root)
 
 -- ── Encoding ───────────────────────────────────────────────────────────────
 
@@ -154,12 +175,28 @@ let field_names: reflect::RecordView 'r -> [String] = fn view =>
   array::map (fn field => match field with | hide 'f { name, .. } => name end) view.fields
 
 @private
-let case_names: reflect::SumView 's -> [String] = fn view =>
-  array::map (fn case => match case with | hide 'p { name, .. } => name end) view.cases
+let described_case_names: reflect::Description -> Nat -> [String] = fn description index =>
+  match array::get description.nodes index with
+  | #Some (#Alias next) => described_case_names description next
+  | #Some (#Sum fields) => array::map (fn field => field.name) fields
+  | _ => []
+  end
+
+@private
+let case_names: reflect::SumView 's -> [String] = fn view => do
+  let description = reflect::describe view.mirror
+  return described_case_names description description.root
+end
+
+@private
+let info_case_names: reflect::InfoSumView 's -> [String] = fn view => do
+  let description = reflect::describe_info view.mirror
+  return described_case_names description description.root
+end
 
 @private
 let encode_elements:
-  [Step] -> Mirror 'e -> Cursor -> ['e] -> Result () Error + !Write =
+  [Step] -> TypeInfo 'e -> Cursor -> ['e] -> Result () Error + !Write =
   fn path element cursor items =>
     result::map
       (fn _ => ())
@@ -176,7 +213,7 @@ let encode_elements:
 
 @private
 let encode_fields:
-  [Step] -> reflect::RecordView 'r -> Cursor -> 'r -> Result () Error + !Write =
+  [Step] -> reflect::InfoRecordView 'r -> Cursor -> 'r -> Result () Error + !Write =
   fn path view cursor value =>
     array::try_fold_result
       (fn _ field => match field with
@@ -193,8 +230,8 @@ let encode_fields:
       view.fields
 
 @private
-let encode_at: [Step] -> Mirror 'a -> 'a -> Result () Error + !Write = fn path mirror value =>
-  match reflect::shape mirror with
+let encode_at: [Step] -> TypeInfo 'a -> 'a -> Result () Error + !Write = fn path mirror value =>
+  match reflect::shape_info mirror with
   | #Nat { read, .. } => at path (!Write.write_nat (read value))
   | #Int { read, .. } => at path (!Write.write_int (read value))
   | #Real { read, .. } => at path (!Write.write_real (read value))
@@ -225,7 +262,13 @@ let encode_at: [Step] -> Mirror 'a -> 'a -> Result () Error + !Write = fn path m
     chain
       (fn cursor =>
         chain (fn _ => at path (!Write.end_record cursor)) (encode_fields path view cursor value))
-      (at path (!Write.begin_record { fields: field_names view }))
+      (at
+        path
+        (!Write.begin_record {
+          fields: array::map
+            (fn field => match field with | hide 'f { name, .. } => name end)
+            view.fields,
+        }))
   | #Sum view =>
     match array::filter_map
       (fn case => match case with
@@ -239,12 +282,13 @@ let encode_at: [Step] -> Mirror 'a -> 'a -> Result () Error + !Write = fn path m
     | [(tag, encode_payload), ..] =>
       chain
         (fn cursor => chain (fn _ => at path (!Write.end_variant cursor)) (encode_payload ()))
-        (at path (!Write.begin_variant { schema: { cases: case_names view }, tag: tag }))
+        (at path (!Write.begin_variant { schema: { cases: info_case_names view }, tag: tag }))
     | [] => fail path (#Custom "the value is no case of its sum")
     end
   | #Function _ => fail path (#Unsupported "a function has no default codec")
   | #Hidden _ => fail path (#Unsupported "a hidden type has no default codec")
   | #Mirror _ => fail path (#Unsupported "a mirror has no default codec")
+  | #TypeInfo _ => fail path (#Unsupported "type information has no default codec")
   | #Foreign => fail path (#Unsupported "a foreign value has no default codec")
   end
 
@@ -342,13 +386,9 @@ let decode_case: [Step] -> reflect::SumView 's -> Cursor -> String -> Result 's 
     | #Some case =>
       match case with
       | hide 'p { mirror, inject, .. } =>
-        match inject with
-        | #Some make =>
-          chain
-            (fn payload => result::map (fn _ => make payload) (at path (!Read.end_variant cursor)))
-            (decode_at [#Case tag, ..path] mirror)
-        | #None => fail path (#Unsupported "the case cannot be made here")
-        end
+        chain
+          (fn payload => result::map (fn _ => inject payload) (at path (!Read.end_variant cursor)))
+          (decode_at [#Case tag, ..path] mirror)
       end
     | #None => fail path (#UnexpectedCase tag)
     end
@@ -404,6 +444,15 @@ let decode_at: [Step] -> Mirror 'a -> Result 'a Error + !Read = fn path mirror =
             (decode_elements path element cursor 0n []))
         (at path (!Read.begin_sequence ()))
     end
+  | #EmptyArray { make, .. } =>
+    chain
+      (fn cursor => chain
+        (fn present =>
+          if present then fail path (#Custom "an empty-only array cannot contain elements")
+          else result::map (fn _ => make []) (at path (!Read.end_sequence cursor))
+          end)
+        (at path (!Read.next_element cursor)))
+      (at path (!Read.begin_sequence ()))
   | #Record view =>
     chain
       (fn cursor =>
@@ -418,41 +467,36 @@ let decode_at: [Step] -> Mirror 'a -> Result 'a Error + !Read = fn path mirror =
     chain
       (fn opened => decode_case path view opened.cursor opened.tag)
       (at path (!Read.begin_variant { cases: case_names view }))
-  | #Function _ => fail path (#Unsupported "a function has no default codec")
-  | #Hidden _ => fail path (#Unsupported "a hidden type has no default codec")
-  | #Mirror _ => fail path (#Unsupported "a mirror has no default codec")
-  | #Foreign => fail path (#Unsupported "a foreign value has no default codec")
   end
 
 -- ── Derivation ─────────────────────────────────────────────────────────────
 
-@doc "The default encoder of a type, from its mirror: the structural one, which writes primitives as themselves, arrays as sequences, records as records of their fields, and sums as variants. A type with a function, hidden type, mirror, or foreign value in it has none, and the error says where."
-let derive_encoder: Mirror 'a -> Result (Encoder 'a) DeriveError = fn mirror => do
-  let description = reflect::describe mirror
+@doc "The default structural encoder from descriptive type information, without construction requirements. It writes primitives, sequences, records, and realizable variants, preserving the full schema and original wire tags. Impossible parts need no codec; unsupported live parts return a derivation error."
+let derive_encoder: TypeInfo 'a -> Result (Encoder 'a) DeriveError = fn mirror => do
+  let description = reflect::describe_info mirror
+  let possible = possible_nodes description (array::map (fn _ => false) description.nodes)
   return result::map
     (fn _ => { schema: description, run: fn value => encode_at [] mirror value })
-    (validate description)
+    (check_node description possible [] [] description.root)
 end
 
-@doc "The default decoder of a type, from its mirror. See `derive_encoder`."
+@doc "The default structural decoder from a constructive mirror. Its constructors are available, while malformed input and format limits remain fallible."
 let derive_decoder: Mirror 'a -> Result (Decoder 'a) DeriveError = fn mirror => do
   let description = reflect::describe mirror
-  return result::map
-    (fn _ => { schema: description, run: fn _ => decode_at [] mirror })
-    (validate description)
+  return #Some { schema: description, run: fn _ => decode_at [] mirror }
 end
 
-@doc "The default codec of a type, from its mirror. See `derive_encoder`."
+@doc "The default encoder and decoder from a constructive mirror. The encoder uses its descriptive evidence and the decoder uses its constructors."
 let derive: Mirror 'a -> Result (Codec 'a) DeriveError = fn mirror =>
   chain
     (fn encoder =>
       result::map (fn decoder => { encoder: encoder, decoder: decoder }) (derive_decoder mirror))
-    (derive_encoder mirror)
+    (derive_encoder (reflect::info mirror))
 
 -- ── Dynamic values ─────────────────────────────────────────────────────────
 
-@doc "One type a registry encodes and decodes dynamically, under an application-owned identity: its mirror and its codec, hidden together so that the codec is known to be the mirror's."
-type Entry = hide 'a => { id: String, mirror: Mirror 'a, codec: Codec 'a }
+@doc "One registered type under an application-owned identity, with authenticated descriptive evidence and its codec hidden together."
+type Entry = hide 'a => { id: String, mirror: TypeInfo 'a, codec: Codec 'a }
 
 @doc "The types a program chooses to write and read as `Any`: a wire identity never manufactures a mirror, so only a registered type can come back with its own."
 type Registry = [Entry]
@@ -460,12 +504,12 @@ type Registry = [Entry]
 @doc "A registry entry with the type's default codec."
 let register: String -> Mirror 'a -> Result Entry DeriveError = fn id mirror =>
   match derive mirror with
-  | #Some codec => #Some (entry id mirror codec)
+  | #Some codec => #Some (entry id (reflect::info mirror) codec)
   | #Error error => #Error error
   end
 
-@doc "A registry entry with an explicit codec."
-let entry: String -> Mirror 'a -> Codec 'a -> Entry = fn id mirror codec =>
+@doc "A registry entry with an explicit codec and descriptive identity evidence. The supplied decoder provides construction; no automatic mirror derivation is required."
+let entry: String -> TypeInfo 'a -> Codec 'a -> Entry = fn id mirror codec =>
   { id: id, mirror: mirror, codec: codec }
 
 @doc "Write an `Any` as a record of the identity its type is registered under and the value, when the registry has an entry whose mirror is the same type."
@@ -474,7 +518,7 @@ let encode_any: Registry -> any::Any -> Result () Error + !Write = fn registry a
   match array::filter_map
     (fn entry => match entry with
     | hide 'e { id, mirror, codec } =>
-      match reflect::same of mirror with
+      match reflect::same_info of mirror with
       | #Some { forward, .. } => #Some (id, fn _ => codec.encoder.run (forward value))
       | #None => #None
       end

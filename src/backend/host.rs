@@ -163,6 +163,11 @@ pub(super) fn native_descriptor(
             Type::Mirror(inner) => {
                 Runtime::Mirror(child(view.child(inner), format!("{path} mirror"), incoming))
             }
+            Type::TypeInfo(inner) => Runtime::TypeInfo(child(
+                view.child(inner),
+                format!("{path} type information"),
+                incoming,
+            )),
             Type::Named { name, args } => {
                 let declaration = declarations
                     .get(name.as_str())
@@ -443,10 +448,14 @@ fn key(
                     work.push(Work::Text(format!("{name:?}:{presence:?};")));
                 }
             }
-            Type::Array(inner) | Type::Package(inner) | Type::Mirror(inner) => {
+            Type::Array(inner)
+            | Type::Package(inner)
+            | Type::Mirror(inner)
+            | Type::TypeInfo(inner) => {
                 out.push_str(match view.ty {
                     Type::Array(_) => "A(",
                     Type::Mirror(_) => "M(",
+                    Type::TypeInfo(_) => "I(",
                     _ => "P(",
                 });
                 work.push(Work::Text(")".into()));
@@ -568,7 +577,7 @@ impl Graph {
                 }
                 Type::Array(inner) => Plan::Array(child(view.child(inner))),
                 // A mirror crosses as the opaque value it is.
-                Type::Mirror(_) => Plan::Value,
+                Type::Mirror(_) | Type::TypeInfo(_) => Plan::Value,
                 Type::Struct(row) | Type::Sum(row) => {
                     let fields = fields(row, view.clone(), declarations);
                     let open = !matches!(fields.rest, Rest::Closed);

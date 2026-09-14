@@ -88,7 +88,7 @@ Observing a host value. Reading a property can run a getter or a proxy trap, so 
 let adapter: () -> Adapter 'a
 ```
 
-The structural adapter for the type this use site infers, made from the mirror the compiler supplies there. No direction carries a function contract.
+The structural adapter for the type this use site infers, made from the runtime type information the compiler supplies there. No direction carries a function contract.
 
 ### apply
 

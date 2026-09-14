@@ -23,16 +23,17 @@ type Node =
   | #Extend { base: Nat, rest: Nat }
   | #Parameter Nat
   | #Mirror Nat
+  | #TypeInfo Nat
   | #Hidden Nat
   | #Variable Nat
 
 @doc "A named position of a record or sum node."
 type Field = { name: String, node: Nat }
 
-@doc "Authentic evidence for the type this position is inferred at. The compiler supplies it: an annotation, a use, or a caller decides the type, never a runtime value."
+@doc "Authentic construction evidence for an inferred type. An annotation, use, or caller selects the type. The compiler requires accessible constructors for every potentially inhabited part and a finite pure construction; empty types and unsupported constructors are compile errors. Generic callers retain this requirement."
 extern mirror: () -> Mirror 'a = "$mirror"
 
-@doc "The mirror of a value's static type at this use. It does not inspect the value."
+@doc "A constructive mirror of a value's static type. It requires the same construction evidence as `mirror`; the value grants no constructor authority. Use `info_of` for observation alone."
 extern type_of: 'a -> Mirror 'a = "$typeOf"
 
 @doc "A mirror's structure as ordinary data. Editing the description grants nothing: it cannot be turned back into a mirror."
@@ -49,7 +50,7 @@ let same: Mirror 'a -> Mirror 'b -> Option { forward: 'a -> 'b, backward: 'b -> 
 @doc "Whether a record field is always there. A mirror describes one exact type, whose fields are all required; the case is kept so a reader written against views handles absence as well."
 type Presence = #Required | #Optional
 
-@doc "The outermost structure of a mirrored type, as views whose operations read and make values of that type. Cells use the opaque Foreign shape and expose no read or write operations. Primitive cases carry the typed conversions; the descriptive cases carry the type's description and no way to make one."
+@doc "Constructive structural views: primitives, records, arrays, empty-only arrays, and sums. Nested mirrors satisfy the same construction contract. Functions, cells, foreign values, hidden packages, and evidence types have no automatic constructors; inspect them with `InfoShape` instead."
 type Shape 'a =
   | #Nat { read: 'a -> Nat, make: Nat -> 'a }
   | #Int { read: 'a -> Int, make: Int -> 'a }
@@ -65,18 +66,22 @@ type Shape 'a =
   | #Int32 { read: 'a -> Int32, make: Int32 -> 'a }
   | #Int64 { read: 'a -> Int64, make: Int64 -> 'a }
   | #Array (ArrayView 'a)
+  | #EmptyArray (EmptyArrayView 'a)
   | #Record (RecordView 'a)
   | #Sum (SumView 'a)
-  | #Function Description
-  | #Hidden Description
-  | #Mirror Description
-  | #Foreign
 
 @doc "An array's element type, hidden, with the conversions between the array and a plain array of that element."
 type ArrayView 'array = hide 'element => {
   element: Mirror 'element,
   read: 'array -> ['element],
   make: ['element] -> 'array,
+}
+
+@doc "An array whose element type is proven empty. Its sole value is the empty array; the element description grants no constructor."
+type EmptyArrayView 'array = {
+  element: Description,
+  read: 'array -> [|],
+  make: [|] -> 'array,
 }
 
 @doc "A record's fields, each with its own hidden type, and a checked builder from bindings back to the record."
@@ -114,13 +119,93 @@ type BuildError =
 @doc "A sum's cases, each with its own hidden payload type."
 type SumView 'sum = { mirror: Mirror 'sum, cases: [SomeCase 'sum] }
 
-@doc "One case of a sum with its payload type hidden. `project` observes the payload when the value is this case; `inject` makes the case, when the mirror proves it may be made."
+@doc "One realizable case, with its payload type hidden. `project` observes the payload and `inject` constructs the case directly. Proven impossible cases are omitted here and retained in `describe`; unsupported but possibly inhabited cases prevent obtaining the mirror."
 type SomeCase 'sum = hide 'payload => {
   name: String,
   mirror: Mirror 'payload,
   project: 'sum -> Option 'payload,
-  inject: Option ('payload -> 'sum),
+  inject: 'payload -> 'sum,
 }
 
 @doc "The outermost structure of a mirror, with typed operations on values of its type. Nested types are reached through the mirrors the views carry, one level per call, so a recursive type is inspected as far as a program looks."
 extern shape: Mirror 'a -> Shape 'a = "$shape"
+
+@doc "Authenticated descriptive evidence for an inferred static type, without construction authority."
+extern type_info: () -> TypeInfo 'a = "$typeInfo"
+
+@doc "Descriptive evidence for a value's static type. Does not capture the value or grant constructors."
+extern info_of: 'a -> TypeInfo 'a = "$infoOf"
+
+@doc "A constructive mirror's descriptive evidence."
+extern info: Mirror 'a -> TypeInfo 'a = "$mirrorInfo"
+
+@doc "The complete type description, including impossible cases and opaque positions."
+extern describe_info: TypeInfo 'a -> Description = "$describeInfo"
+
+@private
+extern same_info_pair: (TypeInfo 'a, TypeInfo 'b)
+-> Option { forward: 'a -> 'b, backward: 'b -> 'a } = "$sameInfo"
+
+@doc "Exact type equality from authenticated descriptive evidence; converts no values and grants no constructors."
+let same_info: TypeInfo 'a -> TypeInfo 'b -> Option { forward: 'a -> 'b, backward: 'b -> 'a } =
+  fn left right => same_info_pair (left, right)
+
+@doc "Executes the mirror's finite pure construction. Primitive values are zero, false, or empty; records construct every field, arrays are empty, and variants choose a case of minimum construction height, breaking ties by canonical case order."
+extern construct: Mirror 'a -> 'a = "$construct"
+
+@doc "Typed observation without construction authority."
+type InfoShape 'a =
+  | #Nat { read: 'a -> Nat }
+  | #Int { read: 'a -> Int }
+  | #Real { read: 'a -> Real }
+  | #String { read: 'a -> String }
+  | #Bool { read: 'a -> Bool }
+  | #Nat8 { read: 'a -> Nat8 }
+  | #Nat16 { read: 'a -> Nat16 }
+  | #Nat32 { read: 'a -> Nat32 }
+  | #Nat64 { read: 'a -> Nat64 }
+  | #Int8 { read: 'a -> Int8 }
+  | #Int16 { read: 'a -> Int16 }
+  | #Int32 { read: 'a -> Int32 }
+  | #Int64 { read: 'a -> Int64 }
+  | #Array (InfoArrayView 'a)
+  | #Record (InfoRecordView 'a)
+  | #Sum (InfoSumView 'a)
+  | #Function Description
+  | #Hidden Description
+  | #Mirror Description
+  | #TypeInfo Description
+  | #Foreign
+
+@doc "An array's descriptive element evidence and read operation."
+type InfoArrayView 'array = hide 'element => {
+  element: TypeInfo 'element,
+  read: 'array -> ['element],
+}
+
+@doc "A record's descriptive field views."
+type InfoRecordView 'record = {
+  mirror: TypeInfo 'record,
+  fields: [InfoSomeField 'record],
+}
+
+@doc "A field's descriptive evidence and read operation, sharing one hidden field type."
+type InfoSomeField 'record = hide 'field => {
+  name: String,
+  mirror: TypeInfo 'field,
+  presence: Presence,
+  read: 'record -> Option 'field,
+}
+
+@doc "Every described case, including cases with impossible payloads."
+type InfoSumView 'sum = { mirror: TypeInfo 'sum, cases: [InfoSomeCase 'sum] }
+
+@doc "A case's descriptive payload evidence and projection, without injection authority."
+type InfoSomeCase 'sum = hide 'payload => {
+  name: String,
+  mirror: TypeInfo 'payload,
+  project: 'sum -> Option 'payload,
+}
+
+@doc "Read-only typed structure. Observing a type does not grant construction authority."
+extern shape_info: TypeInfo 'a -> InfoShape 'a = "$shapeInfo"

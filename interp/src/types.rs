@@ -27,6 +27,7 @@ impl Type {
             nodes,
             plan: None,
             mirror: Cell::new(false),
+            info: Cell::new(false),
         })
     }
 
@@ -67,6 +68,7 @@ fn shifted(node: &Node, offset: u32) -> Node {
         | Node::HiddenBound(_) => node.clone(),
         Node::Array(child) => Node::Array(shift(child)),
         Node::Mirror(child) => Node::Mirror(shift(child)),
+        Node::TypeInfo(child) => Node::TypeInfo(shift(child)),
         Node::Hidden(child) => Node::Hidden(shift(child)),
         Node::Alias(child) => Node::Alias(shift(child)),
         Node::Arrow(children) => Node::Arrow(children.map(|child| child + offset)),
@@ -109,7 +111,11 @@ fn children(node: &Node) -> Vec<u32> {
         | Node::ForeignValue
         | Node::Parameter(_)
         | Node::HiddenBound(_) => Vec::new(),
-        Node::Array(child) | Node::Mirror(child) | Node::Hidden(child) | Node::Alias(child) => {
+        Node::Array(child)
+        | Node::Mirror(child)
+        | Node::TypeInfo(child)
+        | Node::Hidden(child)
+        | Node::Alias(child) => {
             vec![*child]
         }
         Node::Arrow(children) => children.to_vec(),
@@ -200,13 +206,13 @@ pub fn instantiate(
                     deferred = true;
                     break;
                 }
-                Node::Extend(children) => work.extend(children.iter().copied()),
-                Node::Struct(part) if kind != Some(false) => {
-                    kind = Some(true);
+                Node::Extend([left, right]) => work.extend([*right, *left]),
+                Node::Struct(part) => {
+                    kind.get_or_insert(true);
                     fields.extend(part.iter().cloned());
                 }
-                Node::Sum(part) if kind != Some(true) => {
-                    kind = Some(false);
+                Node::Sum(part) => {
+                    kind.get_or_insert(false);
                     fields.extend(part.iter().cloned());
                 }
                 _ => return Err("invalid runtime row extension".into()),
@@ -328,6 +334,7 @@ pub fn native_plan(template: &NativeTemplate, arguments: &[Value]) -> Result<Val
             optional,
         }),
         mirror: Cell::new(false),
+        info: Cell::new(false),
     })))
 }
 
@@ -389,6 +396,7 @@ pub fn same(left: &Type, right: &Type) -> bool {
                 if p == q => {}
             (Node::Array(p), Node::Array(q))
             | (Node::Mirror(p), Node::Mirror(q))
+            | (Node::TypeInfo(p), Node::TypeInfo(q))
             | (Node::Hidden(p), Node::Hidden(q)) => work.push((*p, *q)),
             (Node::Arrow(p), Node::Arrow(q)) => {
                 work.extend(p.iter().copied().zip(q.iter().copied()));

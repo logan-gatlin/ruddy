@@ -1,6 +1,6 @@
 @private
 type Operations 'storage 'key 'value = {
-  key: Mirror 'key,
+  key: TypeInfo 'key,
   len: 'storage -> Nat,
   get: Nat64 -> 'key -> 'storage -> Option 'value,
   insert: Nat64 -> 'key -> 'value -> 'storage -> 'storage,
@@ -10,18 +10,18 @@ type Operations 'storage 'key 'value = {
 
 @doc "A persistent map with hidden storage. Use the module functions to preserve its key and hash invariants. Keys use structural equality and the fixed default hash seed; values are unrestricted."
 type Map 'key 'value = hide 'storage => {
-  mirror: Mirror 'storage,
+  mirror: TypeInfo 'storage,
   storage: 'storage,
   operations: Operations 'storage 'key 'value,
 }
 
 @private
-let wrap: Mirror 's -> 's -> Operations 's 'key 'value -> Map 'key 'value =
+let wrap: TypeInfo 's -> 's -> Operations 's 'key 'value -> Map 'key 'value =
   fn mirror storage operations => { mirror: mirror, storage: storage, operations: operations }
 
 @private
-let pack: Mirror 'key -> hamt::Table 'key 'value -> Map 'key 'value = fn key table => {
-  mirror: reflect::type_of table,
+let pack: TypeInfo 'key -> hamt::Table 'key 'value -> Map 'key 'value = fn key table => {
+  mirror: reflect::info_of table,
   storage: table,
   operations: {
     key: key,
@@ -34,7 +34,7 @@ let pack: Mirror 'key -> hamt::Table 'key 'value -> Map 'key 'value = fn key tab
 }
 
 @doc "An empty persistent map at the inferred key and value types."
-let empty: () -> Map 'key 'value = fn _ => pack (reflect::mirror ()) (hamt::empty ())
+let empty: () -> Map 'key 'value = fn _ => pack (reflect::type_info ()) (hamt::empty ())
 
 @doc "The number of keys, in constant time."
 let len: Map 'key 'value -> Nat = fn map => match map with

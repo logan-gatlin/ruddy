@@ -9,6 +9,192 @@ use std::{fs, path::Path, process::Command};
 use ruddy_interp::{Program, Value, render};
 
 #[test]
+fn descriptive_evidence_cannot_recover_forgotten_constructor_authority() {
+    let source = r#"
+@private let strong: Mirror Nat = std::reflect::mirror ()
+@private let weak = std::reflect::info strong
+@private let read_mirror: ForeignValue -> Result (Mirror Nat) std::ffi::DecodeError = std::ffi::decode
+let rejected = match std::ffi::encode weak with
+| #Some foreign => match read_mirror foreign with | #Error _ => true | #Some _ => false end
+| #Error _ => false
+end
+let equal = match std::reflect::same_info weak (std::reflect::info_of 0n) with | #Some _ => true | #None => false end
+"#;
+    let (node, interpreted) = both(source, &["rejected", "equal"], None);
+    assert_eq!(node, interpreted);
+    assert_eq!(node, ["true", "true"]);
+}
+
+#[test]
+fn explicit_codecs_keep_descriptive_registry_authority() {
+    let source = r#"
+@private let schema = std::reflect::describe_info (std::reflect::info_of 0n)
+@private let custom: std::codec::Codec (() -> Nat) = {
+  encoder: { schema: schema, run: fn call => std::codec::!Write.write_nat (call ()) },
+  decoder: { schema: schema, run: fn _ => std::result::map (fn number => fn _ => number) (std::codec::!Read.read_nat ()) },
+}
+@private let registry = [std::codec::entry "callable" (std::reflect::type_info ()) custom]
+@private let original: () -> Nat = fn _ => 7n
+@private let recover: std::any::Any -> Option (() -> Nat) = std::any::downcast
+@private let encoded = std::json::encode_with { schema: schema, run: std::codec::encode_any registry } std::json::default_limits (std::any::upcast original)
+let restored = match encoded with
+| #Some text => match std::json::decode_with { schema: schema, run: std::codec::decode_any registry } std::json::default_limits text with
+  | #Some packed => match recover packed with
+    | #Some call => call ()
+    | #None => 0n
+    end
+  | #Error _ => 0n
+  end
+| #Error _ => 0n
+end
+"#;
+    let (node, interpreted) = both(source, &["restored"], None);
+    assert_eq!(node, interpreted);
+    assert_eq!(node, ["7"]);
+}
+
+#[test]
+fn codecs_preserve_wire_cases_and_reject_impossible_input() {
+    let source = r#"
+type Empty = { impossible: |, callback: () -> Nat }
+type Choice = #A Empty | #Z
+@private let value: Choice = #Z
+let encoded = match std::binary::encode value with
+| #Some bytes => std::array::map std::nat::to_nat8 bytes
+| #Error _ => []
+end
+@private let read_choice: [Nat8] -> Result Choice std::binary::Error = std::binary::decode
+let live = match read_choice [1n8, 0n8, 0n8, 0n8] with | #Some _ => true | #Error _ => false end
+let impossible = match read_choice [0n8, 0n8, 0n8, 0n8] with | #Error _ => true | #Some _ => false end
+@private let read_empty: String -> Result [Empty] std::json::Error = std::json::decode
+let empty = match read_empty "[]" with | #Some values => std::array::len values == 0n | #Error _ => false end
+let nonempty = match read_empty "[null]" with | #Error _ => true | #Some _ => false end
+@private let read_option: String -> Result (Option (|)) std::json::Error = std::json::decode
+let absent = match read_option "{\"tag\":\"None\",\"value\":{}}" with | #Some value => std::option::is_none value | #Error _ => false end
+"#;
+    let (node, interpreted) = both(
+        source,
+        &[
+            "encoded",
+            "live",
+            "impossible",
+            "empty",
+            "nonempty",
+            "absent",
+        ],
+        None,
+    );
+    assert_eq!(node, interpreted);
+    assert_eq!(node, ["[1,0,0,0]", "true", "true", "true", "true", "true"]);
+}
+
+#[test]
+fn constructive_views_omit_only_impossible_parts() {
+    let source = r#"
+@private let optional: Mirror (Option (|)) = std::reflect::mirror ()
+let names = match std::reflect::shape optional with
+| #Sum view => std::array::map (fn case => match case with | hide 'p {name, ..} => name end) view.cases
+| _ => []
+end
+let built = match std::reflect::shape optional with
+| #Sum view => match std::array::get view.cases 0n with
+  | #Some (hide 'p {mirror, inject, ..}) => std::option::is_none (inject (std::reflect::construct mirror))
+  | #None => false
+  end
+| _ => false
+end
+@private let empty: Mirror [|] = std::reflect::mirror ()
+let array = match std::reflect::shape empty with
+| #EmptyArray view => std::array::len (view.read (view.make [])) == 0n
+| _ => false
+end
+@private let description = std::reflect::describe optional
+let complete = match std::array::get description.nodes description.root with
+| #Some (#Sum fields) => std::array::len fields == 2n
+| _ => false
+end
+"#;
+    let (node, interpreted) = both(source, &["names", "built", "array", "complete"], None);
+    assert_eq!(node, interpreted);
+    assert_eq!(node, [r#"["None"]"#, "true", "true", "true"]);
+}
+
+#[test]
+fn mirrors_construct_finite_values_on_both_backends() {
+    let source = r##"
+@private extern mirror: () -> Mirror 'a = "$mirror"
+@private extern construct: Mirror 'a -> 'a = "$construct"
+type Tree = #Branch { left: Tree, right: Tree } | #Leaf Nat
+type Even = #Next Odd
+type Odd = #Back Even | #Done
+type Chain = { next: [Chain] }
+let mutual_value: Even = construct (mirror ())
+let mutual = std::str::debug mutual_value
+@private let chain_value: Chain = construct (mirror ())
+let chain = std::array::len chain_value.next == 0n
+@private let word: Nat64 = construct (mirror ())
+@private let scalars: (Nat, Int, Real, Nat8, Int8, Nat16, Int16, Nat32, Int32, Nat64, Int64, Bool, String, ()) = construct (mirror ())
+let primitive = if word == 0n64 then scalars == (0n, 0i, 0, 0n8, 0i8, 0n16, 0i16, 0n32, 0i32, 0n64, 0i64, false, "", ()) else false end
+@private let fields: { active: Bool, name: String, count: Int } = construct (mirror ())
+let record = fields == { active: false, name: "", count: 0i }
+@private let tree_value: Tree = construct (mirror ())
+let tree = match tree_value with | #Leaf 0n => true | _ => false end
+@private let option: #Some (|) | #None = construct (mirror ())
+let absent = std::option::is_none option
+@private let elements: [|] = construct (mirror ())
+let empty = std::array::len elements == 0n
+"##;
+    let (node, interpreted) = both(
+        source,
+        &[
+            "primitive",
+            "record",
+            "tree",
+            "absent",
+            "empty",
+            "mutual",
+            "mutual_value",
+            "chain",
+        ],
+        None,
+    );
+    assert_eq!(node, interpreted);
+    assert_eq!(
+        node,
+        [
+            "true",
+            "true",
+            "true",
+            "true",
+            "true",
+            r##""#Next (#Done)""##,
+            r##"{"tag":"Next","value":{"tag":"Done"}}"##,
+            "true"
+        ]
+    );
+}
+
+#[test]
+fn descriptive_reflection_preserves_callable_packages_and_display() {
+    let source = r#"
+@private let info: TypeInfo (() -> Nat) = std::reflect::type_info ()
+@private let description = std::reflect::describe_info info
+let callable = match std::array::get description.nodes description.root with
+| #Some (#Function _) => true
+| _ => false
+end
+@private let original: () -> Nat = fn _ => 7n
+@private let packed = std::any::upcast original
+@private let restored: Option (() -> Nat) = std::any::downcast packed
+let called = match restored with | #Some call => call () | #None => 0n end
+let displayed = std::str::debug original
+"#;
+    let (node, interpreted) = both(source, &["callable", "called", "displayed"], None);
+    assert_eq!(node, interpreted);
+    assert_eq!(node, ["true", "7", "\"<function>\""]);
+}
+
+#[test]
 fn randomness_sampling_and_primitive_contracts_match_across_backends() {
     let source = format!(
         "using std::*\n{}\nlet checked = handle do _ = randomness_primitives () _ = randomness_sampling () return true end with | std::test::!Assert _ => raise false end",
@@ -334,6 +520,7 @@ let kind: std::reflect::Node -> String = fn node => match node with
 | #Extend _ => "Extend"
 | #Parameter _ => "Parameter"
 | #Mirror _ => "Mirror"
+| #TypeInfo _ => "TypeInfo"
 | #Hidden _ => "Hidden"
 | #Variable _ => "Variable"
 end
@@ -455,13 +642,21 @@ let projected = do
   | _ => "none"
   end
 end
+let binding_defaults = match std::reflect::shape (std::reflect::type_of { count: 0n, name: "" }) with
+| #Record view => std::array::all (fn field => match field with
+  | hide 'f { mirror, bind, .. } => match bind (std::reflect::construct mirror) with
+    | hide 'v { mirror, value, .. } => std::reflect::construct mirror == value
+    end
+  end) view.fields
+| _ => false
+end
 "#;
-    let exports = ["described", "rebuilt", "projected"];
+    let exports = ["described", "rebuilt", "projected", "binding_defaults"];
     let (node, interpreted) = both(source, &exports, None);
     assert_eq!(node, interpreted);
     assert_eq!(
         interpreted,
-        vec!["\"count,name\"", "\"ruddy3\"", "\"None,Some\""]
+        vec!["\"count,name\"", "\"ruddy3\"", "\"None,Some\"", "true"]
     );
 }
 
@@ -865,14 +1060,14 @@ let underflow = std::str::join "," [
 
 -- A row is unordered, so two arrows written with the same effects in
 -- different orders are one type.
-let both_ways: Mirror (Nat -> Nat + !A + !B) = std::reflect::mirror ()
-let other_way: Mirror (Nat -> Nat + !B + !A) = std::reflect::mirror ()
-let pure_way: Mirror (Nat -> Nat) = std::reflect::mirror ()
-let reordered = match std::reflect::same both_ways other_way with
+let both_ways: TypeInfo (Nat -> Nat + !A + !B) = std::reflect::type_info ()
+let other_way: TypeInfo (Nat -> Nat + !B + !A) = std::reflect::type_info ()
+let pure_way: TypeInfo (Nat -> Nat) = std::reflect::type_info ()
+let reordered = match std::reflect::same_info both_ways other_way with
 | #Some _ => "same"
 | #None => "different"
 end
-let effects_count = match std::reflect::same both_ways pure_way with
+let effects_count = match std::reflect::same_info both_ways pure_way with
 | #Some _ => "same"
 | #None => "different"
 end
@@ -1035,25 +1230,25 @@ type Even = hide 'a => { value: 'a, odd: std::option::Option Odd }
 type Odd = hide 'b => { value: 'b, even: std::option::Option Even }
 
 @private
-let of_loop: Mirror Loop = std::reflect::mirror ()
+let of_loop: TypeInfo Loop = std::reflect::type_info ()
 @private
-let of_renamed: Mirror Renamed = std::reflect::mirror ()
+let of_renamed: TypeInfo Renamed = std::reflect::type_info ()
 @private
-let of_other: Mirror Other = std::reflect::mirror ()
+let of_other: TypeInfo Other = std::reflect::type_info ()
 @private
-let of_nested: Mirror Nested = std::reflect::mirror ()
+let of_nested: TypeInfo Nested = std::reflect::type_info ()
 @private
-let of_both: Mirror Both = std::reflect::mirror ()
+let of_both: TypeInfo Both = std::reflect::type_info ()
 @private
-let of_plain: Mirror Plain = std::reflect::mirror ()
+let of_plain: TypeInfo Plain = std::reflect::type_info ()
 @private
-let of_even: Mirror Even = std::reflect::mirror ()
+let of_even: TypeInfo Even = std::reflect::type_info ()
 @private
-let of_odd: Mirror Odd = std::reflect::mirror ()
+let of_odd: TypeInfo Odd = std::reflect::type_info ()
 
 @private
-let size: Mirror 'a -> String = fn of =>
-  std::str::from_nat (std::array::len (std::reflect::describe of).nodes)
+let size: TypeInfo 'a -> String = fn of =>
+  std::str::from_nat (std::array::len (std::reflect::describe_info of).nodes)
 let sizes = std::str::join "," [
   size of_loop,
   size of_nested,
@@ -1064,8 +1259,8 @@ let sizes = std::str::join "," [
 ]
 
 @private
-let decided: Mirror 'x -> Mirror 'y -> String = fn left right =>
-  match std::reflect::same left right with
+let decided: TypeInfo 'x -> TypeInfo 'y -> String = fn left right =>
+  match std::reflect::same_info left right with
   | #Some _ => "same"
   | #None => "different"
   end
@@ -1213,7 +1408,7 @@ fn codec_limits_are_counted_before_the_work() {
 let numbers: [Nat] = [1n, 2n]
 @private
 let writer: std::codec::Encoder [Nat] = match
-  std::codec::derive_encoder (std::reflect::type_of numbers) with
+  std::codec::derive_encoder (std::reflect::info_of numbers) with
 | #Some encoder => encoder
 | #Error _ => { schema: std::reflect::describe (std::reflect::type_of numbers), run: fn _ => #Some () }
 end
@@ -1782,7 +1977,7 @@ let hash: 'a -> Result Nat64 std::hash::Error + | = fn value => std::hash::hash 
 let zeros = hash -0.0 == hash 0.0
 let repeat = hash "hé😀" == hash "hé😀"
 let supported = std::result::is_ok (hash 18446744073709551615n64)
-let explicit = std::hash::hash_with (std::reflect::mirror ()) std::hash::default_seed 42n == hash 42n
+let explicit = std::hash::hash_with (std::reflect::type_info ()) std::hash::default_seed 42n == hash 42n
 let seeded = std::hash::hash_seeded 1n64 "hello" != std::hash::hash_seeded 2n64 "hello"
 let nan = match hash (0 / 0) with
 | #Error { path: [], kind: #NaN } => true
@@ -1881,7 +2076,7 @@ let hidden = match hash boxed with
 | _ => false
 end
 let opened = match boxed with
-| hide 'a { mirror, value } => std::hash::hash_with mirror std::hash::default_seed value == hash 42n
+| hide 'a { mirror, value } => std::hash::hash_with (std::reflect::info mirror) std::hash::default_seed value == hash 42n
 end
 let foreign = match std::ffi::encode 1n with
 | #Some value => match hash value with
@@ -2052,7 +2247,7 @@ type Boxed = hide 'a => 'a
 let boxed: Boxed = 1n
 let hidden = boxed != boxed
 let direct = match std::order::compare left right with | #Less => true | _ => false end
-let explicit = match std::order::compare_with (std::reflect::type_of right) right left with | #Greater => true | _ => false end
+let explicit = match std::order::compare_with (std::reflect::info_of right) right left with | #Greater => true | _ => false end
 "#,
         &[
             "record",
@@ -2218,11 +2413,11 @@ let compare_cell: mut 'r 'a -> Bool = fn cell => cell == cell
 let run = fn _ => do
   let numbers = mut 1n
   let words = mut "one"
-  let mirror = std::reflect::type_of numbers
-  let same = match std::reflect::same mirror mirror with | #Some _ => true | #None => false end
-  let different = match std::reflect::same mirror (std::reflect::type_of words) with | #Some _ => false | #None => true end
-  let opaque = match std::reflect::shape mirror with | #Foreign => true | _ => false end
-  let description = std::reflect::describe mirror
+  let mirror = std::reflect::info_of numbers
+  let same = match std::reflect::same_info mirror mirror with | #Some _ => true | #None => false end
+  let different = match std::reflect::same_info mirror (std::reflect::info_of words) with | #Some _ => false | #None => true end
+  let opaque = match std::reflect::shape_info mirror with | #Foreign => true | _ => false end
+  let description = std::reflect::describe_info mirror
   let described = match std::array::get description.nodes description.root with | #Some (#Cell _) => true | _ => false end
   return [same, different, opaque, described, compare_cell numbers, [numbers] != [numbers], { a: 1n, z: numbers } < { a: 2n, z: numbers }]
 end
@@ -2260,7 +2455,7 @@ let result = match boxed with
   value == value,
   eq value value,
   (fn _ => value) == (fn _ => value),
-  match std::order::compare_with mirror value value with | #Equal => true | _ => false end,
+  match std::order::compare_with (std::reflect::info mirror) value value with | #Equal => true | _ => false end,
 ]
 end
 "#,

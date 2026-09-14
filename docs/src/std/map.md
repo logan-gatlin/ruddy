@@ -26,7 +26,7 @@ let age = std::map::get "Ada" second
 
 ```ruddy
 type Map 'key 'value = hide 'storage => {
-  mirror: Mirror 'storage,
+  mirror: TypeInfo 'storage,
   storage: 'storage,
   operations: Operations 'storage 'key 'value,
 }

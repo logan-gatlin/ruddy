@@ -11,6 +11,7 @@ pub struct Interface {
     pub root: u32,
     pub nodes: Vec<Node>,
     pub ports: Vec<BTreeSet<u32>>,
+    pub construction: BTreeMap<u32, super::construction::Demand>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -44,11 +45,13 @@ impl Interface {
         root: ShapeId,
         parameters: &HashMap<u32, u32>,
         solved: &[BTreeSet<super::conventions::Requirement>],
+        construction: &[super::construction::Demand],
     ) -> Self {
         let mut output = Self {
             root: 0,
             nodes: Vec::new(),
             ports: Vec::new(),
+            construction: BTreeMap::new(),
         };
         let mut nodes = HashMap::new();
         let mut ports = HashMap::new();
@@ -161,6 +164,18 @@ impl Interface {
                                 })
                         })
                         .collect();
+                    let demand = &construction[*needs as usize];
+                    let mapped = super::construction::Demand {
+                        condition: demand.condition.rename(parameters),
+                        ports: demand
+                            .ports
+                            .iter()
+                            .map(|id| port(graph, &mut output, &mut ports, parameters, *id))
+                            .collect(),
+                    };
+                    if !mapped.condition.is_true() || !mapped.ports.is_empty() {
+                        output.construction.insert(target, mapped);
+                    }
                     Node::Arrow {
                         argument,
                         result,
@@ -197,6 +212,18 @@ impl Interface {
             renumbered[port as usize] = Some(ports.len() as u32);
             ports.push(std::mem::take(&mut self.ports[port as usize]));
         }
+        // Constructor predicates already contain actual local requests and
+        // supplied callees' requirements. An unbound symbolic port describes
+        // possible descriptor slots, not a demand to construct those types.
+        for demand in self.construction.values_mut() {
+            let mut kept = BTreeSet::new();
+            for p in &demand.ports {
+                if let Some(p) = renumbered[*p as usize] {
+                    kept.insert(p);
+                }
+            }
+            demand.ports = kept;
+        }
         self.ports = ports;
         for node in &mut self.nodes {
             if let Node::Arrow {
@@ -225,6 +252,22 @@ impl Interface {
         for parameters in &self.ports {
             if parameters.iter().any(|p| !valid_parameter(*p)) {
                 return Err("invalid callable demand parameter".into());
+            }
+        }
+        for (node, demand) in &self.construction {
+            if !matches!(self.nodes.get(*node as usize), Some(Node::Arrow { .. })) {
+                return Err("invalid construction demand node".into());
+            }
+            if demand
+                .condition
+                .parameters()
+                .iter()
+                .any(|p| !valid_parameter(*p))
+            {
+                return Err("invalid construction demand parameter".into());
+            }
+            if demand.ports.iter().any(|p| *p as usize >= self.ports.len()) {
+                return Err("invalid construction demand port".into());
             }
         }
         let mut visited = HashSet::new();
@@ -357,6 +400,12 @@ impl Interface {
                             .collect();
                         graph.need(needs)
                     });
+                    if let Some(demand) = self.construction.get(&(id as u32)) {
+                        graph.needs[needs as usize].construction.condition =
+                            demand.condition.clone();
+                        graph.needs[needs as usize].construction.ports =
+                            demand.ports.iter().map(|p| ports[*p as usize]).collect();
+                    }
                     Shape::Arrow {
                         argument: nodes[*argument as usize],
                         result: nodes[*result as usize],

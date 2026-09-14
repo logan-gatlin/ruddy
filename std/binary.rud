@@ -294,7 +294,7 @@ let encode_with: codec::Encoder 'a -> Limits -> 'a -> Result [Nat8] Error =
 
 @doc "Write a value as positional binary with its type's default codec. See `encode_with`."
 let encode: 'a -> Result [Nat8] Error = fn value =>
-  match codec::derive_encoder (reflect::type_of value) with
+  match codec::derive_encoder (reflect::info_of value) with
   | #Some encoder => encode_with encoder default_limits value
   | #Error error => #Error (#Derive error)
   end

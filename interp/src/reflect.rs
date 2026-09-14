@@ -28,18 +28,31 @@ pub fn intrinsic(
     match kind {
         Intrinsic::Decode => Ok(cross(machine, descriptor, value, false)),
         Intrinsic::Encode => Ok(cross(machine, descriptor, value, true)),
+        Intrinsic::TypeInfo | Intrinsic::InfoOf | Intrinsic::MirrorInfo => {
+            // Forgetting authority creates a distinct capability value. The
+            // descriptor graph may be shared conceptually, but its mirror
+            // authentication must not survive a round trip through TypeInfo.
+            let info = Type::plain(descriptor.as_type()?.nodes.clone());
+            info.info.set(true);
+            Ok(Value::Type(info))
+        }
+        Intrinsic::Construct => construct(value.as_type()?),
         Intrinsic::Mirror | Intrinsic::TypeOf => {
             let mirror = descriptor
                 .as_type()
                 .map_err(|_| "missing runtime type information for a mirror".to_string())?;
+            let graph = ruddy::reification::Descriptor {
+                nodes: mirror.nodes.clone(),
+            };
+            ruddy::reification::construction::Construction::analyze(&graph).review(&graph)?;
             mirror.mirror.set(true);
             Ok(descriptor.clone())
         }
-        Intrinsic::Describe => {
+        Intrinsic::Describe | Intrinsic::DescribeInfo => {
             let of = value.as_type()?;
             Ok(describe(machine.domains, of))
         }
-        Intrinsic::Same => {
+        Intrinsic::Same | Intrinsic::SameInfo => {
             let pair = value.as_record()?;
             let left = pair
                 .get(&Key::named("0"))
@@ -58,7 +71,8 @@ pub fn intrinsic(
                 Value::none()
             })
         }
-        Intrinsic::Shape => shape(machine.domains, value.as_type()?),
+        Intrinsic::Shape => shape(machine.domains, value.as_type()?, true),
+        Intrinsic::ShapeInfo => shape(machine.domains, value.as_type()?, false),
     }
 }
 
@@ -107,10 +121,14 @@ fn builtin_value(builtin: Builtin) -> Value {
 
 /// A mirror of one position of a mirror's graph, authentic because the whole
 /// was.
-fn mirror_at(of: &Rc<Type>, index: u32) -> Value {
+fn evidence_at(of: &Rc<Type>, index: u32, constructive: bool) -> Rc<Type> {
     let part = crate::types::at(of, index);
-    part.mirror.set(true);
-    Value::Type(part)
+    if constructive {
+        part.mirror.set(true);
+    } else {
+        part.info.set(true);
+    }
+    part
 }
 
 /// An integer kind's exact domain, as `std::reflect::Domain`.
@@ -209,6 +227,7 @@ fn describe(domains: Domains, of: &Rc<Type>) -> Value {
             ),
             Node::Parameter(index) => Value::sum("Parameter", Some(Value::Nat(u64::from(*index)))),
             Node::Mirror(child) => Value::sum("Mirror", Some(Value::Nat(u64::from(*child)))),
+            Node::TypeInfo(child) => Value::sum("TypeInfo", Some(Value::Nat(u64::from(*child)))),
             Node::Hidden(child) => Value::sum("Hidden", Some(Value::Nat(u64::from(*child)))),
             Node::HiddenBound(index) => Value::sum("Variable", Some(Value::Nat(u64::from(*index)))),
         })
@@ -220,11 +239,34 @@ fn describe(domains: Domains, of: &Rc<Type>) -> Value {
 }
 
 /// A mirror's outermost structure as `std::reflect::Shape`.
-fn shape(domains: Domains, of: &Rc<Type>) -> Result<Value, String> {
+fn shape(domains: Domains, of: &Rc<Type>, constructive: bool) -> Result<Value, String> {
+    let plan = if constructive {
+        if !of.mirror.get() {
+            return Err("construction requires an authentic mirror".into());
+        }
+        let descriptor = ruddy::reification::Descriptor {
+            nodes: of.nodes.clone(),
+        };
+        let plan = ruddy::reification::construction::Construction::analyze(&descriptor);
+        plan.review(&descriptor)?;
+        Some(plan)
+    } else {
+        None
+    };
+    let view_record = |fields: Vec<(&str, Value)>| {
+        Value::record(
+            fields
+                .into_iter()
+                .filter(|(name, _)| {
+                    constructive || !matches!(*name, "make" | "bind" | "build" | "inject")
+                })
+                .collect(),
+        )
+    };
     let typed = |name: &str| {
         Value::sum(
             name,
-            Some(Value::record(vec![
+            Some(view_record(vec![
                 ("read", pass_through()),
                 ("make", pass_through()),
             ])),
@@ -238,10 +280,27 @@ fn shape(domains: Domains, of: &Rc<Type>) -> Result<Value, String> {
         Node::Bool => typed("Bool"),
         Node::Fixed(kind) => typed(kind.name()),
         Node::ForeignValue | Node::Cell(_) => Value::sum("Foreign", None),
+        Node::Array(element)
+            if plan
+                .as_ref()
+                .is_some_and(|plan| !plan.possible[element as usize]) =>
+        {
+            Value::sum(
+                "EmptyArray",
+                Some(view_record(vec![
+                    ("element", describe(domains, &crate::types::at(of, element))),
+                    ("read", pass_through()),
+                    ("make", pass_through()),
+                ])),
+            )
+        }
         Node::Array(element) => Value::sum(
             "Array",
-            Some(Value::record(vec![
-                ("element", mirror_at(of, element)),
+            Some(view_record(vec![
+                (
+                    "element",
+                    Value::Type(evidence_at(of, element, constructive)),
+                ),
                 ("read", pass_through()),
                 ("make", pass_through()),
             ])),
@@ -250,9 +309,10 @@ fn shape(domains: Domains, of: &Rc<Type>) -> Result<Value, String> {
             let views = fields
                 .iter()
                 .map(|(name, index)| {
-                    Value::record(vec![
+                    let field = evidence_at(of, *index, constructive);
+                    view_record(vec![
                         ("name", Value::string(name)),
-                        ("mirror", mirror_at(of, *index)),
+                        ("mirror", Value::Type(field.clone())),
                         ("presence", Value::sum("Required", None)),
                         (
                             "read",
@@ -263,7 +323,7 @@ fn shape(domains: Domains, of: &Rc<Type>) -> Result<Value, String> {
                             builtin_value(Builtin::Bind {
                                 record: of.clone(),
                                 name: Rc::from(name.as_str()),
-                                field: crate::types::at(of, *index),
+                                field,
                             }),
                         ),
                     ])
@@ -271,7 +331,7 @@ fn shape(domains: Domains, of: &Rc<Type>) -> Result<Value, String> {
                 .collect();
             Value::sum(
                 "Record",
-                Some(Value::record(vec![
+                Some(view_record(vec![
                     ("mirror", Value::Type(of.clone())),
                     ("fields", Value::array(views)),
                     ("build", builtin_value(Builtin::Build(of.clone()))),
@@ -281,26 +341,28 @@ fn shape(domains: Domains, of: &Rc<Type>) -> Result<Value, String> {
         Node::Sum(cases) => {
             let views = cases
                 .iter()
+                .filter(|(_, index)| {
+                    plan.as_ref()
+                        .is_none_or(|plan| plan.possible[*index as usize])
+                })
                 .map(|(name, index)| {
-                    Value::record(vec![
+                    view_record(vec![
                         ("name", Value::string(name)),
-                        ("mirror", mirror_at(of, *index)),
+                        ("mirror", Value::Type(evidence_at(of, *index, constructive))),
                         (
                             "project",
                             builtin_value(Builtin::ProjectCase(Rc::from(name.as_str()))),
                         ),
                         (
                             "inject",
-                            Value::some(builtin_value(Builtin::InjectCase(Rc::from(
-                                name.as_str(),
-                            )))),
+                            builtin_value(Builtin::InjectCase(Rc::from(name.as_str()))),
                         ),
                     ])
                 })
                 .collect();
             Value::sum(
                 "Sum",
-                Some(Value::record(vec![
+                Some(view_record(vec![
                     ("mirror", Value::Type(of.clone())),
                     ("cases", Value::array(views)),
                 ])),
@@ -309,6 +371,7 @@ fn shape(domains: Domains, of: &Rc<Type>) -> Result<Value, String> {
         Node::Arrow(_) => Value::sum("Function", Some(describe(domains, of))),
         Node::Hidden(_) => Value::sum("Hidden", Some(describe(domains, of))),
         Node::Mirror(_) => Value::sum("Mirror", Some(describe(domains, of))),
+        Node::TypeInfo(_) => Value::sum("TypeInfo", Some(describe(domains, of))),
         _ => return Err("unknown runtime type node".into()),
     })
 }
@@ -392,4 +455,69 @@ fn build(of: &Rc<Type>, bindings: &Value) -> Result<Value, String> {
         out.insert(key, value);
     }
     Ok(Value::some(Value::Record(Rc::new(out))))
+}
+
+/// Follow a decreasing finite construction recipe without recursive host calls.
+fn construct(of: &Rc<Type>) -> Result<Value, String> {
+    if !of.mirror.get() {
+        return Err("construction requires an authentic mirror".into());
+    }
+    let descriptor = ruddy::reification::Descriptor {
+        nodes: of.nodes.clone(),
+    };
+    let plan = ruddy::reification::construction::Construction::analyze(&descriptor);
+    plan.review(&descriptor)?;
+    enum Work {
+        Node(u32),
+        Record(Vec<String>),
+        Case(String),
+    }
+    let mut work = vec![Work::Node(0)];
+    let mut values = Vec::new();
+    while let Some(next) = work.pop() {
+        match next {
+            Work::Node(at) => match of.node(at) {
+                Node::Nat => values.push(Value::Nat(0)),
+                Node::Int => values.push(Value::Int(0)),
+                Node::Fixed(kind) => values.push(Value::Fixed(*kind, 0)),
+                Node::Real => values.push(Value::Real(0.0)),
+                Node::Bool => values.push(Value::Bool(false)),
+                Node::String => values.push(Value::string("")),
+                Node::Array(_) => values.push(Value::array(Vec::new())),
+                Node::Struct(fields) => {
+                    work.push(Work::Record(
+                        fields.iter().map(|(name, _)| name.clone()).collect(),
+                    ));
+                    work.extend(fields.iter().rev().map(|(_, child)| Work::Node(*child)));
+                }
+                Node::Sum(cases) => {
+                    let (name, child) = cases
+                        .iter()
+                        .filter(|(_, child)| plan.rank[*child as usize].is_some())
+                        .min_by_key(|(_, child)| plan.rank[*child as usize])
+                        .ok_or("missing finite case")?;
+                    work.push(Work::Case(name.clone()));
+                    work.push(Work::Node(*child));
+                }
+                _ => return Err("missing finite construction evidence".into()),
+            },
+            Work::Record(names) => {
+                let fields = values.split_off(values.len() - names.len());
+                values.push(Value::record(
+                    names.iter().map(String::as_str).zip(fields).collect(),
+                ));
+            }
+            Work::Case(name) => {
+                let value = values.pop().ok_or("missing construction payload")?;
+                let payload = match &value {
+                    Value::Record(record) if record.is_empty() => None,
+                    _ => Some(value),
+                };
+                values.push(Value::sum(&name, payload));
+            }
+        }
+    }
+    values
+        .pop()
+        .ok_or_else(|| "missing construction result".into())
 }

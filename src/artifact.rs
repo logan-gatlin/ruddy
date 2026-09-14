@@ -5,7 +5,7 @@
 //! references are qualified by the identity of the bundle that owns them.
 //! [`parse`] accepts only compiler-produced text and deliberately panics for
 //! malformed input. Use [`try_parse`] at trust boundaries. This is an internal
-//! v1 format, not a compatibility promise.
+//! v2 format, not a compatibility promise.
 
 mod regions;
 
@@ -753,6 +753,7 @@ pub enum Type {
     },
     Array(Box<Type>),
     Mirror(Box<Type>),
+    TypeInfo(Box<Type>),
     Mut(Box<Type>, Box<Type>),
     Struct(Row),
     Sum(Row),
@@ -900,7 +901,8 @@ fn semantic_eq(root: SemanticPair<'_>) -> bool {
                     pending.push(SemanticPair::Type(b, d));
                 }
                 (Type::Array(left), Type::Array(right))
-                | (Type::Mirror(left), Type::Mirror(right)) => {
+                | (Type::Mirror(left), Type::Mirror(right))
+                | (Type::TypeInfo(left), Type::TypeInfo(right)) => {
                     pending.push(SemanticPair::Type(left, right));
                 }
                 (Type::Struct(left), Type::Struct(right)) | (Type::Sum(left), Type::Sum(right)) => {
@@ -1026,6 +1028,7 @@ enum CloneWork<'a> {
     Hidden(u32, String),
     Array,
     Mirror,
+    TypeInfo,
     Mut,
     Struct,
     Sum,
@@ -1077,6 +1080,10 @@ fn clone_semantic(root: SemanticRef<'_>) -> (Vec<Type>, Vec<Row>) {
                 }
                 Type::Mirror(element) => {
                     work.push(CloneWork::Mirror);
+                    work.push(CloneWork::Semantic(SemanticRef::Type(element)));
+                }
+                Type::TypeInfo(element) => {
+                    work.push(CloneWork::TypeInfo);
                     work.push(CloneWork::Semantic(SemanticRef::Type(element)));
                 }
                 Type::Mut(region, element) => {
@@ -1165,6 +1172,10 @@ fn clone_semantic(root: SemanticRef<'_>) -> (Vec<Type>, Vec<Row>) {
             CloneWork::Mirror => {
                 let element = types.pop().expect("cloned mirror type");
                 types.push(Type::Mirror(Box::new(element)));
+            }
+            CloneWork::TypeInfo => {
+                let element = types.pop().expect("cloned mirror type");
+                types.push(Type::TypeInfo(Box::new(element)));
             }
             CloneWork::Mut => {
                 let element = types.pop().expect("cell element");
@@ -1256,9 +1267,9 @@ fn drain_type(value: &mut Type, pending: &mut Vec<SemanticOwned>) {
                 Type::Undecided,
             )));
         }
-        Type::Array(element) | Type::Mirror(element) => pending.push(SemanticOwned::Type(
-            std::mem::replace(element.as_mut(), Type::Undecided),
-        )),
+        Type::Array(element) | Type::Mirror(element) | Type::TypeInfo(element) => pending.push(
+            SemanticOwned::Type(std::mem::replace(element.as_mut(), Type::Undecided)),
+        ),
         Type::Arrow(from, to, effects) => {
             pending.push(SemanticOwned::Type(std::mem::replace(
                 from.as_mut(),
@@ -1837,6 +1848,7 @@ fn ty(mint: &Mint, value: &types::Ty) -> Type {
         Hidden(u32, String),
         Array,
         Mirror,
+        TypeInfo,
         Mut,
         Struct,
         Sum,
@@ -1906,6 +1918,10 @@ fn ty(mint: &Mint, value: &types::Ty) -> Type {
                 }
                 types::Ty::Mirror(element) => {
                     work.push(Work::Mirror);
+                    work.push(Work::Ty(element));
+                }
+                types::Ty::TypeInfo(element) => {
+                    work.push(Work::TypeInfo);
                     work.push(Work::Ty(element));
                 }
                 types::Ty::Mut(region, element) => {
@@ -1979,6 +1995,10 @@ fn ty(mint: &Mint, value: &types::Ty) -> Type {
             Work::Mirror => {
                 let element = tys.pop().expect("artifact mirror type");
                 tys.push(Type::Mirror(Box::new(element)));
+            }
+            Work::TypeInfo => {
+                let element = tys.pop().expect("artifact mirror type");
+                tys.push(Type::TypeInfo(Box::new(element)));
             }
             Work::Mut => {
                 let element = tys.pop().expect("cell element");
@@ -2480,7 +2500,7 @@ pub mod text {
     /// what parsing its canonical text would do minus the text.
     pub(crate) fn decode_parts(header: &Header, lir: &Lir) -> Result<Artifact, ParseError> {
         Reader::new().artifact(expanded(L(vec![
-            A("artifact".into()),
+            A("artifact-v2".into()),
             self::header(header),
             self::lir(lir),
         ]))?)
@@ -2542,7 +2562,7 @@ pub mod text {
 
     fn artifact(value: &Artifact) -> S {
         L(vec![
-            A("artifact".into()),
+            A("artifact-v2".into()),
             header(&value.header),
             lir(&value.lir),
         ])
@@ -2830,6 +2850,11 @@ pub mod text {
                         }
                         Type::Mirror(element) => {
                             out.push_str("(mirror ");
+                            work.push(Work::Text(")"));
+                            work.push(Work::Ty(element));
+                        }
+                        Type::TypeInfo(element) => {
+                            out.push_str("(type-info ");
                             work.push(Work::Text(")"));
                             work.push(Work::Ty(element));
                         }
@@ -3510,7 +3535,7 @@ pub mod text {
         }
 
         fn read_artifact(&self, value: S) -> Artifact {
-            let mut values = self.exact(self.list(value, "artifact"), 2, "artifact");
+            let mut values = self.exact(self.list(value, "artifact-v2"), 2, "artifact-v2");
             Artifact {
                 header: self.read_header(self.take(&mut values)),
                 lir: self.read_lir(self.take(&mut values)),
@@ -3832,6 +3857,7 @@ pub mod text {
                         Type::Package(inner)
                         | Type::Array(inner)
                         | Type::Mirror(inner)
+                        | Type::TypeInfo(inner)
                         | Type::Hidden { body: inner, .. } => parts.push(Part::Ty(inner)),
                         Type::Mut(region, element) => {
                             parts.push(Part::Ty(region));
@@ -4033,7 +4059,7 @@ pub mod text {
                             parts.push(Part::Ty(region, owner));
                             parts.push(Part::Ty(element, owner));
                         }
-                        Type::Array(inner) | Type::Mirror(inner) => {
+                        Type::Array(inner) | Type::Mirror(inner) | Type::TypeInfo(inner) => {
                             parts.push(Part::Ty(inner, owner))
                         }
                         Type::Struct(row) | Type::Sum(row) => {
@@ -4183,6 +4209,7 @@ pub mod text {
                 BuildPackage,
                 BuildHidden(u32, String),
                 BuildMirror,
+                BuildTypeInfo,
                 BuildArray,
                 BuildMut,
                 BuildStruct,
@@ -4267,6 +4294,11 @@ pub mod text {
                                     "mirror" => {
                                         let element = self.exact(values, 1, "mirror").remove(0);
                                         tasks.push(Task::BuildMirror);
+                                        tasks.push(Task::Ty(element));
+                                    }
+                                    "type-info" => {
+                                        let element = self.exact(values, 1, "type-info").remove(0);
+                                        tasks.push(Task::BuildTypeInfo);
                                         tasks.push(Task::Ty(element));
                                     }
                                     "struct" => {
@@ -4396,6 +4428,10 @@ pub mod text {
                     Task::BuildMirror => {
                         let element = tys.pop().expect("mirror type");
                         tys.push(Type::Mirror(Box::new(element)));
+                    }
+                    Task::BuildTypeInfo => {
+                        let element = tys.pop().expect("mirror type");
+                        tys.push(Type::TypeInfo(Box::new(element)));
                     }
                     Task::BuildStruct => {
                         let row = rows.pop().expect("struct row");

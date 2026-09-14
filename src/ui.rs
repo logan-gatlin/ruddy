@@ -2289,7 +2289,7 @@ impl Grouped for Ty {
             Ty::Hidden { .. } => Prec::Lambda,
             Ty::Arrow(..) => Prec::Arrow,
             Ty::Sum(_) => Prec::Sum,
-            Ty::Mut(..) | Ty::Mirror(_) => Prec::Apply,
+            Ty::Mut(..) | Ty::Mirror(_) | Ty::TypeInfo(_) => Prec::Apply,
             Ty::Named { args, .. } if !args.is_empty() => Prec::Apply,
             _ => Prec::Atom,
         }
@@ -2366,6 +2366,10 @@ fn format_semantic(f: &mut fmt::Formatter<'_>, root: SemanticRoot<'_>) -> fmt::R
                     }
                     Ty::Mirror(inner) => {
                         f.write_str("Mirror ")?;
+                        work.push(SemanticJob::Applied(inner));
+                    }
+                    Ty::TypeInfo(inner) => {
+                        f.write_str("TypeInfo ")?;
                         work.push(SemanticJob::Applied(inner));
                     }
                     Ty::Nat => f.write_str(Prim::Nat.name())?,
@@ -2901,6 +2905,7 @@ impl Rule {
             Rule::Open => "open",
             Rule::Witness => "witness",
             Rule::Mirror => "mirror",
+            Rule::TypeInfo => "type information",
             Rule::Same => "same",
             Rule::Congruent => "congruent",
             Rule::Bind => "bind",
@@ -2942,6 +2947,7 @@ impl fmt::Display for Rule {
             Rule::Open => f.write_str("a hidden pattern opens its position's type for its arm"),
             Rule::Witness => f.write_str("a value packages under a hidden type at the witness"),
             Rule::Mirror => f.write_str("two mirrors: the types they mirror must agree"),
+            Rule::TypeInfo => f.write_str("two type information values: their indexed types must agree"),
             Rule::Same => f.write_str("already the same thing on both sides"),
             Rule::Congruent => f.write_str(
                 "the same declared type on both sides, and it keeps what it takes: argument against argument",
@@ -3224,6 +3230,7 @@ fn type_description(description: inference::TypeDescription) -> &'static str {
         T::DeclaredType => "a declared type",
         T::Hidden => "a hidden type",
         T::Mirror => "a mirror",
+        T::TypeInfo => "type information",
         T::ForeignValue => "a foreign value",
         T::Undecided => "another type",
     }

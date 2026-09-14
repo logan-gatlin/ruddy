@@ -149,7 +149,7 @@ let partial: Order -> PartialOrder = fn value => match value with
 end
 
 @private
-let compare_elements: Mirror 'a -> ['a] -> ['a] -> Nat -> PartialOrder =
+let compare_elements: TypeInfo 'a -> ['a] -> ['a] -> Nat -> PartialOrder =
   fn mirror left right index => match (array::get left index, array::get right index) with
   | (#None, #None) => #Equal
   | (#None, #Some _) => #Less
@@ -164,12 +164,12 @@ let compare_elements: Mirror 'a -> ['a] -> ['a] -> Nat -> PartialOrder =
   end
 
 @private
-let field_name: reflect::SomeField 'a -> String = fn field => match field with
+let field_name: reflect::InfoSomeField 'a -> String = fn field => match field with
 | hide 'f { name, .. } => name
 end
 
 @private
-let compare_fields: [reflect::SomeField 'a] -> PartialOrdering 'a = fn fields left right =>
+let compare_fields: [reflect::InfoSomeField 'a] -> PartialOrdering 'a = fn fields left right =>
   match fields with
   | [] => #Equal
   | [field, ..tail] =>
@@ -189,12 +189,12 @@ let compare_fields: [reflect::SomeField 'a] -> PartialOrdering 'a = fn fields le
   end
 
 @private
-let case_name: reflect::SomeCase 'a -> String = fn case => match case with
+let case_name: reflect::InfoSomeCase 'a -> String = fn case => match case with
 | hide 'p { name, .. } => name
 end
 
 @private
-let compare_cases: [reflect::SomeCase 'a] -> PartialOrdering 'a = fn cases left right =>
+let compare_cases: [reflect::InfoSomeCase 'a] -> PartialOrdering 'a = fn cases left right =>
   match cases with
   | [] => #Unordered
   | [case, ..tail] =>
@@ -209,9 +209,9 @@ let compare_cases: [reflect::SomeCase 'a] -> PartialOrdering 'a = fn cases left 
     end
   end
 
-@doc "Compare through an explicit mirror. Arrays are lexicographic; records and sums use alphabetical field and case names (case-sensitive Unicode scalar order). The first non-equal component decides, including unordered. Unsupported shapes are unordered, even against themselves."
-let compare_with: Mirror 'a -> PartialOrdering 'a = fn mirror left right =>
-  match reflect::shape mirror with
+@doc "Compare through explicit descriptive type information. Arrays are lexicographic; records and sums use alphabetical field and case names (case-sensitive Unicode scalar order). The first non-equal component decides, including unordered. Unsupported shapes are unordered, even against themselves."
+let compare_with: TypeInfo 'a -> PartialOrdering 'a = fn mirror left right =>
+  match reflect::shape_info mirror with
   | #Nat { read, .. } => partial (nat::compare (read left) (read right))
   | #Int { read, .. } => partial (int::compare (read left) (read right))
   | #Real { read, .. } => real::compare (read left) (read right)
@@ -236,8 +236,8 @@ let compare_with: Mirror 'a -> PartialOrdering 'a = fn mirror left right =>
   | _ => #Unordered
   end
 
-@doc "Pure structural comparison at the operands' shared inferred type. NaNs and unsupported values are unordered. Opened existential types require mirror evidence, including when nested inside function types."
-let compare: PartialOrdering 'a = fn left right => compare_with (reflect::mirror ()) left right
+@doc "Pure structural comparison at the operands' shared inferred type. NaNs and unsupported values are unordered. Opened existential types require authenticated descriptive evidence, including when nested inside function types."
+let compare: PartialOrdering 'a = fn left right => compare_with (reflect::type_info ()) left right
 
 let equal: 'a -> 'a -> Bool = fn left right =>
   (derive_partial compare).equal left right

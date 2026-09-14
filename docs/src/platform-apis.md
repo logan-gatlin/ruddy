@@ -76,6 +76,9 @@ the structural codec of any type made of primitives, arrays, records, sums, and
 regular recursion; it interprets the mirror's views, so a recursive type is
 handled one level at a time. A custom codec bypasses derivation and speaks the
 protocol itself, and a misordered or incomplete session is a protocol error.
+`derive_encoder` accepts `TypeInfo` and needs no constructors; unsupported live
+parts produce derivation errors. `derive_decoder` accepts `Mirror`. Both preserve
+the full schema while skipping proven-impossible positions during traversal.
 
 `std::binary` runs the same codecs over a positional binary format: no names
 or tags on the wire, only what the decoder's schema says comes next, with
@@ -308,65 +311,67 @@ The host contracts follow the official
 [Fetch](https://developer.mozilla.org/en-US/docs/Web/API/Window/fetch), and
 [URL](https://developer.mozilla.org/en-US/docs/Web/API/URL) documentation.
 
-## Mirrors
+## Mirrors and descriptive evidence
 
-`std::reflect` works with `Mirror 'a`, a builtin type whose values are the
-compiler's own evidence for a type. `reflect::mirror : () -> Mirror 'a` makes
-one at whatever type the position is inferred at, and `reflect::type_of : 'a ->
-Mirror 'a` makes one for a value's static type without inspecting the value.
-A mirror cannot be built from data: foreign code cannot forge one, and
-`ffi::decode` accepts only a mirror the compiler made.
+`std::reflect` exposes two authenticated builtin types. `Mirror T` grants exact
+identity, typed structural constructors, and a finite pure construction of `T`.
+`TypeInfo T` grants description, typed observation, and exact identity without
+constructor authority. Ordinary `Description` records grant neither capability.
+Foreign conversion accepts only authentic evidence of exactly the requested type.
 
-`reflect::describe : Mirror 'a -> Description` renders a mirror as an ordinary
-finite graph of nodes, so a program can inspect a type's primitives, fields,
-tags, and function shapes. `reflect::same : Mirror 'a -> Mirror 'b -> Option {
-forward: 'a -> 'b, backward: 'b -> 'a }` decides whether two mirrors are exactly
-one type, and on success supplies the two identity functions that let a value
-cross between the names. A function's mirror carries its effect contract,
-so a function that performs an effect is never the same type as one that
-performs none.
+`reflect::mirror ()` remains inferred from an annotation, use, or generic caller.
+`reflect::type_of value` requests the same constructive evidence for the value's
+static type; possessing a value does not bypass the requirement. Generic wrappers,
+partial applications, captures, and compiled interfaces preserve that requirement.
+Empty types and unavailable constructors cause compile errors at the calling use.
 
-Together with [hidden types](dictionary.md#hidden-type) this recovers a value's
-type at runtime; the standard `Any` is defined exactly this way, as
-`hide 'a => { mirror: Mirror 'a, value: 'a }`, with `any::upcast` packaging a
-value and `any::downcast` opening one:
+`reflect::construct mirror` executes a finite pure construction. Supported
+immutable primitives produce zero, false, or empty text; unit and records construct
+their fields; arrays are empty; variants choose a case of minimum construction
+height, with ties broken by canonical case order. Recursive types need a finite
+base case. Functions, resources, mutable cells, hidden packages, and evidence types
+have no automatic constructors.
+
+`reflect::shape mirror` exposes constructive typed views. An ordinary array view
+carries an element mirror; `[|]` instead yields `#EmptyArray`, with descriptive
+element information and `read`/`make` operations on `[|]`. Sum views omit proven
+impossible cases and expose direct `inject` functions. An unavailable constructor
+for a potentially inhabited field, element, or case prevents obtaining the mirror;
+it never silently removes a valid case. Record builders still return checked
+errors for missing, duplicate, unknown, mismatched, or foreign bindings.
+
+`reflect::describe mirror` preserves the complete exact type graph, including
+impossible cases. Constructive filtering does not change type identity, codec
+schema identities, or binary case indices. Malformed codec input remains fallible.
+
+Use `reflect::type_info ()` for an inferred descriptive request and
+`reflect::info_of value` for a value's static type. `reflect::info mirror` forgets
+construction authority. `reflect::describe_info` returns ordinary description data,
+`reflect::shape_info` exposes typed readers, and `reflect::same_info` returns exact
+identity conversions. Function identity includes effect contracts. These operations
+remain available for empty, callable, and opaque types within their valid scopes.
+
+[Any](std/any.md) packages values with `TypeInfo`, preserving function packaging
+and exact checked casts:
 
 ```ruddy
-type Dynamic = hide 'a => { value: 'a, evidence: Mirror 'a }
+type Dynamic = hide 'a => { value: 'a, evidence: TypeInfo 'a }
 let as_nat: Dynamic -> Option Nat = fn item => match item with
-| hide 'x { value, evidence } => match std::reflect::same evidence (std::reflect::mirror ()) with
+| hide 'x { value, evidence } => match std::reflect::same_info evidence (std::reflect::type_info ()) with
   | #Some { forward, .. } => #Some (forward value)
   | #None => #None
   end
 end
 ```
 
-Inside the arm, a mirror the pattern bound is evidence for the opened type, so
-`std::reflect::type_of value` and generic foreign calls on `value` work there.
+The opened evidence authorizes observation of `'x`, not construction. A producer
+can instead carry an existing `Mirror 'x` to authorize construction after opening.
+Neither an edited description nor an arbitrary user factory can fabricate a mirror.
+The [reflection chapter](book/reflection.md) gives construction and migration examples.
 
-`reflect::shape : Mirror 'a -> Shape 'a` gives a mirror's outermost structure
-as typed views. Primitive cases carry `read : 'a -> Nat` and `make : Nat -> 'a`
-and their like, so a generic library converts without a cast; `#Array`,
-`#Record`, and `#Sum` carry views whose parts each hide their own type:
-
-```ruddy
-type SomeField 'record = hide 'field => {
-  name: String,
-  mirror: Mirror 'field,
-  presence: Presence,
-  read: 'record -> Option 'field,
-  bind: 'field -> Binding 'record,
-}
-```
-
-Opening a field with `hide 'f { mirror, read, bind, .. }` gives one scoped type
-shared by the mirror, what `read` observes, and what `bind` accepts, so a
-generic printer, validator, or decoder can work on a field's value and hand a
-new one back without knowing the field's type. A record view's `build` takes
-such bindings and rejects a missing, duplicate, unknown, or mismatched field,
-or one bound for another record. A sum case's `project` observes its payload
-and `inject` makes the case; functions, hidden types (`Any` among them),
-mirrors, and foreign values are described only.
+The debugger's reification view distinguishes descriptive slots, construction
+predicates, and demands supplied by callbacks. Artifacts use `artifact-v2`; older
+bundles must be recompiled because their mirrors had a weaker contract.
 
 ## ABI plans
 

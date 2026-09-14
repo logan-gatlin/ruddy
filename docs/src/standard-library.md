@@ -77,7 +77,7 @@ The `order` module provides `Ordering`, the type of a comparison function, while
 The numeric and string modules expose `compare` and comparisons such as `equal`, `less_than`, and `greater_than_or_equal`.
 `order::PartialOrder` adds `#Unordered` to the three total-order results. `order::compare` compares values structurally using reflection, and supplies the six infix comparison operators. `real::compare` is partial too: NaNs are unordered and signed zeros are equal. Use `real::total_compare` when sorting requires a total ordering.
 
-Opened existential types need a mirror carried by their package before they can be compared. This also applies when the opened type occurs inside a function type; comparisons retain reflection’s existing evidence requirements.
+Opened existential types need authenticated descriptive evidence (`TypeInfo`, or a stronger `Mirror`) carried by their package before they can be compared. This also applies when the opened type occurs inside a function type; comparisons retain reflection’s existing evidence requirements.
 
 `hash::hash` produces a `Result Nat64 hash::Error` through the same typed reflection
 views. For equal values at a shared static type, successful hashes agree when

@@ -1134,7 +1134,7 @@ fn the_artifact_tab_exposes_canonical_text_and_skips_with_errors() {
         artifact_stage
             .text
             .as_ref()
-            .is_some_and(|text| text.starts_with("(artifact\n  (header"))
+            .is_some_and(|text| text.starts_with("(artifact-v2\n  (header"))
     );
     assert_eq!(
         artifact_stage
@@ -1715,6 +1715,8 @@ type Any = hide 'a => { mirror: Mirror 'a, value: 'a }
     assert_eq!(output.status, Status::Ok);
     let text = format!("{:?}", output.nodes);
     assert!(text.contains("invocation needs"), "{text}");
+    assert!(text.contains("construction"), "{text}");
+    assert!(text.contains("Constructible"), "{text}");
     assert!(text.contains("demand port"), "{text}");
     assert!(text.contains("Evaluation"), "{text}");
 }

@@ -492,6 +492,7 @@ pub(super) fn children(ty: &mut Type, visit: &mut impl FnMut(&mut Type)) {
         }
         TypeKind::Array(element)
         | TypeKind::Mirror(element)
+        | TypeKind::TypeInfo(element)
         | TypeKind::Hidden { body: element, .. } => visit(element),
         TypeKind::Mut(region, element) => {
             visit(region);

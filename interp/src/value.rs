@@ -136,6 +136,7 @@ pub struct Type {
     pub nodes: Vec<Node>,
     pub plan: Option<Plan>,
     pub mirror: Cell<bool>,
+    pub info: Cell<bool>,
 }
 
 #[derive(Debug)]

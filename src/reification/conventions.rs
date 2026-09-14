@@ -51,6 +51,7 @@ pub struct Needs {
     pub variable: bool,
     pub redirect: Option<NeedId>,
     pub direct: BTreeSet<u32>,
+    pub construction: super::construction::Demand,
     pub port: Option<BTreeSet<u32>>,
     pub edges: Vec<Edge>,
     pub instance: Option<Instance>,
@@ -61,6 +62,7 @@ pub struct Edge {
     pub source: NeedId,
     pub substitute: BTreeMap<u32, BTreeSet<u32>>,
     pub retain: Option<BTreeSet<u32>>,
+    pub construction_retain: Option<BTreeSet<u32>>,
 }
 
 /// A use retains a live reference to its scheme's finite equations. The type
@@ -72,6 +74,7 @@ pub struct Instance {
     /// Shared by every need of one instantiation: the map is the size of
     /// the instantiated graph, and a copy per need would square it.
     pub substitute: Arc<BTreeMap<u32, BTreeSet<u32>>>,
+    pub construction_substitute: Arc<BTreeMap<u32, super::construction::Facts>>,
     pub ports: Arc<BTreeMap<NeedId, NeedId>>,
 }
 
@@ -91,7 +94,63 @@ pub struct Graph {
     eager: bool,
 }
 
+pub(super) struct DependencyIndex {
+    pub dependents: Vec<Vec<usize>>,
+    pub group_members: Vec<Vec<usize>>,
+    pub group_targets: Vec<HashMap<NeedId, Vec<NeedId>>>,
+    pub group_of: Vec<Option<usize>>,
+    pub dependent_groups: Vec<Vec<usize>>,
+}
+
 impl Graph {
+    pub(super) fn dependency_index(&self) -> DependencyIndex {
+        let mut dependents = vec![Vec::new(); self.needs.len()];
+        // The needs of one instantiation share one ports map. They depend on
+        // its targets as a group, and look a port's targets up by the port's
+        // root, so that neither the dependencies nor the lookups are the
+        // size of the instantiation per need.
+        let mut groups: HashMap<usize, usize> = HashMap::new();
+        let mut group_members: Vec<Vec<usize>> = Vec::new();
+        let mut group_targets: Vec<HashMap<NeedId, Vec<NeedId>>> = Vec::new();
+        let mut group_of: Vec<Option<usize>> = vec![None; self.needs.len()];
+        let mut dependent_groups: Vec<Vec<usize>> = vec![Vec::new(); self.needs.len()];
+        for (id, needs) in self.needs.iter().enumerate() {
+            for edge in &needs.edges {
+                dependents[edge.source as usize].push(id);
+            }
+            if let Some(source) = needs.redirect {
+                dependents[source as usize].push(id);
+            }
+            if let Some(instance) = &needs.instance {
+                dependents[instance.source as usize].push(id);
+                let key = Arc::as_ptr(&instance.ports) as usize;
+                let group = *groups.entry(key).or_insert_with(|| {
+                    let group = group_members.len();
+                    group_members.push(Vec::new());
+                    let mut targets: HashMap<NeedId, Vec<NeedId>> = HashMap::new();
+                    for (source, target) in instance.ports.iter() {
+                        targets
+                            .entry(self.need_root(*source))
+                            .or_default()
+                            .push(*target);
+                        dependent_groups[*target as usize].push(group);
+                    }
+                    group_targets.push(targets);
+                    group
+                });
+                group_members[group].push(id);
+                group_of[id] = Some(group);
+            }
+        }
+        DependencyIndex {
+            dependents,
+            group_members,
+            group_targets,
+            group_of,
+            dependent_groups,
+        }
+    }
+
     pub fn shape(&mut self, shape: Shape) -> ShapeId {
         let id = self.shapes.len() as ShapeId;
         self.shapes.push(shape);
@@ -472,6 +531,7 @@ impl Graph {
             (true, true) => {
                 let row = &mut self.needs[offered as usize];
                 row.direct.extend(a.direct);
+                row.construction.include(&a.construction);
                 row.edges.extend(a.edges);
                 row.port = match (a.port, b.port) {
                     (Some(a), Some(b)) => Some(a.union(&b).copied().collect()),
@@ -567,44 +627,13 @@ impl Graph {
                     .collect()
             })
             .collect();
-        let mut dependents = vec![Vec::new(); self.needs.len()];
-        // The needs of one instantiation share one ports map. They depend on
-        // its targets as a group, and look a port's targets up by the port's
-        // root, so that neither the dependencies nor the lookups are the
-        // size of the instantiation per need.
-        let mut groups: HashMap<usize, usize> = HashMap::new();
-        let mut group_members: Vec<Vec<usize>> = Vec::new();
-        let mut group_targets: Vec<HashMap<NeedId, Vec<NeedId>>> = Vec::new();
-        let mut group_of: Vec<Option<usize>> = vec![None; self.needs.len()];
-        let mut dependent_groups: Vec<Vec<usize>> = vec![Vec::new(); self.needs.len()];
-        for (id, needs) in self.needs.iter().enumerate() {
-            for edge in &needs.edges {
-                dependents[edge.source as usize].push(id);
-            }
-            if let Some(source) = needs.redirect {
-                dependents[source as usize].push(id);
-            }
-            if let Some(instance) = &needs.instance {
-                dependents[instance.source as usize].push(id);
-                let key = Arc::as_ptr(&instance.ports) as usize;
-                let group = *groups.entry(key).or_insert_with(|| {
-                    let group = group_members.len();
-                    group_members.push(Vec::new());
-                    let mut targets: HashMap<NeedId, Vec<NeedId>> = HashMap::new();
-                    for (source, target) in instance.ports.iter() {
-                        targets
-                            .entry(self.need_root(*source))
-                            .or_default()
-                            .push(*target);
-                        dependent_groups[*target as usize].push(group);
-                    }
-                    group_targets.push(targets);
-                    group
-                });
-                group_members[group].push(id);
-                group_of[id] = Some(group);
-            }
-        }
+        let DependencyIndex {
+            dependents,
+            group_members,
+            group_targets,
+            group_of,
+            dependent_groups,
+        } = self.dependency_index();
         let mut pending: std::collections::VecDeque<_> = (0..self.needs.len()).collect();
         let mut queued = vec![true; self.needs.len()];
         while let Some(id) = pending.pop_front() {
@@ -718,6 +747,12 @@ impl Graph {
             types
                 .iter()
                 .map(|(index, ty)| (*index, super::parameters(ty)))
+                .collect(),
+        );
+        let construction_substitute = Arc::new(
+            types
+                .iter()
+                .map(|(p, ty)| (*p, super::construction::Facts::of(ty, aliases)))
                 .collect(),
         );
         let mut shapes = HashMap::new();
@@ -835,6 +870,7 @@ impl Graph {
                         instance: Some(Instance {
                             source,
                             substitute: Arc::clone(&substitute),
+                            construction_substitute: Arc::clone(&construction_substitute),
                             ports: Arc::default(),
                         }),
                         ..Needs::default()
@@ -905,6 +941,7 @@ pub struct Plan {
     /// the pattern itself: the arm's body has this evidence from the moment
     /// the pattern matched, before any closure in it is built.
     pub evidence: IndexMap<Symbol, u32>,
+    pub constructive_evidence: BTreeSet<Symbol>,
 }
 
 impl Plan {
@@ -971,24 +1008,37 @@ impl Plan {
                         .unwrap_or_default(),
                 );
                 let root = planner.plan.bindings[symbol].value;
+                if matches!(
+                    intrinsic,
+                    super::Intrinsic::Mirror | super::Intrinsic::TypeOf
+                ) && let Shape::Arrow { needs, .. } = planner.plan.graph.exposed(root).clone()
+                    && let Some(ty) = intrinsic.represented(ty, planner.aliases)
+                {
+                    planner.plan.graph.needs[needs as usize]
+                        .construction
+                        .condition =
+                        super::construction::Facts::of(&ty, planner.aliases).constructible;
+                }
                 if let Shape::Arrow {
                     argument, result, ..
                 } = planner.plan.graph.exposed(root).clone()
                 {
                     match intrinsic {
-                        super::Intrinsic::TypeOf => {
+                        super::Intrinsic::TypeOf | super::Intrinsic::InfoOf => {
                             planner.plan.graph.shapes[argument as usize] = Shape::Sealed
                         }
                         // The functions an equality or a shape hands back are
                         // the runtime's own, which take no descriptors.
-                        super::Intrinsic::Same => {
+                        super::Intrinsic::Same | super::Intrinsic::SameInfo => {
                             if let Shape::Sum(fields) = planner.plan.graph.exposed(result).clone()
                                 && let Some(payload) = fields.get("Some")
                             {
                                 planner.plan.graph.shapes[*payload as usize] = Shape::Sealed;
                             }
                         }
-                        super::Intrinsic::Shape => {
+                        super::Intrinsic::Shape
+                        | super::Intrinsic::ShapeInfo
+                        | super::Intrinsic::Construct => {
                             planner.plan.graph.shapes[result as usize] = Shape::Sealed
                         }
                         _ => {}
@@ -1203,6 +1253,11 @@ impl Planner<'_> {
                 let allowed = super::parameters(&term.ty);
                 let captured = self.universe.difference(&allowed).copied().collect();
                 let needs = self.plan.graph.select(body.evaluation, allowed);
+                // Construction predicates can relate captured and invocation
+                // parameters (e.g. at least one live variant case). Keep that
+                // relation intact until the caller's complete substitution.
+                self.plan.graph.needs[needs as usize].edges[0].construction_retain =
+                    Some(self.universe.clone());
                 let evaluation = self.plan.graph.select(body.evaluation, captured);
                 let value = self.plan.graph.shape(Shape::Arrow {
                     argument,
@@ -1374,7 +1429,19 @@ impl Planner<'_> {
                         evaluations.push(body.evaluation);
                     } else {
                         let asked = self.universe.difference(&supplied).copied().collect();
-                        evaluations.push(self.plan.graph.select(body.evaluation, asked));
+                        let selected = self.plan.graph.select(body.evaluation, asked);
+                        let mut binders = Vec::new();
+                        ir::pattern_binders(pattern, &mut binders);
+                        let strong: BTreeSet<_> = binders
+                            .iter()
+                            .filter(|binder| {
+                                self.plan.constructive_evidence.contains(&binder.anchored)
+                            })
+                            .filter_map(|binder| self.plan.evidence.get(&binder.anchored).copied())
+                            .collect();
+                        self.plan.graph.needs[selected as usize].edges[0].construction_retain =
+                            Some(self.universe.difference(&strong).copied().collect());
+                        evaluations.push(selected);
                     }
                 }
                 Flow {
@@ -1503,11 +1570,14 @@ impl Planner<'_> {
                 // A mirror of an opened type, bound by name: evidence for
                 // that type within the arm. Only the mirror itself counts;
                 // a mirror of an array of it says nothing about the element.
-                if let Ty::Mirror(inner) = &*ty
+                if let Ty::Mirror(inner) | Ty::TypeInfo(inner) = &*ty
                     && let Some(slot) = super::evidence_slot(inner)
                     && slot & super::SCOPED != 0
                 {
                     self.plan.evidence.insert(name.anchored, slot);
+                    if matches!(&*ty, Ty::Mirror(_)) {
+                        self.plan.constructive_evidence.insert(name.anchored);
+                    }
                 }
                 self.plan.bindings.insert(
                     name.anchored,

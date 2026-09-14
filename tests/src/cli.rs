@@ -72,6 +72,74 @@ fn prepare_execution(directory: &Path) {
 }
 
 #[test]
+fn compiled_consumers_enforce_construction_predicates() {
+    let root = tempfile::tempdir().unwrap();
+    let producer = root.path().join("producer");
+    let consumer = root.path().join("consumer");
+    write_project(&producer, "producer", "1.0.0", &[]);
+    write_project(
+        &consumer,
+        "consumer",
+        "1.0.0",
+        &[("producer", "../producer")],
+    );
+    fs::write(
+        producer.join("main.rud"),
+        r#"
+@private extern mirror: () -> Mirror 'a = "$mirror"
+@private extern construct: Mirror 'a -> 'a = "$construct"
+let make = fn _ => construct (mirror ())
+let apply = fn callback argument => callback argument
+let forwarded = apply make
+let sum: TypeInfo { ..'r } -> (| ..'r) = fn _ => construct (mirror ())
+let record: TypeInfo (| ..'r) -> { ..'r } = fn _ => construct (mirror ())
+"#,
+    )
+    .unwrap();
+    build_project(&producer).expect("generic producer compiles separately");
+    for (requested, accepted) in [
+        ("#Some (|) | #None", true),
+        ("[|]", true),
+        ("|", false),
+        ("() -> Nat", false),
+    ] {
+        fs::write(
+            consumer.join("main.rud"),
+            format!("let value: {requested} = producer::forwarded ()"),
+        )
+        .unwrap();
+        let result = check_project(&consumer);
+        assert_eq!(result.is_ok(), accepted, "{requested}: {result:?}");
+    }
+    for (use_, accepted) in [
+        (
+            "let evidence: TypeInfo { Live: Nat, Dead: | } = info ()\nlet value = producer::sum evidence",
+            true,
+        ),
+        (
+            "let evidence: TypeInfo {} = info ()\nlet value = producer::sum evidence",
+            false,
+        ),
+        (
+            "let evidence: TypeInfo (#Live Nat | #Dead (|)) = info ()\nlet value = producer::record evidence",
+            false,
+        ),
+        (
+            "let evidence: TypeInfo (|) = info ()\nlet value = producer::record evidence",
+            true,
+        ),
+    ] {
+        fs::write(
+            consumer.join("main.rud"),
+            format!("@private extern info: () -> TypeInfo 'a = \"$typeInfo\"\n{use_}"),
+        )
+        .unwrap();
+        let result = check_project(&consumer);
+        assert_eq!(result.is_ok(), accepted, "{use_}: {result:?}");
+    }
+}
+
+#[test]
 fn executable_main_drains_console_output_and_saturates_exit_codes() {
     let directory = tempfile::tempdir().unwrap();
     executable_project(

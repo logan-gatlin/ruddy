@@ -4,6 +4,7 @@
 //! remain graph edges so constructing a recursive representation never unfolds
 //! the recursive type into an infinite tree.
 
+pub mod construction;
 pub mod conventions;
 pub mod interface;
 
@@ -190,6 +191,13 @@ impl Analysis {
                 declaration.value.target.anchored.as_str(),
                 "$ffiDecode"
                     | "$ffiEncode"
+                    | "$infoOf"
+                    | "$describeInfo"
+                    | "$sameInfo"
+                    | "$shapeInfo"
+                    | "$mirrorInfo"
+                    | "$construct"
+                    | "$typeInfo"
                     | "$mirror"
                     | "$typeOf"
                     | "$describe"
@@ -214,10 +222,63 @@ impl Analysis {
             }
         }
         let solved = self.callables.graph.solve();
+        let construction = self.callables.graph.solve_construction();
+        let unavailable_values = self
+            .callables
+            .graph
+            .unavailable_construction_values(&construction);
         for declaration in semantics.typed().values() {
-            let mut work = vec![(&declaration.value, BTreeSet::new())];
-            while let Some((term, available)) = work.pop() {
+            let mut work = vec![(&declaration.value, BTreeSet::new(), BTreeSet::new())];
+            while let Some((term, available, available_construction)) = work.pop() {
                 let flow = self.callables.occurrences[&term.at];
+                let condition = &construction[flow.evaluation as usize].condition;
+                let scoped = condition
+                    .parameters()
+                    .into_iter()
+                    .filter(|p| *p & SCOPED != 0)
+                    .map(|p| {
+                        let mut facts = construction::Facts::unavailable();
+                        if available_construction.contains(&p) {
+                            facts.constructible = construction::Condition::yes();
+                        }
+                        (p, facts)
+                    })
+                    .collect();
+                if unavailable_values[flow.value as usize]
+                    || condition.substitute(&scoped).is_false()
+                {
+                    let mut pending = vec![term];
+                    let mut reason = None;
+                    while let Some(use_site) = pending.pop() {
+                        let mut ty = inference::unfold(aliases, &use_site.ty);
+                        for _ in 0..64 {
+                            let Ty::Arrow(_, result, _) = &*ty else {
+                                break;
+                            };
+                            ty = inference::unfold(aliases, result);
+                        }
+                        if let Ty::Mirror(requested) = &*ty
+                            && let Ok((descriptor, parameters)) =
+                                Descriptor::template(requested, aliases)
+                            && parameters.is_empty()
+                            && let Err(error) =
+                                construction::Construction::analyze(&descriptor).review(&descriptor)
+                        {
+                            reason = Some(error);
+                            break;
+                        }
+                        children(use_site, &mut pending);
+                    }
+                    report(
+                        term.at,
+                        format!(
+                            "construction evidence is unavailable for this use of {}{}",
+                            term.ty,
+                            reason.map_or_else(String::new, |reason| format!(": {reason}")),
+                        ),
+                    );
+                    continue;
+                }
                 if solved[flow.evaluation as usize]
                     .iter()
                     .any(|need| !available.contains(&need.parameter))
@@ -230,6 +291,22 @@ impl Analysis {
                 if let TermKind::Ident(target) = &term.kind
                     && let Some(binding) = self.bindings.get(target)
                 {
+                    if let Some(external) = program.externs.get(target)
+                        && let Some(intrinsic @ (Intrinsic::Mirror | Intrinsic::TypeOf)) =
+                            Intrinsic::recognize(
+                                &external.value.target.anchored,
+                                &binding.ty,
+                                aliases,
+                            )
+                        && let Some(requested) = intrinsic.represented(&term.ty, aliases)
+                        && let Ok((descriptor, parameters)) =
+                            Descriptor::template(&requested, aliases)
+                        && parameters.is_empty()
+                        && let Err(message) =
+                            construction::Construction::analyze(&descriptor).review(&descriptor)
+                    {
+                        report(term.at, message);
+                    }
                     let supplied = instantiate(&binding.ty, &term.ty, aliases);
                     for parameter in &binding.parameters {
                         if let Some(ty) = supplied.get(parameter) {
@@ -268,17 +345,36 @@ impl Analysis {
                 // An arm has what its pattern's mirrors are evidence for,
                 // from the moment the pattern matched.
                 if let TermKind::Match { scrutinee, arms } = &term.kind {
-                    work.push((scrutinee, available.clone()));
+                    work.push((scrutinee, available.clone(), available_construction.clone()));
                     for (pattern, body) in arms {
                         let mut extended = available.clone();
                         extended.extend(self.callables.arm_evidence(pattern));
-                        work.push((body, extended));
+                        let mut strong = available_construction.clone();
+                        let mut binders = Vec::new();
+                        crate::ir::pattern_binders(pattern, &mut binders);
+                        strong.extend(
+                            binders
+                                .iter()
+                                .filter(|binder| {
+                                    self.callables
+                                        .constructive_evidence
+                                        .contains(&binder.anchored)
+                                })
+                                .filter_map(|binder| {
+                                    self.callables.evidence.get(&binder.anchored).copied()
+                                }),
+                        );
+                        work.push((body, extended, strong));
                     }
                     continue;
                 }
                 let mut nested = Vec::new();
                 children(term, &mut nested);
-                work.extend(nested.into_iter().map(|term| (term, available.clone())));
+                work.extend(
+                    nested
+                        .into_iter()
+                        .map(|term| (term, available.clone(), available_construction.clone())),
+                );
             }
         }
         errors
@@ -395,6 +491,7 @@ pub fn parameters(ty: &Arc<Ty>) -> BTreeSet<u32> {
                 row_parameters(row, &mut work, &mut parameters);
             }
             Ty::Array(inner)
+            | Ty::TypeInfo(inner)
             | Ty::Mirror(inner)
             | Ty::Package(inner)
             | Ty::Hidden { body: inner, .. } => work.push(inner.clone()),
@@ -488,9 +585,9 @@ pub fn instantiate(
             (Ty::Arrow(a, b, _), Ty::Arrow(x, y, _)) | (Ty::Mut(a, b), Ty::Mut(x, y)) => {
                 work.extend([(a.clone(), x.clone()), (b.clone(), y.clone())]);
             }
-            (Ty::Array(a), Ty::Array(b)) | (Ty::Mirror(a), Ty::Mirror(b)) => {
-                work.push((a.clone(), b.clone()))
-            }
+            (Ty::Array(a), Ty::Array(b))
+            | (Ty::Mirror(a), Ty::Mirror(b))
+            | (Ty::TypeInfo(a), Ty::TypeInfo(b)) => work.push((a.clone(), b.clone())),
             (Ty::Struct(a), Ty::Struct(b)) | (Ty::Sum(a), Ty::Sum(b)) => {
                 let a = flattened(a);
                 let mut b = flattened(b);
@@ -559,6 +656,15 @@ pub enum Intrinsic {
     Encode,
     /// `() -> Mirror 'a`: the evidence for the inferred type, as a value.
     Mirror,
+    /// Description-only evidence for the inferred type.
+    TypeInfo,
+    InfoOf,
+    DescribeInfo,
+    SameInfo,
+    ShapeInfo,
+    MirrorInfo,
+    /// Execute the finite construction carried by a mirror.
+    Construct,
     /// `'a -> Mirror 'a`: the evidence for the argument's static type.
     TypeOf,
     /// `Mirror 'a -> Description`: the mirror's finite graph as ordinary data.
@@ -579,9 +685,24 @@ pub enum Intrinsic {
 /// diagnostic rather than an exhausted process.
 const NODE_LIMIT: usize = 1 << 16;
 
-pub const SHAPE_CASES: [&str; 20] = [
-    "Nat", "Int", "Real", "String", "Bool", "Nat8", "Nat16", "Nat32", "Nat64", "Int8", "Int16",
-    "Int32", "Int64", "Array", "Record", "Sum", "Function", "Hidden", "Mirror", "Foreign",
+pub const SHAPE_CASES: [&str; 17] = [
+    "Nat",
+    "Int",
+    "Real",
+    "String",
+    "Bool",
+    "Nat8",
+    "Nat16",
+    "Nat32",
+    "Nat64",
+    "Int8",
+    "Int16",
+    "Int32",
+    "Int64",
+    "Array",
+    "EmptyArray",
+    "Record",
+    "Sum",
 ];
 
 /// Whether a type is `Result <carried> { path, expected, message }`, the
@@ -748,6 +869,17 @@ mod contract {
         }
     }
 
+    fn evidence(
+        constructive: bool,
+        of: impl Fn(&Arc<Ty>, &Aliases) -> bool + Copy,
+    ) -> impl Fn(&Arc<Ty>, &Aliases) -> bool + Copy {
+        move |ty, aliases| match &*unfold(ty, aliases) {
+            Ty::Mirror(inner) if constructive => of(inner, aliases),
+            Ty::TypeInfo(inner) if !constructive => of(inner, aliases),
+            _ => false,
+        }
+    }
+
     /// A hidden type, with its body checked against the variable it binds.
     pub(super) fn hidden(
         body: impl Fn(u32, &Arc<Ty>, &Aliases) -> bool + Copy,
@@ -833,6 +965,7 @@ mod contract {
                 }),
                 ("Parameter", &nat),
                 ("Mirror", &nat),
+                ("TypeInfo", &nat),
                 ("Hidden", &nat),
                 ("Variable", &nat),
             ],
@@ -853,62 +986,96 @@ mod contract {
     /// mirrored type and `P` the primitive the case is named for. Reading and
     /// making the wrong primitive is a different contract, whatever the case
     /// is called.
+    fn record_prefix(
+        ty: &Arc<Ty>,
+        aliases: &Aliases,
+        fields: &[(&str, &dyn Fn(&Arc<Ty>, &Aliases) -> bool)],
+        count: usize,
+    ) -> bool {
+        record(ty, aliases, &fields[..count])
+    }
+
     fn view(
+        constructive: bool,
         mirrored: u32,
         primitive: impl Fn(&Arc<Ty>, &Aliases) -> bool + Copy,
     ) -> impl Fn(&Arc<Ty>, &Aliases) -> bool + Copy {
         move |ty, aliases| {
-            record(
+            record_prefix(
                 ty,
                 aliases,
                 &[
                     ("read", &arrow(bound(mirrored), primitive)),
                     ("make", &arrow(primitive, bound(mirrored))),
                 ],
+                if constructive { 2 } else { 1 },
             )
         }
     }
 
     /// `std::reflect::Shape 'a`: every case the compiler builds, with the
     /// operations it builds there.
-    pub(super) fn shape(ty: &Arc<Ty>, aliases: &Aliases, mirrored: u32) -> bool {
+    pub(super) fn shape(
+        ty: &Arc<Ty>,
+        aliases: &Aliases,
+        mirrored: u32,
+        constructive: bool,
+    ) -> bool {
         use crate::types::FixedInt;
         let of = bound(mirrored);
         let primitives: [(&str, &dyn Fn(&Arc<Ty>, &Aliases) -> bool); 13] = [
-            ("Nat", &view(mirrored, nat)),
+            ("Nat", &view(constructive, mirrored, nat)),
             (
                 "Int",
-                &view(mirrored, |ty: &Arc<Ty>, aliases: &Aliases| {
+                &view(constructive, mirrored, |ty: &Arc<Ty>, aliases: &Aliases| {
                     matches!(&*unfold(ty, aliases), Ty::Int)
                 }),
             ),
             (
                 "Real",
-                &view(mirrored, |ty: &Arc<Ty>, aliases: &Aliases| {
+                &view(constructive, mirrored, |ty: &Arc<Ty>, aliases: &Aliases| {
                     matches!(&*unfold(ty, aliases), Ty::Real)
                 }),
             ),
-            ("String", &view(mirrored, text)),
-            ("Bool", &view(mirrored, boolean)),
-            ("Nat8", &view(mirrored, fixed(FixedInt::Nat8))),
-            ("Nat16", &view(mirrored, fixed(FixedInt::Nat16))),
-            ("Nat32", &view(mirrored, fixed(FixedInt::Nat32))),
-            ("Nat64", &view(mirrored, fixed(FixedInt::Nat64))),
-            ("Int8", &view(mirrored, fixed(FixedInt::Int8))),
-            ("Int16", &view(mirrored, fixed(FixedInt::Int16))),
-            ("Int32", &view(mirrored, fixed(FixedInt::Int32))),
-            ("Int64", &view(mirrored, fixed(FixedInt::Int64))),
+            ("String", &view(constructive, mirrored, text)),
+            ("Bool", &view(constructive, mirrored, boolean)),
+            ("Nat8", &view(constructive, mirrored, fixed(FixedInt::Nat8))),
+            (
+                "Nat16",
+                &view(constructive, mirrored, fixed(FixedInt::Nat16)),
+            ),
+            (
+                "Nat32",
+                &view(constructive, mirrored, fixed(FixedInt::Nat32)),
+            ),
+            (
+                "Nat64",
+                &view(constructive, mirrored, fixed(FixedInt::Nat64)),
+            ),
+            ("Int8", &view(constructive, mirrored, fixed(FixedInt::Int8))),
+            (
+                "Int16",
+                &view(constructive, mirrored, fixed(FixedInt::Int16)),
+            ),
+            (
+                "Int32",
+                &view(constructive, mirrored, fixed(FixedInt::Int32)),
+            ),
+            (
+                "Int64",
+                &view(constructive, mirrored, fixed(FixedInt::Int64)),
+            ),
         ];
         // A field and a case each hide their own type, and everything the view
         // carries is about that one type: the mirror proves it, `read` observes
         // it, and `bind` or `inject` accepts it.
         let some_field = hidden(move |binder, body, aliases| {
-            record(
+            record_prefix(
                 body,
                 aliases,
                 &[
                     ("name", &text),
-                    ("mirror", &mirror(opened(binder))),
+                    ("mirror", &evidence(constructive, opened(binder))),
                     ("presence", &|ty: &Arc<Ty>, aliases: &Aliases| {
                         sum(ty, aliases, &[("Required", &unit), ("Optional", &unit)])
                     }),
@@ -918,18 +1085,20 @@ mod contract {
                     // one thing a caller must not see.
                     ("bind", &arrow(opened(binder), binding_of(mirrored))),
                 ],
+                if constructive { 5 } else { 4 },
             )
         });
         let some_case = hidden(move |binder, body, aliases| {
-            record(
+            record_prefix(
                 body,
                 aliases,
                 &[
                     ("name", &text),
-                    ("mirror", &mirror(opened(binder))),
+                    ("mirror", &evidence(constructive, opened(binder))),
                     ("project", &arrow(bound(mirrored), option(opened(binder)))),
-                    ("inject", &option(arrow(opened(binder), bound(mirrored)))),
+                    ("inject", &arrow(opened(binder), bound(mirrored))),
                 ],
+                if constructive { 4 } else { 3 },
             )
         });
         let build_error = |ty: &Arc<Ty>, aliases: &Aliases| {
@@ -946,11 +1115,11 @@ mod contract {
             )
         };
         let record_view = move |ty: &Arc<Ty>, aliases: &Aliases| {
-            record(
+            record_prefix(
                 ty,
                 aliases,
                 &[
-                    ("mirror", &mirror(bound(mirrored))),
+                    ("mirror", &evidence(constructive, bound(mirrored))),
                     ("fields", &array_of(&some_field)),
                     (
                         "build",
@@ -960,6 +1129,7 @@ mod contract {
                         ),
                     ),
                 ],
+                if constructive { 3 } else { 2 },
             )
         };
         let sum_view = move |ty: &Arc<Ty>, aliases: &Aliases| {
@@ -967,20 +1137,21 @@ mod contract {
                 ty,
                 aliases,
                 &[
-                    ("mirror", &mirror(bound(mirrored))),
+                    ("mirror", &evidence(constructive, bound(mirrored))),
                     ("cases", &array_of(&some_case)),
                 ],
             )
         };
         let array_view = hidden(move |binder, body, aliases| {
-            record(
+            record_prefix(
                 body,
                 aliases,
                 &[
-                    ("element", &mirror(opened(binder))),
+                    ("element", &evidence(constructive, opened(binder))),
                     ("read", &arrow(bound(mirrored), array_of(&opened(binder)))),
                     ("make", &arrow(array_of(&opened(binder)), bound(mirrored))),
                 ],
+                if constructive { 3 } else { 2 },
             )
         });
         let mut cases: Vec<(&str, &dyn Fn(&Arc<Ty>, &Aliases) -> bool)> = primitives
@@ -996,7 +1167,27 @@ mod contract {
             ("Mirror", &description),
             ("Foreign", &unit),
         ];
-        cases.extend(rest);
+        let empty = |ty: &Arc<Ty>, aliases: &Aliases| sum(ty, aliases, &[]);
+        let empty_array = |ty: &Arc<Ty>, aliases: &Aliases| {
+            record(
+                ty,
+                aliases,
+                &[
+                    ("element", &description),
+                    ("read", &arrow(bound(mirrored), array_of(&empty))),
+                    ("make", &arrow(array_of(&empty), bound(mirrored))),
+                ],
+            )
+        };
+        if constructive {
+            cases.extend(rest.into_iter().take(3));
+            cases.push(("EmptyArray", &empty_array));
+        } else {
+            cases.extend(rest);
+        }
+        if !constructive {
+            cases.push(("TypeInfo", &description));
+        }
         let _ = of;
         sum(ty, aliases, &cases)
     }
@@ -1079,6 +1270,40 @@ impl Intrinsic {
                 matches!(&**to, Ty::Mirror(inner) if matches!(&**inner, Ty::Bound(_)))
                     .then_some(Self::Mirror)
             }
+            "$typeInfo" if same_finite_syntax(from, &Arc::new(Ty::unit())) => {
+                matches!(&**to, Ty::TypeInfo(inner) if matches!(&**inner, Ty::Bound(_)))
+                    .then_some(Self::TypeInfo)
+            }
+            "$infoOf" => match (&**from, &**to) {
+                (Ty::Bound(argument), Ty::TypeInfo(inner)) if matches!(&**inner, Ty::Bound(index) if index == argument) => {
+                    Some(Self::InfoOf)
+                }
+                _ => None,
+            },
+            "$mirrorInfo" => match (&**from, &**to) {
+                (Ty::Mirror(left), Ty::TypeInfo(right)) if matches!((&**left, &**right), (Ty::Bound(a), Ty::Bound(b)) if a == b) => {
+                    Some(Self::MirrorInfo)
+                }
+                _ => None,
+            },
+            "$describeInfo" if matches!(&**from, Ty::TypeInfo(_)) => {
+                contract::description(to, aliases).then_some(Self::DescribeInfo)
+            }
+            "$shapeInfo" => match (&**from, &**to) {
+                (Ty::TypeInfo(inner), Ty::Named { args, .. })
+                    if let Ty::Bound(index) = &**inner
+                        && matches!(&**args, [arg] if matches!(&**arg, Ty::Bound(p) if p == index)) =>
+                {
+                    contract::shape(to, aliases, *index, false).then_some(Self::ShapeInfo)
+                }
+                _ => None,
+            },
+            "$construct" => match (&**from, &**to) {
+                (Ty::Mirror(inner), Ty::Bound(result)) if matches!(&**inner, Ty::Bound(index) if index == result) => {
+                    Some(Self::Construct)
+                }
+                _ => None,
+            },
             "$typeOf" => match (&**from, &**to) {
                 (Ty::Bound(argument), Ty::Mirror(inner)) if matches!(&**inner, Ty::Bound(mirrored) if mirrored == argument) => {
                     Some(Self::TypeOf)
@@ -1090,20 +1315,24 @@ impl Intrinsic {
                     if let Ty::Bound(mirrored) = &**inner
                         && matches!(&**args, [arg] if matches!(&**arg, Ty::Bound(index) if index == mirrored)) =>
                 {
-                    contract::shape(to, aliases, *mirrored).then_some(Self::Shape)
+                    contract::shape(to, aliases, *mirrored, true).then_some(Self::Shape)
                 }
                 _ => None,
             },
             "$describe" if matches!(&**from, Ty::Mirror(_)) => {
                 contract::description(to, aliases).then_some(Self::Describe)
             }
-            "$sameMirror" => {
+            "$sameMirror" | "$sameInfo" => {
                 let pair = inference::unfold(aliases, from);
                 let Ty::Struct(pair) = &*pair else {
                     return None;
                 };
                 let mirrored = |name: &str| match &*pair.labels.get(name)?.ty {
-                    Ty::Mirror(inner) => match &**inner {
+                    Ty::Mirror(inner) if target == "$sameMirror" => match &**inner {
+                        Ty::Bound(index) => Some(*index),
+                        _ => None,
+                    },
+                    Ty::TypeInfo(inner) if target == "$sameInfo" => match &**inner {
                         Ty::Bound(index) => Some(*index),
                         _ => None,
                     },
@@ -1141,7 +1370,11 @@ impl Intrinsic {
                     && matches!(casts.rest, Rest::Closed)
                     && arrow("forward", left, right)
                     && arrow("backward", right, left))
-                .then_some(Self::Same)
+                .then_some(if target == "$sameInfo" {
+                    Self::SameInfo
+                } else {
+                    Self::Same
+                })
             }
             _ => None,
         }
@@ -1156,7 +1389,7 @@ impl Intrinsic {
             unreachable!("a reviewed reflection intrinsic is a function")
         };
         match self {
-            Self::TypeOf | Self::Encode => Some(from.clone()),
+            Self::TypeOf | Self::InfoOf | Self::Encode => Some(from.clone()),
             Self::Decode => {
                 let result = inference::unfold(aliases, to);
                 let Ty::Sum(row) = &*result else {
@@ -1164,11 +1397,22 @@ impl Intrinsic {
                 };
                 Some(row.labels["Some"].ty.clone())
             }
+            Self::TypeInfo => match &**to {
+                Ty::TypeInfo(inner) => Some(inner.clone()),
+                _ => unreachable!("reviewed type information intrinsic"),
+            },
             Self::Mirror => match &**to {
                 Ty::Mirror(inner) => Some(inner.clone()),
                 _ => unreachable!("a reviewed mirror intrinsic returns a mirror"),
             },
-            Self::Describe | Self::Same | Self::Shape => None,
+            Self::Describe
+            | Self::DescribeInfo
+            | Self::Same
+            | Self::SameInfo
+            | Self::Shape
+            | Self::ShapeInfo
+            | Self::MirrorInfo
+            | Self::Construct => None,
         }
     }
 }
@@ -1194,6 +1438,7 @@ pub enum Node {
     Cell([u32; 2]),
     /// Authentic evidence of the type at the index: a mirror.
     Mirror(u32),
+    TypeInfo(u32),
     /// `hide 'a => T`, binding a variable over the body at the index.
     Hidden(u32),
     /// A hidden type's variable, by how many binders out it was bound: zero
@@ -1303,6 +1548,9 @@ impl Descriptor {
                 "Unit" => Node::Struct(Vec::new()),
                 "package" if native => Node::Alias(child(edge("body").expect("package body"))),
                 "mirror" => Node::Mirror(child(edge("of").expect("mirror graph edge"))),
+                "type-info" => {
+                    Node::TypeInfo(child(edge("of").expect("type information graph edge")))
+                }
                 // A hidden type binds its variable over its body, numbered by
                 // depth so the spelling of the variable is no part of its
                 // identity. Across a foreign boundary it is a sealed package:
@@ -1518,6 +1766,7 @@ impl Descriptor {
                 Node::Array(index)
                 | Node::Alias(index)
                 | Node::Mirror(index)
+                | Node::TypeInfo(index)
                 | Node::Hidden(index) => {
                     vec![*index]
                 }

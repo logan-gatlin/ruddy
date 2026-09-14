@@ -9,6 +9,312 @@ use ruddy::{
 };
 
 #[test]
+fn generic_construction_preserves_row_context() {
+    let declarations = r#"
+@private extern info: () -> TypeInfo 'a = "$typeInfo"
+@private extern mirror: () -> Mirror 'a = "$mirror"
+@private extern construct: Mirror 'a -> 'a = "$construct"
+@private let sum: TypeInfo { ..'r } -> (| ..'r) = fn _ => construct (mirror ())
+@private let record: TypeInfo (| ..'r) -> { ..'r } = fn _ => construct (mirror ())
+"#;
+    for (use_, accepted) in [
+        (
+            "let evidence: TypeInfo { Live: Nat, Dead: | } = info ()\nlet value = sum evidence",
+            true,
+        ),
+        (
+            "let evidence: TypeInfo {} = info ()\nlet value = sum evidence",
+            false,
+        ),
+        (
+            "let evidence: TypeInfo (#Live Nat | #Dead (|)) = info ()\nlet value = record evidence",
+            false,
+        ),
+        (
+            "let evidence: TypeInfo (|) = info ()\nlet value = record evidence",
+            true,
+        ),
+    ] {
+        let source = format!("{declarations}\n{use_}");
+        let parsed = parse::parse(token::lex(&source, FileID::GENERATED).tokens);
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let result = compile::compile(
+            Mint::new(Bundle::new("tests", Version::new(0, 1, 0)).unwrap()),
+            parsed.stmts,
+            inference::Trace::Off,
+        );
+        assert_eq!(
+            result.is_ok(),
+            accepted,
+            "{use_}: {:?}",
+            result.as_ref().err().map(|failed| &failed.errors)
+        );
+        if let Ok(accepted) = result {
+            let program = ruddy_interp::Program::load(accepted.artifact()).unwrap();
+            let value = ruddy_interp::render::json(&program.export("value").unwrap());
+            assert_eq!(
+                value,
+                if use_.contains("= sum ") {
+                    r#"{"tag":"Live","value":0}"#
+                } else {
+                    "{}"
+                }
+            );
+        }
+    }
+}
+
+#[test]
+fn mutually_recursive_and_array_recursive_construction_compiles() {
+    let source = r#"
+@private extern mirror: () -> Mirror 'a = "$mirror"
+@private extern construct: Mirror 'a -> 'a = "$construct"
+type Even = #Next Odd
+type Odd = #Back Even | #Done
+type Chain = { next: [Chain] }
+let even: Even = construct (mirror ())
+let chain: Chain = construct (mirror ())
+let next = chain.next
+"#;
+    let parsed = parse::parse(token::lex(source, FileID::GENERATED).tokens);
+    assert!(parsed.errors.is_empty());
+    let result = compile::compile(
+        Mint::new(Bundle::new("tests", Version::new(0, 1, 0)).unwrap()),
+        parsed.stmts,
+        inference::Trace::Off,
+    );
+    let accepted = result.unwrap_or_else(|failed| panic!("{:?}", failed.errors));
+    let artifact = accepted.artifact();
+    let _ = ruddy::backend::js::generate(artifact).unwrap();
+    let interpreted = ruddy_interp::Program::load(artifact).unwrap();
+    assert_eq!(
+        ruddy_interp::render::json(&interpreted.export("even").unwrap()),
+        r#"{"tag":"Next","value":{"tag":"Done"}}"#
+    );
+}
+
+#[test]
+fn construction_conditions_survive_captured_and_called_type_parameters() {
+    let prelude = r#"
+extern info: () -> TypeInfo 'a = "$typeInfo"
+extern mirror: () -> Mirror 'a = "$mirror"
+let request: (TypeInfo 'a, TypeInfo 'b) -> Mirror (#Left 'a | #Right 'b) = fn _ => mirror ()
+let demand: TypeInfo 'a -> TypeInfo 'b -> () = fn first second => do
+  _ = request (first, second)
+  return ()
+end
+"#;
+    for (left, right, accepted) in [("|", "|", false), ("|", "Nat", true), ("Nat", "|", true)] {
+        let source = format!(
+            "{prelude}\nlet first: TypeInfo ({left}) = info ()\nlet second: TypeInfo ({right}) = info ()\nlet later = demand first\nlet checked = later second"
+        );
+        let parsed = parse::parse(token::lex(&source, FileID::GENERATED).tokens);
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let result = compile::compile(
+            Mint::new(Bundle::new("tests", Version::new(0, 1, 0)).unwrap()),
+            parsed.stmts,
+            inference::Trace::Off,
+        );
+        assert_eq!(
+            result.is_ok(),
+            accepted,
+            "{left}, {right}: {:?}",
+            result.err().map(|failed| failed.errors)
+        );
+    }
+}
+
+#[test]
+fn hidden_construction_requires_carried_mirror_authority() {
+    for (evidence, accepted) in [("Mirror", true), ("TypeInfo", false)] {
+        let source = format!(
+            r#"
+extern mirror: () -> Mirror 'a = "$mirror"
+extern construct: Mirror 'a -> 'a = "$construct"
+type Package = hide 'a => {{ evidence: {evidence} 'a, value: 'a }}
+let rebuild: Package -> Package = fn package => match package with
+| hide 'a {{ evidence, .. }} => {{ evidence: evidence, value: construct (mirror ()) }}
+end
+"#
+        );
+        let parsed = parse::parse(token::lex(&source, FileID::GENERATED).tokens);
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let result = compile::compile(
+            Mint::new(Bundle::new("tests", Version::new(0, 1, 0)).unwrap()),
+            parsed.stmts,
+            inference::Trace::Off,
+        );
+        assert_eq!(
+            result.is_ok(),
+            accepted,
+            "{evidence}: {:?}",
+            result.err().map(|failed| failed.errors)
+        );
+    }
+}
+
+#[test]
+fn mirrors_require_a_finite_accessible_construction() {
+    for requested in [
+        "|",
+        "{ impossible: | }",
+        "() -> Nat",
+        "[() -> Nat]",
+        "Loop",
+        "{ inner: [#Live Nat | #Opaque (() -> Nat)] }",
+    ] {
+        let source = format!(
+            "type Loop = #Next Loop\nextern mirror: () -> Mirror 'a = \"$mirror\"\nlet requested: Mirror ({requested}) = mirror ()"
+        );
+        let parsed = parse::parse(token::lex(&source, FileID::GENERATED).tokens);
+        assert!(parsed.errors.is_empty(), "{requested}: {:?}", parsed.errors);
+        let failed = compile::compile(
+            Mint::new(Bundle::new("tests", Version::new(0, 1, 0)).unwrap()),
+            parsed.stmts,
+            inference::Trace::Off,
+        )
+        .expect_err("a mirror requires finite accessible construction evidence");
+        assert!(
+            failed
+                .errors
+                .iter()
+                .any(|error| format!("{error:?}").contains("construction")),
+            "{requested}: {:?}",
+            failed.errors
+        );
+    }
+}
+
+#[test]
+fn descriptive_type_information_does_not_require_constructors() {
+    let source = r#"
+extern type_info: () -> TypeInfo 'a = "$typeInfo"
+let empty: TypeInfo (|) = type_info ()
+let callable: TypeInfo (() -> Nat) = type_info ()
+let array: TypeInfo [() -> Nat] = type_info ()
+"#;
+    let parsed = parse::parse(token::lex(source, FileID::GENERATED).tokens);
+    assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+    compile::compile(
+        Mint::new(Bundle::new("tests", Version::new(0, 1, 0)).unwrap()),
+        parsed.stmts,
+        inference::Trace::Off,
+    )
+    .unwrap_or_else(|failed| panic!("{:?}", failed.errors));
+}
+
+#[test]
+fn concrete_callable_values_retain_construction_requirements() {
+    let prelude = r#"
+@private extern type_of: 'a -> Mirror 'a = "$typeOf"
+@private extern info_of: 'a -> TypeInfo 'a = "$infoOf"
+@private let consume: 'a -> () = fn value => do _ = type_of value return () end
+@private let observe: 'a -> () = fn value => do _ = info_of value return () end
+"#;
+    for (usage, accepted) in [
+        ("let bad: (() -> Nat) -> () = consume", false),
+        (
+            "let bad: { run: (() -> Nat) -> () } = { run: consume }",
+            false,
+        ),
+        ("let bad: [(() -> Nat) -> ()] = [consume]", false),
+        ("let bad: () -> (() -> Nat) -> () = fn _ => consume", false),
+        ("let good: Nat -> () = consume", true),
+        ("let good: (() -> Nat) -> () = observe", true),
+    ] {
+        let source = format!("{prelude}\n{usage}");
+        let parsed = parse::parse(token::lex(&source, FileID::GENERATED).tokens);
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let result = compile::compile(
+            Mint::new(Bundle::new("tests", Version::new(0, 1, 0)).unwrap()),
+            parsed.stmts,
+            inference::Trace::Off,
+        );
+        assert_eq!(
+            result.is_ok(),
+            accepted,
+            "{usage}: {:?}",
+            result.as_ref().err().map(|failed| &failed.errors)
+        );
+        if let Err(failed) = result {
+            assert!(
+                failed
+                    .errors
+                    .iter()
+                    .any(|error| format!("{error:?}").contains("construction")),
+                "{:?}",
+                failed.errors
+            );
+        }
+    }
+}
+
+#[test]
+fn construction_requirements_follow_generic_and_higher_order_calls() {
+    let source = r#"
+extern mirror: () -> Mirror 'a = "$mirror"
+extern construct: Mirror 'a -> 'a = "$construct"
+let make = fn _ => construct (mirror ())
+let apply = fn callback => fn value => callback value
+let forwarded = apply make
+let impossible: | = forwarded ()
+"#;
+    let parsed = parse::parse(token::lex(source, FileID::GENERATED).tokens);
+    assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+    let failed = compile::compile(
+        Mint::new(Bundle::new("tests", Version::new(0, 1, 0)).unwrap()),
+        parsed.stmts,
+        inference::Trace::Off,
+    )
+    .expect_err("the caller must satisfy the forwarded construction requirement");
+    assert!(
+        failed
+            .errors
+            .iter()
+            .any(|error| format!("{error:?}").contains("construction")),
+        "{:?}",
+        failed.errors
+    );
+}
+
+#[test]
+fn generic_construction_distinguishes_empty_parts_from_missing_authority() {
+    let declarations = r#"
+type Option 'a = #Some 'a | #None
+type Choice 'a 'b = #Left 'a | #Right 'b
+extern mirror: () -> Mirror 'a = "$mirror"
+extern construct: Mirror 'a -> 'a = "$construct"
+let optional: () -> Option 'a = fn _ => construct (mirror ())
+let array: () -> ['a] = fn _ => construct (mirror ())
+let choice: () -> Choice 'a 'b = fn _ => construct (mirror ())
+"#;
+    for (uses, accepted) in [
+        (
+            "let absent: Option (|) = optional ()\nlet empty: [|] = array ()\nlet left: Choice Nat (|) = choice ()",
+            true,
+        ),
+        ("let impossible: Choice (|) (|) = choice ()", false),
+        ("let unsupported: Option (() -> Nat) = optional ()", false),
+        ("let unsupported: [() -> Nat] = array ()", false),
+    ] {
+        let source = format!("{declarations}\n{uses}");
+        let parsed = parse::parse(token::lex(&source, FileID::GENERATED).tokens);
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let result = compile::compile(
+            Mint::new(Bundle::new("tests", Version::new(0, 1, 0)).unwrap()),
+            parsed.stmts,
+            inference::Trace::Off,
+        );
+        assert_eq!(
+            result.is_ok(),
+            accepted,
+            "{uses}: {:?}",
+            result.err().map(|failed| failed.errors)
+        );
+    }
+}
+
+#[test]
 fn failed_compilation_preserves_completed_phases_and_aggregates_checking_errors() {
     let source = "let bad = 1n 2n\nlet missing = fn truth => match truth with | true => 1n end";
     let parsed = parse::parse(token::lex(source, FileID::GENERATED).tokens);

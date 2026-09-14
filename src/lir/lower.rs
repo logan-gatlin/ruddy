@@ -1379,15 +1379,17 @@ impl Lower<'_> {
         let descriptor = match kind.represented(ty, self.inference.aliases()) {
             Some(represented) => self.representation(&represented, &mut body),
             None => match kind {
-                crate::reification::Intrinsic::Same => self.emit(
-                    &mut body,
-                    Span::default(),
-                    Rep::TypeDescriptor,
-                    Op::Project {
-                        base: argument,
-                        field: FieldKey::named("0".to_owned()),
-                    },
-                ),
+                crate::reification::Intrinsic::Same | crate::reification::Intrinsic::SameInfo => {
+                    self.emit(
+                        &mut body,
+                        Span::default(),
+                        Rep::TypeDescriptor,
+                        Op::Project {
+                            base: argument,
+                            field: FieldKey::named("0".to_owned()),
+                        },
+                    )
+                }
                 _ => argument,
             },
         };
@@ -2278,6 +2280,7 @@ impl Lower<'_> {
             Ty::Arrow(..) => Rep::Fn,
             Ty::Array(_) => Rep::Array,
             Ty::Mirror(_) => Rep::TypeDescriptor,
+            Ty::TypeInfo(_) => Rep::TypeDescriptor,
             Ty::Mut(..) => Rep::Any,
             Ty::Sum(_) => Rep::Sum,
             Ty::Struct(row) => {

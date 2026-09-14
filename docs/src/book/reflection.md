@@ -44,7 +44,7 @@ end
 Within the arm, `'item` names one type shared by `value` and the argument of `show`.
 The consumer need not know whether that type is `Nat` or `String`.
 Returning `value` directly would let an unknown type escape its scope and is rejected; returning the string produced by `show` is valid.
-`render_item` calls the operation stored in the package. Calling `display item` instead would print `<hidden>`; this package does not carry the mirror evidence needed to call `display value` after opening it.
+`render_item` calls the operation stored in the package. Calling `display item` instead would print `<hidden>`; this package does not carry the descriptive evidence needed to call `display value` after opening it.
 An array of `Displayable` packages can therefore be heterogeneous internally while retaining one array element type.
 
 ## Evidence for a type
@@ -62,6 +62,61 @@ The description is ordinary data describing a finite graph of type structure.
 It can be inspected, but editing it cannot create a new mirror or authorize a conversion.
 `reflect::type_of value` obtains a mirror of the value's static type at that use; it does not discover an arbitrary new type by examining host data.
 The [Reflect](../std/reflect.md) reference separates descriptions from typed views.
+
+A `Mirror T` also guarantees accessible construction operations and a finite pure
+construction of `T`. `reflect::construct count_mirror` returns `0n`. Generic
+functions retain this requirement for their callers, including after partial
+application and across compiled imports. The familiar `reflect::mirror ()`
+continues to infer its type from context; constructibility never chooses an
+otherwise ambiguous type.
+
+Automatic construction supports immutable primitives, unit, records, variants,
+and arrays. Primitive defaults are zero, false, and empty text. Records construct
+every field, arrays construct `[]`, and variants choose a case with minimum
+finite construction height, breaking ties in canonical case order. Recursive
+variants need a finite base case; a constructor cycle alone is insufficient.
+This deterministic rule agrees across backends and is not a sampling distribution.
+
+An empty type (`|`) cannot obtain a mirror. `Option (|)` can: its constructive sum
+view exposes only `None`, with a direct `inject` function. Its full description
+still contains `Some`. An array `[|]` exposes `#EmptyArray`, whose `read` and
+`make` operate on `[|]` and whose element is a plain description. No nested
+`Mirror (|)` is exposed. An array of functions, or a variant with a live function
+alternative, is rejected: unavailable constructors are not proof of emptiness.
+Functions, mutable cells, foreign resources, hidden packages, and evidence types
+themselves have no automatic constructors.
+
+Use authenticated `TypeInfo T` when construction is unnecessary:
+
+```ruddy
+let callable_info: TypeInfo (Nat -> Nat) = std::reflect::type_info ()
+let callable_description = std::reflect::describe_info callable_info
+let empty_info: TypeInfo (|) = std::reflect::type_info ()
+```
+
+`reflect::info_of value` obtains the static type information of a value;
+`reflect::info mirror` forgets a mirror's construction authority.
+`reflect::shape_info` provides typed readers and descriptive nested evidence.
+`reflect::same_info` checks exact identity without constructing a value.
+`TypeInfo` cannot be promoted to a `Mirror` unless the construction requirement is
+satisfied independently. Plain `Description` data grants neither capability.
+Display, comparison, hashing, and `Any` use descriptive evidence, so they retain
+their observational domains and existing region restrictions.
+
+A hidden package can explicitly carry construction authority:
+
+```ruddy
+type Constructible = hide 'a => { mirror: Mirror 'a, value: 'a }
+let packaged: Constructible = { mirror: std::reflect::mirror (), value: 3n }
+let reset: Constructible -> Constructible = fn package => match package with
+| hide 'a { mirror, .. } => { mirror: mirror, value: std::reflect::construct mirror }
+end
+```
+
+Opening a package containing only a value or `TypeInfo` does not grant constructors.
+Passing an existing authorized mirror preserves its hidden type and scope; an
+arbitrary resource factory cannot fabricate one.
+
 
 ## Pretty printing arbitrary values
 
@@ -106,10 +161,11 @@ Integer suffixes preserve their types, negative real zero prints as `-0`, and
 non-finite reals print as `NaN`, `Infinity`, or `-Infinity`. Output has no final
 newline and is not truncated. It is diagnostic text, not a serialization format.
 
-Functions print as `<function>`. Hidden packages, mirrors, and foreign values
-(including mutable cells) print as `<hidden>`, `<mirror>`, and `<foreign>`.
+Functions print as `<function>`. Hidden packages, mirrors, descriptive evidence,
+and foreign values (including mutable cells) print as `<hidden>`, `<mirror>`,
+`<type-info>`, and `<foreign>`.
 Displaying a hidden package does not open it. To display its contents, open a
-package that carries mirror evidence, such as `Any`:
+package that carries descriptive evidence, such as `Any`:
 
 ```ruddy
 let contents = match std::any::upcast [1n, 2n] with
@@ -180,7 +236,7 @@ The hidden type establishes compatibility; it does not choose the most efficient
 
 ## Recovering a known type
 
-[Any](../std/any.md) packages a value together with its mirror.
+[Any](../std/any.md) packages a value together with authenticated `TypeInfo`. Its historical field name is `mirror`, but the field grants observation and exact casting only. Function values remain packageable.
 A consumer can attempt to recover a particular type through a checked downcast:
 
 ```ruddy
@@ -191,9 +247,9 @@ let recovered_text: Option String = std::any::downcast hidden_count
 
 The first result is `#Some 3n`; the second is `#None`.
 A type comparison is not a numeric or text conversion.
-The mirror preserves the type contract, including effects for function types.
+The descriptive evidence preserves the type contract, including effects for function types.
 
-At a lower level, `reflect::same` returns evidence connecting two types when they are exactly the same.
+At a lower level, `reflect::same_info` returns evidence connecting two types when they are exactly the same.
 Typed views from `reflect::shape` can expose operations for reading or constructing parts of a value while retaining those parts' hidden types.
 This supports generic operations without unchecked casts.
 
@@ -204,6 +260,16 @@ This supports generic operations without unchecked casts.
 Versioned operations make a save-game or network-message schema identity explicit.
 Type-directed decoding checks the selected schema; migrating an old save still needs an explicit compatibility policy.
 A registry associates dynamic packages with application-selected wire identities; an identity from untrusted input cannot manufacture type evidence.
+Encoder derivation takes `TypeInfo`, so encoding remains observational and
+unsupported live types return derivation errors. Decoder derivation takes a
+constructive `Mirror`. Both accept absent options with empty payload types and
+empty-only arrays. Impossible cases and nonempty input for an empty-only array remain checked
+input errors. Case indices come from the complete description, so filtering
+constructors preserves existing binary tags and schema identities. Record builders
+still check duplicate, missing, unknown, foreign, and mismatched bindings.
+
+The compiler artifact format is now `artifact-v2`. Recompile older bundles: their
+unrestricted mirrors and callable evidence profiles do not satisfy this contract.
 
 ## Summary and exercises
 

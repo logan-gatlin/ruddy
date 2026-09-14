@@ -72,7 +72,7 @@ A function that performs a three-way comparison that may be unordered.
 let compare: PartialOrdering 'a
 ```
 
-Pure structural comparison at the operands' shared inferred type. NaNs and unsupported values are unordered. Opened existential types require mirror evidence, including when nested inside function types.
+Pure structural comparison at the operands' shared inferred type. NaNs and unsupported values are unordered. Opened existential types require authenticated descriptive evidence, including when nested inside function types.
 
 ### compare_by
 
@@ -90,10 +90,10 @@ Compares values by applying a projection before an ordering.
 ### compare_with
 
 ```ruddy
-let compare_with: Mirror 'a -> PartialOrdering 'a
+let compare_with: TypeInfo 'a -> PartialOrdering 'a
 ```
 
-Compare through an explicit mirror. Arrays are lexicographic; records and sums use alphabetical field and case names (case-sensitive Unicode scalar order). The first non-equal component decides, including unordered. Unsupported shapes are unordered, even against themselves.
+Compare through explicit descriptive type information. Arrays are lexicographic; records and sums use alphabetical field and case names (case-sensitive Unicode scalar order). The first non-equal component decides, including unordered. Unsupported shapes are unordered, even against themselves.
 
 ### derive
 

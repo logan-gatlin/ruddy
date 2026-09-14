@@ -11,6 +11,7 @@ pub fn build(spec: &Spec, cx: &Cx) -> Stage {
     };
     let plan = &inference.semantics().reification().callables;
     let solved = plan.graph.solve();
+    let construction = plan.graph.solve_construction();
     let mut ids = Ids::default();
     let mut nodes = Vec::new();
     for (symbol, binding) in &plan.bindings {
@@ -30,7 +31,14 @@ pub fn build(spec: &Spec, cx: &Cx) -> Stage {
             Node::new(
                 ids.next(),
                 mint.name(*symbol),
-                format!("mirror bound by a pattern; evidence for type {slot}"),
+                format!(
+                    "{} bound by a pattern; evidence for type {slot}",
+                    if plan.constructive_evidence.contains(symbol) {
+                        "constructive mirror"
+                    } else {
+                        "descriptive type information"
+                    }
+                ),
             ),
             cx,
             mint,
@@ -56,12 +64,13 @@ pub fn build(spec: &Spec, cx: &Cx) -> Stage {
                     })
                     .collect::<Vec<_>>();
                 format!(
-                    "argument {argument}, result {result}; invocation needs {}",
+                    "argument {argument}, result {result}; invocation needs {}; construction {:?}",
                     if demands.is_empty() {
                         "no descriptors".into()
                     } else {
                         demands.join(", ")
-                    }
+                    },
+                    construction[*needs as usize],
                 )
             }
             _ => format!("{shape:?}"),
@@ -69,14 +78,18 @@ pub fn build(spec: &Spec, cx: &Cx) -> Stage {
         nodes.push(Node::new(ids.next(), format!("value {index}"), text));
     }
     for (at, flow) in &plan.occurrences {
-        if !solved[flow.evaluation as usize].is_empty() {
+        if !solved[flow.evaluation as usize].is_empty()
+            || !construction[flow.evaluation as usize].condition.is_true()
+        {
             nodes.push(
                 Node::new(
                     ids.next(),
                     "Evaluation",
                     format!(
-                        "constructs value {}; needs {:?}",
-                        flow.value, solved[flow.evaluation as usize]
+                        "constructs value {}; descriptive needs {:?}; construction {:?}",
+                        flow.value,
+                        solved[flow.evaluation as usize],
+                        construction[flow.evaluation as usize]
                     ),
                 )
                 .at(cx.source.span(*at)),
