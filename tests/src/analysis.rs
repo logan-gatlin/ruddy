@@ -226,6 +226,34 @@ fn unsaved_dependency_interfaces_flow_without_lowering() {
 }
 
 #[test]
+fn workspace_refresh_reuses_an_unchanged_dependency_after_a_root_edit() {
+    let tree = tempfile::tempdir().unwrap();
+    let dep = tree.path().join("dep");
+    let root = tree.path().join("root");
+    std::fs::create_dir_all(&dep).unwrap();
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(dep.join("Ruddy.toml"), "name = \"dep\"\nversion = \"0.0.0\"\nkind = \"library\"\nroot = \"main.rud\"\n[dependencies]\nstd = false\n").unwrap();
+    std::fs::write(root.join("Ruddy.toml"), "name = \"root\"\nversion = \"0.0.0\"\nkind = \"library\"\nroot = \"main.rud\"\n[dependencies]\nstd = false\ndep = \"../dep\"\n").unwrap();
+    std::fs::write(dep.join("main.rud"), "let value = 1n").unwrap();
+    std::fs::write(root.join("main.rud"), "let answer = dep::value").unwrap();
+    let mut workspace = ruddy_cli::workspace::Workspace::new(root.clone());
+
+    let initial = workspace.refresh().unwrap();
+    assert_eq!((initial.rebuilt, initial.reused), (2, 0));
+    assert_eq!(initial.background, 2);
+    assert!(workspace.check_background().is_empty());
+
+    workspace.set_overlay(
+        &root.join("main.rud"),
+        Some("let answer = dep::value\n".into()),
+    );
+    let edited = workspace.refresh().unwrap();
+    assert_eq!((edited.rebuilt, edited.reused), (1, 1));
+    assert_eq!(edited.background, 1);
+    assert!(workspace.check_background().is_empty());
+}
+
+#[test]
 fn workspace_tracks_unsaved_local_dependencies_and_navigation() {
     let tree = tempfile::tempdir().unwrap();
     let dep = tree.path().join("dep");
@@ -237,14 +265,16 @@ fn workspace_tracks_unsaved_local_dependencies_and_navigation() {
     std::fs::write(dep.join("main.rud"), "let value = 1n").unwrap();
     std::fs::write(root.join("main.rud"), "let answer = dep::value").unwrap();
     let mut workspace = ruddy_cli::workspace::Workspace::new(root.clone());
-    workspace.refresh().unwrap();
+    let initial = workspace.refresh().unwrap();
+    assert_eq!((initial.rebuilt, initial.reused), (2, 0));
     let (project, logical) = workspace.file(&root.join("main.rud")).unwrap();
     assert_eq!(project.analysis.hover(logical, 5).unwrap().ty, "Nat");
     let (target, span) = workspace.definition(&root.join("main.rud"), 19).unwrap();
     assert_eq!(target, dep.join("main.rud"));
     assert_eq!(span.start, 4);
     workspace.set_overlay(&dep.join("main.rud"), Some("let value = false".into()));
-    workspace.refresh().unwrap();
+    let edited = workspace.refresh().unwrap();
+    assert_eq!((edited.rebuilt, edited.reused), (2, 0));
     let (project, logical) = workspace.file(&root.join("main.rud")).unwrap();
     assert_eq!(project.analysis.hover(logical, 5).unwrap().ty, "Bool");
 }

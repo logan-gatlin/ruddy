@@ -3,7 +3,7 @@
 use super::*;
 use ruddy::{
     analysis::{Analysis, Host},
-    artifact::Header,
+    artifact::{Artifact, Header},
     ir,
 };
 
@@ -13,6 +13,21 @@ pub struct ProjectAnalysis {
     pub analysis: Analysis,
     pub interface: Header,
     build: Build,
+    manifest_source: String,
+    focus: Option<String>,
+    dependencies: Vec<(String, PathBuf, u64)>,
+    inputs: HashMap<PathBuf, Option<String>>,
+    revision: u64,
+    artifact: Option<Artifact>,
+}
+
+/// Work performed by a workspace refresh.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RefreshReport {
+    pub rebuilt: usize,
+    pub reused: usize,
+    /// Projects whose current analysis has not yet been lowered.
+    pub background: usize,
 }
 
 struct GitSelection {
@@ -29,6 +44,7 @@ pub struct Workspace {
     overlays: HashMap<PathBuf, String>,
     hosts: HashMap<PathBuf, Host>,
     pub projects: Vec<ProjectAnalysis>,
+    next_revision: u64,
     observed: std::cell::RefCell<HashMap<PathBuf, Option<String>>>,
 }
 
@@ -42,6 +58,7 @@ impl Workspace {
             overlays: HashMap::new(),
             hosts: HashMap::new(),
             projects: Vec::new(),
+            next_revision: 0,
             observed: Default::default(),
         }
     }
@@ -83,8 +100,11 @@ impl Workspace {
 
     /// Refresh the whole dependency graph against the root's build settings.
     /// Failed source definitions still publish explicit recovery interfaces.
-    pub fn refresh(&mut self) -> Result<(), CompileError> {
-        self.projects.clear();
+    pub fn refresh(&mut self) -> Result<RefreshReport, CompileError> {
+        let mut previous: HashMap<_, _> = std::mem::take(&mut self.projects)
+            .into_iter()
+            .map(|project| (project.directory.clone(), project))
+            .collect();
         self.observed.borrow_mut().clear();
         let lock_source = self.read(&self.root.join("Ruddy.lock"));
         if self.lock_source != lock_source {
@@ -98,12 +118,15 @@ impl Workspace {
         let mut resolver = None;
         let mut active = Vec::new();
         let mut projects = Vec::new();
+        let mut report = RefreshReport::default();
         self.visit(
             self.root.clone(),
             build,
             &mut resolver,
             &mut active,
             &mut projects,
+            &mut previous,
+            &mut report,
         )?;
         let reachable: std::collections::HashSet<_> = projects
             .iter()
@@ -112,8 +135,12 @@ impl Workspace {
         self.hosts
             .retain(|directory, _| reachable.contains(directory));
         self.git_selections.retain(|selection| selection.used);
+        report.background = projects
+            .iter()
+            .filter(|project| project.artifact.is_none())
+            .count();
         self.projects = projects;
-        Ok(())
+        Ok(report)
     }
 
     fn resolve_git(
@@ -176,6 +203,8 @@ impl Workspace {
         resolver: &mut Option<git::Resolver>,
         active: &mut Vec<PathBuf>,
         projects: &mut Vec<ProjectAnalysis>,
+        previous: &mut HashMap<PathBuf, ProjectAnalysis>,
+        report: &mut RefreshReport,
     ) -> Result<usize, CompileError> {
         ruddy::cancellation::checkpoint();
         let directory = fs::canonicalize(&directory).map_err(|error| {
@@ -197,7 +226,13 @@ impl Workspace {
             ));
         }
         active.push(directory.clone());
-        let manifest = self.manifest(&directory)?;
+        let manifest_source = self.read(&directory.join(MANIFEST)).ok_or_else(|| {
+            CompileError::report(
+                "manifest-unreadable",
+                format!("could not read `{}`", directory.join(MANIFEST).display()),
+            )
+        })?;
+        let manifest = parse_manifest(&directory, &manifest_source)?;
         let identity = configured_identity(&manifest.name, &manifest.version)?;
         let specifications = dependency_specs(
             &manifest.dependencies.std,
@@ -234,7 +269,7 @@ impl Workspace {
                     format!("executable bundle `{expected}` cannot be a dependency"),
                 ));
             }
-            let at = self.visit(child, build, resolver, active, projects)?;
+            let at = self.visit(child, build, resolver, active, projects, previous, report)?;
             dependencies.push((alias, at));
         }
         if projects.iter().any(|project| {
@@ -269,6 +304,7 @@ impl Workspace {
             directory: &'a Path,
             overlays: &'a HashMap<PathBuf, String>,
             observed: &'a std::cell::RefCell<HashMap<PathBuf, Option<String>>>,
+            inputs: &'a std::cell::RefCell<HashMap<PathBuf, Option<String>>>,
         }
         impl Files for Sources<'_> {
             fn read(&self, path: &str) -> Option<String> {
@@ -277,13 +313,17 @@ impl Workspace {
                 self.observed
                     .borrow_mut()
                     .insert(path.clone(), disk.clone());
-                self.overlays.get(&file_identity(&path)).cloned().or(disk)
+                let source = self.overlays.get(&file_identity(&path)).cloned().or(disk);
+                self.inputs.borrow_mut().insert(path, source.clone());
+                source
             }
         }
+        let inputs = std::cell::RefCell::new(HashMap::new());
         let sources = Sources {
             directory: &source_directory,
             overlays: &self.overlays,
             observed: &self.observed,
+            inputs: &inputs,
         };
         if sources.read(name).is_none() {
             return Err(CompileError::report(
@@ -299,7 +339,6 @@ impl Workspace {
             })
             .collect();
         let linked: Vec<_> = projects.iter().map(|project| &project.interface).collect();
-        let host = self.hosts.entry(directory.clone()).or_default();
         let focus = (directory == self.root)
             .then(|| {
                 self.focus.as_ref().map(|path| {
@@ -310,6 +349,34 @@ impl Workspace {
                 })
             })
             .flatten();
+        let dependency_revisions: Vec<_> = dependencies
+            .iter()
+            .map(|(alias, at)| {
+                (
+                    alias.clone(),
+                    projects[*at].directory.clone(),
+                    projects[*at].revision,
+                )
+            })
+            .collect();
+        if let Some(project) = previous.remove(&directory)
+            && project.build == build
+            && project.manifest_source == manifest_source
+            && project.source_directory == source_directory
+            && project.focus == focus
+            && project.dependencies == dependency_revisions
+            && project
+                .inputs
+                .iter()
+                .all(|(path, source)| self.read(path) == *source)
+        {
+            active.pop();
+            let at = projects.len();
+            projects.push(project);
+            report.reused += 1;
+            return Ok(at);
+        }
+        let host = self.hosts.entry(directory.clone()).or_default();
         host.focus(focus.as_deref());
         let analysis = host.analyze_from_files(
             identity,
@@ -332,6 +399,7 @@ impl Workspace {
             })
             .collect();
         active.pop();
+        self.next_revision += 1;
         let at = projects.len();
         projects.push(ProjectAnalysis {
             directory,
@@ -339,7 +407,14 @@ impl Workspace {
             analysis,
             interface,
             build,
+            manifest_source,
+            focus,
+            dependencies: dependency_revisions,
+            inputs: inputs.into_inner(),
+            revision: self.next_revision,
+            artifact: None,
         });
+        report.rebuilt += 1;
         Ok(at)
     }
 
@@ -353,6 +428,9 @@ impl Workspace {
     /// idle. Cancellation abandons these temporary artifacts, never the frontend.
     pub fn check_background(&mut self) -> Vec<String> {
         for project in &mut self.projects {
+            if project.artifact.is_some() {
+                continue;
+            }
             ruddy::cancellation::checkpoint();
             self.hosts
                 .get_mut(&project.directory)
@@ -363,43 +441,53 @@ impl Workspace {
             interface.dependencies = project.interface.dependencies.clone();
             project.interface = interface;
         }
-        let mut artifacts = Vec::new();
         let mut errors = Vec::new();
-        let mut extra = Vec::new();
-        for project in &self.projects {
+        let mut extra = vec![Vec::new(); self.projects.len()];
+        for at in 0..self.projects.len() {
             ruddy::cancellation::checkpoint();
-            let linked: Vec<_> = artifacts.iter().collect();
-            let (artifact, diagnostics) = project.analysis.lower(&linked);
-            extra.push(diagnostics);
-            let Some(artifact) = artifact else {
-                continue;
-            };
-            let artifact = match project.interface.kind {
-                Kind::Library => artifact,
-                Kind::Executable => match ruddy::entry::executable(&artifact, &linked) {
-                    Ok(artifact) => artifact,
-                    Err(error) => {
-                        errors.push(error.to_string());
-                        continue;
-                    }
-                },
-            };
+            let (dependencies, current) = self.projects.split_at_mut(at);
+            let project = &mut current[0];
+            let linked: Vec<_> = dependencies
+                .iter()
+                .filter_map(|project| project.artifact.as_ref())
+                .collect();
+            if project.artifact.is_none() {
+                let (artifact, diagnostics) = project.analysis.lower(&linked);
+                extra[at] = diagnostics;
+                let Some(artifact) = artifact else {
+                    continue;
+                };
+                project.artifact = match project.interface.kind {
+                    Kind::Library => Some(artifact),
+                    Kind::Executable => match ruddy::entry::executable(&artifact, &linked) {
+                        Ok(artifact) => Some(artifact),
+                        Err(error) => {
+                            errors.push(error.to_string());
+                            None
+                        }
+                    },
+                };
+            }
             if project.build.target == Target::Js
-                && let Err(error) = ruddy::backend::js::check_entry(&artifact, &linked)
+                && let Some(artifact) = &project.artifact
+                && let Err(error) = ruddy::backend::js::check_entry(artifact, &linked)
             {
                 errors.push(error.to_string());
             }
-            artifacts.push(artifact);
         }
+        let artifacts: Vec<_> = self
+            .projects
+            .iter()
+            .filter_map(|project| project.artifact.as_ref())
+            .collect();
         if let (Some(project), Some((root, dependencies))) =
             (self.projects.last(), artifacts.split_last())
             && project.build.target == Target::Js
             && artifacts.len() == self.projects.len()
         {
-            let dependencies: Vec<_> = dependencies.iter().collect();
             if let Err(error) = ruddy::backend::js::check_exports(
                 root,
-                &dependencies,
+                dependencies,
                 project.build.platform.backend(),
             ) {
                 errors.push(error.to_string());
