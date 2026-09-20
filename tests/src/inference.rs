@@ -12223,3 +12223,129 @@ fn function_type_information_needs_a_decided_closed_effect_row() {
         );
     }
 }
+
+#[test]
+fn declared_presence_arguments_control_fields() {
+    let (_, lowered, inferred) = infer_src(
+        "type Field 'p = { x when 'p: Nat }
+let present: Field true = { x: 1n }
+let absent: Field false = {}
+let identity: Field 'p -> Field 'p = fn x => x",
+    );
+    assert!(lowered.errors.is_empty(), "{:#?}", lowered.errors);
+    assert!(inferred.errors().is_empty(), "{:#?}", inferred.errors());
+}
+
+#[test]
+fn declared_presence_constraints_follow_aliases() {
+    let definitions = "type Choice 'a 'p 'q = { left when 'p: 'a, right when 'q: 'a } where 'p != 'q\ntype Nested 'p 'q = { choice: Choice Nat 'p 'q }\n";
+    let (_, lowered, inferred) = infer_src(&format!(
+        "{definitions}let ok: Nested true false = {{ choice: {{ left: 1n }} }}"
+    ));
+    assert!(lowered.errors.is_empty(), "{:#?}", lowered.errors);
+    assert!(inferred.errors().is_empty(), "{:#?}", inferred.errors());
+    let (_, lowered, inferred) =
+        infer_src(&format!("{definitions}type Impossible = Nested true true"));
+    assert!(lowered.errors.is_empty(), "{:#?}", lowered.errors);
+    assert!(
+        !inferred.errors().is_empty(),
+        "an impossible type definition must be rejected"
+    );
+}
+
+#[test]
+fn declared_presence_parameters_work_in_sums_effects_and_recursive_types() {
+    let source = "effect Log = { write: () -> () }\ntype Cases 'p = #A (when 'p) Nat | #B\ntype Action 'p = () -> () + !Log (when 'p)\ntype All 'a 'r 'e 'region 'p = { cell: mut 'region 'a, run: () -> Cases 'p + ..'e, ..'r }\ntype Chain 'p = #End | #Next (when 'p) (Chain 'p)\ntype Required 'p = Nat where 'p\nlet case: Cases false = #B\nlet action: Action true = fn _ => !Log.write ()\nlet pure: Action false = fn _ => ()\nlet chain: Chain true = #Next #End\nlet required: Required true = 1n";
+    let (_, lowered, inferred) = infer_src(source);
+    assert!(lowered.errors.is_empty(), "{:#?}", lowered.errors);
+    assert!(inferred.errors().is_empty(), "{:#?}", inferred.errors());
+}
+
+#[test]
+fn declared_presence_parameters_and_constraints_survive_fixed_spreads() {
+    let definitions = "type Fields 'p = { x when 'p: Nat }\ntype Required 'p = Fields 'p where 'p\ntype Spread 'p = { ..(Fields 'p) }\n";
+    let (_, lowered, inferred) = infer_src(&format!(
+        "{definitions}let absent: Spread false = {{}}\nlet present: Spread true = {{ x: 1n }}"
+    ));
+    assert!(lowered.errors.is_empty(), "{:#?}", lowered.errors);
+    assert!(inferred.errors().is_empty(), "{:#?}", inferred.errors());
+    let (_, lowered, inferred) = infer_src(&format!(
+        "{definitions}type Impossible = {{ ..(Required false) }}"
+    ));
+    assert!(lowered.errors.is_empty(), "{:#?}", lowered.errors);
+    assert!(
+        !inferred.errors().is_empty(),
+        "spread operands retain their constraints"
+    );
+    let (_, lowered, inferred) = infer_src(&format!(
+        "{definitions}let impossible: {{ ..(Required false) }} = {{}}"
+    ));
+    assert!(lowered.errors.is_empty(), "{:#?}", lowered.errors);
+    assert!(
+        !inferred.errors().is_empty(),
+        "annotation spreads retain named constraints in the incremental query"
+    );
+    let (_, _, inferred) = infer_src(&format!(
+        "{definitions}let wrong: Spread false = {{ x: 1n }}"
+    ));
+    assert!(
+        !inferred.errors().is_empty(),
+        "a false presence stays absent after spreading"
+    );
+}
+
+#[test]
+fn declared_presence_arguments_preserve_annotation_ownership() {
+    for spelling in [
+        "Field 'chosen",
+        "{ ..(Field 'chosen) }",
+        "Field _",
+        "{ ..(Field _) }",
+    ] {
+        let (mint, lowered, output) = infer_src(&format!(
+            "type Field 'p = {{ x when 'p: Nat }}\nextern value: {spelling} = \"host.value\""
+        ));
+        assert!(lowered.errors.is_empty(), "{:#?}", lowered.errors);
+        assert!(output.errors().is_empty(), "{:#?}", output.errors());
+        let symbol = symbol_named(&mint, output.semantics().externs().keys().copied(), "value");
+        assert!(
+            !output.semantics().externs()[&symbol]
+                .existentials()
+                .is_empty(),
+            "{spelling} must keep its producer-owned presence"
+        );
+    }
+}
+
+#[test]
+fn declared_type_variables_require_explicit_scoped_parameters() {
+    for source in [
+        "type T = { x when 'p: Nat }",
+        "type T = Nat where 'p",
+        "type T 'p = { x when _: Nat }",
+        "type T 'p = { x when 'p: _ }",
+        "type T 'r = { .. }",
+        "type Field 'p = { x when 'p: Nat } type T = Field _",
+        "type T 'p = { x when 'p: 'p }",
+        "type T 'p = { x when 'p: Nat, ..'p }",
+        "type T 'p = hide 'p => { x when 'p: Nat }",
+        "type Field 'p = { x when 'p: Nat } type T = Field Nat",
+        "type Box 'a = { x: 'a } type T = Box true",
+    ] {
+        let (_, lowered, _) = infer_src(source);
+        assert!(!lowered.errors.is_empty(), "{source} must be rejected");
+    }
+    let (_, lowered, output) = infer_src("type Box = hide 'a => { value: 'a, show: 'a -> String }");
+    assert!(lowered.errors.is_empty(), "{:#?}", lowered.errors);
+    assert!(output.errors().is_empty(), "{:#?}", output.errors());
+}
+
+#[test]
+fn declared_type_arguments_preserve_local_hide_binders() {
+    let (_, lowered, output) = infer_src(
+        "type Box 'a = { value: 'a }\n\
+         extern packed: hide 'a => Box 'a = \"host.packed\"",
+    );
+    assert!(lowered.errors.is_empty(), "{:#?}", lowered.errors);
+    assert!(output.errors().is_empty(), "{:#?}", output.errors());
+}

@@ -1165,3 +1165,11 @@ fn tuple_spreads_format_and_preserve_comments() {
     assert_eq!(fmt("let x=(..base,)"), "let x = (..base)\n");
     assert!(fmt("let x=(1n,\n -- other fields\n ..base)").contains("-- other fields"));
 }
+
+#[test]
+fn formats_presence_arguments_and_declaration_constraints() {
+    let source = "type Choice 'a 'p 'q = { x when 'p: 'a, y when 'q: 'a } where 'p != 'q\ntype One = Choice Nat true false\nlet identity: Choice Nat 'p 'q -> Choice Nat 'p 'q = fn x => x";
+    let output = fmt(source);
+    assert!(output.contains("Choice Nat true false"));
+    assert!(output.contains("where 'p != 'q"));
+}

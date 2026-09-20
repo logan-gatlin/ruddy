@@ -2927,6 +2927,7 @@ impl<'a> Printer<'a> {
                 text(" => "),
                 self.ty(body),
             ]),
+            TypeKind::Presence(value) => text(value.to_string()),
             TypeKind::Hole => text("_"),
             TypeKind::Unit => self.empty("(", ty.span, ")"),
         }
@@ -3588,7 +3589,10 @@ fn type_skeleton(ty: &Type) -> Skel {
         TypeKind::Effects(row) => Skel::new(ty.span, row_skeleton(row)),
         TypeKind::Unit => Skel::leaf(ty.span).closed(),
         TypeKind::Hidden { body, .. } => Skel::new(ty.span, vec![type_skeleton(body)]),
-        TypeKind::Ident { .. } | TypeKind::Variable { .. } | TypeKind::Hole => Skel::leaf(ty.span),
+        TypeKind::Presence(_)
+        | TypeKind::Ident { .. }
+        | TypeKind::Variable { .. }
+        | TypeKind::Hole => Skel::leaf(ty.span),
     }
 }
 

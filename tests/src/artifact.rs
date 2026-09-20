@@ -1612,7 +1612,7 @@ fn malformed_text_returns_errors_while_trusted_api_panics() {
         ("(types ", "(declared-types "),
         ("(type ", "(declared-type "),
         ("(params ", "(parameters "),
-        ("(param type", "(param presence"),
+        ("(param type", "(param mystery"),
         ("(lacks ", "(without "),
         ("(effects ", "(declared-effects "),
         ("(effect ", "(side-effect "),

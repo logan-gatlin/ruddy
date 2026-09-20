@@ -141,6 +141,7 @@
 
 (natural) @number
 (string) @string
+; Boolean literals also supply presence arguments in types.
 (boolean) @boolean
 
 ; A quoted field is lexically a string, but its syntactic role is a property.

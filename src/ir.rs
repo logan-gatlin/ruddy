@@ -199,8 +199,8 @@ pub struct Group {
 pub struct Decl<T> {
     pub name_at: Anchor,
     /// The written type the definition is to be checked against, when it was
-    /// ascribed one. Always `None` for a `type` declaration: that *is* a type,
-    /// so there is nothing to check it against.
+    /// ascribed one. A type declaration stores its written `where` contract
+    /// here; its expanded body remains in `value`.
     pub annotation: Option<Annotation>,
     /// The parameters a `type` declaration binds, in order. Always empty for a
     /// term, which binds none of its own — a lambda's argument is bound inside
@@ -735,6 +735,10 @@ pub type Type = Anchored<TypeKind>;
 
 #[derive(Debug, Clone)]
 pub enum TypeKind {
+    /// A presence constant supplied as an argument.
+    Presence(bool),
+    /// An anonymous presence argument in an annotation.
+    PresenceHole(u32),
     /// The type of an immutable homogeneous array.
     Array(Box<Type>),
     /// `Mirror T` — the builtin type constructor of authentic evidence for
@@ -879,10 +883,45 @@ pub enum TypeField {
 #[derive(Debug, Clone)]
 pub struct When {
     pub at: Anchor,
+    /// A declared parameter or its substituted argument; annotations use name/id.
+    pub argument: Option<Box<Type>>,
     pub name: Option<String>,
     /// Program-unique even for `when _`; anonymous occurrences must never
     /// accidentally share an inferred package slot.
     pub id: u32,
+}
+
+/// Visit the parameter/constant arguments of this node's presence marks.
+fn when_arguments_mut(ty: &mut Type, visit: &mut impl FnMut(&mut Type)) {
+    let mut when = |mark: &mut Option<Box<When>>| {
+        if let Some(argument) = mark.as_mut().and_then(|mark| mark.argument.as_mut()) {
+            visit(argument);
+        }
+    };
+    match &mut ty.anchored {
+        TypeKind::Struct { fields, .. } => {
+            for field in fields.values_mut() {
+                if let TypeField::Written { when: mark, .. } = field {
+                    when(mark);
+                }
+            }
+        }
+        TypeKind::Sum { cases, .. } => {
+            for case in cases.values_mut() {
+                if let SumCase::Written { when: mark, .. } = case {
+                    when(mark);
+                }
+            }
+        }
+        TypeKind::Arrow { effects, .. } | TypeKind::Effects(effects) => {
+            for label in effects.effects.values_mut() {
+                if let EffectLabel::Written { when: mark, .. } = label {
+                    when(mark);
+                }
+            }
+        }
+        _ => {}
+    }
 }
 
 /// A `where` clause, lowered: a formula over the names the written type's
@@ -999,15 +1038,26 @@ impl PresenceOccurrences {
 fn presence_polarities(
     ty: &Type,
     variances: &HashMap<Slot, u8>,
+    variables: &IndexMap<String, Declared>,
 ) -> HashMap<u32, PresenceOccurrences> {
     fn note(
         out: &mut HashMap<u32, PresenceOccurrences>,
         when: &Option<Box<When>>,
         positive: bool,
         owner: Anchor,
+        variables: &IndexMap<String, Declared>,
     ) {
         let Some(when) = when.as_ref() else { return };
-        let occurrence = out.entry(when.id).or_default();
+        let id = match when.argument.as_deref().map(|arg| &arg.anchored) {
+            Some(TypeKind::Var(name)) => match variables.get(name) {
+                Some(var) => var.id,
+                None => return,
+            },
+            Some(TypeKind::PresenceHole(id)) => *id,
+            Some(_) => return,
+            None => when.id,
+        };
+        let occurrence = out.entry(id).or_default();
         if positive {
             occurrence.positive += 1;
             occurrence.owners.push(owner);
@@ -1033,7 +1083,7 @@ fn presence_polarities(
             Work::Effects(row, positive, owner) => {
                 for effect in row.effects.values() {
                     if let EffectLabel::Written { when, .. } = effect {
-                        note(&mut out, when, positive, owner);
+                        note(&mut out, when, positive, owner, variables);
                     }
                 }
             }
@@ -1064,7 +1114,7 @@ fn presence_polarities(
                     TypeKind::Struct { fields, .. } => {
                         for field in fields.values().rev() {
                             if let TypeField::Written { when, value, .. } = field {
-                                note(&mut out, when, positive, owner);
+                                note(&mut out, when, positive, owner, variables);
                                 work.push(Work::Ty(value, positive, owner));
                             }
                         }
@@ -1072,7 +1122,7 @@ fn presence_polarities(
                     TypeKind::Sum { cases, .. } => {
                         for case in cases.values().rev() {
                             if let SumCase::Written { when, payload, .. } = case {
-                                note(&mut out, when, positive, owner);
+                                note(&mut out, when, positive, owner, variables);
                                 if let Some(payload) = payload {
                                     work.push(Work::Ty(payload, positive, owner));
                                 }
@@ -1093,10 +1143,34 @@ fn presence_polarities(
                             }
                         }
                     }
+                    TypeKind::Var(name) => {
+                        if let Some(variable) = variables.get(name)
+                            && variable
+                                .sense
+                                .is_some_and(|(sense, _)| sense == Sense::Presence)
+                        {
+                            let occurrence = out.entry(variable.id).or_default();
+                            if positive {
+                                occurrence.positive += 1;
+                                occurrence.owners.push(owner);
+                            } else {
+                                occurrence.negative += 1;
+                            }
+                        }
+                    }
+                    TypeKind::PresenceHole(id) => {
+                        let occurrence = out.entry(*id).or_default();
+                        if positive {
+                            occurrence.positive += 1;
+                            occurrence.owners.push(owner);
+                        } else {
+                            occurrence.negative += 1;
+                        }
+                    }
                     TypeKind::Ident(_)
                     | TypeKind::Param { .. }
                     | TypeKind::Prim(_)
-                    | TypeKind::Var(_)
+                    | TypeKind::Presence(_)
                     | TypeKind::Hole
                     | TypeKind::Scoped { .. }
                     | TypeKind::Error => {}
@@ -1143,6 +1217,45 @@ fn declaration_variances(
                     continue;
                 }
                 *visited |= bit;
+                let mut marks = Vec::new();
+                match &ty.anchored {
+                    TypeKind::Struct { fields, .. } => {
+                        for field in fields.values() {
+                            if let TypeField::Written {
+                                when: Some(when), ..
+                            } = field
+                            {
+                                marks.push(when);
+                            }
+                        }
+                    }
+                    TypeKind::Sum { cases, .. } => {
+                        for case in cases.values() {
+                            if let SumCase::Written {
+                                when: Some(when), ..
+                            } = case
+                            {
+                                marks.push(when);
+                            }
+                        }
+                    }
+                    TypeKind::Arrow { effects, .. } | TypeKind::Effects(effects) => {
+                        for label in effects.effects.values() {
+                            if let EffectLabel::Written {
+                                when: Some(when), ..
+                            } = label
+                            {
+                                marks.push(when);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                for when in marks {
+                    if let Some(argument) = &when.argument {
+                        work.push((argument, positive));
+                    }
+                }
                 match &ty.anchored {
                     TypeKind::Param { index, .. } => {
                         *out.entry((*owner, *index)).or_default() |= bit;
@@ -1220,6 +1333,8 @@ fn declaration_variances(
                     TypeKind::Ident(_)
                     | TypeKind::Prim(_)
                     | TypeKind::Var(_)
+                    | TypeKind::Presence(_)
+                    | TypeKind::PresenceHole(_)
                     | TypeKind::Hole
                     | TypeKind::Scoped { .. }
                     | TypeKind::Error => {}
@@ -1244,6 +1359,11 @@ fn declaration_variances(
                         }
                         *visited |= bit;
                         match ty {
+                            Ty::Presence(Presence::Bound(index))
+                                if (*index as usize) < decl.params.len() =>
+                            {
+                                *out.entry((*owner, *index)).or_default() |= bit;
+                            }
                             Ty::Bound(index) if (*index as usize) < decl.params.len() => {
                                 *out.entry((*owner, *index)).or_default() |= bit;
                             }
@@ -1290,11 +1410,17 @@ fn declaration_variances(
                             | Ty::Real
                             | Ty::String
                             | Ty::Bool
+                            | Ty::Presence(_)
                             | Ty::ForeignValue => {}
                         }
                     }
                     Semantic::Row(row, positive) => {
                         let bit = if positive { COVARIANT } else { CONTRAVARIANT };
+                        for field in row.labels.values() {
+                            if let Presence::Bound(index) = field.presence {
+                                *out.entry((*owner, index)).or_default() |= bit;
+                            }
+                        }
                         work.extend(
                             row.labels
                                 .values()
@@ -1623,24 +1749,13 @@ pub enum ErrorKind {
     OpenDeclaredType {
         shape: Shape,
     },
-    /// A `where` clause on a `type` declaration's body, as in
-    /// `type T = { x: Nat } where a`.
-    ///
-    /// [`ErrorKind::OpenDeclaredType`]'s sibling and refused for the same
-    /// reason: a declaration holds for every definition, so it has no presence
-    /// of its own left open for a formula to relate. It is a complaint of its
-    /// own rather than that one because a clause sits beside the type rather
-    /// than inside a row, so there is no shape to word it in.
-    ClauseInDeclaration,
     /// A variable written in a `type` declaration's body that its header does
     /// not bind, or one written in an operation's signature at all, as in
     /// `type Bad = { x: 'a }`.
     ///
-    /// [`ErrorKind::ClauseInDeclaration`]'s sibling, and refused for a reason
-    /// of its own rather than for that one's: a variable is something the
-    /// caller picks, and a declaration says the same thing wherever it is used,
-    /// so its own variables are its parameters and they are written in its
-    /// header. Reported at each name, so a body with several reports each.
+    /// A declaration's free variables are parameters supplied by its caller.
+    /// Each must be named in the header, including names in `where` clauses.
+    /// Reported at each undeclared use.
     ///
     /// The fix is the header, which is why this is one complaint rather than
     /// two: `type Bad = { x: Nat, ..'r }` left a row open by naming something
@@ -3204,14 +3319,16 @@ pub fn build_with_interfaces(
         // A declaration's body is read as an annotation so that a `where`
         // written there can be refused rather than misparsed; what survives is
         // the type, since a refused clause is dropped.
-        let value = b.written(body, Place::Declaration).ty;
+        let written = b.written(body, Place::Declaration);
+        let value = written.ty.clone();
+        let annotation = written.clause.is_some().then_some(written);
         b.params.clear();
         if let Some(symbol) = symbol {
             program.types.insert(
                 symbol,
                 Decl {
                     name_at: b.anchor(name.span),
-                    annotation: None,
+                    annotation,
                     params,
                     metadata,
                     value,
@@ -4025,6 +4142,19 @@ fn imported_syntax_resolved(
             artifact::Type::Real => TypeKind::Prim(Prim::Real),
             artifact::Type::String => TypeKind::Prim(Prim::String),
             artifact::Type::Bool => TypeKind::Prim(Prim::Bool),
+            artifact::Type::Presence(p) => match p {
+                artifact::Presence::Present => TypeKind::Presence(true),
+                artifact::Presence::Absent => TypeKind::Presence(false),
+                artifact::Presence::Bound(index) => {
+                    params
+                        .get(*index as usize)
+                        .map_or(TypeKind::Error, |symbol| TypeKind::Param {
+                            symbol: *symbol,
+                            index: *index,
+                        })
+                }
+                _ => TypeKind::Error,
+            },
             artifact::Type::ForeignValue => TypeKind::Prim(Prim::ForeignValue),
             artifact::Type::Bound(index) => {
                 params
@@ -4282,6 +4412,7 @@ fn clamp_bounds(ty: Arc<Ty>, count: usize, presences: usize) -> Arc<Ty> {
                 Ty::Real => types.push(Arc::new(Ty::Real)),
                 Ty::String => types.push(Arc::new(Ty::String)),
                 Ty::Bool => types.push(Arc::new(Ty::Bool)),
+                Ty::Presence(p) => types.push(Arc::new(Ty::Presence(p.clone()))),
                 Ty::ForeignValue => types.push(Arc::new(Ty::ForeignValue)),
                 Ty::Bound(index) if (*index as usize) < count && (*index as usize) >= presences => {
                     types.push(Arc::new(Ty::Bound(*index)))
@@ -4508,6 +4639,7 @@ fn drop_type_iterative(root: Arc<Ty>) {
                     | Ty::Real
                     | Ty::String
                     | Ty::Bool
+                    | Ty::Presence(_)
                     | Ty::ForeignValue
                     | Ty::Var(_)
                     | Ty::Bound(_)
@@ -4634,6 +4766,16 @@ impl ImportedEffectRows {
 /// row or an argument published with `Sense::Effects` may have effect keys
 /// rewritten. In particular, an ordinary sum label containing the separator is
 /// still an ordinary sum label.
+fn import_presence(value: &artifact::Presence) -> Presence {
+    match value {
+        artifact::Presence::Present => Presence::Present,
+        artifact::Presence::Absent => Presence::Absent,
+        artifact::Presence::Bound(index) => Presence::Bound(*index),
+        artifact::Presence::Var(index) => Presence::Recovered(*index),
+        artifact::Presence::Undecided => Presence::Undecided,
+    }
+}
+
 fn import_type(
     mint: &mut Mint,
     value: &artifact::Type,
@@ -4673,6 +4815,9 @@ fn import_type(
                 artifact::Type::Real => types.push(Arc::new(Ty::Real)),
                 artifact::Type::String => types.push(Arc::new(Ty::String)),
                 artifact::Type::Bool => types.push(Arc::new(Ty::Bool)),
+                artifact::Type::Presence(p) => {
+                    types.push(Arc::new(Ty::Presence(import_presence(p))))
+                }
                 artifact::Type::ForeignValue => types.push(Arc::new(Ty::ForeignValue)),
                 artifact::Type::Bound(index) => types.push(Arc::new(Ty::Bound(*index))),
                 artifact::Type::Var(_)
@@ -5363,8 +5508,23 @@ pub(crate) fn representation_key(
 }
 
 impl RegularType<'_> {
-    fn node(&mut self, label: impl Into<String>, edges: Vec<(String, usize)>) -> usize {
+    fn node(&mut self, label: impl Into<String>, mut edges: Vec<(String, usize)>) -> usize {
         let label = label.into();
+        // Substitution can make a written label absent. Its payload then has
+        // no structural meaning, just as for an explicitly absent label.
+        if label == "fields" || label == "sum" {
+            for (edge, child) in &mut edges {
+                if edge.ends_with(":\\") {
+                    *child = self.atom("?");
+                }
+            }
+        } else if label == "effect-case:\\" {
+            for (edge, child) in &mut edges {
+                if edge == "payload" {
+                    *child = self.atom("?");
+                }
+            }
+        }
         let key = (label.clone(), edges.clone());
         if let Some(id) = self.interned.get(&key) {
             return *id;
@@ -5402,6 +5562,55 @@ impl RegularType<'_> {
         args.get(index as usize)
             .copied()
             .unwrap_or_else(|| self.atom("?"))
+    }
+
+    /// Presence arguments are scalar graph nodes; substitute the caller's
+    /// node before spelling a row label so aliases retain structural identity.
+    fn presence_argument(&self, args: &[usize], index: u32) -> Option<String> {
+        let node = self.arena.nodes.get(*args.get(index as usize)?)?;
+        match &node.label {
+            RegularLabel::Ordinary(label) => {
+                Some(label.strip_prefix("presence:").unwrap_or(label).to_owned())
+            }
+            _ => None,
+        }
+    }
+
+    fn written_presence(
+        &self,
+        when: &Option<Box<When>>,
+        args: &[usize],
+        scope: &mut CanonicalPresenceScope,
+    ) -> String {
+        if let Some(argument) = when.as_ref().and_then(|when| when.argument.as_ref()) {
+            match &argument.anchored {
+                TypeKind::Param { index, .. } => {
+                    if let Some(presence) = self.presence_argument(args, *index) {
+                        return presence;
+                    }
+                }
+                TypeKind::Presence(value) => return if *value { "+" } else { "\\" }.into(),
+                TypeKind::Var(name) => return canonical_written_variable(Some(name), scope),
+                TypeKind::PresenceHole(id) => return format!("hole:{id}"),
+                _ => {}
+            }
+        }
+        canonical_written_presence(when, scope)
+    }
+
+    fn semantic_presence(
+        &self,
+        presence: &Presence,
+        args: &[usize],
+        instantiation: usize,
+        scope: &mut CanonicalPresenceScope,
+    ) -> String {
+        if let Presence::Bound(index) = presence
+            && let Some(presence) = self.presence_argument(args, *index)
+        {
+            return presence;
+        }
+        canonical_semantic_presence(presence, instantiation, scope)
     }
 
     fn with_fields(&mut self, core: usize, fields: Vec<(String, String, usize)>) -> usize {
@@ -5531,7 +5740,7 @@ impl RegularType<'_> {
                             .map(|(name, field)| {
                                 let presence = match field {
                                     TypeField::Written { when, .. } => {
-                                        canonical_written_presence(when, presence_scope)
+                                        self.written_presence(when, &args, presence_scope)
                                     }
                                     TypeField::Absent { .. } => "\\".into(),
                                 };
@@ -5555,7 +5764,7 @@ impl RegularType<'_> {
                             .map(|(name, case)| {
                                 let presence = match case {
                                     SumCase::Written { when, .. } => {
-                                        canonical_written_presence(when, presence_scope)
+                                        self.written_presence(when, &args, presence_scope)
                                     }
                                     SumCase::Absent { .. } => "\\".into(),
                                 };
@@ -5604,6 +5813,12 @@ impl RegularType<'_> {
                     TypeKind::Param { index, .. } => {
                         values.push(self.argument(&args, *index));
                     }
+                    TypeKind::Presence(value) => {
+                        values.push(self.atom(if *value { "presence:+" } else { "presence:\\" }))
+                    }
+                    TypeKind::PresenceHole(id) => {
+                        values.push(self.atom(format!("presence:hole:{id}")))
+                    }
                     TypeKind::Prim(prim) => values.push(self.atom(format!("{prim:?}"))),
                     TypeKind::Effects(row) => work.push(Work::EffectRow(row, args)),
                     TypeKind::Hidden { id, body, .. } => {
@@ -5642,7 +5857,7 @@ impl RegularType<'_> {
                     for label in row.effects.values().rev() {
                         let presence = match label {
                             EffectLabel::Written { when, .. } => {
-                                canonical_written_presence(when, presence_scope)
+                                self.written_presence(when, &args, presence_scope)
                             }
                             EffectLabel::Absent { .. } => "\\".into(),
                         };
@@ -5809,6 +6024,11 @@ impl RegularType<'_> {
                     Ty::Real => values.push(self.atom("Real")),
                     Ty::String => values.push(self.atom("String")),
                     Ty::Bool => values.push(self.atom("Bool")),
+                    Ty::Presence(p) => {
+                        let presence =
+                            self.semantic_presence(p, &args, instantiation, presence_scope);
+                        values.push(self.atom(format!("presence:{presence}")));
+                    }
                     Ty::ForeignValue => values.push(self.atom("ForeignValue")),
                     Ty::Bound(index) if instantiation == usize::MAX => {
                         values.push(self.atom(format!("param:{index}")))
@@ -6014,8 +6234,9 @@ impl RegularType<'_> {
                             if effects {
                                 "effect".to_string()
                             } else {
-                                let presence = canonical_semantic_presence(
+                                let presence = self.semantic_presence(
                                     &field.presence,
+                                    &args,
                                     instantiation,
                                     presence_scope,
                                 );
@@ -6065,8 +6286,9 @@ impl RegularType<'_> {
                     }
                     for (name, field) in row.labels.iter().rev() {
                         if effects {
-                            let presence = canonical_semantic_presence(
+                            let presence = self.semantic_presence(
                                 &field.presence,
+                                &args,
                                 instantiation,
                                 presence_scope,
                             );
@@ -6410,7 +6632,11 @@ fn canonical_written_presence(
     let Some(when) = when else {
         return "+".to_string();
     };
-    let index = match &when.name {
+    canonical_written_variable(when.name.as_ref(), scope)
+}
+
+fn canonical_written_variable(name: Option<&String>, scope: &mut CanonicalPresenceScope) -> String {
+    let index = match name {
         Some(name) => *scope.written.entry(name.clone()).or_insert_with(|| {
             let index = scope.next_alpha;
             scope.next_alpha += 1;
@@ -6502,6 +6728,8 @@ fn type_effect_dependencies<'a>(
             TypeKind::Param { .. }
             | TypeKind::Prim(_)
             | TypeKind::Var(_)
+            | TypeKind::Presence(_)
+            | TypeKind::PresenceHole(_)
             | TypeKind::Hole
             | TypeKind::Scoped { .. }
             | TypeKind::Error => {}
@@ -6860,6 +7088,8 @@ fn rekey_type(ty: &mut Type, ids: &IndexMap<Symbol, EffectId>, errors: &mut Vec<
         | TypeKind::Param { .. }
         | TypeKind::Prim(_)
         | TypeKind::Var(_)
+        | TypeKind::Presence(_)
+        | TypeKind::PresenceHole(_)
         | TypeKind::Hole
         | TypeKind::Scoped { .. }
         | TypeKind::Error => {}
@@ -7215,6 +7445,8 @@ impl<'a> Follow<'a> {
                     | TypeKind::Effects(_)
                     | TypeKind::Prim(_)
                     | TypeKind::Var(_)
+                    | TypeKind::Presence(_)
+                    | TypeKind::PresenceHole(_)
                     | TypeKind::Hole
                     | TypeKind::Hidden { .. }
                     | TypeKind::Scoped { .. }
@@ -7285,6 +7517,7 @@ impl<'a> Follow<'a> {
                     | Ty::Real
                     | Ty::String
                     | Ty::Bool
+                    | Ty::Presence(_)
                     | Ty::ForeignValue
                     | Ty::Arrow(..)
                     | Ty::Mut(..)
@@ -8638,6 +8871,14 @@ fn kinds(
     let mut handed: IndexMap<Slot, Vec<Slot>> = IndexMap::new();
     let mut tails: IndexMap<Slot, Vec<Slot>> = IndexMap::new();
     for (symbol, params, bodies) in &declarations {
+        if let Some(annotation) = types.get(symbol).and_then(|decl| decl.annotation.as_ref()) {
+            for variable in &annotation.variables {
+                said.entry((*symbol, variable.id))
+                    .or_default()
+                    .senses
+                    .insert(Sense::Presence);
+            }
+        }
         for (index, param) in params.iter().enumerate() {
             if param.kind.sense() == Sense::Region {
                 said.entry((*symbol, index as u32))
@@ -8723,6 +8964,8 @@ fn kinds(
                 ParamKind::Row { lacks }
             } else if read_as.contains(&Sense::Effects) {
                 ParamKind::Effects { lacks }
+            } else if read_as.contains(&Sense::Presence) {
+                ParamKind::Presence { lacks }
             } else if read_as.contains(&Sense::Region) {
                 ParamKind::Region { lacks }
             } else {
@@ -8743,6 +8986,20 @@ fn kinds(
 ///
 /// One function because there are two rows now — an arrow's own, and the one an
 /// argument may be — and what each says of its tail is the same sentence.
+fn says_presence(when: &Option<Box<When>>, out: &mut impl FnMut(Fact)) {
+    if let Some(when) = when
+        && let Some(argument) = &when.argument
+        && let TypeKind::Param { index, .. } = argument.anchored
+    {
+        out(Fact::Says(
+            index,
+            ParamKind::Presence {
+                lacks: IndexSet::new(),
+            },
+        ));
+    }
+}
+
 fn says_effects(
     effects: &EffectRow,
     summaries: &HashMap<Sense, HashMap<Symbol, RowSummary>>,
@@ -8759,6 +9016,9 @@ fn says_effects(
     // An applied effect is an application: what each argument says is what an
     // argument of a type application says, about the effect's slot instead.
     for label in effects.effects.values() {
+        if let EffectLabel::Written { when, .. } = label {
+            says_presence(when, out);
+        }
         arguments(label.symbol(), label.args(), summaries, out);
     }
 }
@@ -8887,6 +9147,9 @@ fn constrain(
                 constrain(&spread.value, summaries, out);
             }
             for field in fields.values() {
+                if let TypeField::Written { when, .. } = field {
+                    says_presence(when, out);
+                }
                 if let Some(value) = field.value() {
                     constrain(value, summaries, out);
                 }
@@ -8914,6 +9177,9 @@ fn constrain(
                 constrain(&spread.value, summaries, out);
             }
             for case in cases.values() {
+                if let SumCase::Written { when, .. } = case {
+                    says_presence(when, out);
+                }
                 if let Some(payload) = case.payload() {
                     constrain(payload, summaries, out);
                 }
@@ -8943,6 +9209,8 @@ fn constrain(
         TypeKind::Ident(_)
         | TypeKind::Prim(_)
         | TypeKind::Var(_)
+        | TypeKind::Presence(_)
+        | TypeKind::PresenceHole(_)
         | TypeKind::Hole
         | TypeKind::Scoped { .. }
         | TypeKind::Error => {}
@@ -9019,7 +9287,7 @@ fn row_arguments(program: &mut Program, kinds: &HashMap<Symbol, Vec<ParamKind>>)
                 for spread in spreads.iter_mut() {
                     walk(&mut spread.value, kinds, carries, rows, out);
                 }
-                spreads.clear();
+                // Keep operands: their type constraints still apply after expansion.
                 for field in fields.values_mut() {
                     if let TypeField::Written { value, .. } = field {
                         walk(value, kinds, carries, rows, out);
@@ -9030,7 +9298,7 @@ fn row_arguments(program: &mut Program, kinds: &HashMap<Symbol, Vec<ParamKind>>)
                 for spread in spreads.iter_mut() {
                     walk(&mut spread.value, kinds, carries, rows, out);
                 }
-                spreads.clear();
+                // Keep operands: their type constraints still apply after expansion.
                 for case in cases.values_mut() {
                     if let SumCase::Written {
                         payload: Some(payload),
@@ -9045,6 +9313,8 @@ fn row_arguments(program: &mut Program, kinds: &HashMap<Symbol, Vec<ParamKind>>)
             | TypeKind::Param { .. }
             | TypeKind::Prim(_)
             | TypeKind::Var(_)
+            | TypeKind::Presence(_)
+            | TypeKind::PresenceHole(_)
             | TypeKind::Hole
             | TypeKind::Scoped { .. }
             | TypeKind::Error => {}
@@ -9081,6 +9351,26 @@ fn row_arguments(program: &mut Program, kinds: &HashMap<Symbol, Vec<ParamKind>>)
                 })));
             }
             let refused = match kind {
+                Some(kind) if kind.sense() == Sense::Presence => match &arg.anchored {
+                    TypeKind::Presence(_)
+                    | TypeKind::PresenceHole(_)
+                    | TypeKind::Var(_)
+                    | TypeKind::Hole
+                    | TypeKind::Error => None,
+                    TypeKind::Param { symbol, .. }
+                        if rows.get(symbol) == Some(&Sense::Presence) =>
+                    {
+                        None
+                    }
+                    _ => Some(ErrorKind::NotARow {
+                        sense: Sense::Presence,
+                    }),
+                },
+                Some(kind) if matches!(arg.anchored, TypeKind::Presence(_)) => {
+                    Some(ErrorKind::NotARow {
+                        sense: kind.sense(),
+                    })
+                }
                 Some(kind) if kind.sense() == Sense::Region => match &arg.anchored {
                     TypeKind::Param { symbol, .. } if rows.get(symbol) == Some(&Sense::Region) => {
                         None
@@ -9156,7 +9446,10 @@ fn row_arguments(program: &mut Program, kinds: &HashMap<Symbol, Vec<ParamKind>>)
         let rows: HashMap<Symbol, Sense> = decl
             .params
             .iter()
-            .filter(|param| param.kind.row().is_some() || param.kind.sense() == Sense::Region)
+            .filter(|param| {
+                param.kind.row().is_some()
+                    || matches!(param.kind.sense(), Sense::Region | Sense::Presence)
+            })
             .map(|param| (param.symbol, param.kind.sense()))
             .collect();
         walk(&mut decl.value, kinds, &carries, &rows, &mut out);
@@ -9191,7 +9484,10 @@ fn row_arguments(program: &mut Program, kinds: &HashMap<Symbol, Vec<ParamKind>>)
         let rows: HashMap<Symbol, Sense> = decl
             .params
             .iter()
-            .filter(|param| param.kind.row().is_some() || param.kind.sense() == Sense::Region)
+            .filter(|param| {
+                param.kind.row().is_some()
+                    || matches!(param.kind.sense(), Sense::Region | Sense::Presence)
+            })
             .map(|param| (param.symbol, param.kind.sense()))
             .collect();
         match &mut decl.value {
@@ -9332,6 +9628,8 @@ fn row_shaped(
             | TypeKind::Var(_)
             | TypeKind::Hidden { .. }
             | TypeKind::Scoped { .. }
+            | TypeKind::Presence(_)
+            | TypeKind::PresenceHole(_)
             | TypeKind::Hole => false,
         }
     }
@@ -9524,6 +9822,7 @@ fn row_summaries(
                     | Ty::Real
                     | Ty::String
                     | Ty::Bool
+                    | Ty::Presence(_)
                     | Ty::ForeignValue
                     | Ty::Arrow(..)
                     | Ty::Mut(..)
@@ -9581,6 +9880,8 @@ fn row_summaries(
                     | TypeKind::Effects(_)
                     | TypeKind::Prim(_)
                     | TypeKind::Var(_)
+                    | TypeKind::Presence(_)
+                    | TypeKind::PresenceHole(_)
                     | TypeKind::Hole
                     | TypeKind::Hidden { .. }
                     | TypeKind::Scoped { .. }
@@ -9761,6 +10062,8 @@ fn row_summary(ty: &Type, decls: &HashMap<Symbol, RowSummary>, shape: Sense) -> 
         | TypeKind::Effects(_)
         | TypeKind::Prim(_)
         | TypeKind::Var(_)
+        | TypeKind::Presence(_)
+        | TypeKind::PresenceHole(_)
         | TypeKind::Hole
         | TypeKind::Hidden { .. }
         | TypeKind::Scoped { .. }
@@ -9960,6 +10263,8 @@ fn relevance(types: &IndexMap<Symbol, Decl<Type>>) -> HashSet<Slot> {
             TypeKind::Ident(_)
             | TypeKind::Prim(_)
             | TypeKind::Var(_)
+            | TypeKind::Presence(_)
+            | TypeKind::PresenceHole(_)
             | TypeKind::Hole
             | TypeKind::Scoped { .. }
             | TypeKind::Error => {}
@@ -10044,6 +10349,8 @@ fn mentioned(ty: &Type, out: &mut Vec<Symbol>) {
         TypeKind::Param { .. }
         | TypeKind::Prim(_)
         | TypeKind::Var(_)
+        | TypeKind::Presence(_)
+        | TypeKind::PresenceHole(_)
         | TypeKind::Hole
         | TypeKind::Scoped { .. }
         | TypeKind::Error => {}
@@ -10124,6 +10431,8 @@ fn grows(ty: &Type, group: &[Symbol], report: &mut impl FnMut(Anchor)) {
         TypeKind::Param { .. }
         | TypeKind::Prim(_)
         | TypeKind::Var(_)
+        | TypeKind::Presence(_)
+        | TypeKind::PresenceHole(_)
         | TypeKind::Hole
         | TypeKind::Scoped { .. }
         | TypeKind::Error => {}
@@ -10170,6 +10479,8 @@ fn mentions_a_parameter(ty: &Type) -> bool {
         TypeKind::Ident(_)
         | TypeKind::Prim(_)
         | TypeKind::Var(_)
+        | TypeKind::Presence(_)
+        | TypeKind::PresenceHole(_)
         | TypeKind::Hole
         | TypeKind::Scoped { .. }
         | TypeKind::Error => false,
@@ -10715,7 +11026,8 @@ impl<'a> Builder<'a> {
                                 .iter()
                                 .map(|label| effect_rows.label(label))
                                 .collect(),
-                            artifact::Sense::Region
+                            artifact::Sense::Presence
+                            | artifact::Sense::Region
                             | artifact::Sense::Type
                             | artifact::Sense::Row => param.lacks.iter().cloned().collect(),
                         };
@@ -10724,13 +11036,12 @@ impl<'a> Builder<'a> {
                             artifact::Sense::Type => ParamKind::Type { lacks },
                             artifact::Sense::Row => ParamKind::Row { lacks },
                             artifact::Sense::Effects => ParamKind::Effects { lacks },
+                            artifact::Sense::Presence => ParamKind::Presence { lacks },
                         }
                     })
                     .collect();
-                // A declared type's parameter table is authoritative. Unlike a
-                // value scheme it cannot quantify presences or carry a formula;
-                // malformed artifact metadata must not make opening index a
-                // differently sized argument list.
+                // A declaration uses header order, not the presence-first
+                // numbering of a value scheme. The header owns its bounds.
                 let body = import_type(
                     self.mint,
                     &declaration.scheme.body,
@@ -10739,7 +11050,22 @@ impl<'a> Builder<'a> {
                     &effect_rows,
                 );
                 let body = clamp_bounds(body, params.len(), 0);
-                let scheme = Scheme::new(params.len() as u32, body);
+                let (formula, valid) = import_formula(&declaration.scheme.formula);
+                let mut atoms = Vec::new();
+                formula.atoms(&mut atoms);
+                let valid = valid
+                    && atoms.iter().all(|atom| match atom {
+                        crate::types::Atom::Bound(index) => params
+                            .get(*index as usize)
+                            .is_some_and(|kind| kind.sense() == Sense::Presence),
+                        _ => false,
+                    });
+                let formula = if valid {
+                    formula
+                } else {
+                    crate::types::Formula::True
+                };
+                let scheme = Scheme::declaration(params.len() as u32, body, formula);
                 self.imported_row_sources
                     .insert(symbol, (&declaration.scheme.body, params.len()));
                 self.arities.insert(symbol, params.len());
@@ -10785,6 +11111,7 @@ impl<'a> Builder<'a> {
                             artifact::Sense::Type => ParamKind::Type { lacks },
                             artifact::Sense::Row => ParamKind::Row { lacks },
                             artifact::Sense::Effects => ParamKind::Effects { lacks },
+                            artifact::Sense::Presence => ParamKind::Presence { lacks },
                         }
                     })
                     .collect();
@@ -11941,6 +12268,8 @@ impl<'a> Builder<'a> {
             TypeKind::Ident(_)
             | TypeKind::Prim(_)
             | TypeKind::Var(_)
+            | TypeKind::Presence(_)
+            | TypeKind::PresenceHole(_)
             | TypeKind::Hole
             | TypeKind::Scoped { .. }
             | TypeKind::Error => ty.anchored.clone(),
@@ -12204,20 +12533,14 @@ impl<'a> Builder<'a> {
         let ty = self.ty(written.ty, place);
         // Then the constraints, which are resolved against what the type just
         // read: a formula is written about presences, and which variables are
-        // presences is a thing only the `when`s can have said.
+        // presences follows both label guards and application parameter kinds.
         let mut clause: Option<Clause> = None;
         let mut absorbed = false;
         for written in clauses {
-            // A declaration says the same thing wherever it is used, so it has
-            // no presence of its own for a formula to relate.
-            if place == Place::Declaration {
-                self.error(written.span, ErrorKind::ClauseInDeclaration);
-                continue;
-            }
             // Every statement is lowered before any is judged, so a clause with
             // two bad statements reports both — the precedent [`ty`](Self::ty)
             // sets for an open declared type.
-            let Some(lowered) = self.clause(written) else {
+            let Some(lowered) = self.clause(written, place) else {
                 absorbed = true;
                 continue;
             };
@@ -12230,7 +12553,7 @@ impl<'a> Builder<'a> {
                     .anchor(ClauseKind::And(Box::new(before), Box::new(lowered))),
             });
         }
-        let polarity = presence_polarities(&ty, &self.variances);
+        let polarity = presence_polarities(&ty, &self.variances, &self.vars);
         let named_ids: HashSet<u32> = self.vars.values().map(|declared| declared.id).collect();
         let anonymous_existentials = polarity
             .iter()
@@ -12308,12 +12631,25 @@ impl<'a> Builder<'a> {
     /// another way is [`ErrorKind::MixedTail`], and one no `when` ever wore is
     /// [`ErrorKind::UnboundPresence`] — the same complaint a name nothing
     /// declared gets, because the reader's fix is the same either way.
-    fn clause(&mut self, clause: parse::Clause) -> Option<Clause> {
+    fn clause(&mut self, clause: parse::Clause, place: Place) -> Option<Clause> {
         let span = clause.span;
         let here = self.anchor(span);
         let kind = match clause.tracked {
             parse::ClauseKind::Name(name) => {
                 let named = here.anchor(name.clone());
+                if place == Place::Declaration {
+                    let Some(&(_, index)) = self.params.get(&name) else {
+                        self.error(span, ErrorKind::VariableInDeclaration { name });
+                        return None;
+                    };
+                    self.variable(&span.track(name.clone()), Sense::Presence);
+                    let variable = self
+                        .vars
+                        .get_mut(&name)
+                        .expect("declared constraint variable");
+                    variable.id = index;
+                    variable.labelled = true;
+                }
                 let declared = self.vars.get(&name).is_some();
                 if declared && !self.used(&name, named.at, Sense::Presence) {
                     return None;
@@ -12324,24 +12660,24 @@ impl<'a> Builder<'a> {
                 }
                 ClauseKind::Name(name)
             }
-            parse::ClauseKind::Not(inner) => ClauseKind::Not(Box::new(self.clause(*inner)?)),
+            parse::ClauseKind::Not(inner) => ClauseKind::Not(Box::new(self.clause(*inner, place)?)),
             parse::ClauseKind::And(left, right) => {
                 // Both sides are lowered before either is judged, so a clause
                 // naming two unbound presences reports both: the precedent
                 // [`ty`](Self::ty) sets for an open declared type.
-                let (left, right) = (self.clause(*left), self.clause(*right));
+                let (left, right) = (self.clause(*left, place), self.clause(*right, place));
                 ClauseKind::And(Box::new(left?), Box::new(right?))
             }
             parse::ClauseKind::Or(left, right) => {
-                let (left, right) = (self.clause(*left), self.clause(*right));
+                let (left, right) = (self.clause(*left, place), self.clause(*right, place));
                 ClauseKind::Or(Box::new(left?), Box::new(right?))
             }
             parse::ClauseKind::Equal(left, right) => {
-                let (left, right) = (self.clause(*left), self.clause(*right));
+                let (left, right) = (self.clause(*left, place), self.clause(*right, place));
                 ClauseKind::Equal(Box::new(left?), Box::new(right?))
             }
             parse::ClauseKind::NotEqual(left, right) => {
-                let (left, right) = (self.clause(*left), self.clause(*right));
+                let (left, right) = (self.clause(*left, place), self.clause(*right, place));
                 ClauseKind::NotEqual(Box::new(left?), Box::new(right?))
             }
         };
@@ -12362,11 +12698,36 @@ impl<'a> Builder<'a> {
     /// declared there would be the first one said again in different words.
     fn when(&mut self, when: Option<Box<parse::When>>, place: Place) -> Option<Box<When>> {
         let when = when?;
+        if let Some(name) = &when.name
+            && place == Place::Declaration
+        {
+            if self.scoped_id(&name.tracked).is_some() {
+                self.variable(name, Sense::Presence);
+                return None;
+            }
+            if let Some(&(symbol, index)) = self.params.get(&name.tracked) {
+                let at = self.anchor(when.span);
+                return Some(Box::new(When {
+                    at,
+                    name: Some(name.tracked.clone()),
+                    id: index,
+                    argument: Some(Box::new(at.anchor(TypeKind::Param { symbol, index }))),
+                }));
+            }
+            self.error(
+                name.span,
+                ErrorKind::VariableInDeclaration {
+                    name: name.tracked.clone(),
+                },
+            );
+            return None;
+        }
         if place != Place::Annotation {
             let id = self.rigids;
             self.rigids += 1;
             return Some(Box::new(When {
                 at: self.anchor(when.span),
+                argument: None,
                 name: when.name.map(|name| name.tracked),
                 id,
             }));
@@ -12393,6 +12754,7 @@ impl<'a> Builder<'a> {
         });
         Some(Box::new(When {
             at: self.anchor(when.span),
+            argument: None,
             name,
             id,
         }))
@@ -12532,6 +12894,8 @@ impl<'a> Builder<'a> {
                     .is_some_and(|kind| kind.sense() == Sense::Region)
                 {
                     self.region(arg, place)
+                } else if let Some(kind) = parameter_kinds.get(index) {
+                    self.kind_argument(arg, place, kind.sense())
                 } else {
                     self.argument(arg, place)
                 }
@@ -13135,6 +13499,35 @@ impl<'a> Builder<'a> {
         at.anchor(TypeKind::Error)
     }
 
+    fn kind_argument(&mut self, arg: parse::Type, place: Place, sense: Sense) -> Type {
+        if matches!(arg.tracked, parse::TypeKind::Hole)
+            && place == Place::Annotation
+            && sense == Sense::Presence
+        {
+            let id = self.rigids;
+            self.rigids += 1;
+            return self.anchor(arg.span).anchor(TypeKind::PresenceHole(id));
+        }
+        if let parse::TypeKind::Variable { name } = &arg.tracked
+            && place == Place::Annotation
+            && !self.params.contains_key(&name.tracked)
+            && (sense != Sense::Type || self.scoped_id(&name.tracked).is_none())
+        {
+            let at = self.anchor(arg.span);
+            if !self.variable(name, sense) {
+                return at.anchor(TypeKind::Error);
+            }
+            if sense == Sense::Presence {
+                self.vars
+                    .get_mut(&name.tracked)
+                    .expect("declared variable")
+                    .labelled = true;
+            }
+            return at.anchor(TypeKind::Var(name.tracked.clone()));
+        }
+        self.argument(arg, place)
+    }
+
     fn effect_argument(
         &mut self,
         symbol: Symbol,
@@ -13143,17 +13536,19 @@ impl<'a> Builder<'a> {
         place: Place,
     ) -> Type {
         let builtin = self.builtin_mut.is_some_and(|(built, _)| built == symbol);
-        let region = builtin
-            || self
-                .parameter_kinds
+        let sense = if builtin {
+            Sense::Region
+        } else {
+            self.parameter_kinds
                 .get(&symbol)
                 .or_else(|| self.imported_effect_params.get(&symbol))
                 .and_then(|kinds| kinds.get(index))
-                .is_some_and(|kind| kind.sense() == Sense::Region);
-        if region {
+                .map_or(Sense::Type, ParamKind::sense)
+        };
+        if sense == Sense::Region {
             self.region(arg, place)
         } else {
-            self.argument(arg, place)
+            self.kind_argument(arg, place, sense)
         }
     }
 
@@ -13167,6 +13562,7 @@ impl<'a> Builder<'a> {
         let span = ty.span;
         let here = self.anchor(span);
         match ty.tracked {
+            parse::TypeKind::Presence(value) => here.anchor(TypeKind::Presence(value)),
             parse::TypeKind::Effects(written) => {
                 match self.effect_row(span, Some(*written), place) {
                     Some(row) => here.anchor(TypeKind::Effects(Box::new(row))),
@@ -13263,6 +13659,10 @@ impl<'a> Builder<'a> {
             }
             // As in [`term`](Self::term): the two surface spellings of the
             // empty struct, `()` and `{}`, meet here as a closed empty row.
+            parse::TypeKind::Presence(_) => {
+                self.error(span, ErrorKind::NotARow { sense: Sense::Type });
+                here.anchor(TypeKind::Error)
+            }
             parse::TypeKind::Unit => here.anchor(TypeKind::Struct {
                 fields: Default::default(),
                 spreads: Vec::new(),
@@ -13469,7 +13869,7 @@ impl<'a> Builder<'a> {
                 let marks = lowered.values().filter_map(|field| match field {
                     TypeField::Written {
                         when: Some(when), ..
-                    } => Some(when.at),
+                    } if when.argument.is_none() => Some(when.at),
                     _ => None,
                 });
                 let closed = self.closed(place, Shape::Struct, marks, &tail);
@@ -13536,7 +13936,7 @@ impl<'a> Builder<'a> {
                 let marks = lowered.values().filter_map(|case| match case {
                     SumCase::Written {
                         when: Some(when), ..
-                    } => Some(when.at),
+                    } if when.argument.is_none() => Some(when.at),
                     _ => None,
                 });
                 let closed = self.closed(place, Shape::Sum, marks, &tail);
@@ -13726,7 +14126,10 @@ impl<'a> Builder<'a> {
         // The same two checks a struct and a sum make, in the effect reading:
         // a position that holds for every definition may leave nothing open,
         // and a `\` needs a `..` beside it to speak about.
-        let marks = effects.values().filter_map(|label| Some(label.when()?.at));
+        let marks = effects.values().filter_map(|label| {
+            let when = label.when()?;
+            when.argument.is_none().then_some(when.at)
+        });
         let closed = self.closed(place, Shape::Effect, marks, &tail);
         let absences: Vec<_> = effects
             .values()

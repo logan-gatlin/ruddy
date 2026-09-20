@@ -2531,3 +2531,80 @@ fn execution_modes_produce_identical_artifacts() {
     let serial = Execution::sequential().run(compile);
     assert_eq!(serial, Execution::default().run(compile));
 }
+
+#[test]
+fn presence_type_parameters_survive_artifact_round_trip() {
+    let producer = accepted(
+        "type Choice 'a 'p 'q = { left when 'p: 'a, right when 'q: 'a } where 'p != 'q\ntype Forward 'a 'p 'q = Choice 'a 'p 'q\nlet identity: Forward Nat 'p 'q -> Forward Nat 'p 'q = fn x => x",
+    );
+    let dependency = ruddy::artifact::Artifact::try_parse(&producer.artifact().print()).unwrap();
+    accepted_with(
+        "let value: dep::Forward Nat true false = dep::identity { left: 1n }",
+        &dependency,
+    );
+    let parsed = parse::parse(
+        token::lex(
+            "type Impossible = dep::Forward Nat true true",
+            FileID::GENERATED,
+        )
+        .tokens,
+    );
+    assert!(
+        compile::compile_with_dependencies(
+            Mint::new(Bundle::new("app", Version::new(0, 1, 0)).unwrap()),
+            parsed.stmts,
+            &[compile::Dependency {
+                alias: Some("dep"),
+                artifact: compile::DependencyArtifact::Unchecked(&dependency)
+            }],
+            inference::Trace::Off,
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn presence_arguments_preserve_structural_effect_identity() {
+    let program = accepted(
+        "type Field 'a 'p = { x when 'p: 'a }\n\
+         effect Via = { op: Field Nat true -> () }\n\
+         effect Direct = { op: { x: Nat } -> () }\n\
+         effect Without = { op: Field Nat false -> () }\n\
+         effect Other = { op: Field String false -> () }",
+    );
+    let effects = &program.artifact().header().effects;
+    assert_eq!(
+        effects[0].identity.as_ref().unwrap().interface,
+        effects[1].identity.as_ref().unwrap().interface
+    );
+    assert_ne!(
+        effects[0].identity.as_ref().unwrap().interface,
+        effects[2].identity.as_ref().unwrap().interface
+    );
+    assert_eq!(
+        effects[2].identity.as_ref().unwrap().interface,
+        effects[3].identity.as_ref().unwrap().interface
+    );
+    let dependency = ruddy::artifact::Artifact::try_parse(&program.artifact().print()).unwrap();
+    let consumer = accepted_with(
+        "effect Via = { op: dep::Field Nat true -> () }\n\
+         effect Direct = { op: { x: Nat } -> () }\n\
+         effect Without = { op: dep::Field Nat false -> () }\n\
+         effect Other = { op: dep::Field String false -> () }",
+        &dependency,
+    );
+    let effects = &consumer.artifact().header().effects;
+    let local: Vec<_> = effects.iter().filter(|effect| effect.exported).collect();
+    assert_eq!(
+        local[0].identity.as_ref().unwrap().interface,
+        local[1].identity.as_ref().unwrap().interface
+    );
+    assert_eq!(
+        local[2].identity.as_ref().unwrap().interface,
+        local[3].identity.as_ref().unwrap().interface
+    );
+    assert_ne!(
+        local[0].identity.as_ref().unwrap().interface,
+        local[2].identity.as_ref().unwrap().interface
+    );
+}

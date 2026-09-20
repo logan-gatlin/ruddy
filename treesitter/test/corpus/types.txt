@@ -409,3 +409,26 @@ type Choice = | ..Cases | #Extra | ..More
         (fixed_type_spread (identifier))
         (sum_case (tag))
         (fixed_type_spread (identifier))))))
+
+================================================================================
+Presence constants are type arguments
+================================================================================
+
+type Present = Field true
+type Absent = Field false
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (type_definition
+    (identifier)
+    (annotation
+      (type_application
+        (identifier)
+        (boolean))))
+  (type_definition
+    (identifier)
+    (annotation
+      (type_application
+        (identifier)
+        (boolean)))))

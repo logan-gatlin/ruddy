@@ -677,6 +677,8 @@ pub enum ExternTypeKind {
 
 #[derive(Debug, Clone)]
 pub enum TypeKind {
+    /// A concrete presence supplied to a type parameter.
+    Presence(bool),
     Struct {
         fields: IndexMap<TrackedString, TypeField>,
         spreads: Vec<TypeSpread>,
@@ -4507,6 +4509,7 @@ impl Parser {
                     | Kind::ColonColon
                     | Kind::Mut
                     | Kind::Variable(_)
+                    | Kind::Bool(_)
                     | Kind::LeftBrace
                     | Kind::LeftBracket
                     | Kind::LeftParen
@@ -4530,6 +4533,11 @@ impl Parser {
         };
         let span = tok.span;
         match &tok.tracked {
+            Kind::Bool(value) => {
+                let value = *value;
+                self.advance();
+                Some(span.track(TypeKind::Presence(value)))
+            }
             Kind::LeftBrace => self.struct_type(),
             Kind::Mut => {
                 self.advance();

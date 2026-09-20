@@ -4202,6 +4202,7 @@ fn describe_type(ty: &Arc<Ty>) -> TypeDescription {
         Ty::Real => TypeDescription::RealNumber,
         Ty::String => TypeDescription::Text,
         Ty::Bool => TypeDescription::Bool,
+        Ty::Presence(_) => TypeDescription::Undecided,
         Ty::ForeignValue => TypeDescription::ForeignValue,
         Ty::Arrow(..) => TypeDescription::Function,
         Ty::Struct(..) => TypeDescription::Struct,
@@ -4318,6 +4319,7 @@ impl MismatchFingerprints {
                         Ty::Real => values.push(tagged(2, [])),
                         Ty::String => values.push(tagged(3, [])),
                         Ty::Bool => values.push(tagged(4, [])),
+                        Ty::Presence(p) => values.push(tagged(52, [presence_hash(p)])),
                         Ty::ForeignValue => values.push(tagged(51, [])),
                         Ty::Var(id) => values.push(tagged(5, [u64::from(*id)])),
                         Ty::Bound(id) => values.push(tagged(6, [u64::from(*id)])),
@@ -6250,6 +6252,10 @@ impl Fingerprint {
                     Ty::Real => self.word(0x03),
                     Ty::String => self.word(0x04),
                     Ty::Bool => self.word(0x05),
+                    Ty::Presence(p) => {
+                        self.word(0x32);
+                        self.word(formula_digest(&p.formula()));
+                    }
                     Ty::ForeignValue => self.word(0x31),
                     Ty::Arrow(from, to, effects) => {
                         self.word(0x06);
@@ -6492,11 +6498,79 @@ fn declarations(mint: &Mint, program: &Program) -> (Arc<Signatures>, GroupResult
     // name, so this pass reads no alias it is still building and the order it
     // runs in decides nothing — which is what lets two declarations refer to
     // each other.
+    let mut spread_uses = HashMap::new();
     for (symbol, decl) in &program.types {
         // The parameters are already `Ty::Bound`s by their position, so the
         // scheme is closed by counting them rather than by walking anything.
-        let body = lower_type(mint, &mut table, &decl.value);
-        aliases.insert(*symbol, Scheme::new(decl.params.len() as u32, body));
+        let mut tails = Tails::default();
+        let body = lower(mint, &mut table, &mut tails, &decl.value);
+        table.note_lacks(&body);
+        spread_uses.insert(*symbol, std::mem::take(&mut tails.spread_uses));
+        for (index, param) in decl.params.iter().enumerate() {
+            if param.kind.sense() == Sense::Presence {
+                tails.presences.insert(
+                    mint.name(param.symbol).to_string(),
+                    Presence::Bound(index as u32),
+                );
+            }
+        }
+        let formula = decl
+            .annotation
+            .as_ref()
+            .and_then(|annotation| annotation.clause.as_ref())
+            .map_or(Formula::True, |clause| clause_formula(&tails, clause));
+        aliases.insert(
+            *symbol,
+            Scheme::declaration(decl.params.len() as u32, body, formula),
+        );
+    }
+
+    // Requirements form a finite Boolean lattice over each declaration's
+    // parameters. Each pass only strengthens them; recursive bodies stay named.
+    loop {
+        let mut updates = Vec::new();
+        for symbol in program.types.keys() {
+            let scheme = &aliases[symbol];
+            let mut formula = scheme
+                .formula()
+                .clone()
+                .and(declaration_requirements(scheme.body(), &aliases));
+            for operand in &spread_uses[symbol] {
+                formula = formula.and(declaration_requirements(operand, &aliases));
+            }
+            if !sat::entails(scheme.formula(), &formula) {
+                updates.push((
+                    *symbol,
+                    Scheme::declaration(scheme.count(), scheme.body().clone(), formula),
+                ));
+            }
+        }
+        if updates.is_empty() {
+            break;
+        }
+        aliases.extend(updates);
+    }
+    for (symbol, decl) in &program.types {
+        let formula = aliases[symbol].formula();
+        if !sat::satisfiable(formula) {
+            let names: Vec<_> = decl
+                .params
+                .iter()
+                .enumerate()
+                .map(|(index, param)| {
+                    (
+                        format!("'{}", mint.name(param.symbol)),
+                        Presence::Bound(index as u32),
+                    )
+                })
+                .collect();
+            errors.push(Error::new(
+                decl.value.at,
+                ErrorKind::ClauseImpossible {
+                    formula: crate::ui::in_labels(formula, &names),
+                },
+            ));
+        }
     }
 
     let variances = semantic_variances(&aliases);
@@ -8384,6 +8458,9 @@ impl Table {
                         | (Ty::Bool, Ty::Bool)
                         | (Ty::ForeignValue, Ty::ForeignValue)
                         | (Ty::Undecided, Ty::Undecided) => {}
+                        (Ty::Presence(x), Ty::Presence(y)) => {
+                            same &= self.presence_of(x) == self.presence_of(y)
+                        }
                         (Ty::Var(x), Ty::Var(y)) => same &= x == y,
                         (Ty::Rigid { id: x, .. }, Ty::Rigid { id: y, .. }) => same &= x == y,
                         (Ty::Arrow(from, to, effects), Ty::Arrow(other, result, performs)) => {
@@ -8559,6 +8636,7 @@ impl Table {
                     } else {
                         visited_tys.push(ty.clone());
                         match &*ty {
+                            Ty::Presence(p) => work.push((Part::Presence(p.clone()), trace, route)),
                             Ty::Package(body) | Ty::Hidden { body, .. } => {
                                 work.push((Part::Ty(body.clone()), trace, route))
                             }
@@ -8833,6 +8911,7 @@ impl Table {
                         Ty::Named { args, .. } => {
                             work.extend(args.iter().rev().cloned().map(Work::Ty));
                         }
+                        Ty::Presence(p) => self.mentions_presence(p, found),
                         Ty::Nat
                         | Ty::Int
                         | Ty::Fixed(_)
@@ -8973,6 +9052,7 @@ impl Table {
                         | Ty::Real
                         | Ty::String
                         | Ty::Bool
+                        | Ty::Presence(_)
                         | Ty::ForeignValue
                         | Ty::Var(_)
                         | Ty::Bound(_)
@@ -9643,6 +9723,7 @@ impl Table {
                         Ty::Named { args, .. } => {
                             work.extend(args.iter().rev().cloned().map(Work::Ty));
                         }
+                        Ty::Presence(p) => work.push(Work::Presence(p.clone())),
                         Ty::Nat
                         | Ty::Int
                         | Ty::Fixed(_)
@@ -9710,6 +9791,9 @@ impl Table {
         while let Some(next) = work.pop() {
             match next {
                 Work::Ty(ty) => match &*ty {
+                    Ty::Presence(Presence::Bound(index)) if scheme.is_existential(*index) => {
+                        root_slots.insert(*index);
+                    }
                     Ty::Package(_) => {} // a nested owner
                     Ty::Hidden { body, .. } => work.push(Work::Ty(body.clone())),
                     Ty::Array(element) | Ty::Mirror(element) | Ty::TypeInfo(element) => {
@@ -11640,6 +11724,7 @@ impl Table {
                             work.push(Work::Ty(element.clone()));
                             work.push(Work::Ty(region.clone()));
                         }
+                        Ty::Presence(p) if presences => work.push(Work::Presence(p.clone())),
                         Ty::Var(var) if !presences => self.quantify_var(*var, subst, level),
                         // A type opened in a match arm is nobody's to quantify:
                         // it stands for one particular type chosen elsewhere,
@@ -11757,6 +11842,16 @@ impl Table {
                 Work::Ty(ty) => {
                     let ty = self.resolve(&ty);
                     match &*ty {
+                        Ty::Presence(p) => {
+                            let p = match self.presence_of(p) {
+                                Presence::Var(var) => subst
+                                    .presences
+                                    .get(&var)
+                                    .map_or(Presence::Var(var), |index| Presence::Bound(*index)),
+                                p => p,
+                            };
+                            types.push(Arc::new(Ty::Presence(p)));
+                        }
                         Ty::Var(var) => types.push(Arc::new(
                             subst
                                 .types
@@ -12248,6 +12343,9 @@ fn collect_owned_existentials(body: &Arc<Ty>, abstract_: &HashSet<TyVar>) -> Ind
     while let Some(part) = work.pop() {
         match part {
             Work::Ty(ty) => match &*ty {
+                Ty::Presence(Presence::Var(var)) if abstract_.contains(var) => {
+                    found.insert(*var);
+                }
                 Ty::Package(_) => {} // belongs to the nested package
                 Ty::Hidden { body, .. } => work.push(Work::Ty(body.clone())),
                 Ty::Array(element) | Ty::Mirror(element) | Ty::TypeInfo(element) => {
@@ -12351,6 +12449,9 @@ fn substitute_presence_vars(root: &Arc<Ty>, renames: &HashMap<TyVar, Presence>) 
                     work.push(Work::Named(*symbol, name.clone(), args.len()));
                     work.extend(args.iter().rev().cloned().map(Work::Ty));
                 }
+                Ty::Presence(Presence::Var(var)) => types.push(Arc::new(Ty::Presence(
+                    renames.get(var).cloned().unwrap_or(Presence::Var(*var)),
+                ))),
                 other => types.push(Arc::new(other.clone())),
             },
             Work::Row(row) => {
@@ -12482,7 +12583,9 @@ fn semantic_variances(aliases: &IndexMap<Symbol, Scheme>) -> HashMap<(Symbol, u3
                         }
                         *visited |= bit;
                         match &*ty {
-                            Ty::Bound(index) if *index < scheme.count() => {
+                            Ty::Bound(index) | Ty::Presence(Presence::Bound(index))
+                                if *index < scheme.count() =>
+                            {
                                 *out.entry((*owner, *index)).or_default() |=
                                     if positive { 1 } else { 2 };
                             }
@@ -12522,6 +12625,12 @@ fn semantic_variances(aliases: &IndexMap<Symbol, Scheme>) -> HashMap<(Symbol, u3
                         }
                     }
                     Work::Row(row, positive) => {
+                        for field in row.labels.values() {
+                            if let Presence::Bound(index) = field.presence {
+                                *out.entry((*owner, index)).or_default() |=
+                                    if positive { 1 } else { 2 };
+                            }
+                        }
                         work.extend(
                             row.labels
                                 .values()
@@ -12582,6 +12691,17 @@ fn package_positive_presences(
                 }
                 *visited |= bit;
                 match &*ty {
+                    Ty::Presence(Presence::Bound(index))
+                        if *index < presences && !already.contains(index) =>
+                    {
+                        let use_ = uses.entry(*index).or_default();
+                        if positive {
+                            use_.positive += 1;
+                            use_.owners.insert(owner);
+                        } else {
+                            use_.negative += 1;
+                        }
+                    }
                     Ty::Arrow(from, to, effects) => {
                         work.push(Scan::Ty(from.clone(), !positive, owner));
                         let result_owner = if positive {
@@ -13112,6 +13232,8 @@ struct Tails {
     /// together, and what the `where` clause beside them resolves against.
     presences: HashMap<String, Presence>,
     anonymous: HashMap<u32, Presence>,
+    /// Fixed spread operands still impose requirements after their rows expand.
+    spread_uses: Vec<Arc<Ty>>,
 }
 
 fn extern_annotation_sources(
@@ -13370,7 +13492,7 @@ fn lower_annotation(mint: &Mint, table: &mut Table, annotation: &Annotation) -> 
             }
         }
     }
-    let formula = match &annotation.clause {
+    let mut formula = match &annotation.clause {
         Some(clause) => clause_formula(&tails, clause),
         None => Formula::True,
     };
@@ -13389,6 +13511,10 @@ fn lower_annotation(mint: &Mint, table: &mut Table, annotation: &Annotation) -> 
         )
         .collect();
     let ty = lower_scoped(mint, table, &mut tails, &annotation.ty, Some(&boundaries));
+    formula = formula.and(declaration_requirements(&ty, &table.signatures.aliases));
+    for operand in &tails.spread_uses {
+        formula = formula.and(declaration_requirements(operand, &table.signatures.aliases));
+    }
     let extern_sources = extern_annotation_sources(annotation, &tails, &ty);
     for (id, _) in &annotation.anonymous_existentials {
         if let Some(Presence::Var(var)) = tails.anonymous.get(id) {
@@ -13523,6 +13649,54 @@ fn clause_formula(tails: &Tails, clause: &Clause) -> Formula {
     }
 }
 
+/// Requirements of named applications in a finite type tree. Alias summaries
+/// already include their bodies, so no recursive declaration is unfolded here.
+fn declaration_requirements(root: &Arc<Ty>, aliases: &IndexMap<Symbol, Scheme>) -> Formula {
+    enum Part<'a> {
+        Ty(&'a Ty),
+        Row(&'a Row),
+    }
+    let mut work = vec![Part::Ty(root)];
+    let mut seen = HashSet::new();
+    let mut formula = Formula::True;
+    while let Some(part) = work.pop() {
+        match part {
+            Part::Ty(ty) => {
+                if !seen.insert(ty as *const Ty) {
+                    continue;
+                }
+                match ty {
+                    Ty::Named { symbol, args, .. } => {
+                        if let Some(scheme) = aliases.get(symbol) {
+                            let supplied: Vec<_> = args.iter().cloned().map(Assigned::Ty).collect();
+                            formula = formula.and(scheme.formula().open(&supplied));
+                        }
+                        work.extend(args.iter().map(|arg| Part::Ty(arg)));
+                    }
+                    Ty::Arrow(from, to, row) => {
+                        work.extend([Part::Ty(from), Part::Ty(to), Part::Row(row)]);
+                    }
+                    Ty::Mut(region, element) => work.extend([Part::Ty(region), Part::Ty(element)]),
+                    Ty::Array(inner)
+                    | Ty::Mirror(inner)
+                    | Ty::TypeInfo(inner)
+                    | Ty::Package(inner)
+                    | Ty::Hidden { body: inner, .. } => work.push(Part::Ty(inner)),
+                    Ty::Struct(row) | Ty::Sum(row) => work.push(Part::Row(row)),
+                    _ => {}
+                }
+            }
+            Part::Row(row) => {
+                work.extend(row.labels.values().map(|field| Part::Ty(&field.ty)));
+                if let Rest::More(more) = &row.rest {
+                    work.push(Part::Row(more));
+                }
+            }
+        }
+    }
+    formula
+}
+
 /// The recursion inside [`lower_type`], carrying the annotation's named-tail
 /// scope.
 fn lower(mint: &Mint, table: &mut Table, tails: &mut Tails, ty: &Type) -> Arc<Ty> {
@@ -13540,6 +13714,18 @@ fn lower_scoped(
     boundaries: Option<&HashSet<Anchor>>,
 ) -> Arc<Ty> {
     let lowered = match &ty.anchored {
+        TypeKind::PresenceHole(id) => Ty::Presence(
+            tails
+                .anonymous
+                .entry(*id)
+                .or_insert_with(|| table.fresh_presence_for(Subject::Annotation))
+                .clone(),
+        ),
+        TypeKind::Presence(value) => Ty::Presence(if *value {
+            Presence::Present
+        } else {
+            Presence::Absent
+        }),
         TypeKind::Prim(prim) => (*prim).into(),
         TypeKind::Ident(symbol) => Ty::Named {
             symbol: *symbol,
@@ -13553,7 +13739,29 @@ fn lower_scoped(
             name: mint.name(*head).into(),
             args: args
                 .iter()
-                .map(|arg| lower_scoped(mint, table, tails, arg, boundaries))
+                .enumerate()
+                .map(|(index, arg)| {
+                    let presence = table
+                        .signatures
+                        .params
+                        .get(head)
+                        .and_then(|params| params.get(index))
+                        .is_some_and(|kind| kind.sense() == Sense::Presence);
+                    if presence {
+                        match &arg.anchored {
+                            TypeKind::Param { index, .. } => {
+                                return Arc::new(Ty::Presence(Presence::Bound(*index)));
+                            }
+                            TypeKind::Hole => {
+                                return Arc::new(Ty::Presence(
+                                    table.fresh_presence_for(Subject::Annotation),
+                                ));
+                            }
+                            _ => {}
+                        }
+                    }
+                    lower_scoped(mint, table, tails, arg, boundaries)
+                })
                 .collect(),
         },
         // A parameter is the position it was declared at, which is what
@@ -13589,7 +13797,15 @@ fn lower_scoped(
         // field written `\name` is [`Presence::Absent`] in the position it was
         // written, its type deliberately unconstrained — a field that is not
         // there has nothing to have a type.
-        TypeKind::Struct { fields, tail, .. } => {
+        TypeKind::Struct {
+            fields,
+            tail,
+            spreads,
+        } => {
+            for spread in spreads {
+                let operand = lower_scoped(mint, table, tails, &spread.value, boundaries);
+                tails.spread_uses.push(operand);
+            }
             let mut labels = IndexMap::new();
             for (name, field) in fields {
                 let lowered = match field {
@@ -13612,7 +13828,15 @@ fn lower_scoped(
         // — the same type `()` is, built here rather than in the tree so that
         // what the reader wrote and what the compiler means stay two separate
         // things. See [`ir::TermKind::Tag`](crate::ir::TermKind::Tag).
-        TypeKind::Sum { cases, tail, .. } => {
+        TypeKind::Sum {
+            cases,
+            tail,
+            spreads,
+        } => {
+            for spread in spreads {
+                let operand = lower_scoped(mint, table, tails, &spread.value, boundaries);
+                tails.spread_uses.push(operand);
+            }
             let mut labels = IndexMap::new();
             for (name, case) in cases {
                 let lowered = match case {
@@ -13650,7 +13874,15 @@ fn lower_scoped(
         // Indexed rather than looked up: lowering refused a name nothing
         // declared, and a name read at another sort absorbed into
         // [`TypeKind::Error`] rather than reaching here.
-        TypeKind::Var(name) => tails.types[name].clone(),
+        TypeKind::Var(name) => {
+            if let Some(presence) = tails.presences.get(name) {
+                Ty::Presence(presence.clone())
+            } else if let Some(row) = tails.rows.get(name) {
+                Ty::Struct(Row::of(row.clone()))
+            } else {
+                tails.types[name].clone()
+            }
+        }
         TypeKind::Hidden { id, name, body } => {
             tails.hidden.push(*id);
             let body = lower_scoped(mint, table, tails, body, boundaries);
@@ -13694,6 +13926,29 @@ fn presence(table: &mut Table, tails: &mut Tails, when: &Option<Box<ir::When>>) 
     let Some(when) = when else {
         return Presence::Present;
     };
+    if let Some(argument) = &when.argument {
+        return match &argument.anchored {
+            TypeKind::Param { index, .. } => Presence::Bound(*index),
+            TypeKind::PresenceHole(id) => tails
+                .anonymous
+                .entry(*id)
+                .or_insert_with(|| table.fresh_presence_for(Subject::Annotation))
+                .clone(),
+            TypeKind::Presence(value) => {
+                if *value {
+                    Presence::Present
+                } else {
+                    Presence::Absent
+                }
+            }
+            TypeKind::Var(name) => tails
+                .presences
+                .get(name)
+                .cloned()
+                .unwrap_or(Presence::Undecided),
+            _ => Presence::Undecided,
+        };
+    }
     let Some(name) = &when.name else {
         return tails
             .anonymous
@@ -14128,6 +14383,13 @@ fn substitute_type_with(
                     work.push(Work::Row(effects));
                     work.push(Work::Ty(to));
                     work.push(Work::Ty(from));
+                }
+                Ty::Presence(presence) => {
+                    let presence = match presence {
+                        Presence::Bound(index) => bound_presence(*index),
+                        other => other.clone(),
+                    };
+                    types.push(Arc::new(Ty::Presence(presence)));
                 }
                 Ty::Package(body) => {
                     work.push(Work::Package);

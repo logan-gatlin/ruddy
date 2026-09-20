@@ -4309,6 +4309,7 @@ impl Lower<'_> {
             | Ty::Real
             | Ty::String
             | Ty::Bool
+            | Ty::Presence(_)
             | Ty::ForeignValue
                 if primitives =>
             {

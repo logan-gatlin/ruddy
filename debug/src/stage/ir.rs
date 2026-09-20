@@ -117,13 +117,19 @@ fn decl_node<T>(
         mint,
         symbol,
     );
-    // Only a term is ever ascribed one, so this child is simply absent on a
-    // `type` declaration rather than empty. Labelled the way the AST panel
-    // labels the same thing: the role on the type's own node, not a wrapper
-    // repeating its text and span.
+    // Type declarations retain their written contract beside the expanded
+    // body. Terms retain the annotation they must satisfy.
     if let Some(annotation) = &decl.annotation {
         let mut ascribed = annotation_node(ids, cx, mint, annotation);
-        ascribed.label = format!("Ascribed {}", ascribed.label);
+        ascribed.label = format!(
+            "{} {}",
+            if keyword == "type" {
+                "Contract"
+            } else {
+                "Ascribed"
+            },
+            ascribed.label
+        );
         node = node.child(ascribed);
     }
     // The metadata, one row per attribute, spanning the key and its value:
@@ -575,7 +581,7 @@ fn effects_node(
                     format!(
                         "{}{}",
                         print::label(Shape::Effect, name.name()),
-                        when_text(when)
+                        when_text(when, mint)
                     )
                 }
                 EffectLabel::Absent { .. } => {
@@ -829,9 +835,13 @@ fn clause_kids(ids: &mut Ids, cx: &Cx, mint: &Mint, clause: &Clause) -> Vec<Node
 }
 
 /// The `when` clause a lowered label wears, as the row's label shows it.
-fn when_text(when: &Option<Box<When>>) -> String {
+fn when_text(when: &Option<Box<When>>, mint: &Mint) -> String {
     match when {
         None => String::new(),
+        Some(when) if when.argument.is_some() => format!(
+            " when {}",
+            print::ir::ty(&when.argument.as_ref().unwrap().anchored, mint)
+        ),
         Some(when) => match &when.name {
             Some(name) => format!(" when '{name}"),
             None => " when _".to_string(),
@@ -881,7 +891,11 @@ fn type_node(ids: &mut Ids, cx: &Cx, mint: &Mint, ty: &Type, scope: &[Variable])
         // A position left for inference to decide, written `_` by the reader
         // or by the pattern desugar's exact demand: it binds nothing and names
         // nothing, so there is nothing to cross-highlight.
-        TypeKind::Hole => Node {
+        TypeKind::Presence(value) => Node {
+            label: format!("Presence {value}"),
+            ..node
+        },
+        TypeKind::PresenceHole(_) | TypeKind::Hole => Node {
             label: "Hole".into(),
             ..node
         },
@@ -996,7 +1010,7 @@ fn type_node(ids: &mut Ids, cx: &Cx, mint: &Mint, ty: &Type, scope: &[Variable])
                         when,
                         payload,
                     } => {
-                        let mark = when_text(when);
+                        let mark = when_text(when, mint);
                         let text = payload.as_ref().map_or(String::new(), |ty| {
                             print::ir::ty(&ty.anchored, mint).to_string()
                         });
@@ -1054,7 +1068,7 @@ fn type_node(ids: &mut Ids, cx: &Cx, mint: &Mint, ty: &Type, scope: &[Variable])
                         when,
                         value,
                     } => {
-                        let mark = when_text(when);
+                        let mark = when_text(when, mint);
                         Node::new(
                             ids.next(),
                             format!("{}{mark}:", print::label(Shape::Struct, name)),
