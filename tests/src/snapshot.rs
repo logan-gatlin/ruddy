@@ -2403,6 +2403,31 @@ fn a_snapshot_survives_the_wire() {
     assert!(json.contains("\"owner\""));
 }
 
+#[test]
+fn execution_modes_preserve_debugger_traces_and_diagnostics() {
+    use ruddy::execution::Execution;
+    let source = (0..16)
+        .map(|index| format!("let value{index} = fn x => x + 1n\n"))
+        .collect::<String>()
+        + "let bad = value0 false\n";
+    let render = || {
+        let snapshot = snapshot(&source);
+        assert!(snapshot.panic.is_none());
+        let mut value = serde_json::to_value(snapshot).unwrap();
+        for stage in value["stages"].as_array_mut().unwrap() {
+            stage.as_object_mut().unwrap().remove("micros");
+            // Raw Rust Debug dumps include timing fields and randomized HashMap
+            // order even in two sequential runs. Compare the structured views.
+            stage.as_object_mut().unwrap().remove("debug");
+        }
+        value
+    };
+    assert_eq!(
+        Execution::sequential().run(render),
+        Execution::default().run(render)
+    );
+}
+
 /// An empty root is a program with nothing in it, not a program with something
 /// wrong with it; identity is supplied independently.
 #[test]

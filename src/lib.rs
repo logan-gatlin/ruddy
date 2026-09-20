@@ -3,6 +3,7 @@ pub mod backend;
 pub mod bundle;
 pub mod compile;
 pub mod entry;
+pub mod execution;
 pub mod externs;
 pub mod format;
 pub mod inference;

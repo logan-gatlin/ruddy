@@ -3,10 +3,14 @@ name = "ruddy-debug"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default = ["parallel"]
+parallel = ["ruddy/parallel", "ruddy-cli/parallel", "ruddy-interp/parallel"]
+
 [dependencies]
-ruddy = { package = "ruddy-compiler", path = ".." }
-ruddy-cli = { package = "ruddy", path = "../cli" }
-ruddy-interp = { path = "../interp" }
+ruddy = { package = "ruddy-compiler", path = "..", default-features = false }
+ruddy-cli = { package = "ruddy", path = "../cli", default-features = false }
+ruddy-interp = { path = "../interp", default-features = false }
 indexmap = { version = "2", features = ["serde"] }
 tiny_http = "0.12"
 serde = { version = "1", features = ["derive"] }
