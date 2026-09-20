@@ -132,7 +132,10 @@ fn block_spans(text: &str, file: FileID) -> std::collections::HashMap<Span, Span
                     expressions.push(&spread.value);
                 }
             }
-            ExprKind::Tuple(items) => expressions.extend(items),
+            ExprKind::Tuple { elements, spread } => {
+                expressions.extend(elements);
+                expressions.extend(spread.as_ref().map(|spread| spread.value.as_ref()));
+            }
             ExprKind::Array(items) => expressions.extend(items.iter().map(|item| &item.value)),
             ExprKind::Tag { payload, .. } => expressions.extend(payload.as_deref()),
             ExprKind::Handle { body, arms } => {

@@ -332,3 +332,20 @@ let a = match v with
             (type_variable)
             (identifier)))
         (identifier)))))
+
+================================================================================
+Tuple rest patterns
+================================================================================
+
+let (a, b, ..) = value
+let (a, ..,) = value
+let (..) = value
+let (..,) = value
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (let_definition (tuple_pattern (identifier) (identifier) (rest_pattern)) (identifier))
+  (let_definition (tuple_pattern (identifier) (rest_pattern)) (identifier))
+  (let_definition (tuple_pattern (rest_pattern)) (identifier))
+  (let_definition (tuple_pattern (rest_pattern)) (identifier)))

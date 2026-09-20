@@ -8323,7 +8323,7 @@ fn pattern_names(pattern: &parse::Pattern, out: &mut Vec<TrackedString>) {
                 }
             }
         }
-        parse::PatternKind::Tuple(elements) => {
+        parse::PatternKind::Tuple { elements, .. } => {
             for element in elements {
                 pattern_names(element, out);
             }
@@ -12894,7 +12894,7 @@ impl<'a> Builder<'a> {
             // Tuples are positional structs at the IR boundary. Decimal keys
             // are canonical and zero-based; the element's own span stands in
             // for the generated field name, since no label was written.
-            ExprKind::Tuple(elements) => {
+            ExprKind::Tuple { elements, spread } => {
                 let fields = elements
                     .into_iter()
                     .enumerate()
@@ -12909,11 +12909,11 @@ impl<'a> Builder<'a> {
                         )
                     })
                     .collect();
-                TermKind::Struct {
-                    fields,
-                    spread: None,
-                }
-                .at(self.anchor(span))
+                let spread = spread.map(|spread| Spread {
+                    at: self.anchor(spread.span),
+                    value: Box::new(self.term(*spread.value)),
+                });
+                TermKind::Struct { fields, spread }.at(self.anchor(span))
             }
             ExprKind::Tag { name, payload } => {
                 let payload = payload.map(|payload| Box::new(self.term(*payload)));
@@ -14051,10 +14051,10 @@ impl<'a> Builder<'a> {
                 let name = self.anchored(name);
                 self.anchor(span).anchor(PatternKind::Tag { name, payload })
             }
-            // Tuple patterns are exact positional struct patterns. Lowering
+            // Tuple patterns are positional struct patterns. Lowering
             // each element through this same walk preserves binder order and
             // duplicate-binding diagnostics across arbitrary nesting.
-            parse::PatternKind::Tuple(elements) => {
+            parse::PatternKind::Tuple { elements, rest } => {
                 let fields = elements
                     .into_iter()
                     .enumerate()
@@ -14070,7 +14070,10 @@ impl<'a> Builder<'a> {
                         )
                     })
                     .collect();
-                here.anchor(PatternKind::Struct { fields, rest: None })
+                here.anchor(PatternKind::Struct {
+                    fields,
+                    rest: rest.map(|span| self.anchor(span)),
+                })
             }
             parse::PatternKind::Struct {
                 fields: entries,

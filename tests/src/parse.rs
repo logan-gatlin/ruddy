@@ -72,9 +72,13 @@ fn parses_expression_pattern_and_type_tuples() {
     else {
         panic!("expected ascribed tuple let: {:#?}", out.stmts[0]);
     };
-    assert!(matches!(&pattern.tracked, PatternKind::Tuple(items) if items.len() == 2));
+    assert!(
+        matches!(&pattern.tracked, PatternKind::Tuple { elements, rest: None } if elements.len() == 2)
+    );
     assert!(matches!(&ty.ty.tracked, TypeKind::Tuple(items) if items.len() == 2));
-    assert!(matches!(&body.tracked.tracked, ExprKind::Tuple(items) if items.len() == 2));
+    assert!(
+        matches!(&body.tracked.tracked, ExprKind::Tuple { elements, spread: None } if elements.len() == 2)
+    );
 
     let StmtKind::Let { body, .. } = &out.stmts[1].kind else {
         unreachable!()
@@ -83,7 +87,9 @@ fn parses_expression_pattern_and_type_tuples() {
     let StmtKind::Let { body, .. } = &out.stmts[2].kind else {
         unreachable!()
     };
-    assert!(matches!(&body.tracked.tracked, ExprKind::Tuple(items) if items.len() == 1));
+    assert!(
+        matches!(&body.tracked.tracked, ExprKind::Tuple { elements, spread: None } if elements.len() == 1)
+    );
 }
 
 #[test]
@@ -4107,6 +4113,47 @@ fn comparisons_bind_between_arithmetic_and_boolean_operators() {
         assert!(
             !out.errors.is_empty(),
             "accepted comparison chain: {source}"
+        );
+    }
+}
+
+#[test]
+fn tuple_rest_patterns_parse() {
+    for pattern in ["(a, b, ..)", "(a, ..,)", "(..)", "(..,)"] {
+        let source = format!("let {pattern} = value");
+        let out = parse(lex(&source, FileID::GENERATED).tokens);
+        assert!(out.errors.is_empty(), "{source}: {:#?}", out.errors);
+    }
+}
+
+#[test]
+fn tuple_rest_patterns_reject_nonterminal_or_named_rests() {
+    for pattern in ["(a, .., b)", "(.., ..)", "(a, ..tail)", "(a, ...)"] {
+        let source = format!("let {pattern} = value");
+        let out = parse(lex(&source, FileID::GENERATED).tokens);
+        assert!(!out.errors.is_empty(), "{source}");
+    }
+}
+
+#[test]
+fn tuple_spreads_parse_and_round_trip() {
+    for source in [
+        "let x = (1n, ..base)",
+        "let x = (..base)",
+        "let x = (..f x,)",
+    ] {
+        parse_one(source);
+    }
+}
+
+#[test]
+fn tuple_spreads_reject_multiple_nonterminal_and_missing_values() {
+    for source in ["let x = (..a, ..b)", "let x = (..a, b)", "let x = (1n, ..)"] {
+        assert!(
+            !parse(lex(source, FileID::GENERATED).tokens)
+                .errors
+                .is_empty(),
+            "{source}"
         );
     }
 }

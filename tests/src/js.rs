@@ -1039,6 +1039,11 @@ fn generated_module_executes_tuple_values_projections_and_patterns() {
     let artifact = compiled(
         "let pair : { 0: Nat, 1: String } = { 000: 42n, 1: \"answer\" }\n\
          let singleton = (true,)\n\
+         let updated = (99n, ..pair)\n\
+         let copied = (..updated)\n\
+         let (prefix, ..) = (42n, true, false)\n\
+         @private let pick = fn value => match value with | (a, b, ..) => b end\n\
+         let picked = pick (false, 7n, true)\n\
          let first = pair.0\n\
          let second = pair.1\n\
          let swap : (Nat, String) -> (String, Nat) = fn value => match value with \
@@ -1050,7 +1055,7 @@ fn generated_module_executes_tuple_values_projections_and_patterns() {
     fs::write(&path, module).unwrap();
 
     let probe = format!(
-        "const app = await import({}); const swapped = app.swap(app.pair); console.log(JSON.stringify([app.pair[0], app.pair[1], app.singleton[0], app.first, app.second, swapped[0], swapped[1]]));",
+        "const app = await import({}); const swapped = app.swap(app.pair); console.log(JSON.stringify([app.pair[0], app.pair[1], app.singleton[0], app.first, app.second, swapped[0], swapped[1], app.prefix, app.picked, app.updated[0], app.updated[1], app.copied[0], app.copied[1]]));",
         serde_json::to_string(path.to_str().unwrap()).unwrap()
     );
     let output = Command::new("node")
@@ -1064,7 +1069,7 @@ fn generated_module_executes_tuple_values_projections_and_patterns() {
     );
     assert_eq!(
         String::from_utf8(output.stdout).unwrap().trim(),
-        "[42,\"answer\",true,42,\"answer\",\"answer\",42]"
+        "[42,\"answer\",true,42,\"answer\",\"answer\",42,42,7,99,\"answer\",99,\"answer\"]"
     );
 }
 

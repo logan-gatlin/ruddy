@@ -531,8 +531,16 @@ impl fmt::Display for Ast<'_, ExprKind> {
                     write_struct(f, pairs(fields), None)
                 }
             }
-            ExprKind::Tuple(elements) => {
-                write_tuple(f, elements.iter().map(|element| Ast(&element.tracked)))
+            ExprKind::Tuple { elements, spread } => {
+                if let Some(spread) = spread {
+                    f.write_str("(")?;
+                    for element in elements {
+                        write!(f, "{}, ", Ast(&element.tracked))?;
+                    }
+                    write!(f, "..{})", Ast(&spread.value.tracked))
+                } else {
+                    write_tuple(f, elements.iter().map(|element| Ast(&element.tracked)))
+                }
             }
             ExprKind::Array(items) => {
                 f.write_str("[")?;
@@ -621,9 +629,11 @@ impl fmt::Display for Ast<'_, PatternKind> {
                     false => write!(f, "{payload}"),
                 }
             }
-            PatternKind::Tuple(elements) => {
-                write_tuple(f, elements.iter().map(|element| Ast(&element.tracked)))
-            }
+            PatternKind::Tuple { elements, rest } => ruddy::ui::write_tuple_pattern(
+                f,
+                elements.iter().map(|element| Ast(&element.tracked)),
+                rest.is_some(),
+            ),
             PatternKind::Array {
                 before,
                 rest,

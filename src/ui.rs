@@ -234,7 +234,7 @@ pub fn expr_prec(kind: &parse::ExprKind) -> Prec {
         ExprKind::Project { .. }
         | ExprKind::Operation { .. }
         | ExprKind::Struct { .. }
-        | ExprKind::Tuple(_)
+        | ExprKind::Tuple { .. }
         | ExprKind::Array(_)
         | ExprKind::Ident { .. }
         | ExprKind::Natural(_)
@@ -300,7 +300,7 @@ pub fn pattern_prec(kind: &parse::PatternKind) -> Prec {
         | PatternKind::Bool(_)
         | PatternKind::Unit
         | PatternKind::Struct { .. }
-        | PatternKind::Tuple(_)
+        | PatternKind::Tuple { .. }
         | PatternKind::Array { .. } => Prec::Atom,
     }
 }
@@ -1055,9 +1055,11 @@ impl fmt::Display for parse::PatternKind {
             parse::PatternKind::String(value) => write_string(f, value),
             parse::PatternKind::Bool(value) => write!(f, "{value}"),
             parse::PatternKind::Unit => f.write_str("()"),
-            parse::PatternKind::Tuple(elements) => {
-                write_tuple(f, elements.iter().map(|element| &element.tracked))
-            }
+            parse::PatternKind::Tuple { elements, rest } => write_tuple_pattern(
+                f,
+                elements.iter().map(|element| &element.tracked),
+                rest.is_some(),
+            ),
             parse::PatternKind::Tag { name, payload } => write_tag(
                 f,
                 &name.tracked,
@@ -4506,6 +4508,22 @@ pub fn write_tuple<V: fmt::Display>(
         f.write_str(",")?;
     }
     f.write_str(")")
+}
+
+/// Render a tuple pattern, retaining its optional open struct rest.
+pub fn write_tuple_pattern<V: fmt::Display>(
+    f: &mut fmt::Formatter<'_>,
+    elements: impl IntoIterator<Item = V>,
+    rest: bool,
+) -> fmt::Result {
+    if !rest {
+        return write_tuple(f, elements);
+    }
+    f.write_str("(")?;
+    for element in elements {
+        write!(f, "{element}, ")?;
+    }
+    f.write_str("..)")
 }
 
 /// Render an array pattern in canonical surface syntax: the elements before

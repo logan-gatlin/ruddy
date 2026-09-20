@@ -7316,7 +7316,7 @@
     "fields": {
       "element": {
         "multiple": true,
-        "required": true,
+        "required": false,
         "types": [
           {
             "type": "addition",
@@ -7440,6 +7440,16 @@
           }
         ]
       }
+    },
+    "children": {
+      "multiple": false,
+      "required": false,
+      "types": [
+        {
+          "type": "spread",
+          "named": true
+        }
+      ]
     }
   },
   {
@@ -7448,7 +7458,7 @@
     "fields": {
       "element": {
         "multiple": true,
-        "required": true,
+        "required": false,
         "types": [
           {
             "type": "array_pattern",
@@ -7500,6 +7510,16 @@
           }
         ]
       }
+    },
+    "children": {
+      "multiple": false,
+      "required": false,
+      "types": [
+        {
+          "type": "rest_pattern",
+          "named": true
+        }
+      ]
     }
   },
   {

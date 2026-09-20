@@ -430,7 +430,10 @@ pub enum ExprKind {
     /// `(a, b)` — a positional struct, retained in the surface tree so the
     /// spelling can be reproduced. The empty tuple remains [`Unit`](Self::Unit)
     /// and a singleton requires its trailing comma.
-    Tuple(Vec<Expr>),
+    Tuple {
+        elements: Vec<Expr>,
+        spread: Option<Spread>,
+    },
     /// `[a, ..b, c]` — an immutable homogeneous array literal, each item a
     /// value of its own or a `..` spreading another array's values in place.
     /// Homogeneity is a semantic property established by inference; the
@@ -613,9 +616,13 @@ pub enum PatternKind {
         /// The span is the `..`'s own, for the debugger to point at.
         rest: Option<Span>,
     },
-    /// `(a, b)` — an exact positional struct pattern. The elements retain
+    /// `(a, b, ..)` — a positional struct pattern. The elements retain
     /// their tuple spelling until lowering assigns decimal field names.
-    Tuple(Vec<Pattern>),
+    Tuple {
+        elements: Vec<Pattern>,
+        /// A trailing `..` allows additional fields, just as in a struct pattern.
+        rest: Option<Span>,
+    },
     /// `[a, ..rest, b]` — reach into an array's elements. Without a rest the
     /// pattern matches arrays of exactly as many elements as it names; with
     /// one, arrays of at least that many, the elements before the `..`
@@ -3076,10 +3083,8 @@ impl Parser {
         Some(span.track(ExprKind::Operation { effect, selector }))
     }
 
-    /// A grouped expression or tuple. A comma after the first expression is
-    /// the discriminator, so `(x)` remains grouping while `(x,)` is a
-    /// singleton tuple. Remaining elements are full expressions and a final
-    /// trailing comma is accepted.
+    /// A grouped expression or positional struct. A comma distinguishes a
+    /// tuple from grouping; a spread alone also makes a positional struct.
     fn paren_expr(&mut self) -> Option<Expr> {
         let open = self.eat(&Kind::LeftParen).expect("the caller peeked `(`");
         if let Some(close) = self.eat_if(&Kind::RightParen) {
@@ -3088,20 +3093,36 @@ impl Parser {
         if self.at_expr_boundary() {
             return self.expected_closer(open.span, &Kind::RightParen);
         }
-        let first = self.expr()?;
-        if self.eat_if(&Kind::Comma).is_none() {
-            let close = self.close_delimiter(open.span, &Kind::RightParen)?;
-            return Some(open.span.merge(close.span).track(first.tracked));
+        let mut elements = Vec::new();
+        let mut spread = None;
+        if !self.at(&Kind::DotDot) {
+            let first = self.expr()?;
+            if self.eat_if(&Kind::Comma).is_none() {
+                let close = self.close_delimiter(open.span, &Kind::RightParen)?;
+                return Some(open.span.merge(close.span).track(first.tracked));
+            }
+            elements.push(first);
         }
-        let mut elements = vec![first];
-        while !self.at(&Kind::RightParen) && !self.at_expr_boundary() {
+        while !self.at_expr_boundary() {
+            if let Some(dots) = self.eat_if(&Kind::DotDot) {
+                spread = Some(Spread {
+                    span: dots.span,
+                    value: Box::new(self.expr()?),
+                });
+                self.eat_if(&Kind::Comma);
+                break;
+            }
             elements.push(self.expr()?);
             if self.eat_if(&Kind::Comma).is_none() {
                 break;
             }
         }
         let close = self.close_delimiter(open.span, &Kind::RightParen)?;
-        Some(open.span.merge(close.span).track(ExprKind::Tuple(elements)))
+        Some(
+            open.span
+                .merge(close.span)
+                .track(ExprKind::Tuple { elements, spread }),
+        )
     }
 
     /// `[<item>, ...]`, including the empty literal and an optional trailing
@@ -3744,8 +3765,8 @@ impl Parser {
         }))
     }
 
-    /// A grouped pattern or exact tuple pattern, disambiguated by the comma
-    /// after its first element exactly as an expression tuple is.
+    /// A grouped pattern or positional struct pattern. A comma distinguishes
+    /// a tuple from grouping; a bare rest also makes the pattern a tuple.
     fn paren_pattern(&mut self) -> Option<Pattern> {
         let open = self.eat(&Kind::LeftParen).expect("the caller peeked `(`");
         if let Some(close) = self.eat_if(&Kind::RightParen) {
@@ -3754,13 +3775,22 @@ impl Parser {
         if self.at_pattern_boundary() {
             return self.expected_closer(open.span, &Kind::RightParen);
         }
-        let first = self.pattern()?;
-        if self.eat_if(&Kind::Comma).is_none() {
-            let close = self.close_delimiter(open.span, &Kind::RightParen)?;
-            return Some(open.span.merge(close.span).track(first.tracked));
+        let mut elements = Vec::new();
+        let mut rest = None;
+        if !self.at(&Kind::DotDot) {
+            let first = self.pattern()?;
+            if self.eat_if(&Kind::Comma).is_none() {
+                let close = self.close_delimiter(open.span, &Kind::RightParen)?;
+                return Some(open.span.merge(close.span).track(first.tracked));
+            }
+            elements.push(first);
         }
-        let mut elements = vec![first];
         while !self.at(&Kind::RightParen) && !self.at_pattern_boundary() {
+            if let Some(dots) = self.eat_if(&Kind::DotDot) {
+                rest = Some(dots.span);
+                self.eat_if(&Kind::Comma);
+                break;
+            }
             elements.push(self.pattern()?);
             if self.eat_if(&Kind::Comma).is_none() {
                 break;
@@ -3770,7 +3800,7 @@ impl Parser {
         Some(
             open.span
                 .merge(close.span)
-                .track(PatternKind::Tuple(elements)),
+                .track(PatternKind::Tuple { elements, rest }),
         )
     }
 

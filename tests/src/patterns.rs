@@ -1576,3 +1576,22 @@ fn hidden_patterns_are_checked_through_their_payloads() {
         "{reported:?}"
     );
 }
+
+#[test]
+fn tuple_rest_patterns_match_open_structs() {
+    clean("let (a, b, ..) = (1n, true, \"extra\")");
+    clean("let (a, b, ..) = (1n, true)");
+    clean("let (..) = ()");
+    clean(
+        "let first = fn value => match value with | (a, ..) => a end\nlet x = first (1n,)\nlet y = first (true, 2n)",
+    );
+    let (_, checks) = clean(
+        "let choose : (Bool, Nat, String) -> Nat = fn value => match value with | (true, n, ..) => n | (false, n, ..) => n end",
+    );
+    assert!(matches!(
+        sole_report(&checks).coverage,
+        Coverage::Exhaustive
+    ));
+    let (_, inferred, _) = checked("let (a, b, ..) = (1n,)");
+    assert!(!inferred.errors().is_empty());
+}
