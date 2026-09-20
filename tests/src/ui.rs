@@ -346,7 +346,6 @@ fn diagnostics() -> Vec<(&'static str, &'static str, String)> {
             name: "x".to_string(),
             previous: at,
         },
-        IrError::ClauseInDeclaration,
         IrError::VariableInDeclaration {
             name: "a".to_string(),
         },

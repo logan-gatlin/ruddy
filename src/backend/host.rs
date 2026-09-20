@@ -926,7 +926,9 @@ pub(super) fn compile(
             .map(|param| match param.sense {
                 crate::artifact::Sense::Effects => " (..)",
                 crate::artifact::Sense::Row => " { .. }",
-                crate::artifact::Sense::Type | crate::artifact::Sense::Region => " _",
+                crate::artifact::Sense::Type
+                | crate::artifact::Sense::Region
+                | crate::artifact::Sense::Presence => " _",
             })
             .collect::<String>();
         raw_types.insert(name, (local, arguments));

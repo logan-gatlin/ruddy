@@ -28,6 +28,10 @@
             "named": true
           },
           {
+            "type": "boolean",
+            "named": true
+          },
+          {
             "type": "hole",
             "named": true
           },
@@ -322,6 +326,10 @@
             "named": true
           },
           {
+            "type": "boolean",
+            "named": true
+          },
+          {
             "type": "effect_type",
             "named": true
           },
@@ -419,6 +427,10 @@
         "types": [
           {
             "type": "array_type",
+            "named": true
+          },
+          {
+            "type": "boolean",
             "named": true
           },
           {
@@ -841,6 +853,10 @@
         "types": [
           {
             "type": "array_type",
+            "named": true
+          },
+          {
+            "type": "boolean",
             "named": true
           },
           {
@@ -2609,6 +2625,10 @@
             "named": true
           },
           {
+            "type": "boolean",
+            "named": true
+          },
+          {
             "type": "hole",
             "named": true
           },
@@ -2691,6 +2711,10 @@
         "types": [
           {
             "type": "array_type",
+            "named": true
+          },
+          {
+            "type": "boolean",
             "named": true
           },
           {
@@ -3192,6 +3216,10 @@
             "named": true
           },
           {
+            "type": "boolean",
+            "named": true
+          },
+          {
             "type": "effect_type",
             "named": true
           },
@@ -3322,6 +3350,10 @@
             "named": true
           },
           {
+            "type": "boolean",
+            "named": true
+          },
+          {
             "type": "effect_type",
             "named": true
           },
@@ -3397,6 +3429,10 @@
           },
           {
             "type": "array_type",
+            "named": true
+          },
+          {
+            "type": "boolean",
             "named": true
           },
           {
@@ -3660,6 +3696,10 @@
             "named": true
           },
           {
+            "type": "boolean",
+            "named": true
+          },
+          {
             "type": "effect_type",
             "named": true
           },
@@ -3715,6 +3755,10 @@
         "types": [
           {
             "type": "array_type",
+            "named": true
+          },
+          {
+            "type": "boolean",
             "named": true
           },
           {
@@ -4159,6 +4203,10 @@
         "types": [
           {
             "type": "array_type",
+            "named": true
+          },
+          {
+            "type": "boolean",
             "named": true
           },
           {
@@ -5432,6 +5480,10 @@
             "named": true
           },
           {
+            "type": "boolean",
+            "named": true
+          },
+          {
             "type": "hole",
             "named": true
           },
@@ -5475,6 +5527,10 @@
         "types": [
           {
             "type": "array_type",
+            "named": true
+          },
+          {
+            "type": "boolean",
             "named": true
           },
           {
@@ -5888,6 +5944,10 @@
       "types": [
         {
           "type": "array_type",
+          "named": true
+        },
+        {
+          "type": "boolean",
           "named": true
         },
         {
@@ -6985,6 +7045,10 @@
             "named": true
           },
           {
+            "type": "boolean",
+            "named": true
+          },
+          {
             "type": "effect_type",
             "named": true
           },
@@ -7074,6 +7138,10 @@
         "types": [
           {
             "type": "array_type",
+            "named": true
+          },
+          {
+            "type": "boolean",
             "named": true
           },
           {
@@ -7535,6 +7603,10 @@
             "named": true
           },
           {
+            "type": "boolean",
+            "named": true
+          },
+          {
             "type": "effect_type",
             "named": true
           },
@@ -7607,6 +7679,10 @@
             "named": true
           },
           {
+            "type": "boolean",
+            "named": true
+          },
+          {
             "type": "hole",
             "named": true
           },
@@ -7650,6 +7726,10 @@
         "types": [
           {
             "type": "array_type",
+            "named": true
+          },
+          {
+            "type": "boolean",
             "named": true
           },
           {

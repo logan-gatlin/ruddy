@@ -214,6 +214,13 @@ impl fmt::Display for Show<'_, Program> {
                 write!(f, " '{}", self.mint.name(param.symbol))?;
             }
             write!(f, " = {}", self.show(&decl.value))?;
+            if let Some(clause) = decl
+                .annotation
+                .as_ref()
+                .and_then(|annotation| annotation.clause.as_ref())
+            {
+                write!(f, " where {}", self.show(clause))?;
+            }
         }
         for (symbol, decl) in &self.node.externs {
             if !first {
@@ -537,6 +544,8 @@ impl Grouped for Show<'_, TypeKind> {
             | TypeKind::Prim(_)
             | TypeKind::Var(_)
             | TypeKind::Scoped { .. }
+            | TypeKind::Presence(_)
+            | TypeKind::PresenceHole(_)
             | TypeKind::Hole
             | TypeKind::Error => Prec::Atom,
         }
@@ -740,7 +749,8 @@ impl fmt::Display for Show<'_, TypeKind> {
             TypeKind::Error => f.write_str("<error>"),
             // The hole, as written: `_`, whether the reader left it or the
             // pattern desugar did.
-            TypeKind::Hole => f.write_str("_"),
+            TypeKind::Presence(value) => write!(f, "{value}"),
+            TypeKind::PresenceHole(_) | TypeKind::Hole => f.write_str("_"),
             // A variable, as the name it was declared with — which
             // is what the reader wrote and what re-parses to the same use.
             TypeKind::Var(name) => write!(f, "'{name}"),
@@ -773,7 +783,7 @@ impl fmt::Display for Show<'_, TypeKind> {
                 let cases = cases.iter().map(|(name, case)| match case {
                     SumCase::Written { when, payload, .. } => Entry::Written {
                         name,
-                        mark: mark(when),
+                        mark: mark(when, self.mint),
                         holds: payload.as_ref().map(|ty| self.show(ty)),
                     },
                     SumCase::Absent { .. } => Entry::Absent { name },
@@ -838,7 +848,7 @@ impl fmt::Display for Show<'_, TypeKind> {
                 let fields = fields.iter().map(|(name, field)| match field {
                     TypeField::Written { when, value, .. } => Entry::Written {
                         name,
-                        mark: mark(when),
+                        mark: mark(when, self.mint),
                         holds: self.show(value),
                     },
                     TypeField::Absent { .. } => Entry::Absent { name },
@@ -978,7 +988,7 @@ impl Show<'_, TypeKind> {
                 match entry {
                     EffectLabel::Written { when, .. } => Entry::Written {
                         name: applied,
-                        mark: mark(when),
+                        mark: mark(when, self.mint),
                         holds: (),
                     },
                     EffectLabel::Absent { .. } => Entry::Absent { name: applied },
@@ -1042,8 +1052,11 @@ impl fmt::Display for Effects {
 
 /// The `when` clause a lowered label wears. `when _` is the anonymous presence,
 /// spelled back as the `_` it was written as.
-fn mark(when: &Option<Box<When>>) -> Option<Mark> {
+fn mark(when: &Option<Box<When>>, mint: &Mint) -> Option<Mark> {
     let when = when.as_ref()?;
+    if let Some(argument) = &when.argument {
+        return Some(Mark::When(ty(&argument.anchored, mint).to_string()));
+    }
     // The sigil is written back on: a presence is a variable, and one printing
     // bare would read as a type's name. The anonymous `when _` names none.
     Some(Mark::When(match &when.name {

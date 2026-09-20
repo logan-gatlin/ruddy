@@ -1030,6 +1030,7 @@ module.exports = grammar({
     )),
 
     _type_atom: $ => choice(
+      $.boolean,
       $.identifier,
       $.path,
       $.type_variable,

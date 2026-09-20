@@ -410,6 +410,7 @@ pub enum ParamKind {
     Type { lacks: IndexSet<String> },
     Row { lacks: IndexSet<String> },
     Effects { lacks: IndexSet<String> },
+    Presence { lacks: IndexSet<String> },
 }
 
 /// One variable a [`Formula`] names: one the solver still owns, or one a
@@ -538,7 +539,9 @@ impl std::hash::Hash for Formula {
 /// so two alphabets would be two things spelled the same way with nothing to
 /// tell them apart. The presences take the low positions, `0..presences`, and
 /// the types and rows the rest, `presences..count`, which is what lets a bare
-/// [`Ty`] be printed with no scheme beside it to ask.
+/// [`Ty`] be printed with no scheme beside it to ask. This partition applies to
+/// value schemes. Type declarations retain header order for all kinds, set
+/// `presences` to zero, and use the declaration's parameter kinds to open slots.
 #[derive(Debug, Clone)]
 pub struct Scheme {
     callable: Option<Arc<crate::reification::interface::Interface>>,
@@ -559,6 +562,8 @@ pub struct Scheme {
 /// constructor is fieldless by construction.
 #[derive(Debug, Clone, Default)]
 pub enum Ty {
+    /// A presence argument, kept distinct from a value type.
+    Presence(Presence),
     Nat,
     Int,
     Fixed(FixedInt),
@@ -689,7 +694,7 @@ pub enum Ty {
     ///
     /// The arguments are the exception to that, and the one thing about this
     /// variant a walk may not skip. A body holds no solver variable — lowering
-    /// refuses a `..` or a `when` in a declaration for exactly that reason — but
+    /// permits only explicit bound parameters in a declaration — but
     /// `args` is written at the use site and holds whatever that site had. So
     /// every walk stops at the body and descends into the arguments: see
     /// [`Table::occurs`](crate::inference), which does both in one pass.
@@ -853,7 +858,8 @@ impl ParamKind {
             ParamKind::Region { lacks }
             | ParamKind::Type { lacks }
             | ParamKind::Row { lacks }
-            | ParamKind::Effects { lacks } => lacks,
+            | ParamKind::Effects { lacks }
+            | ParamKind::Presence { lacks } => lacks,
         }
     }
 
@@ -864,13 +870,14 @@ impl ParamKind {
             ParamKind::Type { .. } => Sense::Type,
             ParamKind::Row { .. } => Sense::Row,
             ParamKind::Effects { .. } => Sense::Effects,
+            ParamKind::Presence { .. } => Sense::Presence,
         }
     }
 
     /// The row kind and excluded labels, when this parameter expects a row.
     pub fn row(&self) -> Option<(Sense, &IndexSet<String>)> {
         match self {
-            ParamKind::Region { .. } | ParamKind::Type { .. } => None,
+            ParamKind::Region { .. } | ParamKind::Type { .. } | ParamKind::Presence { .. } => None,
             ParamKind::Row { lacks } => Some((Sense::Row, lacks)),
             ParamKind::Effects { lacks } => Some((Sense::Effects, lacks)),
         }
@@ -922,7 +929,11 @@ impl Assigned {
     pub fn presence(&self) -> Presence {
         match self {
             Assigned::Presence(presence) => presence.clone(),
-            Assigned::Ty(_) | Assigned::Row(_) => Presence::Undecided,
+            Assigned::Ty(ty) => match &**ty {
+                Ty::Presence(presence) => presence.clone(),
+                _ => Presence::Undecided,
+            },
+            Assigned::Row(_) => Presence::Undecided,
         }
     }
 
@@ -987,6 +998,7 @@ fn take_ty_children(ty: &mut Ty, types: &mut Vec<Arc<Ty>>, rows: &mut Vec<Arc<Ro
         | Ty::Real
         | Ty::String
         | Ty::Bool
+        | Ty::Presence(_)
         | Ty::ForeignValue
         | Ty::Var(_)
         | Ty::Bound(_)
@@ -1143,6 +1155,7 @@ pub(crate) fn same_finite_syntax_metered(
                     | (Ty::Bool, Ty::Bool)
                     | (Ty::ForeignValue, Ty::ForeignValue)
                     | (Ty::Undecided, Ty::Undecided) => {}
+                    (Ty::Presence(left), Ty::Presence(right)) if left == right => {}
                     (Ty::Var(left), Ty::Var(right)) | (Ty::Bound(left), Ty::Bound(right)) => {
                         if left != right {
                             return Some(false);
@@ -1381,6 +1394,7 @@ pub fn open_hidden(body: &Arc<Ty>, binder: u32, replacement: &Arc<Ty>) -> Arc<Ty
                 | Ty::Real
                 | Ty::String
                 | Ty::Bool
+                | Ty::Presence(_)
                 | Ty::ForeignValue
                 | Ty::Var(_)
                 | Ty::Bound(_)
@@ -1663,10 +1677,9 @@ impl Scheme {
     /// declaration's binds its parameters, and unfolding hands each one the
     /// argument written at the use site. See [`Ty::Bound`].
     ///
-    /// A declaration's scheme is always one of these: a declaration's body
-    /// holds no presence variable — lowering refuses a `when` there for the
-    /// reason it refuses a `..` — so there is nothing for it to quantify or to
-    /// require.
+    /// Declarations without constraints can use this constructor too. A
+    /// constrained declaration uses [`Scheme::declaration`], whose header owns
+    /// the kinds of its positional bound parameters.
     pub fn new(count: u32, body: Arc<Ty>) -> Self {
         Self {
             callable: None,
@@ -1677,6 +1690,12 @@ impl Scheme {
             body,
             formula: Formula::True,
         }
+    }
+
+    /// A type declaration uses header order for every bound position. Its
+    /// parameter table supplies kinds; `presences` partitions value schemes only.
+    pub fn declaration(count: u32, body: Arc<Ty>, formula: Formula) -> Self {
+        Self::constrained(count, 0, body, formula)
     }
 
     /// [`new`](Self::new) with the presences a definition's generalization
@@ -1782,6 +1801,11 @@ fn existential_outside_package(body: &Arc<Ty>, existentials: &IndexSet<u32>) -> 
                     work.push(Work::Ty(from.clone(), packaged));
                 }
                 Ty::Struct(row) | Ty::Sum(row) => work.push(Work::Row(row.clone(), packaged)),
+                Ty::Presence(Presence::Bound(index))
+                    if !packaged && existentials.contains(index) =>
+                {
+                    return true;
+                }
                 Ty::Named { args, .. } => {
                     work.extend(args.iter().rev().cloned().map(|ty| Work::Ty(ty, packaged)))
                 }
@@ -1842,6 +1866,12 @@ fn partition_package_formula(
                     work.push(Work::Ty(from.clone(), owner));
                 }
                 Ty::Struct(row) | Ty::Sum(row) => work.push(Work::Row(row.clone(), owner)),
+                Ty::Presence(Presence::Bound(index)) if existentials.contains(index) => {
+                    let owner = owner.expect("an existential argument has a package owner");
+                    if let Some(before) = slot_owners.insert(*index, owner) {
+                        debug_assert_eq!(before, owner);
+                    }
+                }
                 Ty::Named { args, .. } => {
                     work.extend(args.iter().rev().cloned().map(|ty| Work::Ty(ty, owner)))
                 }

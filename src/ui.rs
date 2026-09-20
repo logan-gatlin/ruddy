@@ -274,6 +274,7 @@ pub fn type_prec(kind: &parse::TypeKind) -> Prec {
         | TypeKind::Array(_)
         | TypeKind::Ident { .. }
         | TypeKind::Variable { .. }
+        | TypeKind::Presence(_)
         | TypeKind::Hole
         | TypeKind::Unit => Prec::Atom,
     }
@@ -1373,7 +1374,6 @@ impl ir::ErrorKind {
                 Namespace::Terms | Namespace::Effects | Namespace::Modules => "circular-term",
             },
             ir::ErrorKind::OpenDeclaredType { .. } => "open-declared-type",
-            ir::ErrorKind::ClauseInDeclaration => "declared-where-clause",
             ir::ErrorKind::VariableInDeclaration { .. } => "variable-in-declaration",
             ir::ErrorKind::InvalidFixedSpread => "invalid-fixed-spread",
             ir::ErrorKind::OpenFixedSpread => "open-fixed-spread",
@@ -1600,11 +1600,6 @@ impl ir::Error {
             )
             .label("this leaves part of the declared type undecided")
             .help("list every label, use one of the declaration's parameters, or move this type to an annotation"),
-            E::ClauseInDeclaration => {
-                Diagnostic::new(code, "a declared type cannot have a `where` clause", span)
-                    .label("there is nothing in a declaration for this clause to decide")
-                    .help("move the `where` clause to an annotation")
-            }
             E::VariableInDeclaration { name } => Diagnostic::new(
                 code,
                 format!("`'{name}` is not declared in this type's header"),
@@ -2380,6 +2375,13 @@ fn format_semantic(f: &mut fmt::Formatter<'_>, root: SemanticRoot<'_>) -> fmt::R
                     Ty::Real => f.write_str(Prim::Real.name())?,
                     Ty::String => f.write_str(Prim::String.name())?,
                     Ty::Bool => f.write_str(Prim::Bool.name())?,
+                    Ty::Presence(p) => match p {
+                        Presence::Present => f.write_str("true")?,
+                        Presence::Absent => f.write_str("false")?,
+                        Presence::Bound(index) => f.write_str(&name_at(*index))?,
+                        Presence::Var(var) | Presence::Recovered(var) => write!(f, "?{var}")?,
+                        Presence::Undecided => f.write_str("_")?,
+                    },
                     Ty::ForeignValue => f.write_str(Prim::ForeignValue.name())?,
                     Ty::Arrow(from, to, effects) => {
                         let shown = effect_row_shown(effects);

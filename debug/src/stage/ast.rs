@@ -989,6 +989,10 @@ fn type_node(ids: &mut Ids, ty: &Type) -> Node {
         // A leaf like a pattern's wildcard, and for the same reason: it binds
         // nothing and can never be referred to, so there is nothing to
         // cross-highlight.
+        TypeKind::Presence(value) => Node {
+            label: format!("Presence {value}"),
+            ..node
+        },
         TypeKind::Hole => Node {
             label: "Hole".into(),
             ..node

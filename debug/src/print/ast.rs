@@ -846,6 +846,7 @@ impl fmt::Display for Ast<'_, TypeKind> {
             // a variable printing bare would come back as a type's name.
             TypeKind::Variable { name } => write!(f, "'{}", name.tracked),
             // The hole as written: `_`, a position left for inference.
+            TypeKind::Presence(value) => write!(f, "{value}"),
             TypeKind::Hole => f.write_str("_"),
             TypeKind::Unit => f.write_str("()"),
         }

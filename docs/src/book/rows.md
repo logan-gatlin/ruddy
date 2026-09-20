@@ -190,7 +190,9 @@ let inspect_session: {
 Changing `!=` to `or` would promise to accept both fields, which `active_world` cannot handle.
 The compiler rejects that mismatch instead of silently strengthening the annotation to rescue the implementation.
 
-A `where` clause belongs on an annotation, not a type definition.
+A `where` clause can appear on an annotation or a type definition.
+A type definition must declare every free variable in its header; its constraints
+apply at every use and are inherited by definitions that use it.
 It can use `not`, `and`, `or`, `=`, and `!=`; parentheses group relationships and semicolons separate constraints.
 For example, `not 'target or 'path` says that a target requires a path.
 Equality would require a target and a path to appear together, rejecting a stale path without its target as well.

@@ -982,7 +982,7 @@ fn a_declared_type_must_be_closed() {
     // refused, and the struct that carried it lowers to the error type.
     for src in [
         "type T = { x: Nat, .. }",
-        "type T = { x when 'a: Nat }",
+        "type T = { x when _: Nat }",
         "type T = { a: { b: Nat, .. } }",
     ] {
         let (_, out) = build_src(src);
@@ -999,7 +999,7 @@ fn a_declared_type_must_be_closed() {
     }
 
     // One report per marker, in source order.
-    let (_, out) = build_src("type T = { x when 'a: Nat, y when 'b: Nat, .. }");
+    let (_, out) = build_src("type T = { x when _: Nat, y when _: Nat, .. }");
     assert_eq!(out.errors.len(), 3, "errors: {:#?}", out.errors);
     assert!(
         out.errors.iter().all(|error| matches!(
@@ -1018,7 +1018,7 @@ fn a_declared_type_must_be_closed() {
     assert_eq!(out.errors.len(), 2, "errors: {:#?}", out.errors);
 
     // An annotation is where 'openness belongs, and it passes through whole.
-    let (_, out) = build_src("let f : { x when 'a: Nat, ..'r } -> Nat = fn p => p.x");
+    let (_, out) = build_src("let f : { x when _: Nat, ..'r } -> Nat = fn p => p.x");
     assert!(out.errors.is_empty(), "errors: {:#?}", out.errors);
 }
 
@@ -1158,7 +1158,7 @@ fn a_head_that_cannot_be_applied_is_still_lowered() {
     let codes: Vec<&str> = out.errors.iter().map(|error| error.kind.code()).collect();
     assert_eq!(codes, ["not-a-type-constructor", "open-declared-type"]);
 
-    let (_, out) = build_src("type A = { x when 'a: Nat } Nat");
+    let (_, out) = build_src("type A = { x when _: Nat } Nat");
     let codes: Vec<&str> = out.errors.iter().map(|error| error.kind.code()).collect();
     assert_eq!(codes, ["not-a-type-constructor", "open-declared-type"]);
 }
@@ -1757,7 +1757,7 @@ fn a_declaration_is_open_only_through_a_parameter() {
 
     for src in [
         "type T = { x: Nat, .. }",
-        "type T 'r = { x when 'a: Nat, ..'r }",
+        "type T 'r = { x when _: Nat, ..'r }",
     ] {
         let (_, out) = build_src(src);
         assert!(
@@ -1973,7 +1973,7 @@ fn bare_and_quoted_labels_are_duplicates() {
 /// fields describes a type its writer never wrote.
 #[test]
 fn a_declared_sum_must_list_its_cases() {
-    for src in ["type T = #A Nat | ..", "type T = #A (when 'a) Nat | #B"] {
+    for src in ["type T = #A Nat | ..", "type T = #A (when _) Nat | #B"] {
         let (_, out) = build_src(src);
         assert!(
             out.errors.iter().any(|error| matches!(
@@ -4427,32 +4427,16 @@ fn a_clause_may_not_name_what_the_type_does_not_bind() {
     }
 }
 
-/// A declaration says the same thing wherever it is used, so it has no presence
-/// of its own for a clause to relate — the refusal `..` already gets, about the
-/// thing beside the type rather than a label inside it.
+/// A declaration's constraints and presence marks use only header parameters.
 #[test]
-fn a_declaration_may_not_carry_a_clause() {
-    let src = "type T = { x: Nat } where 'a";
-    let (_, out) = build_src(src);
-    let [error] = out.errors.as_slice() else {
-        panic!("expected one error: {:#?}", out.errors);
-    };
-    assert!(matches!(error.kind, ErrorKind::ClauseInDeclaration));
-    assert_eq!(
-        out.source.span(error.at).start,
-        src.rfind("'a").expect("the clause")
-    );
-
-    // A `when` inside one is the same refusal about a label, and it is the one
-    // `..` already gets: the declaration's body lowers to the error type.
-    let (_, out) = build_src("type T = #A (when 'a) Nat");
-    assert_eq!(
-        out.errors
-            .iter()
-            .map(|error| error.kind.code())
-            .collect::<Vec<_>>(),
-        ["open-declared-type"]
-    );
+fn a_declarations_presence_variables_must_be_declared() {
+    for src in ["type T = { x: Nat } where 'a", "type T = #A (when 'a) Nat"] {
+        let (_, out) = build_src(src);
+        let [error] = out.errors.as_slice() else {
+            panic!("{src}: {:#?}", out.errors);
+        };
+        assert!(matches!(&error.kind, ErrorKind::VariableInDeclaration { name } if name == "a"));
+    }
 }
 
 /// Every complaint one source made, as the codes a reporter keys on, in the
@@ -5433,7 +5417,7 @@ fn a_declared_effect_row_must_be_closed() {
     let base = "effect Log = { write: Nat -> () }\n";
     for source in [
         "type T = Nat -> Nat + ..",
-        "type T = Nat -> Nat + !Log (when 'a)",
+        "type T = Nat -> Nat + !Log (when _)",
     ] {
         let src = format!("{base}{source}");
         let out = build_src(&src).1;
@@ -6499,8 +6483,8 @@ fn a_formula_names_only_what_a_when_wears() {
 }
 
 /// A declaration's variables are its parameters, so a variable written in one's
-/// body is refused where it stands — and its `where` has nothing for a formula
-/// to relate either. Each is reported at its own name, so a body with several
+/// body or `where` clause must be declared in its header.
+/// Each undeclared use is reported at its own name, so a body with several
 /// reports each.
 #[test]
 fn a_declaration_may_declare_nothing_in_its_where() {
@@ -6544,16 +6528,16 @@ fn a_declaration_may_declare_nothing_in_its_where() {
         );
     }
 
-    // One report per name, and the clause is refused for existing at all.
+    // Every use of an undeclared name is reported.
     let src = "type Bad = { x when 'a: Nat, ..'r } where 'a";
     let (_, out) = build_src(src);
     let codes: Vec<&str> = out.errors.iter().map(|error| error.kind.code()).collect();
     assert_eq!(
         codes,
         [
-            "open-declared-type",
             "variable-in-declaration",
-            "declared-where-clause"
+            "variable-in-declaration",
+            "variable-in-declaration"
         ]
     );
 }

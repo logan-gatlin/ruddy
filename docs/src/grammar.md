@@ -240,6 +240,31 @@ type Optional 'a = #Some 'a | #None
 ```
 
 The type `Optional String` supplies `String` as the argument for `'a`.
+
+Parameters can stand for whole types, struct/sum rows, effect rows, regions, or
+presences. Their kinds are inferred from the definition's body and `where`
+constraints. Every free variable must appear in the header; anonymous `..`,
+`when _`, and `_` holes are not allowed in definitions. A `hide` binder still
+introduces its own whole-type variable within its body.
+
+Presence arguments are `true`, `false`, or a variable:
+
+```ruddy
+type Choice 'a 'left 'right = {
+  left when 'left: 'a,
+  right when 'right: 'a,
+} where 'left != 'right
+
+type LeftOnly 'a = Choice 'a true false
+let value: LeftOnly Nat = { left: 1n }
+```
+
+A definition inherits constraints from the types it uses, including through
+aliases and nested types. Impossible definitions are rejected; every application
+must satisfy the combined constraints. A parameter used only in `where` is a
+presence parameter. One parameter cannot be used at incompatible kinds.
+Annotations may infer variables from type arguments and may use `_` arguments.
+
 Parentheses group a type argument that itself contains an application, as in `Optional (Optional String)`.
 
 | Type form | Meaning |

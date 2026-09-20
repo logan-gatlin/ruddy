@@ -622,6 +622,7 @@ pub struct Parameter {
 /// The role a parameter has in its declaration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Sense {
+    Presence,
     Region,
     Type,
     Row,
@@ -711,8 +712,9 @@ pub enum OperationSelector {
     Named(String),
 }
 
-/// A normalized scheme.  Quantifier positions use the compiler's one shared
-/// index space: presences are `0..presences`, then types and rows.
+/// A normalized scheme. Value schemes put presences in `0..presences`, then
+/// types and rows. Type declarations use header order for all kinds and set
+/// `presences` to zero; their parameter table identifies presence positions.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Scheme {
     pub callable: Option<crate::reification::interface::Interface>,
@@ -731,6 +733,7 @@ pub struct Scheme {
 /// the `Struct` constructor.
 #[derive(Debug)]
 pub enum Type {
+    Presence(Presence),
     Nat,
     Int,
     Fixed(crate::types::FixedInt),
@@ -849,6 +852,7 @@ fn semantic_eq(root: SemanticPair<'_>) -> bool {
                 | (Type::Bool, Type::Bool)
                 | (Type::ForeignValue, Type::ForeignValue)
                 | (Type::Undecided, Type::Undecided) => {}
+                (Type::Presence(left), Type::Presence(right)) if left == right => {}
                 (Type::Var(left), Type::Var(right)) | (Type::Bound(left), Type::Bound(right))
                     if left == right => {}
                 (
@@ -1055,6 +1059,7 @@ fn clone_semantic(root: SemanticRef<'_>) -> (Vec<Type>, Vec<Row>) {
                 Type::Real => types.push(Type::Real),
                 Type::String => types.push(Type::String),
                 Type::Bool => types.push(Type::Bool),
+                Type::Presence(p) => types.push(Type::Presence(p.clone())),
                 Type::ForeignValue => types.push(Type::ForeignValue),
                 Type::Arrow(from, to, effects) => {
                     work.push(CloneWork::Arrow);
@@ -1293,6 +1298,7 @@ fn drain_type(value: &mut Type, pending: &mut Vec<SemanticOwned>) {
         | Type::Real
         | Type::String
         | Type::Bool
+        | Type::Presence(_)
         | Type::ForeignValue
         | Type::Var(_)
         | Type::Bound(_)
@@ -1538,6 +1544,7 @@ pub fn interface(
                             types::ParamKind::Type { .. } => Sense::Type,
                             types::ParamKind::Row { .. } => Sense::Row,
                             types::ParamKind::Effects { .. } => Sense::Effects,
+                            types::ParamKind::Presence { .. } => Sense::Presence,
                         },
                         lacks: param.kind.lacks().iter().cloned().collect(),
                         relevant: param.relevant,
@@ -1562,6 +1569,7 @@ pub fn interface(
                             types::ParamKind::Type { .. } => Sense::Type,
                             types::ParamKind::Row { .. } => Sense::Row,
                             types::ParamKind::Effects { .. } => Sense::Effects,
+                            types::ParamKind::Presence { .. } => Sense::Presence,
                         },
                         lacks: param.kind.lacks().iter().cloned().collect(),
                         // Every effect parameter counts: even one no operation
@@ -1893,6 +1901,7 @@ fn ty(mint: &Mint, value: &types::Ty) -> Type {
                 types::Ty::Real => tys.push(Type::Real),
                 types::Ty::String => tys.push(Type::String),
                 types::Ty::Bool => tys.push(Type::Bool),
+                types::Ty::Presence(p) => tys.push(Type::Presence(presence(p))),
                 types::Ty::ForeignValue => tys.push(Type::ForeignValue),
                 types::Ty::Arrow(from, to, effects) => {
                     work.push(Work::Arrow);
@@ -2678,6 +2687,7 @@ pub mod text {
                 Sense::Type => "type",
                 Sense::Row => "row",
                 Sense::Effects => "effects",
+                Sense::Presence => "presence",
             }
             .into()),
             A(value.relevant.to_string()),
@@ -2805,6 +2815,17 @@ pub mod text {
                         Type::Real => work.push(Work::Text("real")),
                         Type::String => work.push(Work::Text("string")),
                         Type::Bool => work.push(Work::Text("boolean")),
+                        Type::Presence(p) => {
+                            out.push_str("(presence ");
+                            out.push_str(&match p {
+                                Presence::Present => "present".into(),
+                                Presence::Absent => "absent".into(),
+                                Presence::Undecided => "undecided".into(),
+                                Presence::Var(index) => format!("(var {index})"),
+                                Presence::Bound(index) => format!("(bound {index})"),
+                            });
+                            out.push(')');
+                        }
                         Type::ForeignValue => work.push(Work::Text("foreign-value")),
                         Type::Arrow(from, to, row) => {
                             out.push_str("(arrow ");
@@ -3705,16 +3726,21 @@ pub mod text {
         }
         fn read_declared_type(&self, value: S) -> DeclaredType {
             let mut value = self.exact(self.list(value, "type"), 5, "type");
+            let name = self.string(self.take(&mut value));
+            let exported = self.boolean(self.take(&mut value));
+            let params: Vec<_> = self
+                .many(self.take(&mut value), "params")
+                .into_iter()
+                .map(|value| self.read_parameter(value))
+                .collect();
+            let scheme = self.read_scheme_with_parameters(self.take(&mut value), Some(&params));
+            let metadata = self.read_metadata(self.take(&mut value));
             DeclaredType {
-                name: self.string(self.take(&mut value)),
-                exported: self.boolean(self.take(&mut value)),
-                params: self
-                    .many(self.take(&mut value), "params")
-                    .into_iter()
-                    .map(|value| self.read_parameter(value))
-                    .collect(),
-                scheme: self.read_scheme(self.take(&mut value)),
-                metadata: self.read_metadata(self.take(&mut value)),
+                name,
+                exported,
+                params,
+                scheme,
+                metadata,
             }
         }
         fn read_parameter(&self, value: S) -> Parameter {
@@ -3725,6 +3751,7 @@ pub mod text {
                     "type" => Sense::Type,
                     "row" | "fields" | "cases" => Sense::Row,
                     "effects" => Sense::Effects,
+                    "presence" => Sense::Presence,
                     _ => self.invalid("invalid parameter sense", Sense::Type),
                 },
                 relevant: self.boolean(self.take(&mut value)),
@@ -3979,6 +4006,13 @@ pub mod text {
             }
         }
         fn read_scheme(&self, value: S) -> Scheme {
+            self.read_scheme_with_parameters(value, None)
+        }
+        fn read_scheme_with_parameters(
+            &self,
+            value: S,
+            parameters: Option<&[Parameter]>,
+        ) -> Scheme {
             let mut value = self.list(value, "scheme");
             let callable = if value.last().is_some_and(|value| matches!(value, S::List(parts) if matches!(parts.first(), Some(S::Atom(tag)) if tag == "callable"))) {
                 let mut encoded = self.exact(self.list(value.pop().unwrap(), "callable"), 1, "callable");
@@ -3992,6 +4026,17 @@ pub mod text {
             let mut value = self.exact(value, if has_representations { 6 } else { 5 }, "scheme");
             let count = self.number(self.take(&mut value));
             let presences = self.number(self.take(&mut value));
+            // Legacy declarations may carry value-style quantifier metadata.
+            // Header-ordered declarations use zero presence-prefix slots.
+            let parameters = parameters.filter(|_| presences == 0);
+            let is_presence = |index: u32| {
+                parameters.map_or(index < presences, |params| {
+                    params
+                        .get(index as usize)
+                        .is_some_and(|param| param.sense == Sense::Presence)
+                })
+            };
+            let is_type = |index: u32| index < count && !is_presence(index);
             let mut encoded = self.list(self.take(&mut value), "existentials");
             let mut existentials = Vec::new();
             while !encoded.is_empty() {
@@ -4000,7 +4045,7 @@ pub mod text {
             if presences > count {
                 self.fail("scheme presence count exceeds quantifier count");
             }
-            if existentials.iter().any(|index| *index >= presences)
+            if existentials.iter().any(|index| !is_presence(*index))
                 || existentials.windows(2).any(|pair| pair[0] >= pair[1])
             {
                 self.fail("invalid existential presence positions");
@@ -4011,9 +4056,7 @@ pub mod text {
                 while !encoded.is_empty() {
                     representations.push(self.number(self.take(&mut encoded)));
                 }
-                if representations
-                    .iter()
-                    .any(|index| *index < presences || *index >= count)
+                if representations.iter().any(|index| !is_type(*index))
                     || representations.windows(2).any(|pair| pair[0] >= pair[1])
                 {
                     self.fail("invalid runtime representation positions");
@@ -4039,8 +4082,27 @@ pub mod text {
             while let Some(part) = parts.pop() {
                 match part {
                     Part::Ty(ty, owner) => match ty {
+                        Type::Presence(Presence::Bound(index)) => {
+                            if !is_presence(*index) {
+                                self.fail(
+                                    "presence argument is outside the presence quantifier space",
+                                );
+                            }
+                            if existentials.contains(index) {
+                                if let Some(owner) = owner {
+                                    if slot_owners
+                                        .insert(*index, owner)
+                                        .is_some_and(|before| before != owner)
+                                    {
+                                        self.fail("existential presence crosses package owners");
+                                    }
+                                } else {
+                                    self.fail("existential presence occurs outside a package");
+                                }
+                            }
+                        }
                         Type::Bound(index) => {
-                            if *index < presences || *index >= count {
+                            if !is_type(*index) {
                                 self.fail("type bound is outside the type quantifier space");
                             }
                         }
@@ -4072,7 +4134,7 @@ pub mod text {
                     },
                     Part::Row(row, owner) => {
                         if let Rest::Bound(index) = row.rest
-                            && (index < presences || index >= count)
+                            && (!is_type(index))
                         {
                             self.fail("row bound is outside the row quantifier space");
                         }
@@ -4081,7 +4143,7 @@ pub mod text {
                         }
                         for (_, field) in row.labels.iter().rev() {
                             if let Presence::Bound(index) = field.presence {
-                                if index >= presences {
+                                if !is_presence(index) {
                                     self.fail(
                                         "presence bound is outside the presence quantifier space",
                                     );
@@ -4145,7 +4207,7 @@ pub mod text {
                 while let Some(formula) = formulas.pop() {
                     match formula {
                         Formula::Bound(index) => {
-                            if *index >= presences {
+                            if !is_presence(*index) {
                                 self.fail("formula bound is outside the presence quantifier space");
                             }
                             atoms.push(*index);
@@ -4277,6 +4339,10 @@ pub mod text {
                                         let binder = self.number(self.take(&mut values));
                                         let name = self.string(self.take(&mut values));
                                         tys.push(Type::HiddenVar { binder, name });
+                                    }
+                                    "presence" => {
+                                        let encoded = self.exact(values, 1, "presence").remove(0);
+                                        tys.push(Type::Presence(self.read_presence(encoded)));
                                     }
                                     "mut" => {
                                         let mut values = self.exact(values, 2, "mut");

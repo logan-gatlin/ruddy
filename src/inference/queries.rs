@@ -337,11 +337,24 @@ fn written_names(root: &ir::Type, out: &mut HashSet<Symbol>) {
                 written_effects(effects, out, &mut work);
             }
             T::Effects(effects) => written_effects(effects, out, &mut work),
-            T::Struct { fields, .. } => {
-                work.extend(fields.values().filter_map(|field| field.value()))
+            T::Struct {
+                fields, spreads, ..
+            } => {
+                work.extend(fields.values().filter_map(|field| field.value()));
+                work.extend(spreads.iter().map(|spread| &spread.value));
             }
-            T::Sum { cases, .. } => work.extend(cases.values().filter_map(|case| case.payload())),
-            T::Param { .. } | T::Prim(_) | T::Var(_) | T::Scoped { .. } | T::Hole | T::Error => {}
+            T::Sum { cases, spreads, .. } => {
+                work.extend(cases.values().filter_map(|case| case.payload()));
+                work.extend(spreads.iter().map(|spread| &spread.value));
+            }
+            T::Param { .. }
+            | T::Prim(_)
+            | T::Var(_)
+            | T::Scoped { .. }
+            | T::Presence(_)
+            | T::PresenceHole(_)
+            | T::Hole
+            | T::Error => {}
         }
     }
 }

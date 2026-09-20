@@ -442,6 +442,7 @@ fn install(ty: &mut Type, fields: Fields) {
 
 /// Every type-bearing child, including operands retained for kind validation.
 pub(super) fn children(ty: &mut Type, visit: &mut impl FnMut(&mut Type)) {
+    super::when_arguments_mut(ty, visit);
     match &mut ty.anchored {
         TypeKind::Struct {
             fields, spreads, ..

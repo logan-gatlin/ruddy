@@ -494,6 +494,9 @@ pub fn stands_for(mint: &Mint, param: &Param) -> String {
     // and a row that dropped the mark would be showing a spelling the source
     // cannot use.
     let name = format!("'{}", mint.name(param.symbol));
+    if param.kind.sense() == Sense::Presence {
+        return format!("{name} (presence)");
+    }
     let lacks = param.kind.lacks();
     let (opener, shape) = match param.kind.row() {
         Some((Sense::Effects, _)) => (format!("..{name} (effects)"), Shape::Effect),
