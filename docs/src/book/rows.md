@@ -268,6 +268,24 @@ A sum-case presence says whether the **type admits a case**, not which tag one p
 A value of type `#Running World | #Paused World` carries one tag while both cases belong to its type.
 Constraining the two case presences with `!=` is stronger than the usual rule that a sum value carries one tag.
 
+A match whose arms name tags can infer requirements on another argument for
+each admitted case:
+
+```ruddy
+let get_channel = fn channel image => match channel with
+| #Red => image.r
+| #Green => image.g
+end
+
+let red = get_channel #Red { r: 1 }
+let green = get_channel #Green { g: 2 }
+```
+
+The inferred relationship says that admitting `#Red` requires `r`, and admitting
+`#Green` requires `g`. A channel typed as `#Red | #Green` therefore requires both
+fields. The branch results still share one type; this inference relates case
+and field presences, rather than selecting different scalar types at runtime.
+
 ## Parameters and effect rows
 
 An effect can be parameterized by the type returned by its operation:

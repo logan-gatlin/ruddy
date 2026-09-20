@@ -55,7 +55,7 @@ let try_get: 'key -> Map 'key 'value -> Result (Option 'value) hash::Error = fn 
 
 @doc "Look up a key. Unhashable and missing keys both return None."
 let get: 'key -> Map 'key 'value -> Option 'value = fn key map =>
-  result::unwrap_or (#None) (try_get key map)
+  result::unwrap_or #None (try_get key map)
 
 @doc "Whether a key is present, reporting hashing errors."
 let try_contains: 'key -> Map 'key 'value -> Result Bool hash::Error = fn key map =>

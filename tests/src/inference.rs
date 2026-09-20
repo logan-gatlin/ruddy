@@ -20,6 +20,102 @@ fn dummy_mint() -> Mint {
     Mint::new(Bundle::new("test", Version::new(0, 0, 0)).expect("valid bundle"))
 }
 
+#[test]
+fn channel_accessors_infer_tag_conditional_fields() {
+    let (mint, _, output) = inferred(
+        "let get_channel = fn channel img => match channel with
+         | #Red => img.r | #Blue => img.r | #Green => img.g | #Alpha => img.a end
+         let red = get_channel #Red {r: 1}
+         let green = get_channel #Green {g: 2}
+         let alpha = get_channel #Alpha {a: 3}
+         let blue = get_channel #Blue {r: 4}",
+    );
+    for name in ["red", "green", "alpha", "blue"] {
+        assert_eq!(scheme(&mint, &output, name), "Real");
+    }
+    assert!(output.diagnostics().refinements().iter().any(|arm| {
+        arm.facts
+            .iter()
+            .any(|fact| fact.field == ["#Red"] && fact.present)
+    }));
+}
+
+#[test]
+fn curried_match_accessors_accept_direct_and_partial_calls() {
+    let (mint, _, output) = inferred(
+        "let f = fn channel img => match channel with | #Red => img.r end
+         let direct = f #Red {r: 1}
+         let red = f #Red
+         let partial = red {r: 2}",
+    );
+    assert_eq!(scheme(&mint, &output, "direct"), "Real");
+    assert_eq!(scheme(&mint, &output, "partial"), "Real");
+}
+
+#[test]
+fn channel_accessors_require_every_possible_tags_field() {
+    let accessor = "let get = fn channel img => match channel with
+        | #Red => img.r | #Green => img.g end\n";
+    for call in [
+        "let bad = get #Red {g: 1}",
+        "let bad = get #Green {r: 1}",
+        "let bad = get #Blue {r: 1, g: 2}",
+        "let both: #Red | #Green = #Red\nlet bad = get both {r: 1}",
+        "let both: #Red | #Green = #Green\nlet bad = get both {g: 1}",
+    ] {
+        let (_, _, output) = infer_src(&format!("{accessor}{call}"));
+        assert!(!output.errors().is_empty(), "accepted {call}");
+    }
+    inferred(&format!(
+        "{accessor}let both: #Red | #Green = #Red
+         let good = get both {{r: 1, g: 2}}"
+    ));
+}
+
+#[test]
+fn channel_accessors_preserve_requirements_through_aliases_and_partial_calls() {
+    inferred(
+        "let get = fn channel img => match channel with
+         | #Red => img.r | #Green => img.g end
+         let alias = get
+         let red = alias #Red
+         let green = alias #Green
+         let r = red {r: 1}
+         let g = green {g: 2}
+         let local = do let pick = get #Red return pick {r: 3} end",
+    );
+}
+
+#[test]
+fn channel_accessors_compose_nested_guards_and_tag_payloads() {
+    inferred(
+        "let get = fn mode channel img => match mode with
+         | #Color => match channel with | #Red => img.r | #Green => img.g end
+         | #Alpha => img.a end
+         let red = get #Color #Red {r: 1}
+         let green = get #Color #Green {g: 2}
+         let alpha = get #Alpha #Red {a: 3}
+         let scaled = fn channel img => match channel with
+         | #Red scale => img.r * scale | #Green scale => img.g * scale end
+         let value = scaled (#Red 2) {r: 4}",
+    );
+}
+
+#[test]
+fn tag_conditional_requirements_do_not_choose_incompatible_branch_results() {
+    let (_, _, output) = infer_src(
+        "let bad = fn channel img => match channel with
+         | #Red => img.r + 1 | #Green => \"green\" end",
+    );
+    assert!(!output.errors().is_empty());
+    inferred(
+        "let retag = fn value => match value with
+         | #Red => #R | #Green => #G end
+         let both: #Red | #Green = #Red
+         let value: #R | #G = retag both",
+    );
+}
+
 fn semantic_named(symbol: Symbol, args: Vec<Arc<Ty>>) -> Arc<Ty> {
     Arc::new(Ty::Named {
         symbol,
@@ -569,7 +665,10 @@ fn array_patterns_never_refine_a_later_binder_out_of_a_case() {
     assert_eq!(scheme(&mint, &output, "f"), "#A [Nat] | ..'a -> Nat");
     assert_eq!(scheme(&mint, &output, "g"), "#A ['a] | ..'b -> Nat");
     assert_eq!(scheme(&mint, &output, "h"), "[#A | ..'a] -> Nat");
-    assert_eq!(scheme(&mint, &output, "k"), "#A [Nat] | #B -> Nat");
+    assert_eq!(
+        scheme(&mint, &output, "k"),
+        "#A (when 'a) [Nat] | #B (when 'b) -> Nat"
+    );
 }
 
 #[test]
@@ -5356,18 +5455,17 @@ fn a_sums_open_tail_is_the_definitions_to_leave_alone() {
     let (mint, _, output) = inferred("let f : (#A Nat | ..'r) -> Nat = fn p => f (#B 1n)");
     assert_eq!(scheme(&mint, &output, "f"), "#A Nat | ..'a -> Nat");
 
-    // What the promise refuses is a case demanded of the argument itself: the
-    // caller picks what else the sum allows, so no arm may test one.
+    // Optional case demands do not force a particular extra case, but this
+    // finite match still cannot consume an arbitrary caller-chosen remainder.
     let (_, _, output) = infer_src(
         "let f : (#A Nat | ..'r) -> Nat = \
          fn p => match p with | #A x => 1n | #B y => 0n end",
     );
     assert_eq!(output.errors().len(), 1, "{:#?}", output.errors());
-    assert_eq!(output.errors()[0].kind.code(), "rigid-field");
+    assert_eq!(output.errors()[0].kind.code(), "rigid-broken");
     assert_eq!(
         output.errors()[0].kind.to_string(),
-        "this matches case `#B`, but `'r` stands for whatever other cases the caller chooses, \
-         so `#B` cannot be assumed"
+        "this is `|`, but `'r` stands for whatever row of fields or cases the caller picks"
     );
 
     // And the other way: a declared rest handed to something that allows
@@ -5926,7 +6024,10 @@ fn a_match_without_a_default_closes_the_sum() {
         "type Option 'T = #Some 'T | #None\n\
          let get = fn opt => match opt with | #Some x => x | #None => 0n end",
     );
-    assert_eq!(scheme(&mint, &output, "get"), "#Some Nat | #None -> Nat");
+    assert_eq!(
+        scheme(&mint, &output, "get"),
+        "#Some (when 'a) Nat | #None (when 'b) -> Nat"
+    );
 }
 
 /// With a default the row stays open — the rest a fresh tail lacking the
@@ -5991,7 +6092,7 @@ fn payloads_flow_to_binders_and_a_bare_tag_means_unit() {
     );
     assert_eq!(
         scheme(&mint, &output, "pick"),
-        "#Cons { head: #Some Nat | #None, tail: 'a } | #Nil -> Nat"
+        "#Cons (when 'a) { head: #Some Nat | #None, tail: 'c } | #Nil (when 'b) -> Nat"
     );
     // The bare `#None` and `#Nil` both carry unit: supplying a
     // payload to one is the ordinary mismatch.
@@ -6079,7 +6180,7 @@ fn supplying_an_unhandled_case_is_a_use_site_mismatch() {
     match &output.errors()[0].kind {
         ErrorKind::ExtraField { shape, base, field } => {
             assert_eq!(*shape, Shape::Sum);
-            assert_eq!(base.to_string(), "#Some 'a");
+            assert_eq!(base.to_string(), "#Some? 'a");
             assert_eq!(field, "None");
         }
         other => panic!("expected an extra case, got {other:?}"),
@@ -6196,7 +6297,7 @@ fn a_column_closes_over_every_listed_case() {
     );
     assert_eq!(
         scheme(&mint, &output, "f"),
-        "#T { a: #A | #B, b: Nat } -> Nat"
+        "#T (when 'a) { a: #A | #B, b: Nat } -> Nat"
     );
 
     // The same three shapes with a trailing catch-all still build clean.
@@ -6336,7 +6437,10 @@ fn a_wildcard_arm_types_as_a_named_catch_all() {
     // payload to the scrutinee.
     let (mint, _, output) =
         inferred("let has = fn opt => match opt with | #Some _ => 1n | #None => 0n end");
-    assert_eq!(scheme(&mint, &output, "has"), "#Some 'a | #None -> Nat");
+    assert_eq!(
+        scheme(&mint, &output, "has"),
+        "#Some (when 'a) 'c | #None (when 'b) -> Nat"
+    );
 }
 
 /// The motivating program of the exactness spec: exact arms over every
@@ -7752,7 +7856,12 @@ fn an_ordinary_program_requires_nothing() {
          let g = fn v => match v with | #A n => n | #B => 0n end",
     );
     assert!(
-        store(&output).is_empty(),
+        output
+            .semantics()
+            .store()
+            .batches
+            .iter()
+            .all(|batch| batch.formula.is_true()),
         "{:#?}",
         output.semantics().store()
     );
@@ -9220,7 +9329,8 @@ fn a_label_demanded_of_a_rigid_is_refused() {
     let (mint, _, output) = inferred("let f : { x: Nat, ..'r } -> Nat = fn p => p.x");
     assert_eq!(scheme(&mint, &output, "f"), "{ x: Nat, ..'a } -> Nat");
 
-    // And a sum's rest, tested for a case its row does not name.
+    // A finite tag match cannot close a caller-chosen sum remainder, even
+    // though the newly optional case can itself settle absent.
     let (_, _, output) = infer_src(
         "let f : (#A Nat | ..'r) -> Nat = \
          fn p => match p with | #A x => 1n | #B y => 0n end",
@@ -9228,9 +9338,9 @@ fn a_label_demanded_of_a_rigid_is_refused() {
     let [error] = output.errors() else {
         panic!("expected one error: {:#?}", output.errors());
     };
-    assert_eq!(error.kind.code(), "rigid-field");
+    assert_eq!(error.kind.code(), "rigid-broken");
     assert!(
-        error.kind.to_string().starts_with("this matches case `#B`"),
+        error.kind.to_string().starts_with("this is `|`"),
         "{}",
         error.kind
     );

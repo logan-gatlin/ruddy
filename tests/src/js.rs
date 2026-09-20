@@ -137,6 +137,41 @@ fn compiled(source: &str) -> Artifact {
 }
 
 #[test]
+fn tag_conditional_accessors_execute_with_only_the_selected_field() {
+    let artifact = compiled(
+        "@private let get = fn channel img => match channel with
+         | #Red => img.r | #Blue => img.r | #Green => img.g | #Alpha => img.a end
+         let red = get #Red {r: 1}
+         let green = get #Green {g: 2}
+         let alpha = get #Alpha {a: 3}
+         let blue = get #Blue {r: 4}
+         @private let both: #Red | #Green = #Green
+         let union = get both {r: 5, g: 6}",
+    );
+    let module = js::generate(&artifact).unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("channels.mjs");
+    fs::write(&path, module).unwrap();
+    let probe = format!(
+        "import * as app from {}; console.log(JSON.stringify([app.red, app.green, app.alpha, app.blue, app.union]));",
+        serde_json::to_string(path.to_str().unwrap()).unwrap()
+    );
+    let output = Command::new("node")
+        .args(["--input-type=module", "--eval", &probe])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap().trim(),
+        "[1,2,3,4,6]"
+    );
+}
+
+#[test]
 fn reification_preserves_the_boxed_type_instead_of_the_javascript_numeric_representation() {
     let artifact = compiled(
         r#"

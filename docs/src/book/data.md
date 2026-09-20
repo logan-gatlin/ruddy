@@ -51,6 +51,11 @@ The `#Some` pattern binds its payload to `id`, while the `#None` pattern needs n
 Both branches produce a string.
 A tag's name is case-sensitive, and its payload is grouped with parentheses when it contains an application.
 
+In a function call, a bare tag is one complete argument: `get_channel #Red image`
+passes the tag and the image separately. Parenthesize a tag with a payload when
+passing it to a function: `consume (#Some 0n)`. At the start of an expression,
+`#Some 0n` still constructs a tag carrying `0n`.
+
 Absence does not decide gameplay policy.
 An enemy without a target might patrol, wait, or search; the consuming function chooses what to do.
 
@@ -138,4 +143,3 @@ Immutable updates produce new values while preserving the input.
 3. Implement a function that returns the second array element as an option, including arrays of lengths zero and one.
 
 [Selected answers](answers.md#data) include the short-array cases.
-

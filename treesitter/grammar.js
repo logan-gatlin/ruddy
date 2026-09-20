@@ -39,8 +39,8 @@ const PREC = {
   multiplication: 8,
   unary: 9,
   application: 10,
-  // A tag takes its payload before an application takes another argument, so
-  // `f #A 1` is `f` applied to `#A 1`.
+  // A tag at expression head takes a payload; in argument position it is
+  // bare, so `f #A 1` passes two arguments.
   tag: 8,
   // `f p.x` reaches into the record before passing it along.
   projection: 9,
@@ -561,7 +561,7 @@ module.exports = grammar({
      * a `fn`, whose body then runs to the end of the application.
      */
     _argument: $ => choice(
-      $._atom,
+      $._argument_atom,
       alias($._atom_projection, $.projection),
       $.match_function,
       $.function,
@@ -572,7 +572,7 @@ module.exports = grammar({
     // [`projection`], reached from the one position that narrows what it may
     // be read off.
     _atom_projection: $ => prec.left(PREC.projection, seq(
-      field('base', choice($._atom, alias($._atom_projection, $.projection))),
+      field('base', choice($._argument_atom, alias($._atom_projection, $.projection))),
       '.',
       field('field', choice(
         $.identifier,
@@ -582,7 +582,16 @@ module.exports = grammar({
       )),
     )),
 
-    _atom: $ => choice(
+    _argument_atom: $ => choice(
+      $._non_tag_atom,
+      alias($._bare_tag_expression, $.tag_expression),
+    ),
+
+    _bare_tag_expression: $ => field('name', $.tag),
+
+    _atom: $ => choice($._non_tag_atom, $.tag_expression),
+
+    _non_tag_atom: $ => choice(
       $.identifier,
       $.path,
       $.natural,
@@ -592,7 +601,6 @@ module.exports = grammar({
       $.struct_expression,
       $.array_expression,
       $.tuple_expression,
-      $.tag_expression,
       $.operation,
       $.parenthesized_expression,
     ),
@@ -732,7 +740,7 @@ module.exports = grammar({
     /** `#Some 1` — one case of a sum, with what it carries. */
     tag_expression: $ => prec.right(PREC.tag, seq(
       field('name', $.tag),
-      optional(field('payload', $._argument)),
+      optional(field('payload', choice($.tag_expression, $._argument))),
     )),
 
     /** `!Log`, `!State.get`, or a module-qualified form. */

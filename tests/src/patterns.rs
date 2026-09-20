@@ -17,6 +17,18 @@ fn dummy_mint() -> Mint {
     Mint::new(Bundle::new("test", Version::new(0, 0, 0)).expect("valid bundle"))
 }
 
+#[test]
+fn tag_conditional_accessors_keep_all_possible_cases_exhaustive() {
+    clean(
+        "let get = fn channel img => match channel with
+         | #Red => img.r | #Green => img.g end
+         let r = get #Red {r: 1}
+         let g = get #Green {g: 2}
+         let both: #Red | #Green = #Red
+         let value = get both {r: 1, g: 2}",
+    );
+}
+
 /// Parse, lower, infer and check. Only the parse is required to be clean:
 /// several tests are exactly about what the checks do with a program an
 /// earlier phase complained about.

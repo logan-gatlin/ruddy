@@ -172,7 +172,7 @@ let put_node:
             key
             value
             (nat::add depth 1n)
-            (option::unwrap_or (#Empty) (array::get children index)) with
+            (option::unwrap_or #Empty (array::get children index)) with
           | next => {
             node: #Branch {
               bitmap: bitmap,
@@ -254,7 +254,7 @@ let remove_node:
             hash
             key
             (nat::add depth 1n)
-            (option::unwrap_or (#Empty) (array::get children index)) with
+            (option::unwrap_or #Empty (array::get children index)) with
           | next =>
             if next.removed then
               {

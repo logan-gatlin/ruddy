@@ -181,7 +181,7 @@ let encode_with: codec::Encoder 'a -> Limits -> 'a -> Result [Nat8] Error =
         let bytes = utf8_encode text
         return scalar (array::concat (nat32_to_bytes (array::len bytes)) bytes)
       end
-    | codec::!Write.begin_record schema => open (#Record) schema.fields []
+    | codec::!Write.begin_record schema => open #Record schema.fields []
     | codec::!Write.write_field field =>
       chain
         (fn frame =>
@@ -209,11 +209,11 @@ let encode_with: codec::Encoder 'a -> Limits -> 'a -> Result [Nat8] Error =
             | #None => protocol (str::concat "the field is not in the schema: " field.name)
             end
           end)
-        (top (#Record) field.cursor)
+        (top #Record field.cursor)
     | codec::!Write.end_record cursor =>
       chain
-        (fn frame => close (#Record) cursor (array::len frame.fields))
-        (top (#Record) cursor)
+        (fn frame => close #Record cursor (array::len frame.fields))
+        (top #Record cursor)
     | codec::!Write.begin_sequence count =>
       if nat::greater_than count 4294967295n then limit "a sequence longer than the format's length"
       else
@@ -231,7 +231,7 @@ let encode_with: codec::Encoder 'a -> Limits -> 'a -> Result [Nat8] Error =
               return #Some cursor
             end)
             (emit (nat32_to_bytes count)))
-          (open (#Sequence) [] [])
+          (open #Sequence [] [])
       end
     | codec::!Write.next_element cursor =>
       chain
@@ -255,11 +255,11 @@ let encode_with: codec::Encoder 'a -> Limits -> 'a -> Result [Nat8] Error =
               end)
               (counted ())
           end)
-        (top (#Sequence) cursor)
+        (top #Sequence cursor)
     | codec::!Write.end_sequence cursor =>
       chain
-        (fn frame => close (#Sequence) cursor frame.declared)
-        (top (#Sequence) cursor)
+        (fn frame => close #Sequence cursor frame.declared)
+        (top #Sequence cursor)
     | codec::!Write.begin_variant opened =>
       match array::find_index (fn known => str::equal known opened.tag) opened.schema.cases with
       | #Some index =>
@@ -278,10 +278,10 @@ let encode_with: codec::Encoder 'a -> Limits -> 'a -> Result [Nat8] Error =
               return #Some cursor
             end)
             (emit (nat32_to_bytes index)))
-          (open (#Variant) [] opened.schema.cases)
+          (open #Variant [] opened.schema.cases)
       | #None => protocol (str::concat "not a case of the sum: " opened.tag)
       end
-    | codec::!Write.end_variant cursor => close (#Variant) cursor 1n
+    | codec::!Write.end_variant cursor => close #Variant cursor 1n
     end with
     | #Some _ =>
       if not ~done or not nat::is_zero (array::len (~stack)) then
@@ -442,7 +442,7 @@ let decode_with: codec::Decoder 'a -> Limits -> [Nat8] -> Result 'a Error =
             path: [],
             kind: #Unsupported "positional binary cannot skip a value without its schema",
           }
-        | codec::!Read.begin_record schema => open (#Record) schema.fields [] 0n
+        | codec::!Read.begin_record schema => open #Record schema.fields [] 0n
         | codec::!Read.next_field cursor =>
           chain
             (fn frame =>
@@ -464,8 +464,8 @@ let decode_with: codec::Decoder 'a -> Limits -> [Nat8] -> Result 'a Error =
                 | #None => #Some (#None)
                 end
               end)
-            (top (#Record) cursor)
-        | codec::!Read.end_record cursor => close (#Record) cursor
+            (top #Record cursor)
+        | codec::!Read.end_record cursor => close #Record cursor
         | codec::!Read.begin_sequence _ =>
           chain
             (fn cursor => chain
@@ -489,7 +489,7 @@ let decode_with: codec::Decoder 'a -> Limits -> [Nat8] -> Result 'a Error =
                   end
               end)
               (take 4n))
-            (open (#Sequence) [] [] 0n)
+            (open #Sequence [] [] 0n)
         | codec::!Read.next_element cursor =>
           chain
             (fn frame =>
@@ -509,14 +509,14 @@ let decode_with: codec::Decoder 'a -> Limits -> [Nat8] -> Result 'a Error =
                   return #Some true
                 end
               end)
-            (top (#Sequence) cursor)
+            (top #Sequence cursor)
         | codec::!Read.end_sequence cursor =>
           chain
             (fn frame =>
-              if nat::is_zero frame.count then close (#Sequence) cursor
+              if nat::is_zero frame.count then close #Sequence cursor
               else protocol "the sequence has elements left"
               end)
-            (top (#Sequence) cursor)
+            (top #Sequence cursor)
         | codec::!Read.begin_variant schema =>
           chain
             (fn cursor => chain
@@ -535,8 +535,8 @@ let decode_with: codec::Decoder 'a -> Limits -> [Nat8] -> Result 'a Error =
                 }
               end)
               (take 4n))
-            (open (#Variant) [] schema.cases 0n)
-        | codec::!Read.end_variant cursor => close (#Variant) cursor
+            (open #Variant [] schema.cases 0n)
+        | codec::!Read.end_variant cursor => close #Variant cursor
         end with
         | #Some value =>
           if not ~done or not nat::is_zero (array::len (~stack)) then
