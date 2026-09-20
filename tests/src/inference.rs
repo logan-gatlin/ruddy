@@ -11401,6 +11401,119 @@ fn sat_choices(name: &str, terms: usize, attribute: &str) -> String {
     )
 }
 
+const EXTEND4_CHANNELS: &str = "let extend4 = fn
+    | () => (#None, #None, #None, #None)
+    | (a,) => (a, #None, #None, #None)
+    | (a, b) => (a, b, #None, #None)
+    | (a, b, c) => (a, b, c, #None)
+    | (a, b, c, d) => (a, b, c, d)
+    let pair = fn x y => (extend4 x, extend4 y)";
+
+#[test]
+fn independent_tuple_padding_calls_fit_the_default_sat_term_budget() {
+    // Each call contributes independent presence constraints. Publishing the
+    // pair's scheme must not expand their conjunction into every combination.
+    inferred(EXTEND4_CHANNELS);
+}
+
+#[test]
+fn independent_tuple_padding_constraints_preserve_channels_and_padding() {
+    inferred(&format!(
+        "{EXTEND4_CHANNELS}
+         let empty: (#None, #None, #None, #None) = extend4 ()
+         let two: (#Red, #Green, #None, #None) = extend4 (#Red, #Green)
+         let three: (#Red, #Green, #Blue, #None) = extend4 (#Red, #Green, #Blue)
+         let four: (#Red, #Green, #Blue, #Alpha) = extend4 (#Red, #Green, #Blue, #Alpha)
+         let channels: ((#Red, #None, #None, #None), (#Green, #None, #None, #None)) =
+             pair (#Red,) (#Green,)
+         let mixed: ((#None, #Blue, #None, #None), (#None, #None, #None, #None)) =
+             pair (#None, #Blue) ()"
+    ));
+
+    for call in [
+        "let bad: ((#Green, #None, #None, #None), (#Green, #None, #None, #None)) = pair (#Red,) (#Green,)",
+        "let bad: ((#Red, #None, #None, #None), (#Red, #None, #None, #None)) = pair (#Red,) (#Green,)",
+        "let bad: ((#Red, #Blue, #None, #None), (#Green, #None, #None, #None)) = pair (#Red,) (#Green,)",
+        "let bad = pair (#Red, #Green, #Blue, #Alpha, #Other) ()",
+    ] {
+        let (_, _, output) = infer_src(&format!("{EXTEND4_CHANNELS}\n{call}"));
+        assert!(!output.errors().is_empty(), "accepted {call}");
+        assert!(
+            !output
+                .errors()
+                .iter()
+                .any(|error| matches!(error.kind, ErrorKind::SatTermLimit { .. })),
+            "expected a type error for {call}, got {:?}",
+            output.errors()
+        );
+    }
+}
+
+#[test]
+fn channel_swizzle_fits_the_default_sat_term_budget() {
+    let source = "type Channel = #Red | #Blue | #Green | #Alpha
+        type Buf = [Nat8]
+        type RGB = { r: Buf, g: Buf, b: Buf }
+        type RGBA = { ..RGB, a: Buf }
+
+        let get_channel = fn channel img => match channel with
+        | #Red => img.r
+        | #Green => img.g
+        | #Blue => img.b
+        | #Alpha => img.a
+        end
+
+        let set_channel = fn channel value img => match channel with
+        | #Red => { r: value, ..img }
+        | #Green => { g: value, ..img }
+        | #Blue => { b: value, ..img }
+        | #Alpha => { a: value, ..img }
+        end
+
+        let try_get_set = fn get set img => match (get, set) with
+        | (#None, _) => img
+        | (_, #None) => img
+        | (get, set) => set_channel set (get_channel get img) img
+        end
+
+        let extend4 = fn
+        | () => (#None, #None, #None, #None)
+        | (a,) => (a, #None, #None, #None)
+        | (a, b) => (a, b, #None, #None)
+        | (a, b, c) => (a, b, c, #None)
+        | (a, b, c, d) => (a, b, c, d)
+
+        let swizzle = fn in_channels out_channels img => do
+          let (in_a, in_b, in_c, in_d) = extend4 in_channels
+          let (out_a, out_b, out_c, out_d) = extend4 out_channels
+          return img
+            |> try_get_set in_a out_a
+            |> try_get_set in_b out_b
+            |> try_get_set in_c out_c
+            |> try_get_set in_d out_d
+        end";
+    inferred(&format!(
+        "{source}\nlet rgba: RGBA = swizzle (#Red,) (#Green,) {{ r: [], g: [], b: [], a: [] }}"
+    ));
+
+    // Matching the setter's branch results still requires an alpha field.
+    // Compact constraint projection must retain that existing restriction.
+    let (_, _, output) = infer_src(&format!(
+        "{source}\nlet rgb = swizzle (#Red,) (#Green,) {{ r: [], g: [], b: [] }}"
+    ));
+    let [error] = output.errors() else {
+        panic!(
+            "expected exactly one missing-field error: {:#?}",
+            output.errors()
+        );
+    };
+    assert!(
+        matches!(&error.kind, ErrorKind::MissingField { field, .. } if field == "a"),
+        "{:?}",
+        error.kind
+    );
+}
+
 #[test]
 fn sat_term_limit_defaults_to_256_and_can_be_raised() {
     inferred(&sat_choices("fits", 256, ""));

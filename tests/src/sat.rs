@@ -506,3 +506,143 @@ fn incremental_search_cancels_after_encoding_and_accepts_a_new_revision() {
     );
     worker.join().unwrap();
 }
+
+/// Independent requirements stay compact even when distributing their
+/// conjunction would exceed the projection budget by orders of magnitude.
+#[test]
+fn independent_relations_use_an_additive_projection_budget() {
+    let relations = Formula::all((0..12).map(|at| var(at * 2).iff(var(at * 2 + 1))));
+    let keep = atoms(&relations);
+    let projected = sat::project(&relations, &keep, 24).expect("twelve two-term factors fit");
+    assert!(sat::entails(&relations, &projected));
+    assert!(sat::entails(&projected, &relations));
+    assert!(projected.to_string().len() <= relations.to_string().len() * 2);
+    assert_eq!(
+        sat::project(&relations, &keep, 23),
+        Err(sat::TermLimitExceeded { max_terms: 23 })
+    );
+
+    // A product conjoins without creating another choice, even after the
+    // disjunctive factors have consumed the whole budget.
+    let with_literals = relations.and(Formula::all((24..58).map(var)));
+    let projected = sat::project(&with_literals, &atoms(&with_literals), 24)
+        .expect("fixed presences do not multiply alternatives");
+    assert!(sat::entails(&with_literals, &projected));
+    assert!(sat::entails(&projected, &with_literals));
+    let literals = Formula::all((0..34).map(var));
+    assert_eq!(sat::project(&literals, &atoms(&literals), 1), Ok(literals));
+
+    // A factor that simplifies away still spent its enumeration budget. The
+    // resource guard applies before minimization, including between factors.
+    let before_simplification = var(0).xor(var(1)).and(var(2).or(var(2).not()));
+    assert_eq!(
+        sat::project(&before_simplification, &atoms(&before_simplification), 3),
+        Err(sat::TermLimitExceeded { max_terms: 3 })
+    );
+    assert_eq!(
+        sat::project(&before_simplification, &atoms(&before_simplification), 4),
+        Ok(var(0).xor(var(1)))
+    );
+}
+
+#[test]
+fn independent_factors_follow_the_retained_atom_order() {
+    let literals = var(0).and(var(1)).and(var(2));
+    let reversed = [Atom::Var(2), Atom::Var(1), Atom::Var(0), Atom::Var(2)];
+    assert_eq!(
+        sat::project(&literals, &reversed, 1),
+        Ok(var(2).and(var(1)).and(var(0)))
+    );
+
+    let factors = var(0).iff(var(1)).and(var(2).xor(var(3)));
+    let reversed = [Atom::Var(3), Atom::Var(2), Atom::Var(1), Atom::Var(0)];
+    assert_eq!(
+        sat::project(&factors, &reversed, 4),
+        Ok(var(3).xor(var(2)).and(var(1).iff(var(0))))
+    );
+}
+
+#[test]
+fn factoring_preserves_hidden_correlations_and_unsatisfiable_components() {
+    // The hidden atom belongs to both requirements; giving each occurrence
+    // its own existential witness would incorrectly produce `always`.
+    let correlated = Formula::owned(
+        3,
+        var(0)
+            .iff(var(2))
+            .and(Formula::owned(4, var(1).iff(var(2)))),
+    );
+    assert_eq!(
+        sat::project(&correlated, &[Atom::Var(0), Atom::Var(1)], 2),
+        Ok(var(0).iff(var(1)))
+    );
+
+    // An independent contradiction settles the entire answer before a
+    // different component can exhaust the term budget.
+    let expensive = (1..10).fold(var(0), |sum, at| sum.xor(var(at)));
+    let keep = atoms(&expensive);
+    let impossible = expensive.and(var(20).and(var(20).not()));
+    assert_eq!(sat::project(&impossible, &keep, 0), Ok(Formula::False));
+
+    // With no retained atoms the answer is existential satisfiability;
+    // `always` still occupies the one empty product.
+    let satisfiable = var(0).xor(var(1)).and(var(2).iff(var(3)));
+    assert_eq!(sat::project(&satisfiable, &[], 1), Ok(Formula::True));
+    assert_eq!(
+        sat::project(&satisfiable, &[], 0),
+        Err(sat::TermLimitExceeded { max_terms: 0 })
+    );
+}
+
+/// Check the existential meaning independently of the SAT solver and normal
+/// form, including every retained subset and every pair of binary relations.
+#[test]
+fn factored_projection_agrees_with_exhaustive_existential_semantics() {
+    fn relation(table: u32, variables: [u32; 2]) -> Formula {
+        Formula::any((0..4).filter(|row| table & (1 << row) != 0).map(|row| {
+            Formula::all(variables.into_iter().enumerate().map(|(at, index)| {
+                if row & (1 << at) != 0 {
+                    var(index)
+                } else {
+                    var(index).not()
+                }
+            }))
+        }))
+    }
+
+    // The first topology has independent requirements. The second shares a
+    // variable, which can be retained or hidden depending on the subset.
+    for (right_variables, width) in [([2, 3], 4), ([1, 2], 3)] {
+        for left_table in 0..16 {
+            for right_table in 0..16 {
+                let formula = Formula::owned(1, relation(left_table, [0, 1]))
+                    .and(relation(right_table, right_variables));
+                for retained in 0..(1u32 << width) {
+                    let keep: Vec<_> = (0..width)
+                        .filter(|at| retained & (1 << at) != 0)
+                        .map(Atom::Var)
+                        .collect();
+                    let projected = sat::project(&formula, &keep, 16).unwrap();
+                    assert!(atoms(&projected).iter().all(|atom| keep.contains(atom)));
+                    for visible in 0..(1u32 << width) {
+                        let evaluate = |formula: &Formula, row: u32| {
+                            formula.eval(&|atom| {
+                                let Atom::Var(at) = atom else { unreachable!() };
+                                row & (1 << at) != 0
+                            })
+                        };
+                        let expected = (0..(1u32 << width)).any(|extension| {
+                            extension & retained == visible & retained
+                                && evaluate(&formula, extension)
+                        });
+                        assert_eq!(
+                            evaluate(&projected, visible),
+                            expected,
+                            "{formula}, keep={keep:?}, assignment={visible}: {projected}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}

@@ -10,18 +10,12 @@
 //! under it. Rolling a solver of our own is out of scope and would be a poor
 //! trade — this is a decidable question with an off-the-shelf answer.
 //!
-//! [`project`] is the fourth thing and the only one that is not a single
-//! question: it existentially eliminates variables and puts what is left in the
-//! canonical form R12 prints. It goes through the solver as well, and why is
-//! worth saying. Eliminating a variable *by enumeration* — Shannon expansion,
-//! a truth table over every atom the formula names — costs two to the power of
-//! the atom count whatever the formula happens to say, so a definition relating
-//! twenty presences took seconds and one relating thirty-two overran the row
-//! index counting them. Nothing about those formulas is hard. A match over
-//! twenty fields says "exactly one of these" and the answer is twenty products;
-//! the walk simply declined to look at it and counted out a million rows
-//! instead. So the elimination asks the solver for satisfying *products* rather
-//! than rows, and what it costs tracks the size of the answer.
+//! [`project`] existentially eliminates variables. Independent conjunctive
+//! components stay factored: turning their answers into one sum of products
+//! would multiply unrelated choices. Each connected component is projected by
+//! enumerating satisfying products with an incremental solver, never a truth
+//! table over all assignments. The term budget bounds that enumeration before
+//! minimization, and is shared across the components' alternative products.
 //!
 //! Staging is what keeps inference terminating. Nothing here is called from
 //! unification: the solver runs at generalization boundaries, at the use-site
@@ -38,9 +32,11 @@ use crate::{
     types::{Atom, Formula},
 };
 
-/// Default maximum number of product terms collected by projection.
-/// Definitions may override this with `@max_sat_terms <nat>`. Exhaustion is
-/// an error, even when the input itself has a compact non-product spelling.
+/// Default maximum number of product alternatives collected by projection.
+/// Independent factors share this budget additively, without distributing
+/// their conjunction. Singleton products can conjoin without alternatives,
+/// and together require at least one budget unit. Definitions may override
+/// this with `@max_sat_terms <nat>`; enumeration is bounded before minimization.
 pub const DEFAULT_MAX_TERMS: usize = 256;
 
 /// Projection could not finish within its product-term budget.
@@ -174,36 +170,119 @@ fn unowned(mut formula: &Formula) -> &Formula {
     formula
 }
 
-/// `formula` with every atom it names but `keep` does not existentially
-/// eliminated, in the canonical form R12 prints.
+/// Existentially eliminate atoms outside `keep`, retaining independent
+/// conjunctive factors rather than expanding their Cartesian product.
 ///
-/// Two jobs in one pass because they are one job: eliminating a variable is
-/// asking which assignments of the ones that stay some assignment of the ones
-/// that go satisfies the formula under, and the answer to that *is* what the
-/// canonical form is read off. [`eliminate`] finds it a product at a time and
-/// [`minimized`] writes it as few products as it knows how.
-///
-/// The canonical form is a sum of products over the kept atoms in the caller's
-/// order (normally their first appearance in a type), with the two-variable
-/// `a = b` and `a != b` cases
-/// recognized first because those are what a reader wrote and what R12 asks to
-/// see. Deterministic throughout: the atom order fixes the literal order inside
-/// a product, and the products are sorted by it.
+/// Components and their product literals follow the caller's retained-atom
+/// order. Each connected component has a deterministic sum-of-products answer,
+/// with two-variable equivalence and exclusive-or recognized by [`rebuild`].
+/// The generation budget is shared across factors
+/// before any minimization: singleton products conjoin without branching,
+/// while covers with alternatives contribute their full raw term counts.
 pub fn project(
     formula: &Formula,
     keep: &[Atom],
     max_terms: usize,
 ) -> Result<Formula, TermLimitExceeded> {
-    let mut named = Vec::new();
-    formula.atoms(&mut named);
-    let mut kept: Vec<Atom> = Vec::new();
-    for atom in keep.iter().copied().filter(|atom| named.contains(atom)) {
-        if !kept.contains(&atom) {
-            kept.push(atom);
+    let mut order = HashMap::new();
+    for atom in keep {
+        let next = order.len();
+        order.entry(*atom).or_insert(next);
+    }
+    let mut components: Vec<_> = components(formula)
+        .into_iter()
+        .map(|component| {
+            let mut atoms = Vec::new();
+            component.atoms(&mut atoms);
+            (component, atoms)
+        })
+        .collect();
+    components.sort_by_key(|(_, atoms)| {
+        atoms
+            .iter()
+            .filter_map(|atom| order.get(atom))
+            .min()
+            .copied()
+            .unwrap_or(usize::MAX)
+    });
+    // A contradiction in any component makes the whole projection false,
+    // even if an earlier, independent component would exhaust the budget.
+    if components.len() > 1 && !satisfiable(formula) {
+        return Ok(Formula::False);
+    }
+    let mut answer = Formula::True;
+    let mut spent = 0;
+    for (component, mut kept) in components {
+        crate::cancellation::checkpoint();
+        kept.retain(|atom| order.contains_key(atom));
+        kept.sort_by_key(|atom| order[atom]);
+        let available = (max_terms - spent).max(usize::from(max_terms > 0));
+        let cover =
+            eliminate(&component, &kept, available).ok_or(TermLimitExceeded { max_terms })?;
+        if cover.is_empty() {
+            return Ok(Formula::False);
+        }
+        // Singleton products conjoin into one product without expansion.
+        // Choices remain separate factors: charge their raw covers together,
+        // before minimization, rather than their Cartesian product.
+        if cover.len() > 1 {
+            spent += cover.len();
+        }
+        answer = answer.and(rebuild(&kept, minimized(&kept, cover)));
+    }
+    Ok(answer)
+}
+
+/// Conjuncts connected by an atom must be projected together. In particular,
+/// splitting two uses of the same eliminated atom would give each an
+/// independent witness and weaken the answer. Disjoint components commute
+/// with existential quantification, so their projected answers stay factored.
+fn components(formula: &Formula) -> Vec<Formula> {
+    let mut conjuncts = Vec::new();
+    let mut work = vec![formula];
+    while let Some(formula) = work.pop() {
+        match unowned(formula) {
+            Formula::And(left, right) => {
+                work.push(right);
+                work.push(left);
+            }
+            formula => conjuncts.push(formula),
         }
     }
-    let cover = eliminate(formula, &kept, max_terms).ok_or(TermLimitExceeded { max_terms })?;
-    Ok(rebuild(&kept, minimized(&kept, cover)))
+    let mut parents: Vec<_> = (0..conjuncts.len()).collect();
+    fn root(parents: &mut [usize], mut at: usize) -> usize {
+        while parents[at] != at {
+            parents[at] = parents[parents[at]];
+            at = parents[at];
+        }
+        at
+    }
+    let mut owners = HashMap::new();
+    for (at, conjunct) in conjuncts.iter().enumerate() {
+        crate::cancellation::checkpoint();
+        let mut atoms = Vec::new();
+        conjunct.atoms(&mut atoms);
+        for atom in atoms {
+            if let Some(&previous) = owners.get(&atom) {
+                let previous = root(&mut parents, previous);
+                let current = root(&mut parents, at);
+                // Earliest conjunct wins, independently of hash iteration.
+                parents[previous.max(current)] = previous.min(current);
+            } else {
+                owners.insert(atom, at);
+            }
+        }
+    }
+    let mut groups = vec![Formula::True; conjuncts.len()];
+    for (at, conjunct) in conjuncts.into_iter().enumerate() {
+        let group = root(&mut parents, at);
+        groups[group] = std::mem::replace(&mut groups[group], Formula::True).and(conjunct.clone());
+    }
+    groups.retain(|formula| !formula.is_true());
+    if groups.is_empty() {
+        groups.push(Formula::True);
+    }
+    groups
 }
 
 /// The products of `∃ dropped. formula` over `kept`, or `None` where there are
@@ -218,30 +297,59 @@ pub fn project(
 /// asking again walks the answer a product at a time, so a formula whose answer
 /// is twenty products takes twenty calls however many atoms it names.
 fn eliminate(formula: &Formula, kept: &[Atom], max_terms: usize) -> Option<Vec<Cube>> {
-    let mut cover: Vec<Cube> = Vec::new();
-    // What is left to account for: everything no product found so far covers.
-    let mut left = Formula::True;
-    loop {
-        let Some(model) = model(&formula.clone().and(left.clone())) else {
-            return Some(cover);
+    // Most inference projections are constants or literals. Keep them out of
+    // the solver, just as ordinary satisfiability queries do.
+    if let Some(model) = literal_model(formula) {
+        return match model {
+            None => Some(Vec::new()),
+            Some(model) if max_terms > 0 => Some(vec![
+                kept.iter().map(|atom| model.get(atom).copied()).collect(),
+            ]),
+            Some(_) => None,
         };
+    }
+    let mut cover: Vec<Cube> = Vec::new();
+    let mut encoding = Incremental::default();
+    let top = encoding.encode(formula);
+    encoding.add_clause(&[top]);
+    let positions: HashMap<_, _> = kept
+        .iter()
+        .enumerate()
+        .map(|(i, atom)| (*atom, i))
+        .collect();
+    loop {
+        if !encoding.satisfiable(&[]) {
+            return Some(cover);
+        }
+        // Refuse the next product before allocating it or minimizing anything.
+        if cover.len() == max_terms {
+            return None;
+        }
         let mut needed = Vec::new();
-        justify(formula, true, &|atom| model[&atom], &mut needed);
+        justify(
+            formula,
+            true,
+            &|atom| encoding.solver.value_var(encoding.atoms[&atom]) == lbool::TRUE,
+            &mut needed,
+        );
         let mut cube: Cube = vec![None; kept.len()];
         for (atom, there) in needed {
-            // Justification may visit one atom through several agreeing paths.
-            // Collapse those visits into the one literal a cube can carry, and
-            // discard eliminated atoms outright rather than letting either
-            // affect the projected cover.
-            if let Some(at) = kept.iter().position(|known| *known == atom) {
+            if let Some(&at) = positions.get(&atom) {
                 debug_assert!(cube[at].is_none_or(|known| known == there));
                 cube[at] = Some(there);
             }
         }
-        if cover.len() == max_terms {
-            return None;
-        }
-        left = left.and(product(kept, &cube).not());
+        // Block this projected product in the existing solver. Re-encoding
+        // the original formula and every previous blocker per model makes
+        // even a bounded cover quadratic in encoding work.
+        let blocker: Vec<_> = literals(&cube)
+            .into_iter()
+            .map(|(at, there)| {
+                let lit = encoding.atom(kept[at]);
+                if there { !lit } else { lit }
+            })
+            .collect();
+        encoding.add_clause(&blocker);
         cover.push(cube);
     }
 }
