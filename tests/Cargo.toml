@@ -4,12 +4,16 @@ version = "0.1.0"
 edition = "2024"
 publish = false
 
+[features]
+default = ["parallel"]
+parallel = ["ruddy/parallel", "ruddy-cli/parallel", "ruddy-debug/parallel", "ruddy-interp/parallel"]
+
 [dependencies]
 gix = { version = "0.85.0", default-features = false, features = ["sha1"] }
-ruddy = { package = "ruddy-compiler", path = ".." }
-ruddy-cli = { package = "ruddy", path = "../cli" }
-ruddy-debug = { path = "../debug" }
-ruddy-interp = { path = "../interp" }
+ruddy = { package = "ruddy-compiler", path = "..", default-features = false }
+ruddy-cli = { package = "ruddy", path = "../cli", default-features = false }
+ruddy-debug = { path = "../debug", default-features = false }
+ruddy-interp = { path = "../interp", default-features = false }
 indexmap = "2"
 regex = "1"
 serde_json = "1"

@@ -2510,3 +2510,24 @@ fn test_attribute_checks_signature_and_hides_tests() {
     check("effect Assert = String -> ()\n@test let works: () -> () + .. = fn _ => !Assert \"failure\"")
         .expect("tests permit the structural Assert effect");
 }
+#[test]
+fn execution_modes_produce_identical_artifacts() {
+    use ruddy::execution::Execution;
+    let source = (0..32)
+        .map(|i| format!("let value{i} = fn x => {{ value: x, index: {i}n }}\n"))
+        .collect::<String>();
+    let compile = || {
+        let parsed = ruddy::parse::parse(
+            ruddy::token::lex(&source, ruddy::tracking::FileID::GENERATED).tokens,
+        );
+        let mint = ruddy::symbol::Mint::new(
+            ruddy::symbol::Bundle::new("parallel", ruddy::symbol::Version::new(0, 1, 0)).unwrap(),
+        );
+        ruddy::compile::compile(mint, parsed.stmts, ruddy::inference::Trace::Off)
+            .unwrap()
+            .artifact()
+            .print()
+    };
+    let serial = Execution::sequential().run(compile);
+    assert_eq!(serial, Execution::default().run(compile));
+}

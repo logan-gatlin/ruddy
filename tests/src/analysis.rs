@@ -17,6 +17,61 @@ fn program(text: &str) -> (Mint, ir::Program) {
 }
 
 #[test]
+fn execution_modes_agree_across_dependency_and_recursive_group_edits() {
+    use ruddy::execution::Execution;
+    let mut serial = inference::Session::with_execution(Execution::sequential());
+    #[cfg(feature = "parallel")]
+    let execution = Execution::with_threads(std::num::NonZeroUsize::new(4).unwrap()).unwrap();
+    #[cfg(not(feature = "parallel"))]
+    let execution = Execution::default();
+    let mut parallel = inference::Session::with_execution(execution);
+    let independent: String = (0..24)
+        .map(|i| format!("\nlet independent{i} = fn x => {{ value: x }}"))
+        .collect();
+    let revisions = [
+        "let id = fn x => x\nlet left = id 1n\nlet right = id false\nlet both = { left: left, right: right }\nlet a = fn x => b x\nlet b = fn x => a x",
+        "let id = fn x => do let same = x return same end\nlet left = id 1n\nlet right = id false\nlet both = { left: left, right: right }\nlet a = fn x => b x\nlet b = fn x => a x",
+        "let id = fn x => x + 1n\nlet left = id 1n\nlet right = id false\nlet both = { left: left, right: right }\nlet a = fn x => b x\nlet b = fn x => x",
+        "let id = fn x => x\nlet left = id 1n\nlet right = id false\nlet both = { left: left, right: right }\nlet a = fn x => b x\nlet b = fn x => a x",
+    ];
+    for revision in revisions {
+        let (mint, program) = program(&format!("{revision}{independent}"));
+        let before = serial.solved_groups();
+        let expected = serial.infer(&mint, &program, Trace::Complete);
+        let actual = parallel.infer(&mint, &program, Trace::Complete);
+        assert_eq!(
+            format!("{:?}", actual.semantics()),
+            format!("{:?}", expected.semantics())
+        );
+        assert_eq!(
+            format!("{:?}", actual.errors()),
+            format!("{:?}", expected.errors())
+        );
+        assert_eq!(
+            format!("{:?}", actual.diagnostics().steps()),
+            format!("{:?}", expected.diagnostics().steps())
+        );
+        assert_eq!(
+            format!("{:?}", actual.diagnostics().reasons()),
+            format!("{:?}", expected.diagnostics().reasons())
+        );
+        assert_eq!(
+            parallel.solved_groups(),
+            serial.solved_groups(),
+            "shared prerequisites must only be solved once"
+        );
+        let count = parallel.solved_groups();
+        parallel.infer(&mint, &program, Trace::Off);
+        assert_eq!(
+            parallel.solved_groups(),
+            count,
+            "unchanged rechecks must reuse every solve"
+        );
+        assert!(count > before);
+    }
+}
+
+#[test]
 fn edits_reuse_unaffected_groups_and_match_fresh_analysis() {
     let mut session = inference::Session::default();
     let (mint, before) = program("let id = fn x => x\nlet use = id 1n\nlet apart = true");
@@ -471,7 +526,7 @@ fn completion_understands_annotations_effect_qualifiers_and_pattern_binders() {
 
 #[test]
 fn active_file_requests_and_background_completion_share_one_revision() {
-    let mut host = ruddy::analysis::Host::default();
+    let mut host = ruddy::analysis::Host::with_execution(ruddy::execution::Execution::default());
     host.set_file("main.rud", Some("module Other\nlet value = 1n".into()));
     host.set_file(
         "Other.rud",

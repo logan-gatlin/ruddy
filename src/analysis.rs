@@ -65,6 +65,14 @@ fn bound(environment: &bundle::Environment) -> crate::types::Domains {
 }
 
 impl Host {
+    /// Use an explicit compiler execution policy for this editor host.
+    pub fn with_execution(execution: crate::execution::Execution) -> Self {
+        Self {
+            inference: inference::Session::with_execution(execution),
+            ..Self::default()
+        }
+    }
+
     /// `None` records deletion. Setting unchanged text does not create a revision.
     pub fn set_file(&mut self, path: &str, text: Option<String>) {
         if let Some(file) = self.files.get(path) {

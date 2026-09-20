@@ -416,12 +416,22 @@ fn semantic_names(root: &Ty, out: &mut HashSet<Symbol>, effects: &mut HashSet<St
 #[derive(Default)]
 pub struct Session {
     db: Db,
+    execution: crate::execution::Execution,
     source: Option<Source>,
     requested: usize,
     body_inputs: HashMap<Vec<Symbol>, Projection<Context>>,
 }
 
 impl Session {
+    /// Create a session with an explicit execution policy. Cloning the policy
+    /// shares its worker pool, while each session keeps its own query database.
+    pub fn with_execution(execution: crate::execution::Execution) -> Self {
+        Self {
+            execution,
+            ..Self::default()
+        }
+    }
+
     /// The number of group solves performed, useful for incremental work budgets.
     pub fn solved_groups(&self) -> usize {
         self.db.solved.load(Ordering::Relaxed)
@@ -590,13 +600,29 @@ impl Session {
             }
             wanted
         });
-        for body in &graph.bodies {
-            if wanted.as_ref().is_some_and(|wanted| !wanted.contains(body)) {
-                continue;
-            }
+        let requested: Vec<_> = graph
+            .bodies
+            .iter()
+            .filter(|body| wanted.as_ref().is_none_or(|wanted| wanted.contains(body)))
+            .copied()
+            .collect();
+        self.requested += requested.len();
+        // Warm the shared query cache concurrently, then borrow results from the
+        // original database in source order. These copyable query keys belong to
+        // the shared storage; the original database borrow keeps their revision
+        // alive until every worker has joined. No query result borrows escape.
+        // Focused editor requests usually touch a few mostly cached groups.
+        // Evaluate those directly to avoid pool dispatch and a second cache
+        // lookup; full/background checks can amortize scheduling across the graph.
+        if selected.is_none() {
+            self.execution
+                .for_each(self.db.clone(), &requested, |db, body| {
+                    solved(db, source, *body);
+                });
+        }
+        for body in requested {
             crate::cancellation::checkpoint();
-            self.requested += 1;
-            results.push(solved(&self.db, source, *body));
+            results.push(solved(&self.db, source, body));
         }
         assemble(mint, program, signatures.clone(), results, trace)
     }

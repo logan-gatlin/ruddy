@@ -11,6 +11,10 @@ name = "ruddy_interp"
 name = "ruddy-interp"
 path = "src/main.rs"
 
+[features]
+default = ["parallel"]
+parallel = ["ruddy/parallel"]
+
 [dependencies]
 indexmap = "2"
-ruddy = { package = "ruddy-compiler", path = ".." }
+ruddy = { package = "ruddy-compiler", path = "..", default-features = false }

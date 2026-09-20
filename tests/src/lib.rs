@@ -17,6 +17,7 @@ mod cli;
 mod compile;
 mod docs;
 mod entry;
+mod execution;
 mod fixed_integers;
 mod format;
 mod host_exports;
