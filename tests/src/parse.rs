@@ -1698,18 +1698,16 @@ fn quoted_tags_parse_everywhere_and_print_canonically() {
 }
 
 #[test]
-fn a_tag_binds_tighter_than_application() {
+fn application_arguments_do_not_consume_tag_payloads() {
     assert_eq!(parse_one("let v = #Some 1n"), "let v = #Some 1n");
     assert_eq!(parse_one("let v = #None"), "let v = #None");
-    assert_eq!(parse_one("let v = f #A 1n"), "let v = f (#A 1n)");
-    // Which is why a bare tag written as an argument comes back in
-    // parentheses: nothing follows it here, but the printer decides one node
-    // at a time, and a second argument after it would be read as the payload
-    // it has not got.
-    assert_eq!(parse_one("let v = f #A"), "let v = f (#A)");
-    // The same rule at the head of an application, where 'leaving them off
-    // would turn the argument into a payload and print the tree above.
-    assert_eq!(parse_one("let v = f (#A) 1n"), "let v = f (#A) 1n");
+    assert_eq!(parse_one("let v = f #A 1n"), "let v = f #A 1n");
+    assert_eq!(parse_one("let v = f (#A 1n)"), "let v = f (#A 1n)");
+    // A bare tag is a complete argument even when another argument follows.
+    assert_eq!(parse_one("let v = f #A"), "let v = f #A");
+    assert_eq!(parse_one("let v = f (#A) 1n"), "let v = f #A 1n");
+    // At the head, parentheses still distinguish applying a unit tag from
+    // constructing a tag carrying the following value.
     assert_eq!(parse_one("let v = (#A) 1n"), "let v = (#A) 1n");
     // The payload is a projection, so the field is carried rather than the
     // record it was read off.

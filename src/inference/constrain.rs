@@ -1524,7 +1524,7 @@ impl Constrain<'_> {
                     .enumerate()
                     .map(|(arm, pattern)| (arm, Col::Pattern(pattern)))
                     .collect();
-                let (demand, cover) = self.position(&columns, &mut Vec::new(), &root);
+                let (mut demand, cover) = self.position(&columns, &mut Vec::new(), &root);
                 // The column-to-constraint conversion: what the arms
                 // cover between them, over the finite presences the
                 // demand just minted. Its ordered per-arm forms also
@@ -1552,7 +1552,50 @@ impl Constrain<'_> {
                         }),
                         formula,
                     );
-                    qualifying = Some((raw, premise_reason));
+                    let effective = effective_conditions(&raw);
+                    qualifying = Some((raw, effective, premise_reason));
+                } else if arms
+                    .iter()
+                    .all(|(pattern, _)| matches!(pattern.anchored, ir::PatternKind::Tag { .. }))
+                {
+                    // A sum presence means that a case is possible, not that
+                    // this invocation selected it. Several cases may coexist,
+                    // so a later case must not negate the earlier cases as a
+                    // structural-presence match does. Each possible case
+                    // contributes its own conditional body requirements.
+                    let Ty::Sum(row) = &*demand else {
+                        unreachable!("a column containing only tag patterns is a sum")
+                    };
+                    let mut row = row.clone();
+                    for field in row.labels.values_mut() {
+                        field.presence = self.table.fresh_presence_for(Subject::PatternDemand);
+                    }
+                    let raw: Vec<Formula> = arms
+                        .iter()
+                        .map(|(pattern, _)| {
+                            let ir::PatternKind::Tag { name, .. } = &pattern.anchored else {
+                                unreachable!("tag arms checked above")
+                            };
+                            row.labels[&name.anchored].presence.formula()
+                        })
+                        .collect();
+                    // Exhaustiveness remains the pattern matrix's job: a
+                    // disjunction of possible cases is not a coverage formula
+                    // (and the empty sum is a valid, uninhabited input).
+                    let premise_reason = self.table.require(
+                        span,
+                        Origin::Refinement(Named {
+                            labels: row
+                                .labels
+                                .iter()
+                                .map(|(name, field)| (name.clone(), field.presence.clone()))
+                                .collect(),
+                            shape: Some(Shape::Sum),
+                        }),
+                        Formula::True,
+                    );
+                    demand = Arc::new(Ty::Sum(row));
+                    qualifying = Some((raw.clone(), raw, premise_reason));
                 }
                 demand
             }
@@ -1588,8 +1631,7 @@ impl Constrain<'_> {
         }
 
         match qualifying {
-            Some((raw, premise_reason)) => {
-                let effective = effective_conditions(&raw);
+            Some((raw, effective, premise_reason)) => {
                 let mut guarded = Vec::with_capacity(arms.len());
                 for ((((pattern, body), raw), effective), opens) in
                     arms.iter_mut().zip(raw).zip(effective).zip(arm_opens)

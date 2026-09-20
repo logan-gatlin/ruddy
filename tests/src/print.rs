@@ -436,17 +436,13 @@ fn both_trees_render_a_sum_the_same_way() {
     }
 }
 
-/// A tag with no payload is a word still waiting for one, so both printers put
-/// it in parentheses wherever an atom could follow it. Without them the printed
-/// source reads back as a different tree: `f (#A) 1` is `f` applied to the
-/// case and then to `1`, while `f #A 1` is `f` applied to a case carrying
-/// `1` — one printed program, two meanings, and the one it re-parses as is not
-/// the one it was printed from.
+/// Bare tags are complete application arguments. At expression head or as
+/// another tag's payload, parentheses still prevent consuming the next atom.
 #[test]
 fn a_tag_with_no_payload_is_kept_off_what_follows_it() {
     for source in [
-        "let f = fn a => a\nlet v = f (#A) 1n",
-        "let f = fn a => a\nlet v = f (#A)",
+        "let f = fn a => a\nlet v = f #A 1n",
+        "let f = fn a => a\nlet v = f #A",
         "let f = fn a => a\nlet v = (#A) 1n",
         // As a payload, where the same argument applies: the inner tag would
         // take the `1` the outer one is applied to.

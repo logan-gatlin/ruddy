@@ -2007,7 +2007,7 @@
       "members": [
         {
           "type": "SYMBOL",
-          "name": "_atom"
+          "name": "_argument_atom"
         },
         {
           "type": "ALIAS",
@@ -2042,7 +2042,7 @@
               "members": [
                 {
                   "type": "SYMBOL",
-                  "name": "_atom"
+                  "name": "_argument_atom"
                 },
                 {
                   "type": "ALIAS",
@@ -2093,7 +2093,46 @@
         ]
       }
     },
+    "_argument_atom": {
+      "type": "CHOICE",
+      "members": [
+        {
+          "type": "SYMBOL",
+          "name": "_non_tag_atom"
+        },
+        {
+          "type": "ALIAS",
+          "content": {
+            "type": "SYMBOL",
+            "name": "_bare_tag_expression"
+          },
+          "named": true,
+          "value": "tag_expression"
+        }
+      ]
+    },
+    "_bare_tag_expression": {
+      "type": "FIELD",
+      "name": "name",
+      "content": {
+        "type": "SYMBOL",
+        "name": "tag"
+      }
+    },
     "_atom": {
+      "type": "CHOICE",
+      "members": [
+        {
+          "type": "SYMBOL",
+          "name": "_non_tag_atom"
+        },
+        {
+          "type": "SYMBOL",
+          "name": "tag_expression"
+        }
+      ]
+    },
+    "_non_tag_atom": {
       "type": "CHOICE",
       "members": [
         {
@@ -2131,10 +2170,6 @@
         {
           "type": "SYMBOL",
           "name": "tuple_expression"
-        },
-        {
-          "type": "SYMBOL",
-          "name": "tag_expression"
         },
         {
           "type": "SYMBOL",
@@ -2860,8 +2895,17 @@
                 "type": "FIELD",
                 "name": "payload",
                 "content": {
-                  "type": "SYMBOL",
-                  "name": "_argument"
+                  "type": "CHOICE",
+                  "members": [
+                    {
+                      "type": "SYMBOL",
+                      "name": "tag_expression"
+                    },
+                    {
+                      "type": "SYMBOL",
+                      "name": "_argument"
+                    }
+                  ]
                 }
               },
               {

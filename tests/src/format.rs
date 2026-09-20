@@ -79,6 +79,14 @@ fn a_definition_is_printed_on_one_line_when_it_fits() {
 }
 
 #[test]
+fn tag_arguments_keep_payloads_and_following_arguments_distinct() {
+    assert_eq!(
+        fmt("let a=get_channel #Red {r:1}\nlet b=f (#Some 1n) #None\nlet c=f (#Red) x"),
+        "let a = get_channel #Red { r: 1 }\nlet b = f (#Some 1n) #None\nlet c = f #Red x\n"
+    );
+}
+
+#[test]
 fn discard_bindings_preserve_their_written_form() {
     assert_eq!(fmt("_  =  tick ()"), "_ = tick ()\n");
     assert_eq!(fmt("_ : Nat = 1n"), "_: Nat = 1n\n");
@@ -404,7 +412,7 @@ fn operators_keep_their_grouping() {
         fmt(
             "let last = f x #None\nlet mid = f #None x\nlet pay = #Some #None\nlet pay2 = #Some (f x)\nlet head = (#A 1n) 2n"
         ),
-        "let last = f x #None\nlet mid = f (#None x)\nlet pay = #Some (#None)\nlet pay2 = #Some (f x)\nlet head = #A 1n 2n\n"
+        "let last = f x #None\nlet mid = f #None x\nlet pay = #Some (#None)\nlet pay2 = #Some (f x)\nlet head = #A 1n 2n\n"
     );
     assert_eq!(
         fmt(

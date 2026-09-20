@@ -2080,11 +2080,10 @@ impl<'a> Printer<'a> {
                 let head = current;
                 let signal =
                     self.gaps_have_newline(head.span.end(), args.iter().map(|(_, arg)| arg.span));
-                // The last argument alone may be a bare tag: nothing follows
-                // an application that could be read as the tag's payload.
-                let arg_doc = |at: usize, arg: &Expr| {
-                    let bare_tag = at + 1 == args.len()
-                        && matches!(arg.tracked, ExprKind::Tag { payload: None, .. });
+                // Bare tags are complete arguments; payload-bearing tags
+                // still need parentheses to keep their payload with them.
+                let arg_doc = |arg: &Expr| {
+                    let bare_tag = matches!(arg.tracked, ExprKind::Tag { payload: None, .. });
                     let mut parts = self.leading_docs(arg.span);
                     parts.push(self.expr_after(arg, prec(arg) < Prec::Atom && !bare_tag));
                     concat(parts)
@@ -2093,7 +2092,7 @@ impl<'a> Printer<'a> {
                 let mut rest = Vec::new();
                 for (at, (node, arg)) in args.iter().enumerate() {
                     rest.push(Doc::Line);
-                    rest.push(arg_doc(at, arg));
+                    rest.push(arg_doc(arg));
                     if at + 1 < args.len() {
                         rest.extend(self.trailing_docs(node.span));
                     }
@@ -2110,7 +2109,7 @@ impl<'a> Printer<'a> {
                     let mut hugged = vec![head_doc];
                     for (at, (node, arg)) in args.iter().enumerate() {
                         hugged.push(Doc::Space);
-                        hugged.push(arg_doc(at, arg));
+                        hugged.push(arg_doc(arg));
                         if at + 1 < args.len() {
                             hugged.extend(self.trailing_docs(node.span));
                         }

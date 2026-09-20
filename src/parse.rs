@@ -2815,7 +2815,7 @@ impl Parser {
     fn application(&mut self) -> Option<Expr> {
         let mut func = self.projection()?;
         while self.at_expr_atom() {
-            let arg = self.projection()?;
+            let arg = self.projection_with_tag_payload(false)?;
             let span = func.span.merge(arg.span);
             func = span.track(ExprKind::Apply {
                 func: Box::new(func),
@@ -2841,7 +2841,16 @@ impl Parser {
     /// "unexpected token" about the line below and `a` would silently be
     /// whatever `p` is.
     fn projection(&mut self) -> Option<Expr> {
-        let mut base = self.atom()?;
+        self.projection_with_tag_payload(true)
+    }
+
+    fn projection_with_tag_payload(&mut self, tag_payload: bool) -> Option<Expr> {
+        let mut base =
+            if !tag_payload && matches!(self.peek().map(|tok| &tok.tracked), Some(Kind::Tag(_))) {
+                self.tag_expr(false)?
+            } else {
+                self.atom()?
+            };
         loop {
             if matches!(self.peek().map(|tok| &tok.tracked), Some(Kind::DotDot)) {
                 return self.expected(Expected::Field);
@@ -2917,7 +2926,7 @@ impl Parser {
             Kind::LeftBrace => self.struct_expr(),
             Kind::LeftBracket => self.array_expr(),
             Kind::LeftParen => self.paren_expr(),
-            Kind::Tag(_) => self.tag_expr(),
+            Kind::Tag(_) => self.tag_expr(true),
             Kind::EffectLabel(_) => self.operation_expr(),
             Kind::String(value) => {
                 let value = value.clone();
@@ -3023,11 +3032,9 @@ impl Parser {
 
     /// `#Some <atom>` — one case of a sum, with what it carries.
     ///
-    /// The payload is one atom, taken greedily, which is what makes a tag bind
-    /// tighter than application: `f #A 1` is `f` applied to `#A 1`
-    /// rather than `f #A` applied to `1`. A tag carries one thing, so
-    /// there is nothing for the second reading to mean, and the greedy one is
-    /// what a reader writing a constructor expects.
+    /// At the head of an expression the payload is one atom, taken greedily.
+    /// In application argument position a tag stands alone: `f #A 1` passes
+    /// two arguments. A payload-bearing argument is written `f (#A 1)`.
     ///
     /// Through [`projection`](Self::projection) rather than
     /// [`atom`](Self::atom), so that `#Some p.x` carries the field rather
@@ -3037,9 +3044,9 @@ impl Parser {
     /// unit. That is not decided here: this records what was written, and
     /// lowering is where `#None` and `#None ()` meet — the same
     /// division `()` and `{}` already keep.
-    fn tag_expr(&mut self) -> Option<Expr> {
+    fn tag_expr(&mut self, allow_payload: bool) -> Option<Expr> {
         let name = self.tag().expect("the caller peeked a tag");
-        let payload = match self.at_expr_atom() {
+        let payload = match allow_payload && self.at_expr_atom() {
             true => Some(self.projection()?),
             false => None,
         };

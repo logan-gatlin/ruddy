@@ -33,7 +33,7 @@ let a = f p.x
         (identifier)))))
 
 ================================================================================
-A tag takes its payload before an application takes another argument
+A bare tag is one application argument
 ================================================================================
 
 let a = f #A 1
@@ -44,10 +44,11 @@ let a = f #A 1
   (let_definition
     (identifier)
     (application
-      (identifier)
-      (tag_expression
-        (tag)
-        (natural)))))
+      (application
+        (identifier)
+        (tag_expression
+          (tag)))
+      (natural))))
 
 ================================================================================
 A tag's payload is taken greedily
@@ -65,6 +66,29 @@ let a = #A #B x
       (tag_expression
         (tag)
         (identifier)))))
+
+================================================================================
+Payload-bearing tag arguments use parentheses
+================================================================================
+
+let a = f (#Some 1) #None x
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (let_definition
+    (identifier)
+    (application
+      (application
+        (application
+          (identifier)
+          (parenthesized_expression
+            (tag_expression
+              (tag)
+              (natural))))
+        (tag_expression
+          (tag)))
+      (identifier))))
 
 ================================================================================
 A function's body runs as far right as it can

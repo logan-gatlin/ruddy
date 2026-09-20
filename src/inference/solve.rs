@@ -1150,6 +1150,21 @@ impl Solve<'_> {
             self.run(&arm.constraints);
         }
 
+        if matches!(&**scrutinee, Ty::Sum(_)) {
+            // Case presences describe all variants admitted by a type, not
+            // the runtime choice of one arm. They guard input requirements,
+            // but each result must still belong to the same ordinary result
+            // type. In particular, two possible tags returning different
+            // tags must form a sum, not require both runtime results at once.
+            self.guard = enclosing_guard;
+            self.guard_reasons = enclosing_guard_reasons;
+            self.active_refinement = enclosing_refinement;
+            for arm in arms {
+                self.run(std::slice::from_ref(&arm.result));
+            }
+            return;
+        }
+
         // Build the structural family after every body-local constraint has
         // had its ordinary say. Its finite label unions carry fresh presences;
         // relating those to each arm under that arm's premise is where the
@@ -3653,6 +3668,7 @@ impl Solve<'_> {
             return;
         }
 
+        let error_start = self.errors.len();
         for (name, field) in &extras {
             let presence = self.table.presence_of(&field.presence);
             // A label certainly there, demanded of a variable. The
@@ -3723,9 +3739,10 @@ impl Solve<'_> {
         }
         // And whatever would have continued past them allows nothing more
         // either, which is this side's own tail said of it. Skipped where
-        // `rest` already allows nothing more, which would be a step saying what
-        // both sides had already said.
-        if !rest.closed() {
+        // both tails are already closed. A rigid tail is not closed: even
+        // when every extra label settles absent, it must still agree with
+        // the remainder. Avoid a second complaint after a rigid-field error.
+        if !rest.closed() || (rigid.is_some() && self.errors.len() == error_start) {
             match side {
                 Side::Expected => self.tails(span, tail, rest),
                 Side::Actual => self.tails(span, rest, tail),

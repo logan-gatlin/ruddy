@@ -828,7 +828,7 @@ let read_document: codec::Decoder 'a -> Limits -> String -> Result 'a Error =
         (fn at => result::map
           (fn parsed => ((), parsed.1))
           (parse_value input at (array::len (~stack)) limits))
-    | codec::!Read.begin_record _ => open (#Record) "{" "an object"
+    | codec::!Read.begin_record _ => open #Record "{" "an object"
     | codec::!Read.next_field cursor =>
       chain
         (fn frame =>
@@ -862,9 +862,9 @@ let read_document: codec::Decoder 'a -> Limits -> String -> Result 'a Error =
                 end)
               (#Some (skip_whitespace input (~pos)))
           end)
-        (top (#Record) cursor)
-    | codec::!Read.end_record cursor => close (#Record) cursor "}"
-    | codec::!Read.begin_sequence _ => open (#Sequence) "[" "an array"
+        (top #Record cursor)
+    | codec::!Read.end_record cursor => close #Record cursor "}"
+    | codec::!Read.begin_sequence _ => open #Sequence "[" "an array"
     | codec::!Read.next_element cursor =>
       chain
         (fn frame =>
@@ -893,8 +893,8 @@ let read_document: codec::Decoder 'a -> Limits -> String -> Result 'a Error =
                 end
             end
           end)
-        (top (#Sequence) cursor)
-    | codec::!Read.end_sequence cursor => close (#Sequence) cursor "]"
+        (top #Sequence cursor)
+    | codec::!Read.end_sequence cursor => close #Sequence cursor "]"
     | codec::!Read.begin_variant _ =>
       chain
         (fn cursor =>
@@ -932,8 +932,8 @@ let read_document: codec::Decoder 'a -> Limits -> String -> Result 'a Error =
                 end)
               (scan_string input at []))
             (expect input (skip_whitespace input (~pos)) "\""))
-        (open (#Variant) "{" "an object")
-    | codec::!Read.end_variant cursor => close (#Variant) cursor "}"
+        (open #Variant "{" "an object")
+    | codec::!Read.end_variant cursor => close #Variant cursor "}"
     end with
     | #Some value =>
       if not ~done or not nat::is_zero (array::len (~stack)) then
@@ -1078,7 +1078,7 @@ let encode_with: codec::Encoder 'a -> Limits -> 'a -> Result String Error =
       else range "a finite number" (real_token r)
       end
     | codec::!Write.write_text text => scalar (quote text)
-    | codec::!Write.begin_record schema => open (#Record) (array::len schema.fields) "{"
+    | codec::!Write.begin_record schema => open #Record (array::len schema.fields) "{"
     | codec::!Write.write_field field =>
       chain
         (fn frame =>
@@ -1088,12 +1088,12 @@ let encode_with: codec::Encoder 'a -> Limits -> 'a -> Result String Error =
               (fn _ => emit (str::concat (quote field.name) ":"))
               (separate frame)
           end)
-        (top (#Record) field.cursor)
+        (top #Record field.cursor)
     | codec::!Write.end_record cursor =>
       chain
-        (fn frame => close (#Record) cursor frame.declared "}")
-        (top (#Record) cursor)
-    | codec::!Write.begin_sequence count => open (#Sequence) count "["
+        (fn frame => close #Record cursor frame.declared "}")
+        (top #Record cursor)
+    | codec::!Write.begin_sequence count => open #Sequence count "["
     | codec::!Write.next_element cursor =>
       chain
         (fn frame =>
@@ -1102,11 +1102,11 @@ let encode_with: codec::Encoder 'a -> Limits -> 'a -> Result String Error =
             protocol "more elements than the sequence declared"
           else separate frame
           end)
-        (top (#Sequence) cursor)
+        (top #Sequence cursor)
     | codec::!Write.end_sequence cursor =>
       chain
-        (fn frame => close (#Sequence) cursor frame.declared "]")
-        (top (#Sequence) cursor)
+        (fn frame => close #Sequence cursor frame.declared "]")
+        (top #Sequence cursor)
     | codec::!Write.begin_variant opened =>
       if array::any (fn known => str::equal known opened.tag) opened.schema.cases then
         chain
@@ -1116,10 +1116,10 @@ let encode_with: codec::Encoder 'a -> Limits -> 'a -> Result String Error =
               return #Some cursor
             end)
             (emit (str::concat "\"tag\":" (str::concat (quote opened.tag) ",\"value\":"))))
-          (open (#Variant) 0n "{")
+          (open #Variant 0n "{")
       else protocol (str::concat "not a case of the sum: " opened.tag)
       end
-    | codec::!Write.end_variant cursor => close (#Variant) cursor 0n "}"
+    | codec::!Write.end_variant cursor => close #Variant cursor 0n "}"
     end with
     | #Some _ =>
       if not ~done or not nat::is_zero (array::len (~stack)) then

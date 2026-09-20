@@ -177,8 +177,8 @@ pub enum Prec {
     /// between the two: a tag that already carries something groups as the
     /// application it reads as and may head one, `#A 1 2` being `#A 1`
     /// applied to `2`, while a bare tag heading one would swallow the argument
-    /// it was applied to — `f (#A) 1` printed without the parentheses reads
-    /// back as `f (#A 1)`.
+    /// it was applied to — `(#A) 1` printed without the parentheses reads
+    /// back as `#A 1`. In argument position a bare tag stands alone.
     Tag,
     /// `func arg`.
     Apply,
@@ -4351,7 +4351,7 @@ pub fn write_apply(
 ) -> fmt::Result {
     write_grouped(f, func.prec() < Prec::Apply, func)?;
     f.write_str(" ")?;
-    write_grouped(f, arg.prec() < Prec::Atom, arg)
+    write_grouped(f, arg.prec() < Prec::Atom && arg.prec() != Prec::Tag, arg)
 }
 
 /// Render `head arg arg ...` — the flat form of [`write_apply`], for the type
