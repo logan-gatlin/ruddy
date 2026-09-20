@@ -552,8 +552,12 @@ compiler's address size. The maximum is inclusive, can be raised or lowered,
 and does not change the budget of other definitions or called functions.
 A zero maximum permits no product terms, including the empty product for
 `always`. Terms are counted during projection, before minimization; this is
-independent of the size of the printed `where` clause. A larger maximum may
-require more compilation time and memory.
+independent of the size of the printed `where` clause. Independent groups of
+constraints remain separate factors instead of expanding every combination.
+Their alternative product terms share the budget additively; single-product
+factors can be conjoined without branching and together cost one term when
+there are no alternatives. A larger maximum may require more compilation
+time and memory.
 
 A [foreign value](dictionary.md#foreign-value) uses `extern name: Type = "target expression"` and requires an explicit type.
 Within an `extern` type, `fn(A, B) -> R` describes a foreign function that receives two arguments in one call.
