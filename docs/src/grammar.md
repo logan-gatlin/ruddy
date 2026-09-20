@@ -112,7 +112,9 @@ All elements have a compatible element type.
 Structs, tuples, and arrays allow a trailing comma.
 
 A [spread](dictionary.md#spread) uses `..` to include fields or elements from another value.
-A struct allows one spread, written last; explicitly written fields replace fields with the same name.
+A struct or tuple allows one spread, written last; explicitly written fields replace fields with the same name.
+Tuple spreads use positional field names: `(99n, ..(1n, 2n))` is `{ 0: 99n, ..{ 0: 1n, 1: 2n } }`, producing `(99n, 2n)`.
+`(..value)` copies all fields from a struct or tuple.
 An array allows several spreads in any position.
 For example, a spread adds an enemy while retaining the existing enemies:
 
@@ -193,12 +195,14 @@ Patterns appear after `let` and in [pattern matching](dictionary.md#pattern-matc
 | `{ name, sprite: image }` | Match fields and bind their values |
 | `{ name, .. }` | Match a field while allowing additional fields |
 | `(first, second)` | Match tuple positions |
+| `(first, second, ..)` | Match initial tuple positions while allowing additional fields |
 | `[]`, `[first, second]` | Match an exact array length |
 | `[first, ..rest]`, `[first, .., last]` | Match an array with a variable number of middle elements |
 | `#Some value`, `#None` | Match a tag and any value it carries |
 | `hide 'item pattern` | Open a [hidden type](dictionary.md#hidden-type), naming its type `'item` for the arm |
 
-A struct pattern's `..` must be last and cannot bind a name.
+A struct or tuple pattern's `..` must be last and cannot bind a name.
+`let (a, b, ..) = value` is shorthand for `let { 0: a, 1: b, .. } = value`.
 An array pattern permits at most one `..`, optionally followed by a name for the remaining elements.
 A hidden pattern takes the pattern after its variable greedily, so `hide 'a #Some x` opens onto `#Some x`.
 Patterns can contain other patterns.

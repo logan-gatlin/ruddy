@@ -840,3 +840,16 @@ let record = { 001: 2, x: (3, 4) }
         (tuple_expression
           (natural)
           (natural))))))
+
+================================================================================
+Tuple spreads keep struct semantics
+================================================================================
+
+let x = (1n, ..base)
+let y = (..base,)
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (let_definition (identifier) (tuple_expression (natural) (spread (identifier))))
+  (let_definition (identifier) (tuple_expression (spread (identifier)))))

@@ -1150,3 +1150,18 @@ fn comparison_formatting_preserves_explicit_grouping_and_comments() {
     let source = "let x = (a == b)\n  -- compare the result\n  == c\n";
     assert_eq!(fmt(source), source);
 }
+
+#[test]
+fn tuple_rest_patterns_format_and_round_trip() {
+    assert_eq!(fmt("let (a,b,..)=value"), "let (a, b, ..) = value\n");
+    assert_eq!(fmt("let (..,)=value"), "let (..) = value\n");
+    let source = "let (a,\n -- remaining fields\n ..) = value";
+    assert!(fmt(source).contains("-- remaining fields"));
+}
+
+#[test]
+fn tuple_spreads_format_and_preserve_comments() {
+    assert_eq!(fmt("let x=(1n,..base,)"), "let x = (1n, ..base)\n");
+    assert_eq!(fmt("let x=(..base,)"), "let x = (..base)\n");
+    assert!(fmt("let x=(1n,\n -- other fields\n ..base)").contains("-- other fields"));
+}

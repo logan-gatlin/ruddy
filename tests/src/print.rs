@@ -1260,3 +1260,20 @@ fn hidden_forms_print_to_a_fixed_point() {
         );
     }
 }
+
+#[test]
+fn tuple_rest_patterns_print_as_open_structs_after_lowering() {
+    let (ast, ir) = printed("let pick = fn p => match p with | (a, b, ..) => b end");
+    assert_eq!(ast, "let pick = fn p => match p with | (a, b, ..) => b end");
+    assert_eq!(
+        ir,
+        "let pick = fn p => match p with | { 0: a, 1: b, .. } => b end"
+    );
+}
+
+#[test]
+fn tuple_spreads_lower_to_struct_spreads() {
+    let (ast, ir) = printed("let update = fn p => (1n, ..p)");
+    assert_eq!(ast, "let update = fn p => (1n, ..p)");
+    assert_eq!(ir, "let update = fn p => { 0: 1n, ..p }");
+}

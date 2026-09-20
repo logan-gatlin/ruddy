@@ -360,11 +360,20 @@ fn expr_node(ids: &mut Ids, expr: &Expr) -> Node {
         .child(expr_role_node(ids, "Predicate", predicate))
         .child(expr_role_node(ids, "Then", consequent))
         .child(expr_role_node(ids, "Else", alternative)),
-        ExprKind::Tuple(elements) => Node {
+        ExprKind::Tuple { elements, spread } => Node {
             label: "Tuple".into(),
             ..node
         }
-        .children(elements.iter().map(|element| expr_node(ids, element))),
+        .children(elements.iter().map(|element| expr_node(ids, element)))
+        .children(spread.iter().map(|spread| {
+            Node::new(
+                ids.next(),
+                "Spread",
+                format!("..{}", print::ast::expr(&spread.value.tracked)),
+            )
+            .at(spread.span.merge(spread.value.span))
+            .child(expr_node(ids, &spread.value))
+        })),
         // A spread item is shown as a row of its own around the value it
         // spreads, the way a struct's `..` is shown beside its fields.
         ExprKind::Array(items) => Node {
@@ -605,11 +614,20 @@ fn pattern_node(ids: &mut Ids, pattern: &Pattern) -> Node {
             Node::new(ids.next(), "Variable", format!("'{}", variable.tracked)).at(variable.span),
         )
         .child(pattern_node(ids, pattern)),
-        PatternKind::Tuple(elements) => Node {
-            label: "Tuple".into(),
-            ..node
+        PatternKind::Tuple { elements, rest } => {
+            let mut kids: Vec<Node> = elements
+                .iter()
+                .map(|element| pattern_node(ids, element))
+                .collect();
+            if let Some(rest) = rest {
+                kids.push(Node::new(ids.next(), "Rest", "..").at(*rest));
+            }
+            Node {
+                label: "Tuple".into(),
+                ..node
+            }
+            .children(kids)
         }
-        .children(elements.iter().map(|element| pattern_node(ids, element))),
         PatternKind::Struct { fields, rest } => {
             let mut kids: Vec<Node> = fields
                 .iter()

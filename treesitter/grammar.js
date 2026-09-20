@@ -753,17 +753,19 @@ module.exports = grammar({
       field('effect', choice($.effect_label, $.effect_path)),
     ),
 
-    /** `(a, b)` — a positional struct; a singleton keeps its comma. */
+    /** Positional structs permit one trailing spread. */
     tuple_expression: $ => seq(
       '(',
-      field('element', $._expression),
-      ',',
-      optional(seq(
-        field('element', $._expression),
-        repeat(seq(',', field('element', $._expression))),
-        optional(','),
-      )),
+      choice(
+        seq($.spread, optional(',')),
+        seq(field('element', $._expression), ',', optional($._tuple_expression_tail)),
+      ),
       ')',
+    ),
+
+    _tuple_expression_tail: $ => choice(
+      seq($.spread, optional(',')),
+      seq(field('element', $._expression), optional(seq(',', optional($._tuple_expression_tail)))),
     ),
 
     /**
@@ -872,17 +874,26 @@ module.exports = grammar({
       optional(field('payload', $._pattern)),
     )),
 
-    /** `(a, b)` — an exact positional struct pattern. */
+    /** Positional struct patterns may end with a bare rest. */
     tuple_pattern: $ => seq(
       '(',
-      field('element', $._pattern),
-      ',',
-      optional(seq(
-        field('element', $._pattern),
-        repeat(seq(',', field('element', $._pattern))),
-        optional(','),
-      )),
+      choice(
+        seq(alias($._struct_rest, $.rest_pattern), optional(',')),
+        seq(
+          field('element', $._pattern),
+          ',',
+          optional($._tuple_pattern_tail),
+        ),
+      ),
       ')',
+    ),
+
+    _tuple_pattern_tail: $ => choice(
+      seq(alias($._struct_rest, $.rest_pattern), optional(',')),
+      seq(
+        field('element', $._pattern),
+        optional(seq(',', optional($._tuple_pattern_tail))),
+      ),
     ),
 
     parenthesized_pattern: $ => seq('(', $._pattern, ')'),

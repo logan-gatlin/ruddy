@@ -2323,10 +2323,24 @@ impl<'a> Printer<'a> {
                     signal,
                 )
             }
-            ExprKind::Tuple(elements) => {
-                let signal =
-                    self.gaps_have_newline(expr.span.start + 1, elements.iter().map(|e| e.span));
-                let trailing = if elements.len() == 1 {
+            ExprKind::Tuple { elements, spread } => {
+                let mut entries: Vec<_> = elements
+                    .iter()
+                    .map(|element| (element.span, self.expr(element)))
+                    .collect();
+                if let Some(spread) = spread {
+                    let span = spread.span.merge(spread.value.span);
+                    entries.push((
+                        span,
+                        self.with_comments(
+                            span,
+                            concat(vec![text(".."), self.expr(&spread.value)]),
+                        ),
+                    ));
+                }
+                let signal = self
+                    .gaps_have_newline(expr.span.start + 1, entries.iter().map(|(span, _)| *span));
+                let trailing = if elements.len() == 1 && spread.is_none() {
                     text(",")
                 } else {
                     if_break(text(","), nil())
@@ -2334,7 +2348,7 @@ impl<'a> Printer<'a> {
                 self.brackets(
                     "(",
                     ")",
-                    elements.iter().map(|element| self.expr(element)).collect(),
+                    entries.into_iter().map(|(_, doc)| doc).collect(),
                     trailing,
                     self.dangling_docs(expr.span),
                     signal,
@@ -2596,21 +2610,27 @@ impl<'a> Printer<'a> {
                     signal,
                 )
             }
-            PatternKind::Tuple(elements) => {
-                let signal =
-                    self.gaps_have_newline(pattern.span.start + 1, elements.iter().map(|e| e.span));
-                let trailing = if elements.len() == 1 {
+            PatternKind::Tuple { elements, rest } => {
+                let signal = self.gaps_have_newline(
+                    pattern.span.start + 1,
+                    elements.iter().map(|e| e.span).chain(rest.iter().copied()),
+                );
+                let trailing = if elements.len() == 1 && rest.is_none() {
                     text(",")
                 } else {
                     if_break(text(","), nil())
                 };
+                let mut entries: Vec<_> = elements
+                    .iter()
+                    .map(|element| self.pattern(element))
+                    .collect();
+                if let Some(rest) = rest {
+                    entries.push(self.with_comments(*rest, text("..")));
+                }
                 self.brackets(
                     "(",
                     ")",
-                    elements
-                        .iter()
-                        .map(|element| self.pattern(element))
-                        .collect(),
+                    entries,
                     trailing,
                     self.dangling_docs(pattern.span),
                     signal,
@@ -3173,15 +3193,18 @@ impl<'a> Printer<'a> {
                 }
                 return Skel::new(expr.span, kids).closed();
             }
-            ExprKind::Tuple(elements) => {
-                return Skel::new(
-                    expr.span,
-                    elements
-                        .iter()
-                        .map(|element| self.expr_skeleton(element))
-                        .collect(),
-                )
-                .closed();
+            ExprKind::Tuple { elements, spread } => {
+                let mut kids: Vec<_> = elements
+                    .iter()
+                    .map(|element| self.expr_skeleton(element))
+                    .collect();
+                if let Some(spread) = spread {
+                    kids.push(Skel::new(
+                        spread.span.merge(spread.value.span),
+                        vec![self.expr_skeleton(&spread.value)],
+                    ));
+                }
+                return Skel::new(expr.span, kids).closed();
             }
             ExprKind::Array(items) => {
                 return Skel::new(
@@ -3279,7 +3302,7 @@ fn layout_of(expr: &Expr) -> Layout {
 fn delimited(expr: &Expr) -> bool {
     matches!(
         expr.tracked,
-        ExprKind::Struct { .. } | ExprKind::Tuple(_) | ExprKind::Array(_)
+        ExprKind::Struct { .. } | ExprKind::Tuple { .. } | ExprKind::Array(_)
     )
 }
 
@@ -3352,7 +3375,10 @@ fn expr_children(expr: &Expr) -> Vec<&Expr> {
             out.extend(spread.as_ref().map(|spread| spread.value.as_ref()));
             out
         }
-        ExprKind::Tuple(elements) => elements.iter().collect(),
+        ExprKind::Tuple { elements, spread } => elements
+            .iter()
+            .chain(spread.iter().map(|spread| spread.value.as_ref()))
+            .collect(),
         ExprKind::Array(items) => items.iter().map(|item| &item.value).collect(),
         ExprKind::Tag { payload, .. } => payload.iter().map(Box::as_ref).collect(),
         ExprKind::Project { base, .. } => vec![base],
@@ -3447,9 +3473,13 @@ fn pattern_skeleton(pattern: &Pattern) -> Skel {
             }
             Skel::new(pattern.span, kids).closed()
         }
-        PatternKind::Tuple(elements) => Skel::new(
+        PatternKind::Tuple { elements, rest } => Skel::new(
             pattern.span,
-            elements.iter().map(pattern_skeleton).collect(),
+            elements
+                .iter()
+                .map(pattern_skeleton)
+                .chain(rest.iter().map(|span| Skel::leaf(*span)))
+                .collect(),
         )
         .closed(),
         PatternKind::Array {
