@@ -18,9 +18,21 @@ fn editor_request(
     let root = format!("file://{}/", tree.path().display());
     let uri = format!("{root}main.rud");
     let (server, client) = Connection::memory();
-    let worker = std::thread::spawn(move || ruddy_cli::lsp::serve(server).unwrap());
+    let (finished, completion) = std::sync::mpsc::sync_channel(1);
+    let worker = std::thread::spawn(move || {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            ruddy_cli::lsp::serve(server)
+        }));
+        let _ = finished.send(result);
+    });
+    let case = std::thread::current()
+        .name()
+        .unwrap_or("unnamed")
+        .to_owned();
     let expect_valid = method == "textDocument/codeAction";
     let request = |id: i32, method: &str, params| {
+        let started = std::time::Instant::now();
+        let timeout = Duration::from_secs(60);
         client
             .sender
             .send(Message::Request(Request::new(
@@ -28,14 +40,28 @@ fn editor_request(
                 method.into(),
                 params,
             )))
-            .unwrap();
+            .unwrap_or_else(|error| {
+                panic!("{case}: could not send LSP request {id} ({method}): {error}")
+            });
         loop {
+            assert!(
+                started.elapsed() < timeout,
+                "{case}: LSP request {id} ({method}) timed out after {:.1?} (deadline {timeout:?})",
+                started.elapsed()
+            );
             match client
                 .receiver
-                .recv_timeout(Duration::from_secs(60))
-                .unwrap()
+                .recv_timeout(timeout.saturating_sub(started.elapsed()))
+                .unwrap_or_else(|error| {
+                    panic!("{case}: LSP request {id} ({method}) failed after {:.1?} (deadline {timeout:?}): {error}", started.elapsed())
+                })
             {
-                Message::Response(response) => break response.response_result.unwrap(),
+                Message::Response(response) => {
+                    assert_eq!(response.id, id.into(), "{case}: unexpected response to {method}");
+                    break response.response_result.unwrap_or_else(|error| {
+                        panic!("{case}: LSP request {id} ({method}) returned an error after {:.1?}: {error:?}", started.elapsed())
+                    });
+                }
                 Message::Notification(note)
                     if expect_valid && note.method == "textDocument/publishDiagnostics" =>
                 {
@@ -53,33 +79,63 @@ fn editor_request(
             }
         }
     };
-    request(
-        1,
-        "initialize",
-        json!({"rootUri":root,"capabilities":{"workspace":{"workspaceEdit":{"documentChanges":true}}}}),
-    );
-    client
-        .sender
-        .send(Message::Notification(Notification::new(
-            "initialized".into(),
-            json!({}),
-        )))
-        .unwrap();
-    client.sender.send(Message::Notification(Notification::new("textDocument/didOpen".into(), json!({"textDocument":{"uri":uri,"languageId":"ruddy","version":1,"text":files.iter().find(|(path, _)| *path == "main.rud").unwrap().1}})))).unwrap();
-    let mut result = request(
-        2,
-        method,
-        json!({"textDocument":{"uri":uri},"position":{"line":line,"character":character},"range":{"start":{"line":0,"character":0},"end":{"line":files[0].1.lines().count(),"character":0}},"context":{"diagnostics":[]}}),
-    );
-    request(3, "shutdown", json!(null));
-    client
-        .sender
-        .send(Message::Notification(Notification::new(
-            "exit".into(),
-            json!(null),
-        )))
-        .unwrap();
-    worker.join().unwrap();
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        request(
+            1,
+            "initialize",
+            json!({"rootUri":root,"capabilities":{"workspace":{"workspaceEdit":{"documentChanges":true}}}}),
+        );
+        client
+            .sender
+            .send(Message::Notification(Notification::new(
+                "initialized".into(),
+                json!({}),
+            )))
+            .unwrap();
+        client.sender.send(Message::Notification(Notification::new("textDocument/didOpen".into(), json!({"textDocument":{"uri":uri,"languageId":"ruddy","version":1,"text":files.iter().find(|(path, _)| *path == "main.rud").unwrap().1}})))).unwrap();
+        request(
+            2,
+            method,
+            json!({"textDocument":{"uri":uri},"position":{"line":line,"character":character},"range":{"start":{"line":0,"character":0},"end":{"line":files[0].1.lines().count(),"character":0}},"context":{"diagnostics":[]}}),
+        )
+    }));
+    // The input thread cancels active analysis as soon as it receives shutdown.
+    // Clean up after assertions and timeouts too, before removing the fixture.
+    let _ = client.sender.send(Message::Request(Request::new(
+        3.into(),
+        "shutdown".into(),
+        json!(null),
+    )));
+    let _ = client.sender.send(Message::Notification(Notification::new(
+        "exit".into(),
+        json!(null),
+    )));
+    let cleanup = match completion.recv_timeout(Duration::from_secs(30)) {
+        Ok(result) => match (worker.join(), result) {
+            (Ok(()), Ok(Ok(()))) => Ok(()),
+            (Ok(()), Ok(Err(error))) => Err(format!("LSP worker failed during cleanup: {error}")),
+            _ => Err("LSP worker panicked during cleanup".to_owned()),
+        },
+        Err(error) => {
+            // Joining an unresponsive in-process server would hang the test suite.
+            drop(worker);
+            Err(format!(
+                "LSP worker did not finish within 30s after shutdown: {error}; detached worker"
+            ))
+        }
+    };
+    let mut result = match result {
+        Ok(value) => {
+            cleanup.unwrap_or_else(|error| panic!("{case}: {error}"));
+            value
+        }
+        Err(panic) => {
+            if let Err(error) = cleanup {
+                eprintln!("{case}: cleanup after failed request: {error}");
+            }
+            std::panic::resume_unwind(panic)
+        }
+    };
     if let Some(uri) = result.get_mut("uri") {
         *uri = json!(uri.as_str().unwrap().strip_prefix(root.as_str()).unwrap());
     }
