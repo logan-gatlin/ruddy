@@ -29,6 +29,45 @@ fn tag_conditional_accessors_keep_all_possible_cases_exhaustive() {
     );
 }
 
+#[test]
+fn tag_conditional_results_keep_coverage_and_reachability_checks() {
+    let (_, checks) = clean(
+        "let set = fn channel value img => match channel with
+         | #Red => {r: value, ..img} | #Green => {g: value, ..img} end",
+    );
+    let report = sole_report(&checks);
+    assert!(matches!(report.coverage, Coverage::Exhaustive));
+    assert_eq!(verdicts(report), [Verdict::Reachable; 2]);
+
+    let (_, _, checks) = checked(
+        "let f = fn tag => match tag with
+         | #A x => {value: x} | #A y => {value: y} end",
+    );
+    assert_eq!(checks.errors.len(), 1, "{checks:#?}");
+    assert_eq!(
+        verdicts(sole_report(&checks)),
+        [Verdict::Reachable, Verdict::Unreachable]
+    );
+
+    let (_, _, checks) = checked("let f = fn tag => match tag with | #A 0n => {value: 1n} end");
+    assert_eq!(checks.errors.len(), 1, "{checks:#?}");
+    assert_eq!(witness_of(&checks), "#A 1n");
+}
+
+#[test]
+fn a_conditional_case_refines_its_payload_presence_during_coverage() {
+    let (_, checks) = clean(
+        "let f: (#A (when 'p) {x when 'p: Nat} | #B) -> {value: Nat} =
+         fn tag => match tag with | #A {x} => {value: x} | #B => {value: 0n} end",
+    );
+    let report = sole_report(&checks);
+    assert!(
+        matches!(report.coverage, Coverage::Exhaustive),
+        "{report:#?}"
+    );
+    assert_eq!(verdicts(report), [Verdict::Reachable; 2]);
+}
+
 /// Parse, lower, infer and check. Only the parse is required to be clean:
 /// several tests are exactly about what the checks do with a program an
 /// earlier phase complained about.
@@ -870,7 +909,10 @@ fn a_report_names_the_match_and_its_scrutinee() {
         out.source.span(report.scrutinee_at).start,
         src.find("opt with").expect("the scrutinee")
     );
-    assert_eq!(report.scrutinee.to_string(), "#Some Nat | #None");
+    assert_eq!(
+        report.scrutinee.to_string(),
+        "#Some (when 'a) Nat | #None (when 'b)"
+    );
 }
 
 /// A scrutinee behind a declared name: the checks look through the alias, and

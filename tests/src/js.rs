@@ -172,6 +172,47 @@ fn tag_conditional_accessors_execute_with_only_the_selected_field() {
 }
 
 #[test]
+fn tag_conditional_setters_execute_with_branch_specific_fields() {
+    let artifact = compiled(
+        "@private let set = fn channel value img => match channel with
+         | #Red => {r: value, ..img} | #Green => {g: value, ..img}
+         | #Blue => {b: value, ..img} | #Alpha => {a: value, ..img} end
+         let red = set #Red 1 {}
+         let green = set #Green 2 {r: 3}
+         let blue = set #Blue 4 {r: 5, g: 6}
+         let alpha = set #Alpha 7 {r: 8, g: 9, b: 10}
+         @private let both: #Red | #Green = #Green
+         let union = set both 11 {r: 12, g: 13}",
+    );
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("setters.mjs");
+    fs::write(&path, js::generate(&artifact).unwrap()).unwrap();
+    let probe = format!(
+        "import * as app from {}; console.log(JSON.stringify([app.red, app.green, app.blue, app.alpha, app.union].map(v => Object.entries(v).sort())));",
+        serde_json::to_string(path.to_str().unwrap()).unwrap()
+    );
+    let output = Command::new("node")
+        .args(["--input-type=module", "--eval", &probe])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap(),
+        serde_json::json!([
+            [["r", 1]],
+            [["g", 2], ["r", 3]],
+            [["b", 4], ["g", 6], ["r", 5]],
+            [["a", 7], ["b", 10], ["g", 9], ["r", 8]],
+            [["g", 11], ["r", 12]]
+        ])
+    );
+}
+
+#[test]
 fn reification_preserves_the_boxed_type_instead_of_the_javascript_numeric_representation() {
     let artifact = compiled(
         r#"
