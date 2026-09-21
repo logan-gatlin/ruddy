@@ -1152,25 +1152,13 @@ impl Solve<'_> {
             self.run(&arm.constraints);
         }
 
-        if matches!(&**scrutinee, Ty::Sum(_)) {
-            // Case presences describe all variants admitted by a type, not
-            // the runtime choice of one arm. They guard input requirements,
-            // but each result must still belong to the same ordinary result
-            // type. In particular, two possible tags returning different
-            // tags must form a sum, not require both runtime results at once.
-            self.guard = enclosing_guard;
-            self.guard_reasons = enclosing_guard_reasons;
-            self.active_refinement = enclosing_refinement;
-            for arm in arms {
-                self.run(std::slice::from_ref(&arm.result));
-            }
-            return;
-        }
-
         // Build the structural family after every body-local constraint has
         // had its ordinary say. Its finite label unions carry fresh presences;
         // relating those to each arm under that arm's premise is where the
-        // input/output relationship is published.
+        // input/output relationship is published. Tag premises can overlap:
+        // every possible case must agree with this same family. Keeping them
+        // on the result equalities lets a field depend on its case without
+        // forcing it into the input rows shared by other arms.
         self.guard = None;
         self.guard_reasons.clear();
         self.active_refinement = enclosing_refinement;

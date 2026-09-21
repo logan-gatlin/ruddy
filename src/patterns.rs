@@ -47,7 +47,7 @@ use crate::{
     ir::{Literal, Pattern, PatternKind, Program, Term, TermKind, Witness},
     symbol::Symbol,
     tracking::Anchor,
-    types::{Atom, Formula, Presence, Rest, Row, Scheme, Ty},
+    types::{Atom, Formula, Presence, Rest, Row, RowField, Scheme, Ty},
 };
 
 /// What the phase found, over the whole program: one report per match, in the
@@ -989,9 +989,9 @@ impl Check<'_> {
     /// undecided — means the typing failed, and the checks stand aside.
     ///
     /// The two shapes read a settled absence differently, because inference
-    /// treats them differently. A tested *case* is always demanded present,
-    /// so a case the row nonetheless settles absent went through a presence
-    /// mismatch — the type error already speaks, and the match skips. A
+    /// treats them differently. A tested *case* must be possible; a quantified
+    /// presence is an ordinary conditional case, while a settled absence went
+    /// through a presence mismatch — the type error already speaks, and the match skips. A
     /// tested *field's* presence is the column rule's fresh variable, which
     /// absence can settle without a word — so an absent field is compatible,
     /// and the arm demanding it is the unreachable arm the checks report.
@@ -1025,7 +1025,9 @@ impl Check<'_> {
                     row.labels
                         .get(name)
                         .is_some_and(|case| match &case.presence {
-                            Presence::Present => self.compatible(&case.ty, payload),
+                            Presence::Present | Presence::Bound(_) => {
+                                self.compatible(&case.ty, payload)
+                            }
                             _ => false,
                         })
                 }
@@ -1652,12 +1654,19 @@ impl Check<'_> {
                 })
                 .collect()
         };
-        let ask = |sub: &Cell, name: &str, ty: &Arc<Ty>| -> Option<Vec<Option<Witness>>> {
-            let mut cols = vec![Col::Whole(ty.clone())];
+        let ask = |sub: &Cell, name: &str, case: &RowField| -> Option<Vec<Option<Witness>>> {
+            // Entering this case proves it is possible. Its quantified presence
+            // may also constrain the payload or another column of the match.
+            let literal = match case.presence {
+                Presence::Bound(index) => Some(Formula::bound(index)),
+                _ => None,
+            };
+            let walk = self.assuming(walk, literal)?;
+            let mut cols = vec![Col::Whole(case.ty.clone())];
             cols.extend(later.iter().cloned());
             let mut sub_q = vec![sub.clone()];
             sub_q.extend(q[1..].iter().cloned());
-            let mut wits = self.useful(&narrow(name), &cols, &sub_q, walk)?;
+            let mut wits = self.useful(&narrow(name), &cols, &sub_q, &walk)?;
             let payload = wits.remove(0).unwrap_or(Witness::Any);
             Some(
                 std::iter::once(Some(tag_witness(name, payload)))
@@ -1667,27 +1676,26 @@ impl Check<'_> {
         };
         match &q[0] {
             Cell::Tag { name, payload } => {
-                // Compatibility checked the case is in the row and present —
+                // Compatibility checked the case is in the row and possible —
                 // a case settled absent went through a presence mismatch, and
                 // that match was skipped whole.
                 let case = row
                     .labels
                     .get(name)
                     .expect("compatibility checked the case is in the row");
-                ask(payload, name, &case.ty)
+                ask(payload, name, case)
             }
             // A wildcard — nothing else tests a sum position — asks the
             // universe: each case a value may be, and whatever an open rest
             // still allows.
             _ => {
-                let universe: Vec<(&String, &Arc<Ty>)> = row
+                let universe: Vec<(&String, &RowField)> = row
                     .labels
                     .iter()
                     .filter(|(_, case)| may_be_present(&case.presence))
-                    .map(|(name, case)| (name, &case.ty))
                     .collect();
-                for (name, ty) in &universe {
-                    if let Some(wits) = ask(&Cell::Wild, name, ty) {
+                for (name, case) in &universe {
+                    if let Some(wits) = ask(&Cell::Wild, name, case) {
                         return Some(wits);
                     }
                 }

@@ -196,6 +196,48 @@ fn shared_rows_round_trip_and_import_with_their_exclusions() {
 }
 
 #[test]
+fn tag_conditional_setters_preserve_constraints_across_artifact_imports() {
+    let dependency = built(
+        "let set = fn channel value img => match channel with
+         | #Red => {r: value, ..img} | #Green => {g: value, ..img} end",
+    );
+    let dependency = Artifact::try_parse(&assert_round_trip(&dependency))
+        .unwrap()
+        .validate()
+        .unwrap();
+    for (source, accepted) in [
+        (
+            "let red: {r: Real} = tests::set #Red 1 {}
+             let green = tests::set #Green 2
+             let kept: {g: Real, r: Real} = green {r: 3}",
+            true,
+        ),
+        ("let bad: {g: Real} = tests::set #Red 1 {}", false),
+        (
+            "let both: #Red | #Green = #Green
+             let bad: {r: Real} = tests::set both 1 {}",
+            false,
+        ),
+    ] {
+        let mut files = FileManager::new();
+        let file = files.register_new_file("consumer.rud".into(), source.into());
+        let parsed = parse::parse(token::lex(source, file).tokens);
+        assert!(parsed.errors.is_empty(), "{:#?}", parsed.errors);
+        let mut mint = Mint::new(Bundle::new("consumer", Version::new(0, 1, 0)).unwrap());
+        let out =
+            ir::build_with_dependencies(&mut mint, parsed.stmts, std::slice::from_ref(&dependency));
+        assert!(out.errors.is_empty(), "{:#?}", out.errors);
+        let inferred = inference::infer(&mint, &out.program, inference::Trace::Off);
+        assert_eq!(
+            inferred.errors().is_empty(),
+            accepted,
+            "{:#?}",
+            inferred.errors()
+        );
+    }
+}
+
+#[test]
 fn shared_rows_reify_with_the_enclosing_constructor() {
     let artifact = built(
         "@private extern type_of : 'a -> Mirror 'a = \"$typeOf\"\n\

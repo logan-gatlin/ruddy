@@ -41,6 +41,57 @@ fn channel_accessors_infer_tag_conditional_fields() {
 }
 
 #[test]
+fn channel_setters_preserve_branch_specific_fields() {
+    let (mint, _, output) = inferred(
+        "let set_channel = fn channel value img => match channel with
+         | #Red => {r: value, ..img} | #Green => {g: value, ..img} end
+         let red: {r: Real, g: Real} = set_channel #Red 1 {g: 2}
+         let green: {r: Real, g: Real} = set_channel #Green 3 {r: 4}",
+    );
+    assert_eq!(scheme(&mint, &output, "red"), "{ r: Real, g: Real }");
+    assert_eq!(scheme(&mint, &output, "green"), "{ r: Real, g: Real }");
+}
+
+#[test]
+fn channel_setters_keep_presence_relations_through_partial_calls_and_aliases() {
+    inferred(
+        "let set = fn channel value img => match channel with
+         | #Red => {r: value, ..img} | #Green => {g: value, ..img} end
+         let alias = set
+         let red = alias #Red
+         let green = alias #Green 2
+         let added: {r: Real} = red 1 {}
+         let kept: {g: Real, flag: Bool} = green {flag: true}
+         let replaced: {g: Real, r: Real} = green {r: 3, g: 4}
+         let local = do let update = set #Red 5 return update {g: 6} end
+         let r: Real = local.r
+         let g: Real = local.g",
+    );
+}
+
+#[test]
+fn channel_setters_check_each_possible_tags_result() {
+    let setter = "let set = fn channel value img => match channel with
+        | #Red => {r: value, ..img} | #Green => {g: value, ..img} end\n";
+    for call in [
+        "let bad: {g: Real} = set #Red 1 {}",
+        "let bad: {r: Real} = set #Green 1 {}",
+        "let bad = (set #Red 1 {}).g",
+        "let bad = set #Blue 1 {}",
+        "let both: #Red | #Green = #Red\nlet bad: {r: Real} = set both 1 {}",
+        "let both: #Red | #Green = #Green\nlet bad: {g: Real} = set both 1 {}",
+        "let bad: {r: Real} = set #Red 1 {flag: true}",
+    ] {
+        let (_, _, output) = infer_src(&format!("{setter}{call}"));
+        assert!(!output.errors().is_empty(), "accepted {call}");
+    }
+    inferred(&format!(
+        "{setter}let both: #Red | #Green = #Red
+         let good: {{r: Real, g: Real}} = set both 1 {{r: 2, g: 3}}"
+    ));
+}
+
+#[test]
 fn curried_match_accessors_accept_direct_and_partial_calls() {
     let (mint, _, output) = inferred(
         "let f = fn channel img => match channel with | #Red => img.r end
@@ -11496,22 +11547,10 @@ fn channel_swizzle_fits_the_default_sat_term_budget() {
         "{source}\nlet rgba: RGBA = swizzle (#Red,) (#Green,) {{ r: [], g: [], b: [], a: [] }}"
     ));
 
-    // Matching the setter's branch results still requires an alpha field.
-    // Compact constraint projection must retain that existing restriction.
-    let (_, _, output) = infer_src(&format!(
-        "{source}\nlet rgb = swizzle (#Red,) (#Green,) {{ r: [], g: [], b: [] }}"
+    // The unused alpha branch must not add an alpha requirement to RGB.
+    inferred(&format!(
+        "{source}\nlet rgb: RGB = swizzle (#Red,) (#Green,) {{ r: [], g: [], b: [] }}"
     ));
-    let [error] = output.errors() else {
-        panic!(
-            "expected exactly one missing-field error: {:#?}",
-            output.errors()
-        );
-    };
-    assert!(
-        matches!(&error.kind, ErrorKind::MissingField { field, .. } if field == "a"),
-        "{:?}",
-        error.kind
-    );
 }
 
 #[test]
