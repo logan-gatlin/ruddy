@@ -3,7 +3,7 @@
 use std::{
     collections::{HashMap, HashSet, hash_map::DefaultHasher},
     hash::{Hash, Hasher},
-    sync::Arc,
+    sync::{Arc, Weak},
 };
 
 use indexmap::{IndexMap, IndexSet};
@@ -327,6 +327,9 @@ pub struct Solve<'a> {
     pub constraint: Option<super::ConstraintId>,
     /// Root reason of the constraint currently being expanded.
     pub constraint_reason: Option<ReasonId>,
+    /// The arm that selected each synthesized match-family constructor. Weak
+    /// identities keep this diagnostic sidecar from retaining discarded types.
+    pub family_origins: HashMap<usize, (Weak<Ty>, ReasonId)>,
     /// The goals about two declared types that the goals currently open were
     /// reached by unfolding, innermost last.
     ///
@@ -1169,7 +1172,8 @@ impl Solve<'_> {
                 _ => unreachable!("a guarded arm result is an equality"),
             })
             .collect();
-        let family = self.family_type(&body_types);
+        let origins: Vec<_> = arms.iter().map(|arm| arm.result.reason).collect();
+        let family = self.family_type_with(&body_types, Some(&origins));
         self.unify(span, result, &family);
         for (((arm, body_ty), guard), report) in
             arms.iter().zip(body_types).zip(guards).zip(reports)
@@ -1201,7 +1205,7 @@ impl Solve<'_> {
     /// remain ordinary structural types and are checked by the unifications
     /// that follow.
     pub(super) fn family_type(&mut self, types: &[Arc<Ty>]) -> Arc<Ty> {
-        self.family_type_with(types)
+        self.family_type_with(types, None)
     }
 
     /// Build a family with an explicit continuation stack. Match results can
@@ -1209,7 +1213,23 @@ impl Solve<'_> {
     /// walk must not borrow the native call stack for each one. `unfolding`
     /// remains a path stack: `PopUnfolding` runs immediately after the expanded
     /// child, before any sibling is visited.
-    fn family_type_with(&mut self, types: &[Arc<Ty>]) -> Arc<Ty> {
+    fn family_type_with(&mut self, types: &[Arc<Ty>], origins: Option<&[ReasonId]>) -> Arc<Ty> {
+        // Keep source attribution beside the contributors, never in the types
+        // or their fingerprints: recursive-family equality remains semantic.
+        struct Contributor<T> {
+            value: T,
+            origin: Option<ReasonId>,
+        }
+
+        impl<T> Contributor<T> {
+            fn with<U>(&self, value: U) -> Contributor<U> {
+                Contributor {
+                    value,
+                    origin: self.origin,
+                }
+            }
+        }
+
         /// Stable semantic hashes for the duration of this family walk. Family
         /// construction mints variables and records lacks conditions, but does
         /// not bind an existing variable, so a resolved node cannot change
@@ -1509,16 +1529,17 @@ impl Solve<'_> {
         }
 
         struct RowState {
-            flat: Vec<Row>,
-            maps: Vec<IndexMap<String, RowField>>,
+            flat: Vec<Contributor<Row>>,
+            maps: Vec<Contributor<IndexMap<String, RowField>>>,
             names: Vec<String>,
             at: usize,
             labels: IndexMap<String, RowField>,
         }
 
         enum Work {
-            Type(Vec<Arc<Ty>>),
-            Row(Vec<Row>),
+            Type(Vec<Contributor<Arc<Ty>>>),
+            Row(Vec<Contributor<Row>>),
+            RecordOrigin(ReasonId),
             PopUnfolding(Vec<u64>),
             Arrow,
             Struct,
@@ -1542,7 +1563,16 @@ impl Solve<'_> {
         let mut unfolding: Vec<Vec<Arc<Ty>>> = Vec::new();
         let mut fingerprints = Fingerprints::new();
         let mut assumptions: HashMap<Vec<u64>, Vec<usize>> = HashMap::new();
-        let mut work = vec![Work::Type(types.to_vec())];
+        let mut work = vec![Work::Type(
+            types
+                .iter()
+                .enumerate()
+                .map(|(at, ty)| Contributor {
+                    value: ty.clone(),
+                    origin: origins.map(|origins| origins[at]),
+                })
+                .collect(),
+        )];
         // Type and row continuations have statically distinct result stacks.
         // The work variants determine which stack each result belongs to, so a
         // mixed value enum would only add impossible runtime alternatives.
@@ -1552,12 +1582,14 @@ impl Solve<'_> {
         while let Some(next) = work.pop() {
             match next {
                 Work::Type(types) => {
-                    let resolved: Vec<Arc<Ty>> =
-                        types.iter().map(|ty| self.table.resolve(ty)).collect();
+                    let resolved: Vec<_> = types
+                        .iter()
+                        .map(|ty| ty.with(self.table.resolve(&ty.value)))
+                        .collect();
                     let mut symbols = Vec::new();
                     let mut other_concrete = false;
                     for ty in &resolved {
-                        match &**ty {
+                        match &*ty.value {
                             Ty::Named { symbol, .. } => {
                                 if !symbols.contains(symbol) {
                                     symbols.push(*symbol);
@@ -1569,14 +1601,14 @@ impl Solve<'_> {
                     }
                     let assumption = resolved
                         .iter()
-                        .map(|ty| fingerprints.ty(self.table, ty))
+                        .map(|ty| fingerprints.ty(self.table, &ty.value))
                         .collect::<Vec<_>>();
                     let repeated = assumptions.get(&assumption).is_some_and(|candidates| {
                         candidates.iter().any(|at| {
                             unfolding[*at]
                                 .iter()
                                 .zip(&resolved)
-                                .all(|(a, b)| self.table.alike(a, b))
+                                .all(|(a, b)| self.table.alike(a, &b.value))
                         })
                     });
                     if !symbols.is_empty() && (symbols.len() > 1 || other_concrete) && !repeated {
@@ -1584,10 +1616,10 @@ impl Solve<'_> {
                             .entry(assumption.clone())
                             .or_default()
                             .push(unfolding.len());
-                        unfolding.push(resolved.clone());
+                        unfolding.push(resolved.iter().map(|ty| ty.value.clone()).collect());
                         let expanded = resolved
                             .iter()
-                            .map(|ty| self.table.unfolded(self.aliases, ty))
+                            .map(|ty| ty.with(self.table.unfolded(self.aliases, &ty.value)))
                             .collect();
                         work.push(Work::PopUnfolding(assumption));
                         work.push(Work::Type(expanded));
@@ -1595,23 +1627,29 @@ impl Solve<'_> {
                     }
                     let Some(chosen) = resolved
                         .iter()
-                        .find(|ty| !matches!(&***ty, Ty::Var(_) | Ty::Undecided))
+                        .find(|ty| !matches!(&*ty.value, Ty::Var(_) | Ty::Undecided))
                     else {
                         type_values.push(self.table.fresh_match_family_type());
                         continue;
                     };
-                    match &**chosen {
+                    if let Some(origin) = chosen.origin {
+                        work.push(Work::RecordOrigin(origin));
+                    }
+                    match &*chosen.value {
                         Ty::Arrow(..) => {
                             let arrows: Vec<_> = resolved
                                 .iter()
-                                .filter_map(|ty| match &**ty {
-                                    Ty::Arrow(a, b, e) => Some((a.clone(), b.clone(), e.clone())),
+                                .filter_map(|ty| match &*ty.value {
+                                    Ty::Arrow(a, b, e) => {
+                                        Some(ty.with((a.clone(), b.clone(), e.clone())))
+                                    }
                                     _ => None,
                                 })
                                 .collect();
-                            let from = arrows.iter().map(|x| x.0.clone()).collect();
-                            let to = arrows.iter().map(|x| x.1.clone()).collect();
-                            let effects = arrows.iter().map(|x| x.2.clone()).collect();
+                            let from = arrows.iter().map(|x| x.with(x.value.0.clone())).collect();
+                            let to = arrows.iter().map(|x| x.with(x.value.1.clone())).collect();
+                            let effects =
+                                arrows.iter().map(|x| x.with(x.value.2.clone())).collect();
                             work.push(Work::Arrow);
                             work.push(Work::Row(effects));
                             work.push(Work::Type(to));
@@ -1620,7 +1658,7 @@ impl Solve<'_> {
                         Ty::Struct(..) => {
                             let rows = resolved
                                 .iter()
-                                .filter_map(|ty| ty.fields().cloned())
+                                .filter_map(|ty| ty.value.fields().map(|row| ty.with(row.clone())))
                                 .collect();
                             work.push(Work::Struct);
                             work.push(Work::Row(rows));
@@ -1628,8 +1666,8 @@ impl Solve<'_> {
                         Ty::Sum(..) => {
                             let rows = resolved
                                 .iter()
-                                .filter_map(|ty| match &**ty {
-                                    Ty::Sum(row) => Some(row.clone()),
+                                .filter_map(|ty| match &*ty.value {
+                                    Ty::Sum(row) => Some(ty.with(row.clone())),
                                     _ => None,
                                 })
                                 .collect();
@@ -1638,12 +1676,14 @@ impl Solve<'_> {
                         }
                         Ty::Named { symbol, name, args } => {
                             let arguments = args.len();
-                            let merged: Vec<Vec<Arc<Ty>>> = (0..arguments)
+                            let merged: Vec<Vec<Contributor<Arc<Ty>>>> = (0..arguments)
                                 .map(|at| {
                                     resolved
                                         .iter()
-                                        .filter_map(|ty| match &**ty {
-                                            Ty::Named { args, .. } => args.get(at).cloned(),
+                                        .filter_map(|ty| match &*ty.value {
+                                            Ty::Named { args, .. } => {
+                                                args.get(at).map(|arg| ty.with(arg.clone()))
+                                            }
                                             _ => None,
                                         })
                                         .collect()
@@ -1663,12 +1703,17 @@ impl Solve<'_> {
                 }
                 Work::Row(rows) => {
                     let _ = rows.first().expect("a row family has a contributor");
-                    let flat: Vec<Row> = rows.iter().map(|row| self.table.canon(row)).collect();
-                    let maps: Vec<IndexMap<String, RowField>> =
-                        flat.iter().map(|row| row.labels.clone()).collect();
+                    let flat: Vec<_> = rows
+                        .iter()
+                        .map(|row| row.with(self.table.canon(&row.value)))
+                        .collect();
+                    let maps: Vec<_> = flat
+                        .iter()
+                        .map(|row| row.with(row.value.labels.clone()))
+                        .collect();
                     let mut names = Vec::new();
                     for labels in &maps {
-                        for name in labels.keys() {
+                        for name in labels.value.keys() {
                             if !names.contains(name) {
                                 names.push(name.clone());
                             }
@@ -1681,6 +1726,11 @@ impl Solve<'_> {
                         at: 0,
                         labels: IndexMap::new(),
                     }));
+                }
+                Work::RecordOrigin(origin) => {
+                    let ty = type_values.last().expect("completed family type");
+                    self.family_origins
+                        .insert(Arc::as_ptr(ty) as usize, (Arc::downgrade(ty), origin));
                 }
                 Work::PopUnfolding(assumption) => {
                     unfolding.pop();
@@ -1724,11 +1774,11 @@ impl Solve<'_> {
                         let rest = if state
                             .flat
                             .iter()
-                            .any(|row| matches!(row.rest, Rest::Var(_)))
+                            .any(|row| matches!(row.value.rest, Rest::Var(_)))
                         {
                             self.table.fresh_match_family_row()
                         } else {
-                            state.flat[0].rest.clone()
+                            state.flat[0].value.rest.clone()
                         };
                         row_values.push(Row {
                             labels: state.labels,
@@ -1743,17 +1793,22 @@ impl Solve<'_> {
                         state
                             .maps
                             .iter()
-                            .filter_map(|labels| labels.get(&name))
+                            .filter_map(|labels| labels.value.get(&name))
                             .map(|field| &field.presence),
                     );
-                    let payloads: Vec<Arc<Ty>> = state
+                    let payloads: Vec<_> = state
                         .maps
                         .iter()
-                        .filter_map(|labels| labels.get(&name))
-                        .filter(|field| {
-                            !matches!(self.table.presence_of(&field.presence), Presence::Absent)
+                        .filter_map(|labels| {
+                            labels.value.get(&name).map(|field| labels.with(field))
                         })
-                        .map(|field| field.ty.clone())
+                        .filter(|field| {
+                            !matches!(
+                                self.table.presence_of(&field.value.presence),
+                                Presence::Absent
+                            )
+                        })
+                        .map(|field| field.with(field.value.ty.clone()))
                         .collect();
                     if payloads.is_empty() {
                         state.labels.insert(
@@ -2318,6 +2373,18 @@ impl Solve<'_> {
                 SolveWork::Ty(lhs, rhs, depth) => {
                     self.depth = depth;
                     let (lhs, rhs) = (self.table.resolve(&lhs), self.table.resolve(&rhs));
+                    // A synthesized constructor was selected from one arm at
+                    // this exact structural position. The rule consumes only
+                    // that contributor, so a sibling's source cannot leak into
+                    // a nested mismatch or a later arm's explanation.
+                    for ty in [&lhs, &rhs] {
+                        if let Some((known, origin)) =
+                            self.family_origins.get(&(Arc::as_ptr(ty) as usize))
+                            && known.upgrade().is_some_and(|known| Arc::ptr_eq(&known, ty))
+                        {
+                            self.table.note_binding_read(*origin);
+                        }
+                    }
                     let goal = Goal::Type {
                         expected: lhs.clone(),
                         actual: rhs.clone(),

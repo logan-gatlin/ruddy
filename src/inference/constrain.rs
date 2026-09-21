@@ -1665,7 +1665,12 @@ impl Constrain<'_> {
                     let mut arm_result = self.constraint(
                         body.at,
                         ConstraintOrigin::MatchArm,
-                        ConstraintSubjects::pair(Subject::MatchResult, Subject::MatchArm),
+                        ConstraintSubjects::pair_at(
+                            Subject::MatchResult,
+                            None,
+                            Subject::MatchArm,
+                            Some(body.at),
+                        ),
                         ConstraintKind::Equal {
                             expected: result.clone(),
                             actual: body.ty.clone(),
