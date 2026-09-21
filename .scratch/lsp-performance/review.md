@@ -56,6 +56,13 @@ remainder. Regressions distinguish this error from a valid catch-all and from a
 closed sum with a conditional case. Branch regressions cover three arms,
 unreachable arms, nested fields, and shared values in unrelated fields.
 
+The LSP test helper now enforces its existing 60-second limit against elapsed
+request time and reports the case, method, and request on failure. It attempts
+shutdown after failed assertions or timeouts, waits a bounded time for the
+worker, and preserves the original panic if cleanup also fails. Both earlier
+std-related debug timeouts pass with the final implementation and the original
+deadline. No test-profile change or longer deadline is retained.
+
 ## Measurements
 
 The warm measurements below were repeated after rebasing and fixing diagnostics,
@@ -100,10 +107,25 @@ remain alongside this review, excluded from version control.
 
 ## Validation
 
-Final full validation after the semantic follow-up is in progress. All six
-reported failures now pass in focused runs; the final diagnostic run passed 106
-tests. Formatting and clippy passed, with three pre-existing enum-size warnings.
-Earlier focused validation passed 42 analysis, 10 incremental-lowering, 14
-workspace, and 31 LSP tests.
-The previous compiler coverage was 96.21% lines and 88.27% branches; the existing
-100% coverage requirement was not met. This is not a passing final test report.
+All six reported failures now pass. The final diagnostic/inference check passed
+106 focused tests. Final complete release validation passed 2,181 tests with zero
+failures and 10 intentionally ignored tests, including 2,108 passes in the main
+test crate. The final default-profile LSP run passed all 31 tests with the
+original 60-second deadlines. Formatting and clippy passed, with three
+pre-existing enum-size warnings.
+
+Commands used:
+
+```sh
+RUDDY_HOME=/tmp/ruddy-lsp-test-home RUST_TEST_THREADS=1 just test --release -j2
+RUDDY_HOME=/tmp/ruddy-lsp-debug-test-home RUST_TEST_THREADS=1 just test -j1 --lib -- --test-threads=1 lsp:: --nocapture
+RUDDY_HOME=/tmp/ruddy-lsp-coverage-home RUST_TEST_THREADS=1 CARGO_PROFILE_TEST_OPT_LEVEL=1 CARGO_BUILD_JOBS=2 just cov
+just fmt-check
+just clippy
+```
+
+The complete `just cov` run also passed: 2,182 tests, zero failures, and 10
+intentionally ignored tests. It includes one additional test enabled by debug
+assertions. Compiler coverage is **96.24% of lines and 88.34% of branches**.
+The repository's existing 100% coverage requirement remains unmet; this report
+does not treat that target as satisfied.
