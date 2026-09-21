@@ -38,6 +38,35 @@ pub(super) struct Imports {
     completed: Vec<(Span, Bindings)>,
 }
 
+impl Imports {
+    /// Relocate retained lexical scopes and discard scopes in replaced bodies.
+    pub(super) fn remap(&mut self, mut span: impl FnMut(Span) -> Option<Span>) {
+        fn binding(imported: &mut Imported, span: &mut impl FnMut(Span) -> Option<Span>) {
+            if let Some(current) = span(imported.span) {
+                imported.span = current;
+            }
+            if let Some(fallback) = &mut imported.fallback {
+                binding(fallback, span);
+            }
+        }
+        for bindings in self.modules.values_mut() {
+            for imported in bindings.values_mut() {
+                binding(imported, &mut span);
+            }
+        }
+        self.completed.retain_mut(|(scope, bindings)| {
+            let Some(current) = span(*scope) else {
+                return false;
+            };
+            *scope = current;
+            for imported in bindings.values_mut() {
+                binding(imported, &mut span);
+            }
+            true
+        });
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(super) struct LocalScope {
     bindings: Bindings,

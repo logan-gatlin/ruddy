@@ -18,9 +18,21 @@ fn editor_request(
     let root = format!("file://{}/", tree.path().display());
     let uri = format!("{root}main.rud");
     let (server, client) = Connection::memory();
-    let worker = std::thread::spawn(move || ruddy_cli::lsp::serve(server).unwrap());
+    let (finished, completion) = std::sync::mpsc::sync_channel(1);
+    let worker = std::thread::spawn(move || {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            ruddy_cli::lsp::serve(server)
+        }));
+        let _ = finished.send(result);
+    });
+    let case = std::thread::current()
+        .name()
+        .unwrap_or("unnamed")
+        .to_owned();
     let expect_valid = method == "textDocument/codeAction";
     let request = |id: i32, method: &str, params| {
+        let started = std::time::Instant::now();
+        let timeout = Duration::from_secs(60);
         client
             .sender
             .send(Message::Request(Request::new(
@@ -28,14 +40,28 @@ fn editor_request(
                 method.into(),
                 params,
             )))
-            .unwrap();
+            .unwrap_or_else(|error| {
+                panic!("{case}: could not send LSP request {id} ({method}): {error}")
+            });
         loop {
+            assert!(
+                started.elapsed() < timeout,
+                "{case}: LSP request {id} ({method}) timed out after {:.1?} (deadline {timeout:?})",
+                started.elapsed()
+            );
             match client
                 .receiver
-                .recv_timeout(Duration::from_secs(60))
-                .unwrap()
+                .recv_timeout(timeout.saturating_sub(started.elapsed()))
+                .unwrap_or_else(|error| {
+                    panic!("{case}: LSP request {id} ({method}) failed after {:.1?} (deadline {timeout:?}): {error}", started.elapsed())
+                })
             {
-                Message::Response(response) => break response.response_result.unwrap(),
+                Message::Response(response) => {
+                    assert_eq!(response.id, id.into(), "{case}: unexpected response to {method}");
+                    break response.response_result.unwrap_or_else(|error| {
+                        panic!("{case}: LSP request {id} ({method}) returned an error after {:.1?}: {error:?}", started.elapsed())
+                    });
+                }
                 Message::Notification(note)
                     if expect_valid && note.method == "textDocument/publishDiagnostics" =>
                 {
@@ -53,33 +79,63 @@ fn editor_request(
             }
         }
     };
-    request(
-        1,
-        "initialize",
-        json!({"rootUri":root,"capabilities":{"workspace":{"workspaceEdit":{"documentChanges":true}}}}),
-    );
-    client
-        .sender
-        .send(Message::Notification(Notification::new(
-            "initialized".into(),
-            json!({}),
-        )))
-        .unwrap();
-    client.sender.send(Message::Notification(Notification::new("textDocument/didOpen".into(), json!({"textDocument":{"uri":uri,"languageId":"ruddy","version":1,"text":files.iter().find(|(path, _)| *path == "main.rud").unwrap().1}})))).unwrap();
-    let mut result = request(
-        2,
-        method,
-        json!({"textDocument":{"uri":uri},"position":{"line":line,"character":character},"range":{"start":{"line":0,"character":0},"end":{"line":files[0].1.lines().count(),"character":0}},"context":{"diagnostics":[]}}),
-    );
-    request(3, "shutdown", json!(null));
-    client
-        .sender
-        .send(Message::Notification(Notification::new(
-            "exit".into(),
-            json!(null),
-        )))
-        .unwrap();
-    worker.join().unwrap();
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        request(
+            1,
+            "initialize",
+            json!({"rootUri":root,"capabilities":{"workspace":{"workspaceEdit":{"documentChanges":true}}}}),
+        );
+        client
+            .sender
+            .send(Message::Notification(Notification::new(
+                "initialized".into(),
+                json!({}),
+            )))
+            .unwrap();
+        client.sender.send(Message::Notification(Notification::new("textDocument/didOpen".into(), json!({"textDocument":{"uri":uri,"languageId":"ruddy","version":1,"text":files.iter().find(|(path, _)| *path == "main.rud").unwrap().1}})))).unwrap();
+        request(
+            2,
+            method,
+            json!({"textDocument":{"uri":uri},"position":{"line":line,"character":character},"range":{"start":{"line":0,"character":0},"end":{"line":files[0].1.lines().count(),"character":0}},"context":{"diagnostics":[]}}),
+        )
+    }));
+    // The input thread cancels active analysis as soon as it receives shutdown.
+    // Clean up after assertions and timeouts too, before removing the fixture.
+    let _ = client.sender.send(Message::Request(Request::new(
+        3.into(),
+        "shutdown".into(),
+        json!(null),
+    )));
+    let _ = client.sender.send(Message::Notification(Notification::new(
+        "exit".into(),
+        json!(null),
+    )));
+    let cleanup = match completion.recv_timeout(Duration::from_secs(30)) {
+        Ok(result) => match (worker.join(), result) {
+            (Ok(()), Ok(Ok(()))) => Ok(()),
+            (Ok(()), Ok(Err(error))) => Err(format!("LSP worker failed during cleanup: {error}")),
+            _ => Err("LSP worker panicked during cleanup".to_owned()),
+        },
+        Err(error) => {
+            // Joining an unresponsive in-process server would hang the test suite.
+            drop(worker);
+            Err(format!(
+                "LSP worker did not finish within 30s after shutdown: {error}; detached worker"
+            ))
+        }
+    };
+    let mut result = match result {
+        Ok(value) => {
+            cleanup.unwrap_or_else(|error| panic!("{case}: {error}"));
+            value
+        }
+        Err(panic) => {
+            if let Err(error) = cleanup {
+                eprintln!("{case}: cleanup after failed request: {error}");
+            }
+            std::panic::resume_unwind(panic)
+        }
+    };
     if let Some(uri) = result.get_mut("uri") {
         *uri = json!(uri.as_str().unwrap().strip_prefix(root.as_str()).unwrap());
     }
@@ -318,6 +374,249 @@ fn positions_use_utf16_and_respect_crlf() {
 }
 
 #[test]
+fn cached_line_index_round_trips_unicode_and_trailing_empty_lines() {
+    let text = "ascii\r\n😀é中𝄞z\n\nlast\n";
+    let index = ruddy_cli::lsp::LineIndex::new(text);
+    for (byte, character) in text.char_indices() {
+        let position = index.position(byte);
+        let prefix = &text[..byte];
+        let row = prefix.bytes().filter(|byte| *byte == b'\n').count();
+        let start = prefix.rfind('\n').map_or(0, |at| at + 1);
+        assert_eq!(
+            position,
+            json!({"line":row,"character":prefix[start..].encode_utf16().count()})
+        );
+        if character != '\r' && character != '\n' {
+            assert_eq!(index.offset(&position), Some(byte));
+        }
+        // A byte in the middle of a UTF-8 scalar is rounded back safely.
+        for inside in 1..character.len_utf8() {
+            assert_eq!(index.position(byte + inside), position);
+        }
+    }
+    assert_eq!(index.offset(&json!({"line":1,"character":1})), None);
+    assert_eq!(index.offset(&json!({"line":1,"character":5})), None);
+    assert_eq!(
+        index.offset(&json!({"line":4,"character":1000})),
+        Some(text.len())
+    );
+    assert_eq!(index.offset(&json!({"line":5,"character":0})), None);
+    assert_eq!(index.position(usize::MAX), json!({"line":4,"character":0}));
+}
+
+struct WatchingEditor {
+    client: Connection,
+    worker: Option<std::thread::JoinHandle<()>>,
+    main_uri: String,
+}
+
+impl WatchingEditor {
+    fn open(root: &std::path::Path, source: &str) -> Self {
+        std::fs::write(root.join("Ruddy.toml"), "name = \"watcher\"\nversion = \"0.0.0\"\nkind = \"library\"\nroot = \"main.rud\"\n[dependencies]\nstd = false").unwrap();
+        std::fs::write(root.join("main.rud"), source).unwrap();
+        let root_uri = url::Url::from_directory_path(root).unwrap().to_string();
+        let main_uri = url::Url::from_file_path(root.join("main.rud"))
+            .unwrap()
+            .to_string();
+        let (server, client) = Connection::memory();
+        let worker = std::thread::spawn(move || ruddy_cli::lsp::serve(server).unwrap());
+        client
+            .sender
+            .send(Message::Request(Request::new(
+                1.into(),
+                "initialize".into(),
+                json!({"rootUri":root_uri,"capabilities":{}}),
+            )))
+            .unwrap();
+        assert!(matches!(
+            client
+                .receiver
+                .recv_timeout(Duration::from_secs(10))
+                .unwrap(),
+            Message::Response(_)
+        ));
+        client
+            .sender
+            .send(Message::Notification(Notification::new(
+                "initialized".into(),
+                json!({}),
+            )))
+            .unwrap();
+        client.sender.send(Message::Notification(Notification::new("textDocument/didOpen".into(), json!({"textDocument":{"uri":main_uri,"languageId":"ruddy","version":1,"text":source}})))).unwrap();
+        Self {
+            client,
+            worker: Some(worker),
+            main_uri,
+        }
+    }
+
+    fn diagnostics(&self, uri: &str, empty: bool) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let message = self
+                .client
+                .receiver
+                .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+                .unwrap_or_else(|error| {
+                    panic!("waiting for diagnostics (empty={empty}) for {uri}: {error}")
+                });
+            if let Message::Notification(note) = message
+                && note.method == "textDocument/publishDiagnostics"
+                && note.params["uri"] == uri
+                && note.params["diagnostics"].as_array().unwrap().is_empty() == empty
+            {
+                return;
+            }
+        }
+    }
+}
+
+impl Drop for WatchingEditor {
+    fn drop(&mut self) {
+        let _ = self.client.sender.send(Message::Request(Request::new(
+            (-1).into(),
+            "shutdown".into(),
+            json!(null),
+        )));
+        let _ = self
+            .client
+            .sender
+            .send(Message::Notification(Notification::new(
+                "exit".into(),
+                json!(null),
+            )));
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+#[test]
+fn native_watcher_follows_missing_module_directories_and_renames() {
+    let tree = tempfile::tempdir().unwrap();
+    let editor = WatchingEditor::open(tree.path(), "module Added\nlet value = 1n");
+    editor.diagnostics(&editor.main_uri, false);
+    std::fs::create_dir(tree.path().join("Added")).unwrap();
+    std::fs::write(tree.path().join("Added/module.rud"), "let answer = 1n").unwrap();
+    editor.diagnostics(&editor.main_uri, true);
+    std::fs::rename(tree.path().join("Added"), tree.path().join("Moved")).unwrap();
+    editor.diagnostics(&editor.main_uri, false);
+    std::fs::rename(tree.path().join("Moved"), tree.path().join("Added")).unwrap();
+    editor.diagnostics(&editor.main_uri, true);
+}
+
+#[test]
+fn dependency_edits_publish_both_analysis_phases_for_unchanged_open_documents() {
+    let tree = tempfile::tempdir().unwrap();
+    std::fs::write(tree.path().join("Added.rud"), "let answer = 1n").unwrap();
+    let editor = WatchingEditor::open(tree.path(), "module Added\nlet value = 1n");
+    editor.diagnostics(&editor.main_uri, true);
+    editor.diagnostics(&editor.main_uri, true);
+    std::fs::write(tree.path().join("Added.rud"), "let answer = 2n").unwrap();
+    editor.diagnostics(&editor.main_uri, true);
+    editor.diagnostics(&editor.main_uri, true);
+}
+
+#[test]
+#[cfg(unix)]
+fn native_watcher_observes_symlink_targets_recreation_and_retargeting() {
+    let tree = tempfile::tempdir().unwrap();
+    let targets = tempfile::tempdir().unwrap();
+    let first = targets.path().join("first.rud");
+    let second = targets.path().join("second.rud");
+    std::fs::write(&first, "let answer = 1n").unwrap();
+    std::fs::write(&second, "let answer = 1n").unwrap();
+    std::os::unix::fs::symlink(&first, tree.path().join("Linked.rud")).unwrap();
+    let editor = WatchingEditor::open(tree.path(), "module Linked\nlet value = 1n");
+    editor.diagnostics(&editor.main_uri, true);
+    let first_uri = url::Url::from_file_path(&first).unwrap().to_string();
+    let second_uri = url::Url::from_file_path(&second).unwrap().to_string();
+    std::fs::write(&first, "let answer : Nat = false").unwrap();
+    editor.diagnostics(&first_uri, false);
+    std::fs::remove_file(&first).unwrap();
+    editor.diagnostics(&editor.main_uri, false);
+    std::fs::write(&first, "let answer = 1n").unwrap();
+    editor.diagnostics(&editor.main_uri, true);
+    std::fs::remove_file(tree.path().join("Linked.rud")).unwrap();
+    std::os::unix::fs::symlink(&second, tree.path().join("Linked.rud")).unwrap();
+    std::fs::write(&second, "let answer : Nat = false").unwrap();
+    editor.diagnostics(&second_uri, false);
+}
+
+#[test]
+#[cfg(unix)]
+fn native_watcher_observes_intermediate_symlink_retargeting() {
+    let tree = tempfile::tempdir().unwrap();
+    let links = tempfile::tempdir().unwrap();
+    let targets = tempfile::tempdir().unwrap();
+    let first = targets.path().join("first.rud");
+    let second = targets.path().join("second.rud");
+    let intermediate = links.path().join("redirect.rud");
+    std::fs::write(&first, "let answer = 1n").unwrap();
+    std::fs::write(&second, "let answer : Nat = false").unwrap();
+    std::os::unix::fs::symlink(&first, &intermediate).unwrap();
+    std::os::unix::fs::symlink(&intermediate, tree.path().join("Linked.rud")).unwrap();
+    let editor = WatchingEditor::open(tree.path(), "module Linked\nlet value = 1n");
+    editor.diagnostics(&editor.main_uri, true);
+    editor.diagnostics(&editor.main_uri, true);
+    std::fs::remove_file(&intermediate).unwrap();
+    std::os::unix::fs::symlink(&second, &intermediate).unwrap();
+    let second_uri = url::Url::from_file_path(&second).unwrap().to_string();
+    editor.diagnostics(&second_uri, false);
+}
+
+#[test]
+#[cfg(unix)]
+fn native_watcher_resolves_relative_links_under_symlinked_directories() {
+    let tree = tempfile::tempdir().unwrap();
+    let targets = tempfile::tempdir().unwrap();
+    std::fs::create_dir(targets.path().join("nested")).unwrap();
+    let target = targets.path().join("target.rud");
+    std::fs::write(&target, "let answer = 1n").unwrap();
+    std::os::unix::fs::symlink("../target.rud", targets.path().join("nested/module.rud")).unwrap();
+    std::os::unix::fs::symlink(targets.path().join("nested"), tree.path().join("Linked")).unwrap();
+    let editor = WatchingEditor::open(tree.path(), "module Linked\nlet value = 1n");
+    editor.diagnostics(&editor.main_uri, true);
+    editor.diagnostics(&editor.main_uri, true);
+    std::fs::write(&target, "let answer : Nat = false").unwrap();
+    let target_uri = url::Url::from_file_path(&target).unwrap().to_string();
+    editor.diagnostics(&target_uri, false);
+}
+
+#[test]
+fn unsupported_requests_do_not_drop_background_diagnostics() {
+    let tree = tempfile::tempdir().unwrap();
+    // Frontend errors in a closed file make rendering substantial while the
+    // foreground document stays valid. Requests may interrupt either phase.
+    std::fs::write(
+        tree.path().join("Many.rud"),
+        "let repeated = 1n\n".repeat(2000),
+    )
+    .unwrap();
+    let editor = WatchingEditor::open(tree.path(), "module Many\nlet value = 1n");
+    editor.diagnostics(&editor.main_uri, true);
+    let sender = editor.client.sender.clone();
+    let requests = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(250));
+        for id in 2..502 {
+            sender
+                .send(Message::Request(Request::new(
+                    id.into(),
+                    "unsupported/test".into(),
+                    json!({}),
+                )))
+                .unwrap();
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    });
+    requests.join().unwrap();
+    let many_uri = url::Url::from_file_path(tree.path().join("Many.rud"))
+        .unwrap()
+        .to_string();
+    editor.diagnostics(&many_uri, false);
+}
+
+#[test]
 fn background_analysis_waits_for_a_quiet_editing_interval() {
     let tree = tempfile::tempdir().unwrap();
     std::fs::write(tree.path().join("Ruddy.toml"), "name = \"editor\"\nversion = \"0.0.0\"\nkind = \"library\"\nroot = \"main.rud\"\n[dependencies]\nstd = false").unwrap();
@@ -359,7 +658,7 @@ fn background_analysis_waits_for_a_quiet_editing_interval() {
     assert!(
         client
             .receiver
-            .recv_timeout(Duration::from_millis(75))
+            .recv_timeout(Duration::from_millis(200))
             .is_err(),
         "background diagnostics should not begin between consecutive keystrokes"
     );

@@ -87,11 +87,11 @@ help: or add this field explicitly to the annotation
 note: 1 intermediate use is omitted from this short explanation
 
 ## rigid-field-sum
-[rigid-field] the body cannot assume caller-chosen case `#B`
+[rigid-broken] the body cannot fix a choice that belongs to each caller
 primary: this annotation leaves the choice to each caller
-related: this matches case `#B` from the caller's choice
-help: match caller-chosen cases only when named explicitly before the annotation's `..` remainder
-help: or add this case explicitly to the annotation
+related: this use fixes a type that the caller must be free to choose
+help: preserve the caller-chosen row remainder instead of closing it
+help: or remove the open remainder from the annotation
 
 ## rigid-field-effect
 [rigid-field] the body cannot assume caller-chosen effect `!Log`

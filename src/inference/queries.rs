@@ -29,6 +29,7 @@ impl QueryDb for Db {
 struct Source {
     mint: Arc<Mint>,
     program: Arc<Program>,
+    header: Projection<Context>,
     bodies: Vec<PreparedBody>,
 }
 
@@ -50,6 +51,7 @@ impl<T> Eq for Projection<T> {}
 struct Context {
     mint: Arc<Mint>,
     program: Arc<Program>,
+    references: Arc<[Symbol]>,
 }
 
 #[derive(Clone)]
@@ -80,24 +82,7 @@ struct Layout<'db> {
 
 #[salsa::tracked]
 fn layout(db: &dyn Database, source: Source) -> Layout<'_> {
-    let mint = source.mint(db);
-    let program = source.program(db);
-    let mut key = Fingerprint::default();
-    key.declarations(program);
-    // Declaration inference reads the names, but never the term bodies.
-    for symbol in program.terms.keys() {
-        key.debug(symbol);
-    }
-    let header = Header::new(
-        db,
-        Projection {
-            key: key.text.into(),
-            value: Context {
-                mint: mint.clone(),
-                program: program.clone(),
-            },
-        },
-    );
+    let header = Header::new(db, source.header(db).clone());
     let mut owners = HashMap::new();
     let bodies = source
         .bodies(db)
@@ -158,16 +143,11 @@ fn group_input<'db>(
     let (signatures, _) = declared(db, graph.header);
     let context = &body.context(db).value;
     let mut env = HashMap::new();
-    let mut references = Vec::new();
-    for decl in context.program.terms.values() {
-        ir::references(&decl.value, &mut references);
-    }
-    references.sort_unstable();
-    references.dedup();
+    let references = &context.references;
     let mut key = Fingerprint {
         text: body.context(db).key.to_vec(),
     };
-    for symbol in &references {
+    for symbol in references.iter() {
         let binding = if let Some(owner) = graph.owners.get(symbol).filter(|owner| **owner != body)
         {
             Some(Binding::Poly(
@@ -189,7 +169,8 @@ fn group_input<'db>(
         }
     }
     let mut used: HashSet<_> = references
-        .into_iter()
+        .iter()
+        .copied()
         .chain(body.members(db).iter().copied())
         .collect();
     let mut effect_keys = HashSet::new();
@@ -289,6 +270,7 @@ fn group_input<'db>(
             context: Context {
                 mint: context.mint.clone(),
                 program: Arc::new(program),
+                references: context.references.clone(),
             },
             signatures: signatures.clone(),
             env: Arc::new(env),
@@ -433,6 +415,8 @@ pub struct Session {
     source: Option<Source>,
     requested: usize,
     body_inputs: HashMap<Vec<Symbol>, Projection<Context>>,
+    fingerprinted_bodies: usize,
+    header_input: Option<Projection<Context>>,
 }
 
 impl Session {
@@ -454,6 +438,11 @@ impl Session {
         self.requested - self.solved_groups()
     }
 
+    /// Bodies inspected while preparing changed inference inputs.
+    pub fn fingerprinted_bodies(&self) -> usize {
+        self.fingerprinted_bodies
+    }
+
     pub fn infer(&mut self, mint: &Mint, program: &Program, trace: Trace) -> Output {
         self.infer_shared(
             Arc::new(mint.clone()),
@@ -470,16 +459,48 @@ impl Session {
         trace: Trace,
         selected: Option<&HashSet<Symbol>>,
     ) -> Output {
-        let bodies = self.prepare_bodies(&mint, &program);
+        self.infer_shared_changed(mint, program, trace, selected, None)
+    }
+
+    pub(crate) fn infer_shared_changed(
+        &mut self,
+        mint: Arc<Mint>,
+        program: Arc<Program>,
+        trace: Trace,
+        selected: Option<&HashSet<Symbol>>,
+        changed: Option<&HashSet<Symbol>>,
+    ) -> Output {
+        let bodies = self.prepare_bodies(&mint, &program, changed);
+        let header = if changed.is_some()
+            && let Some(header) = &self.header_input
+        {
+            header.clone()
+        } else {
+            let mut key = Fingerprint::default();
+            key.declarations(&program);
+            for symbol in program.terms.keys() {
+                key.debug(symbol);
+            }
+            Projection {
+                key: key.text.into(),
+                value: Context {
+                    mint: mint.clone(),
+                    program: program.clone(),
+                    references: Arc::from([]),
+                },
+            }
+        };
+        self.header_input = Some(header.clone());
         let source = match self.source {
             Some(source) => {
                 source.set_mint(&mut self.db).to(mint);
                 source.set_program(&mut self.db).to(program);
+                source.set_header(&mut self.db).to(header);
                 source.set_bodies(&mut self.db).to(bodies);
                 source
             }
             None => {
-                let source = Source::new(&self.db, mint, program, bodies);
+                let source = Source::new(&self.db, mint, program, header, bodies);
                 self.source = Some(source);
                 source
             }
@@ -490,12 +511,30 @@ impl Session {
     // Input preparation preserves immutable body snapshots before handing them
     // to Salsa. Comparing canonical source keys needs no solver; unchanged
     // bodies avoid allocating another AST and name table on every keystroke.
-    fn prepare_bodies(&mut self, mint: &Mint, program: &Program) -> Vec<PreparedBody> {
-        let mut previous = std::mem::take(&mut self.body_inputs);
+    fn prepare_bodies(
+        &mut self,
+        mint: &Mint,
+        program: &Program,
+        changed: Option<&HashSet<Symbol>>,
+    ) -> Vec<PreparedBody> {
+        // Retain the last completed inputs if cancellation abandons preparation.
+        let previous = &self.body_inputs;
         let mut next = HashMap::new();
         let mut bodies = Vec::new();
         for group in &program.groups {
             crate::cancellation::checkpoint();
+            if changed
+                .is_some_and(|changed| group.members.iter().all(|symbol| !changed.contains(symbol)))
+                && let Some(context) = previous.get(&group.members)
+            {
+                next.insert(group.members.clone(), context.clone());
+                bodies.push(PreparedBody {
+                    members: group.members.clone(),
+                    context: context.clone(),
+                });
+                continue;
+            }
+            self.fingerprinted_bodies += 1;
             let mut key = Fingerprint::default();
             for symbol in &group.members {
                 let decl = &program.terms[symbol];
@@ -507,10 +546,10 @@ impl Session {
                 key.term(&decl.value);
             }
             let context = if let Some(previous) = previous
-                .remove(&group.members)
+                .get(&group.members)
                 .filter(|previous| previous.key.as_ref() == key.text.as_slice())
             {
-                previous
+                previous.clone()
             } else {
                 let terms: IndexMap<_, _> = group
                     .members
@@ -543,6 +582,12 @@ impl Session {
                     }
                 }
 
+                let mut references = Vec::new();
+                for decl in terms.values() {
+                    ir::references(&decl.value, &mut references);
+                }
+                references.sort_unstable();
+                references.dedup();
                 Projection {
                     key: key.text.into(),
                     value: Context {
@@ -551,6 +596,7 @@ impl Session {
                             terms,
                             ..Default::default()
                         }),
+                        references: references.into(),
                     },
                 }
             };
@@ -601,15 +647,13 @@ impl Session {
                 if !wanted.insert(body) {
                     continue;
                 }
-                for symbol in body.members(&self.db) {
-                    let mut references = Vec::new();
-                    ir::references(&program.terms[symbol].value, &mut references);
-                    work.extend(
-                        references
-                            .iter()
-                            .filter_map(|symbol| graph.owners.get(symbol).copied()),
-                    );
-                }
+                work.extend(
+                    body.context(&self.db)
+                        .value
+                        .references
+                        .iter()
+                        .filter_map(|symbol| graph.owners.get(symbol).copied()),
+                );
             }
             wanted
         });

@@ -100,6 +100,12 @@ impl FileID {
     /// Represents a non-existant placeholder file for generated code
     pub const GENERATED: FileID = FileID(0);
 
+    /// Allocate from a driver's persistent, one-based file table.
+    pub(crate) fn from_index(index: usize) -> Self {
+        assert!(index > 0);
+        Self(index)
+    }
+
     pub const fn is_generated(self) -> bool {
         self.0 == Self::GENERATED.0
     }
@@ -280,6 +286,17 @@ impl Order {
 }
 
 impl SourceMap {
+    /// Refresh positions independently of the semantic nodes they locate.
+    pub(crate) fn remap(&mut self, mut map: impl FnMut(Anchor, Span) -> Option<Span>) {
+        self.spans.retain(|anchor, span| {
+            if let Some(next) = map(*anchor, *span) {
+                *span = next;
+                true
+            } else {
+                false
+            }
+        });
+    }
     /// Record where a node of `definition`, whose own text starts at `base`,
     /// was written, and answer the anchor that names it.
     pub fn record(&mut self, definition: Symbol, base: usize, span: Span) -> Anchor {
@@ -342,6 +359,13 @@ impl FileManager {
         self.next_file_id += 1;
         self.files.insert(id, rf);
         id
+    }
+
+    /// Register an identity allocated by a persistent source driver.
+    pub fn register_file(&mut self, id: FileID, path: String, content: String) {
+        assert!(!id.is_generated());
+        self.next_file_id = self.next_file_id.max(id.0 + 1);
+        self.files.insert(id, RegisteredFile { path, content });
     }
 
     pub fn get_file(&mut self, file_id: FileID) -> &RegisteredFile {

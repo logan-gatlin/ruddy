@@ -74,6 +74,291 @@ fn built(src: &str) -> (Mint, Output) {
     (mint, out)
 }
 
+fn incremental_file(
+    session: &mut ruddy::ir::Session,
+    source: &str,
+) -> (Mint, ruddy::ir::SharedOutput) {
+    let mut files = FileManager::new();
+    let file = files.register_new_file("test.rud".into(), source.into());
+    let parsed = parse::parse(lex(source, file).tokens);
+    assert!(parsed.errors.is_empty(), "{:#?}", parsed.errors);
+    let mut mint = dummy_mint();
+    let output = session.build_with_interfaces(
+        &mut mint,
+        parsed.stmts,
+        &[],
+        &[],
+        &[(file, source.to_owned())].into(),
+    );
+    (mint, output)
+}
+
+fn assert_incremental_ir_current(source: &str, incremental: &ruddy::ir::SharedOutput) {
+    let fresh = build_file(source);
+    assert_eq!(
+        format!("{:?}", incremental.program),
+        format!("{:?}", fresh.program)
+    );
+    assert_eq!(
+        format!("{:?}", incremental.errors),
+        format!("{:?}", fresh.errors)
+    );
+    for (symbol, declaration) in &fresh.program.terms {
+        let cached = &incremental.program.terms[symbol];
+        assert_eq!(
+            incremental.source.span(cached.name_at),
+            fresh.source.span(declaration.name_at)
+        );
+        for (cached, fresh_term) in cached.value.walk().zip(declaration.value.walk()) {
+            assert_eq!(
+                incremental.source.span(cached.at),
+                fresh.source.span(fresh_term.at)
+            );
+        }
+    }
+}
+
+#[test]
+fn incremental_lowering_reuses_declarations_bodies_and_groups_on_length_changing_edits() {
+    let mut session = ruddy::ir::Session::default();
+    let before = "type Count = Nat\nlet first = fn x => x + 1n\nlet second = fn y => first y\n";
+    let (_, first) = incremental_file(&mut session, before);
+    assert!(first.errors.is_empty(), "{:?}", first.errors);
+    let after = before.replace("+ 1n", "+ 10000n");
+    let (_, current) = incremental_file(&mut session, &after);
+    assert_incremental_ir_current(&after, &current);
+    let stats = session.stats();
+    assert_eq!(stats.declaration_builds, 1);
+    assert_eq!(stats.lowered_bodies, 3);
+    assert_eq!(stats.reused_bodies, 1);
+    assert_eq!(stats.group_builds, 1);
+    assert_eq!(session.changed_symbols().unwrap().len(), 1);
+    assert!(!std::sync::Arc::ptr_eq(&first.program, &current.program));
+    assert_incremental_ir_current(before, &first);
+
+    let moved = format!("\n\n{after}");
+    let program = current.program.clone();
+    let (_, current) = incremental_file(&mut session, &moved);
+    assert_incremental_ir_current(&moved, &current);
+    assert!(session.changed_symbols().unwrap().is_empty());
+    assert_eq!(session.stats().declaration_builds, 1);
+    assert_eq!(session.stats().lowered_bodies, 3);
+    assert!(std::sync::Arc::ptr_eq(&program, &current.program));
+}
+
+#[test]
+fn incremental_lowering_regroups_changed_references_and_undo_without_redeclaring() {
+    let mut session = ruddy::ir::Session::default();
+    let separate = "let first = fn x => x\nlet second = fn y => first y\n";
+    let (_, initial) = incremental_file(&mut session, separate);
+    assert_eq!(initial.program.groups.len(), 2);
+    let recursive = "let first = fn x => second x\nlet second = fn y => first y\n";
+    let (_, merged) = incremental_file(&mut session, recursive);
+    assert_incremental_ir_current(recursive, &merged);
+    assert_eq!(merged.program.groups.len(), 1);
+    assert!(merged.program.groups[0].recursive);
+    let (_, split) = incremental_file(&mut session, separate);
+    assert_incremental_ir_current(separate, &split);
+    assert_eq!(split.program.groups.len(), 2);
+    assert_eq!(session.stats().declaration_builds, 1);
+    assert_eq!(session.stats().group_builds, 3);
+}
+
+#[test]
+fn incremental_lowering_rebuilds_changed_declarations_and_recovers_current_errors() {
+    let mut session = ruddy::ir::Session::default();
+    let first = "type Count = Nat\nlet identity = fn value => value\n";
+    incremental_file(&mut session, first);
+    let declared = first.replace("Nat", "Int");
+    let (_, output) = incremental_file(&mut session, &declared);
+    assert_incremental_ir_current(&declared, &output);
+    assert_eq!(session.stats().declaration_builds, 2);
+    assert!(session.changed_symbols().is_none());
+    let invalid = declared.replace("=> value", "=> missing");
+    let (_, output) = incremental_file(&mut session, &invalid);
+    assert!(!output.errors.is_empty());
+    assert_incremental_ir_current(&invalid, &output);
+    let (_, repaired) = incremental_file(&mut session, &declared);
+    assert_incremental_ir_current(&declared, &repaired);
+    assert!(repaired.errors.is_empty());
+}
+
+#[test]
+fn incremental_lowering_refreshes_module_and_metadata_locations() {
+    let mut session = ruddy::ir::Session::default();
+    let source =
+        "@private\nlet first = 1n\nmodule Nested =\n@private\nlet second = fn x => x\nend\n";
+    incremental_file(&mut session, source);
+    let edited = source.replace("1n", "123456n");
+    let (_, cached) = incremental_file(&mut session, &edited);
+    let fresh = build_file(&edited);
+    assert!(cached.errors.is_empty());
+    assert_eq!(session.stats().declaration_builds, 1);
+    for (symbol, declaration) in &fresh.program.modules {
+        assert_eq!(
+            cached.source.span(cached.program.modules[symbol].name_at),
+            fresh.source.span(declaration.name_at)
+        );
+    }
+    for (symbol, declaration) in &fresh.program.terms {
+        let previous = &cached.program.terms[symbol];
+        assert_eq!(
+            cached.source.span(previous.name_at),
+            fresh.source.span(declaration.name_at)
+        );
+        for (name, attribute) in &declaration.metadata {
+            assert_eq!(
+                cached.source.span(previous.metadata[name].key_at),
+                fresh.source.span(attribute.key_at)
+            );
+        }
+        let file = fresh.source.span(declaration.name_at).file_id;
+        for offset in 0..edited.len() {
+            assert_eq!(
+                cached.names.scope_at(file, offset),
+                fresh.names.scope_at(file, offset)
+            );
+        }
+    }
+}
+
+#[test]
+fn incremental_lowering_does_not_restore_erased_circular_bodies() {
+    let mut session = ruddy::ir::Session::default();
+    let good = "let first = fn x => second x\nlet second = fn y => y\n";
+    incremental_file(&mut session, good);
+    let circular = "let first = second\nlet second = first\n";
+    let (_, output) = incremental_file(&mut session, circular);
+    assert!(!output.errors.is_empty());
+    assert_incremental_ir_current(circular, &output);
+    let (_, repaired) = incremental_file(&mut session, good);
+    assert_incremental_ir_current(good, &repaired);
+    assert!(repaired.errors.is_empty());
+}
+
+#[test]
+fn incremental_lowering_checks_forwarding_shape_even_when_references_are_unchanged() {
+    let mut session = ruddy::ir::Session::default();
+    let good = "let first = fn x => second\nlet second = first\n";
+    let (_, initial) = incremental_file(&mut session, good);
+    assert!(initial.errors.is_empty());
+    let circular = "let first = second\nlet second = first\n";
+    let (_, output) = incremental_file(&mut session, circular);
+    assert!(!output.errors.is_empty());
+    assert_incremental_ir_current(circular, &output);
+
+    let good = "let first = fn x => do let local = 1n return x end\n";
+    incremental_file(&mut session, good);
+    let circular = good.replace("local = 1n", "local = local");
+    let (_, output) = incremental_file(&mut session, &circular);
+    assert!(!output.errors.is_empty());
+    assert_incremental_ir_current(&circular, &output);
+}
+
+#[test]
+fn incremental_lowering_keeps_rigid_ranges_and_rebuilds_when_a_body_allocates_more() {
+    let mut session = ruddy::ir::Session::default();
+    let source =
+        "let identity : 'a -> 'a = fn value => value\nlet next : 'a -> 'a = fn other => other\n";
+    let (_, initial) = incremental_file(&mut session, source);
+    assert!(initial.errors.is_empty(), "{:?}", initial.errors);
+    let renamed = source.replace("fn value => value", "fn chosen => chosen");
+    let (_, output) = incremental_file(&mut session, &renamed);
+    assert_incremental_ir_current(&renamed, &output);
+    assert_eq!(session.stats().declaration_builds, 1);
+
+    let nested = renamed.replace(
+        "fn chosen => chosen",
+        "fn chosen => do let nested : 'b -> 'b = fn item => item return nested chosen end",
+    );
+    let (_, output) = incremental_file(&mut session, &nested);
+    assert_incremental_ir_current(&nested, &output);
+    assert_eq!(session.stats().declaration_builds, 2);
+    assert!(session.changed_symbols().is_none());
+    let renamed = nested.replace("nested chosen", "nested (nested chosen)");
+    let (_, output) = incremental_file(&mut session, &renamed);
+    assert_incremental_ir_current(&renamed, &output);
+    assert_eq!(session.stats().declaration_builds, 2);
+
+    let regions =
+        "let inspect : mut 'r Nat -> Nat = fn cell => 1n\nlet next : 'a -> 'a = fn x => x\n";
+    let (_, initial) = incremental_file(&mut session, regions);
+    assert!(initial.errors.is_empty(), "{:?}", initial.errors);
+    let edited = regions.replace("1n", "200n");
+    let before = session.stats().declaration_builds;
+    let (_, output) = incremental_file(&mut session, &edited);
+    assert_incremental_ir_current(&edited, &output);
+    assert_eq!(session.stats().declaration_builds, before);
+}
+
+#[test]
+fn incremental_lowering_relocates_and_removes_local_import_scopes() {
+    let mut session = ruddy::ir::Session::default();
+    let source = "module Math = let identity = fn x => x end\nlet shifted = 1n\nlet value = do using Math::identity as call return call 1n end\nlet next = do using Math::identity as other return other 2n end\n";
+    let (_, initial) = incremental_file(&mut session, source);
+    assert!(initial.errors.is_empty(), "{:?}", initial.errors);
+    for edited in [
+        source.replace("shifted = 1n", "shifted = 123456n"),
+        source.replace("using Math::identity as call return call 1n", "return 99n"),
+        source.replace("as call return call", "as renamed return renamed"),
+    ] {
+        let (_, output) = incremental_file(&mut session, &edited);
+        let fresh = build_file(&edited);
+        assert!(output.errors.is_empty(), "{:?}", output.errors);
+        assert_eq!(session.stats().declaration_builds, 1);
+        let file = fresh
+            .source
+            .span(fresh.program.terms.values().next().unwrap().name_at)
+            .file_id;
+        for offset in 0..edited.len() {
+            let names = |scope: &ruddy::ir::ScopeNames| {
+                let mut names: Vec<_> = scope
+                    .local_import_names(file, offset)
+                    .into_iter()
+                    .map(|name| format!("{name:?}"))
+                    .collect();
+                names.sort();
+                names
+            };
+            assert_eq!(
+                names(&output.names),
+                names(&fresh.names),
+                "import scope at {offset}"
+            );
+        }
+    }
+}
+
+#[test]
+fn incremental_lowering_rebuilds_renamed_cross_module_declarations() {
+    let mut session = ruddy::ir::Session::default();
+    let source =
+        "module Math = let identity = fn x => x end\nlet apply = fn x => Math::identity x\n";
+    incremental_file(&mut session, source);
+    let renamed = source.replace("identity", "renamed");
+    let (_, output) = incremental_file(&mut session, &renamed);
+    assert_incremental_ir_current(&renamed, &output);
+    assert_eq!(session.stats().declaration_builds, 2);
+    assert!(session.changed_symbols().is_none());
+}
+
+#[test]
+fn incremental_lowering_rebuilds_when_the_last_implicit_effect_use_disappears() {
+    let mut session = ruddy::ir::Session::default();
+    let source =
+        "let outer = fn x => do let action : () -> () + !mut 'r = fn y => () return x end\n";
+    let (_, initial) = incremental_file(&mut session, source);
+    assert!(initial.errors.is_empty(), "{:?}", initial.errors);
+    let edited = source.replace("() -> () + !mut 'r = fn y => ()", "'a -> 'a = fn y => y");
+    let (_, output) = incremental_file(&mut session, &edited);
+    assert_incremental_ir_current(&edited, &output);
+    assert_eq!(session.stats().declaration_builds, 2);
+    assert!(session.changed_symbols().is_none());
+    let (_, restored) = incremental_file(&mut session, source);
+    assert_incremental_ir_current(source, &restored);
+    assert_eq!(session.stats().declaration_builds, 3);
+}
+
 #[test]
 fn arrays_cross_native_extern_boundaries_while_runtime_intrinsics_keep_exact_signatures() {
     let (_, direct) = build_src("extern values : [Nat] = \"host.values\"");

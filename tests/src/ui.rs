@@ -1160,6 +1160,69 @@ fn pivots_name_repeated_inputs_branches_and_anonymous_shared_values_once() {
 }
 
 #[test]
+fn conditional_match_diagnostics_link_only_conflicting_branch_results() {
+    for (source, contributors) in [
+        (
+            "let bad = fn value => match value with | #A => 1n | #B => {} | #C => 2n end",
+            ["1n", "{}"],
+        ),
+        (
+            "let bad : (#A | #B) -> _ = fn value => match value with | #A => 1n | #B => {} | #C => 2n end",
+            ["1n", "{}"],
+        ),
+        (
+            "let bad = fn value => match value with | #A => { y: 1n } | #B => { x: 2n } | #C => { x: false } end",
+            ["{ x: 2n }", "{ x: false }"],
+        ),
+        (
+            "let shared = 1n\nlet bad = fn value => match value with | #A => { y: shared } | #B => { x: shared } | #C => { x: false } end",
+            ["{ x: shared }", "{ x: false }"],
+        ),
+    ] {
+        let (map, errors) = inference_fixture_errors(source);
+        let error = errors.last().expect("incompatible branch results");
+        let explanation = error.explanation.as_ref().expect("branch explanation");
+        let pivot = explanation.pivot.as_ref().expect("shared branch result");
+        assert_eq!(pivot.kind, inference::ExplanationPivotKind::BranchResult);
+        let spans: Vec<_> = pivot
+            .references
+            .iter()
+            .map(|at| map.span(explanation.full_facts[*at].at))
+            .collect();
+        let actual: Vec<_> = spans
+            .iter()
+            .map(|span| &source[span.start..span.end()])
+            .collect();
+        assert_eq!(actual, contributors, "{source}\n{explanation:#?}");
+    }
+}
+
+#[test]
+fn conditional_sum_matches_must_preserve_caller_chosen_remainders() {
+    for arms in ["| #A n => n", "| #A n => n | #B n => n"] {
+        let source =
+            format!("let bad : (#A Nat | ..'r) -> Nat = fn value => match value with {arms} end");
+        let (map, errors) = inference_fixture_errors(&source);
+        let [error] = errors.as_slice() else {
+            panic!("one row-closure error: {errors:#?}");
+        };
+        assert_eq!(error.kind.code(), "rigid-broken");
+        assert!(error.diagnostic(&map).help.iter().any(|help| {
+            help == "preserve the caller-chosen row remainder instead of closing it"
+        }));
+    }
+    // A catch-all preserves arbitrary extra cases. A closed conditional sum
+    // has no arbitrary remainder to preserve, and #B need not be present.
+    for source in [
+        "let good : (#A Nat | ..'r) -> Nat = fn value => match value with | #A n => n | _ => 0n end",
+        "let good : (#A Nat | #B (when 'p) Nat) -> Nat = fn value => match value with | #A n => n | #B n => n end",
+    ] {
+        let (_, errors) = inference_fixture_errors(source);
+        assert!(errors.is_empty(), "{source}\n{errors:#?}");
+    }
+}
+
+#[test]
 fn pivot_labels_avoid_visible_source_names_without_solver_spelling() {
     let source = "let Input = fn use => { first: use 1n, second: use false }";
     let (_, errors) = inference_fixture_errors(source);

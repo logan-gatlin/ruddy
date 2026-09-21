@@ -162,7 +162,7 @@ fn a_nested_bundle_splices_every_file_into_one_tree() {
     let mut manager = manager;
     for file in &out.loaded {
         assert_eq!(manager.get_file(file.id).path, file.path);
-        for token in &file.tokens {
+        for token in file.tokens.iter() {
             assert_eq!(token.span.file_id, file.id, "{}", file.path);
         }
     }

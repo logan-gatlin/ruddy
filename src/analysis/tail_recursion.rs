@@ -5,7 +5,7 @@ use crate::{
     ir::{BinaryOp, Term, TermKind, UnaryOp},
     parse::{self, ExprKind, StmtKind},
     symbol::{Namespace, Symbol},
-    tracking::{Anchor, FileID, Span},
+    tracking::{Anchor, Span},
     types::{Presence, Rest, Row, Ty},
 };
 
@@ -19,6 +19,27 @@ pub struct TailRecursion {
 
 impl Analysis {
     pub fn tail_recursion(&self, path: &str) -> Vec<TailRecursion> {
+        // Background validation may append diagnostics after the frontend checks.
+        // Never reuse a refactoring on a file that now has a diagnostic.
+        if self.diagnostics.iter().any(|d| {
+            self.paths
+                .get(&d.primary.span.file_id)
+                .is_some_and(|p| p == path)
+        }) {
+            return Vec::new();
+        }
+        if let Some(cached) = self.lint_cache.lock().unwrap().get(path) {
+            return cached.to_vec();
+        }
+        let result = self.compute_tail_recursion(path);
+        self.lint_cache
+            .lock()
+            .unwrap()
+            .insert(path.to_owned(), result.clone().into());
+        result
+    }
+
+    fn compute_tail_recursion(&self, path: &str) -> Vec<TailRecursion> {
         let Some(text) = self.sources.get(path) else {
             return Vec::new();
         };
@@ -29,12 +50,10 @@ impl Analysis {
         }) {
             return Vec::new();
         }
-        let file = self
-            .paths
-            .iter()
-            .find_map(|(file, known)| (known == path).then_some(*file))
-            .unwrap_or(FileID::GENERATED);
-        let blocks = block_spans(text, file);
+        let Some(syntax) = self.syntax.get(path) else {
+            return Vec::new();
+        };
+        let blocks = block_spans(&syntax.stmts);
         let mut opportunities = Vec::new();
         for (symbol, decl) in self.terms_in(path) {
             crate::cancellation::checkpoint();
@@ -66,10 +85,9 @@ impl Analysis {
 /// Lowering erases `do` wrappers: a binding's anchor covers its statement,
 /// while a block with only imports inherits its result's anchor. Recover those
 /// wrappers from syntax so copying an expression also copies its lexical scope.
-fn block_spans(text: &str, file: FileID) -> std::collections::HashMap<Span, Span> {
-    let parsed = parse::parse(crate::token::lex(text, file).tokens);
+fn block_spans(stmts: &[parse::Stmt]) -> std::collections::HashMap<Span, Span> {
     let mut blocks = std::collections::HashMap::new();
-    let mut statements: Vec<_> = parsed.stmts.iter().collect();
+    let mut statements: Vec<_> = stmts.iter().collect();
     let mut expressions = Vec::new();
     loop {
         if let Some(statement) = statements.pop() {

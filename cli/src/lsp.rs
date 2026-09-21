@@ -1,9 +1,17 @@
 //! The language server: LSP transport and newest-revision scheduling. Input handling runs separately
 //! from analysis; only a current revision may publish diagnostics.
+mod diagnostics;
+mod positions;
+mod watcher;
 use crate::workspace::{Workspace, file_identity};
 use crossbeam_channel::Sender;
+use diagnostics::{Diagnostics, tail_diagnostic};
 use lsp_server::{Connection, Message, Notification, Request, RequestId, Response};
-use ruddy::{analysis::CompletionKind, cancellation::Cancellation, tracking::Span};
+pub use positions::LineIndex;
+use ruddy::{
+    analysis::CompletionKind,
+    cancellation::{Cancellation, checkpoint},
+};
 use serde_json::{Value, json};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
@@ -11,8 +19,11 @@ use std::{
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
+use watcher::Watcher;
 
-const BACKGROUND_QUIET_INTERVAL: Duration = Duration::from_millis(150);
+// Full-project inference/lowering should wait through ordinary typing pauses.
+// Foreground requests and active-file diagnostics do not wait for this timer.
+const BACKGROUND_QUIET_INTERVAL: Duration = Duration::from_millis(300);
 use url::Url;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
@@ -107,8 +118,10 @@ pub fn serve(connection: Connection) -> Result<()> {
             }
         }
     });
+    let mut workspace = Workspace::new(root);
+    workspace.set_notification_driven(true);
     let mut worker = Worker {
-        workspace: Workspace::new(root),
+        workspace,
         versioned_edits: params
             .pointer("/capabilities/workspace/workspaceEdit/documentChanges")
             .and_then(Value::as_bool)
@@ -126,6 +139,8 @@ pub fn serve(connection: Connection) -> Result<()> {
         published: None,
         published_closed: HashSet::new(),
         watched: watcher.inputs.clone(),
+        diagnostics: Diagnostics::default(),
+        published_payloads: HashMap::new(),
     };
     let mut pending = VecDeque::new();
     loop {
@@ -157,8 +172,11 @@ pub fn serve(connection: Connection) -> Result<()> {
         }
         if !worker.shutdown && !worker.documents.is_empty() && worker.dirty {
             let token = worker.begin(None);
-            if token.run(|| worker.refresh()).is_ok() {
-                worker.publish()?;
+            if let Ok(result) = token.run(|| {
+                worker.refresh();
+                worker.publish()
+            }) {
+                result?;
             }
             worker.end();
         }
@@ -182,11 +200,27 @@ pub fn serve(connection: Connection) -> Result<()> {
                 }
             }
             let token = worker.begin(None);
-            if let Ok(errors) = token.run(|| worker.workspace.check_background()) {
-                worker.background_errors = errors;
+            if let Ok(result) = token.run(|| {
+                worker.background_errors = worker.workspace.check_background();
                 worker.background = true;
                 worker.background_due = None;
-                worker.publish()?;
+                worker.publish()
+            }) {
+                result?;
+            }
+            worker.end();
+        }
+        // Analysis can finish before a new request cancels diagnostic rendering.
+        // Retry that publication independently of whether background checks have
+        // completed, including after requests handled without semantic analysis.
+        if !worker.shutdown
+            && !worker.dirty
+            && !worker.documents.is_empty()
+            && worker.published != Some((worker.revision, worker.background))
+        {
+            let token = worker.begin(None);
+            if let Ok(result) = token.run(|| worker.publish()) {
+                result?;
             }
             worker.end();
         }
@@ -222,7 +256,9 @@ struct Worker {
     background_errors: Vec<String>,
     published: Option<(u64, bool)>,
     published_closed: HashSet<String>,
-    watched: Arc<Mutex<HashMap<PathBuf, Option<String>>>>,
+    watched: Sender<watcher::Command>,
+    diagnostics: Diagnostics,
+    published_payloads: HashMap<String, Value>,
 }
 
 impl Worker {
@@ -230,6 +266,7 @@ impl Worker {
         let token = Cancellation::default();
         let mut schedule = self.shared.lock().unwrap();
         if schedule.revision != self.revision
+            || (request.is_none() && !schedule.pending.is_empty())
             || request
                 .as_ref()
                 .is_some_and(|id| schedule.cancelled.contains(id))
@@ -295,12 +332,11 @@ impl Worker {
                             break;
                         };
                         if let Some(range) = change.get("range") {
+                            let index = self.diagnostics.index(&path, &text);
                             let start = range
                                 .get("start")
-                                .and_then(|position| offset(&text, position));
-                            let end = range
-                                .get("end")
-                                .and_then(|position| offset(&text, position));
+                                .and_then(|position| index.offset(position));
+                            let end = range.get("end").and_then(|position| index.offset(position));
                             if let (Some(start), Some(end)) = (start, end) {
                                 if start <= end {
                                     text.replace_range(start..end, replacement);
@@ -334,6 +370,7 @@ impl Worker {
                     })
                 {
                     if let Some(document) = self.documents.remove(&path) {
+                        self.published_payloads.remove(&document.uri);
                         self.sender.send(Message::Notification(Notification::new(
                             "textDocument/publishDiagnostics".into(),
                             json!({"uri":document.uri,"diagnostics":[]}),
@@ -342,9 +379,40 @@ impl Worker {
                     self.dirty |= self.workspace.set_overlay(&path, None);
                 }
             }
-            "workspace/didChangeWatchedFiles"
-            | "workspace/didChangeConfiguration"
-            | "textDocument/didSave" => self.dirty = true,
+            "workspace/didChangeWatchedFiles" => {
+                let paths: Vec<_> = params
+                    .get("changes")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|change| {
+                        // Keep lexical loader paths for symlink deletion/retargeting;
+                        // canonicalizing an event after a deletion loses its identity.
+                        Url::parse(change.get("uri")?.as_str()?)
+                            .ok()?
+                            .to_file_path()
+                            .ok()
+                    })
+                    .collect();
+                if paths.is_empty() {
+                    self.workspace.invalidate_all();
+                } else {
+                    self.workspace.invalidate_paths(paths);
+                }
+                self.dirty = true;
+            }
+            "workspace/didChangeConfiguration" => {
+                self.workspace.invalidate_all();
+                self.dirty = true;
+            }
+            "textDocument/didSave" => {
+                if let Some(path) = path {
+                    self.workspace.invalidate_paths([path]);
+                } else {
+                    self.workspace.invalidate_all();
+                }
+                self.dirty = true;
+            }
             _ => {}
         }
         Ok(())
@@ -365,7 +433,27 @@ impl Worker {
                 self.background_due = None;
             }
         }
-        *self.watched.lock().unwrap() = self.workspace.observed_files();
+        let _ = self
+            .watched
+            .send(watcher::Command::Inputs(self.workspace.observed_files()));
+        let paths = self
+            .workspace
+            .projects
+            .iter()
+            .filter_map(|project| {
+                project
+                    .source_analysis()
+                    .map(|analysis| (project, analysis))
+            })
+            .flat_map(|(project, analysis)| {
+                analysis
+                    .sources
+                    .keys()
+                    .map(|logical| project.source_directory.join(logical))
+            })
+            .chain(self.documents.keys().cloned())
+            .collect();
+        self.diagnostics.retain(&paths);
         self.background = false;
         self.background_errors.clear();
         self.dirty = false;
@@ -408,20 +496,71 @@ impl Worker {
         }
         let token = self.begin(Some(request.id.clone()));
         let result = token.run(|| {
-            self.refresh();
-            if let Some(path) = request
+            let path = request
                 .params
                 .pointer("/textDocument/uri")
                 .and_then(Value::as_str)
-                .and_then(file_path)
-                && self.workspace.request_file(&path)
+                .and_then(file_path);
+            if request.method == "textDocument/formatting"
+                && let Some(path) = &path
+                && let Some(document) = self.documents.get(path)
             {
-                self.published = None;
+                let index = self.diagnostics.index(path, &document.text);
+                return Ok(format_edits(&index, &document.text));
+            }
+            let positional = matches!(
+                request.method.as_str(),
+                "textDocument/hover" | "textDocument/completion"
+            );
+            let at = path.as_ref().and_then(|path| {
+                let text = self
+                    .documents
+                    .get(path)
+                    .map(|document| document.text.as_str())
+                    .or_else(|| {
+                        self.workspace
+                            .file(path)
+                            .map(|(project, logical)| project.analysis().sources[logical].as_str())
+                    })?;
+                self.diagnostics
+                    .index(path, text)
+                    .offset(request.params.get("position")?)
+            });
+            if positional && let Some(path) = &path {
+                self.workspace.focus_at(path, at);
+            }
+            self.refresh();
+            if let Some(path) = &path {
+                // Closed documents can have changed on disk since the last
+                // publication. Resolve their position against the refreshed
+                // snapshot before choosing which definition to infer.
+                let at = if self.documents.contains_key(path) {
+                    at
+                } else {
+                    self.workspace.file(path).and_then(|(project, logical)| {
+                        self.diagnostics
+                            .index(path, &project.analysis().sources[logical])
+                            .offset(request.params.get("position")?)
+                    })
+                };
+                let expanded = if positional {
+                    match at {
+                        Some(at) if request.method == "textDocument/completion" => {
+                            self.workspace.request_completion(path, at)
+                        }
+                        Some(at) => self.workspace.request_at(path, at),
+                        None => self.workspace.request_file(path),
+                    }
+                } else {
+                    request.method == "textDocument/codeAction" && self.workspace.request_file(path)
+                };
+                if expanded {
+                    self.published = None;
+                }
             }
             self.answer(&request)
         });
         self.end();
-        self.shared.lock().unwrap().cancelled.remove(&request.id);
         let response = match result {
             Ok(Ok(value)) => Response::new_ok(request.id, value),
             Ok(Err(message)) => Response::new_err(request.id, -32602, message),
@@ -429,9 +568,9 @@ impl Worker {
         };
         {
             let schedule = self.shared.lock().unwrap();
-            let response = if request.method == "textDocument/codeAction"
-                && schedule.revision != self.revision
-            {
+            let response = if schedule.cancelled.contains(&response.id) {
+                Response::new_err(response.id, -32800, "request was cancelled".into())
+            } else if schedule.revision != self.revision {
                 Response::new_err(
                     response.id,
                     -32801,
@@ -442,9 +581,15 @@ impl Worker {
             };
             self.sender.send(Message::Response(response))?;
         }
+        drop(_registration);
         // A request may have finished the revision's analysis before the idle
         // diagnostics task ran. Publish through the same revision barrier.
-        self.publish()?;
+        let token = self.begin(None);
+        let published = token.run(|| self.publish());
+        self.end();
+        if let Ok(result) = published {
+            result?;
+        }
         Ok(())
     }
 
@@ -456,17 +601,16 @@ impl Worker {
             .and_then(file_path)
             .ok_or("expected a file URI")?;
         if request.method == "textDocument/definition" {
-            let Some(source) = self
-                .workspace
-                .file(&path)
-                .map(|(project, logical)| project.analysis().sources[logical].clone())
-            else {
+            let Some(index) = self.workspace.file(&path).map(|(project, logical)| {
+                self.diagnostics
+                    .index(&path, &project.analysis().sources[logical])
+            }) else {
                 return Ok(Value::Null);
             };
             let at = request
                 .params
                 .get("position")
-                .and_then(|position| offset(&source, position))
+                .and_then(|position| index.offset(position))
                 .ok_or("invalid document position")?;
             return Ok(self
                 .workspace
@@ -477,8 +621,11 @@ impl Worker {
                         .documents
                         .get(&file_identity(&path))
                         .map(|document| document.uri.clone())
-                        .or_else(|| Url::from_file_path(path).ok().map(|uri| uri.to_string()))?;
-                    Some(json!({"uri":uri,"range":range(&target.analysis().sources[logical],span)}))
+                        .or_else(|| Url::from_file_path(&path).ok().map(|uri| uri.to_string()))?;
+                    let index = self
+                        .diagnostics
+                        .index(&path, &target.analysis().sources[logical]);
+                    Some(json!({"uri":uri,"range":index.range(span)}))
                 })
                 .unwrap_or(Value::Null));
         }
@@ -487,18 +634,12 @@ impl Worker {
         };
         let analysis = project.analysis();
         let source = &analysis.sources[logical];
+        let index = self.diagnostics.index(&path, source);
         // Formatting is whole-document and positionless: one edit replacing
         // everything, or none when the buffer is already formatted. Syntax
         // errors are formatted around, as the command line does.
         if request.method == "textDocument/formatting" {
-            let formatted = ruddy::format::format(source, ruddy::tracking::FileID::GENERATED);
-            if formatted.text == *source {
-                return Ok(Value::Array(Vec::new()));
-            }
-            return Ok(json!([{
-                "range": {"start": position(source, 0), "end": position(source, source.len())},
-                "newText": formatted.text,
-            }]));
+            return Ok(format_edits(&index, source));
         }
         if request.method == "textDocument/codeAction" {
             let Some(document) = self.documents.get(&path) else {
@@ -519,12 +660,12 @@ impl Worker {
             let start = request
                 .params
                 .pointer("/range/start")
-                .and_then(|p| offset(source, p))
+                .and_then(|p| index.offset(p))
                 .ok_or("invalid action range")?;
             let end = request
                 .params
                 .pointer("/range/end")
-                .and_then(|p| offset(source, p))
+                .and_then(|p| index.offset(p))
                 .ok_or("invalid action range")?;
             if start > end {
                 return Err("invalid action range".into());
@@ -535,8 +676,8 @@ impl Worker {
                 .into_iter()
                 .filter(|fix| start <= fix.binding.end() && end >= fix.binding.start)
                 .map(|fix| {
-                    let diagnostic = tail_diagnostic(source, &fix);
-                    let edits = json!([{"range":range(source,fix.span),"newText":fix.replacement}]);
+                    let diagnostic = tail_diagnostic(&index, &fix);
+                    let edits = json!([{"range":index.range(fix.span),"newText":fix.replacement}]);
                     let edit = if self.versioned_edits {
                         json!({"documentChanges":[{
                             "textDocument":{"uri":document.uri,"version":document.version},"edits":edits
@@ -555,10 +696,10 @@ impl Worker {
         let at = request
             .params
             .get("position")
-            .and_then(|position| offset(source, position))
+            .and_then(|position| index.offset(position))
             .ok_or("invalid document position")?;
         Ok(match request.method.as_str() {
-            "textDocument/hover" => analysis.hover(logical, at).map(|hover| json!({"contents":{"kind":"markdown","value":format!("```ruddy\n{}\n```{}",hover.ty,hover.runtime_information.map(|note| format!("\n\n{note}")).unwrap_or_default())},"range":range(source, hover.span)})).unwrap_or(Value::Null),
+            "textDocument/hover" => analysis.hover(logical, at).map(|hover| json!({"contents":{"kind":"markdown","value":format!("```ruddy\n{}\n```{}",hover.ty,hover.runtime_information.map(|note| format!("\n\n{note}")).unwrap_or_default())},"range":index.range(hover.span)})).unwrap_or(Value::Null),
             "textDocument/completion" => Value::Array(analysis.completions(logical, at).into_iter().map(|item| {
                 // LSP has no general type kind. Class and TypeParameter both
                 // misdescribe aliases and primitive types; name the category
@@ -583,33 +724,38 @@ impl Worker {
         if self.published == Some((self.revision, self.background)) || self.dirty {
             return Ok(());
         }
-        let schedule = self.shared.lock().unwrap();
-        if schedule.revision != self.revision {
-            return Ok(());
-        }
+        checkpoint();
+        // Rendering, linting and JSON construction are cancellable work and
+        // must never prevent the router from accepting the next edit.
+        let mut payloads = Vec::new();
         for (path, document) in &self.documents {
-            let mut diagnostics: Vec<_> = if let Some(message) = &self.project_error {
-                vec![
-                    json!({"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":0}},"severity":1,"source":"ruddy","code":"project","message":message}),
-                ]
+            checkpoint();
+            let mut diagnostics = if let Some(message) = &self.project_error {
+                vec![project_diagnostic(message)]
             } else if let Some((project, logical)) = self.workspace.file(path) {
-                diagnostics_for(project, logical, &document.text)
+                self.diagnostics.for_file(project, logical, &document.text)
             } else {
                 Vec::new()
             };
-            diagnostics.extend(self.background_errors.iter().map(|message| json!({"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":0}},"severity":1,"source":"ruddy","code":"project","message":message})));
-            self.sender.send(Message::Notification(Notification::new(
-                "textDocument/publishDiagnostics".into(),
+            diagnostics.extend(
+                self.background_errors
+                    .iter()
+                    .map(|message| project_diagnostic(message)),
+            );
+            payloads.push((
+                document.uri.clone(),
                 json!({"uri":document.uri,"version":document.version,"diagnostics":diagnostics}),
-            )))?;
+            ));
         }
+        let mut current = self.published_closed.clone();
         if self.background {
-            let mut current = HashSet::new();
+            current.clear();
             for project in &self.workspace.projects {
                 let Some(analysis) = project.source_analysis() else {
                     continue;
                 };
                 for (logical, text) in &analysis.sources {
+                    checkpoint();
                     let path = file_identity(&project.source_directory.join(logical));
                     if self.documents.contains_key(&path) {
                         continue;
@@ -617,64 +763,76 @@ impl Worker {
                     let Ok(uri) = Url::from_file_path(path) else {
                         continue;
                     };
-                    let diagnostics = diagnostics_for(project, logical, text);
+                    let diagnostics = self.diagnostics.for_file(project, logical, text);
                     if !diagnostics.is_empty() || self.published_closed.contains(uri.as_str()) {
-                        self.sender.send(Message::Notification(Notification::new(
-                            "textDocument/publishDiagnostics".into(),
+                        payloads.push((
+                            uri.to_string(),
                             json!({"uri":uri.as_str(),"diagnostics":diagnostics}),
-                        )))?;
+                        ));
                         current.insert(uri.to_string());
                     }
                 }
             }
             for uri in self.published_closed.difference(&current) {
+                checkpoint();
                 if self.documents.values().any(|document| &document.uri == uri) {
                     continue;
                 }
-                self.sender.send(Message::Notification(Notification::new(
-                    "textDocument/publishDiagnostics".into(),
-                    json!({"uri":uri,"diagnostics":[]}),
-                )))?;
+                payloads.push((uri.clone(), json!({"uri":uri,"diagnostics":[]})));
             }
-            self.published_closed = current;
         }
+        // Open documents publish on each analyzed revision and again when full
+        // background checks finish, even when their text/version did not change
+        // (for example, a dependency edit). The early guard deduplicates repeated
+        // publication of one phase; closed files also deduplicate equal payloads.
+        let notifications: Vec<_> = payloads
+            .iter()
+            .filter(|(uri, params)| {
+                params.get("version").is_some() || self.published_payloads.get(uri) != Some(params)
+            })
+            .map(|(_, params)| {
+                checkpoint();
+                Message::Notification(Notification::new(
+                    "textDocument/publishDiagnostics".into(),
+                    params.clone(),
+                ))
+            })
+            .collect();
+        checkpoint();
+        {
+            // The only scheduling critical section is the final revision check
+            // and enqueue of already-rendered notifications.
+            let schedule = self.shared.lock().unwrap();
+            if schedule.revision != self.revision {
+                return Ok(());
+            }
+            for notification in notifications {
+                self.sender.send(notification)?;
+            }
+        }
+        self.published_payloads.extend(payloads);
+        self.published_payloads.retain(|uri, _| {
+            current.contains(uri) || self.documents.values().any(|document| &document.uri == uri)
+        });
+        self.published_closed = current;
         self.published = Some((self.revision, self.background));
         Ok(())
     }
 }
 
-fn diagnostics_for(
-    project: &crate::workspace::ProjectAnalysis,
-    logical: &str,
-    text: &str,
-) -> Vec<Value> {
-    let analysis = project.analysis();
-    let mut diagnostics: Vec<_> = analysis.diagnostics.iter().filter(|diagnostic| analysis.paths.get(&diagnostic.primary.span.file_id).is_some_and(|path| path == logical)).map(|diagnostic| {
-                    let mut message = diagnostic.title.clone();
-                    for detail in std::iter::once(&diagnostic.primary.message).chain(&diagnostic.notes).chain(&diagnostic.help) {
-                        if !detail.is_empty() && detail != &diagnostic.title { message.push('\n'); message.push_str(detail); }
-                    }
-                    let related: Vec<_> = diagnostic.related.iter().filter_map(|annotation| {
-                        let logical = analysis.paths.get(&annotation.span.file_id)?;
-                        let uri = Url::from_file_path(project.source_directory.join(logical)).ok()?;
-                        let source = analysis.sources.get(logical)?;
-                        Some(json!({"location":{"uri":uri.as_str(),"range":range(source,annotation.span)},"message":annotation.message}))
-                    }).collect();
-                    json!({"range":range(text,diagnostic.primary.span),"severity":1,"source":"ruddy","code":diagnostic.code,"message":message,"relatedInformation":related})
-                }).collect();
-    diagnostics.extend(
-        project
-            .analysis()
-            .tail_recursion(logical)
-            .iter()
-            .map(|fix| tail_diagnostic(text, fix)),
-    );
-    diagnostics
+fn project_diagnostic(message: &str) -> Value {
+    json!({"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":0}},"severity":1,"source":"ruddy","code":"project","message":message})
 }
 
-fn tail_diagnostic(text: &str, fix: &ruddy::analysis::TailRecursion) -> Value {
-    json!({"range":range(text,fix.binding),"severity":3,"source":"ruddy",
-        "code":ruddy::ui::TAIL_RECURSION_CODE,"message":ruddy::ui::TAIL_RECURSION_MESSAGE})
+fn format_edits(index: &LineIndex, source: &str) -> Value {
+    let formatted = ruddy::format::format(source, ruddy::tracking::FileID::GENERATED);
+    if formatted.text == source {
+        return Value::Array(Vec::new());
+    }
+    json!([{
+        "range": {"start": index.position(0), "end": index.position(source.len())},
+        "newText": formatted.text,
+    }])
 }
 
 fn file_path(uri: &str) -> Option<PathBuf> {
@@ -686,37 +844,13 @@ fn file_path(uri: &str) -> Option<PathBuf> {
 }
 
 /// Convert negotiated UTF-16 positions to compiler byte offsets.
+/// Repeated conversions should use a shared `LineIndex`.
 pub fn offset(text: &str, position: &Value) -> Option<usize> {
-    let line = usize::try_from(position.get("line")?.as_u64()?).ok()?;
-    let character = usize::try_from(position.get("character")?.as_u64()?).ok()?;
-    let start = if line == 0 {
-        0
-    } else {
-        text.match_indices('\n').nth(line - 1)?.0 + 1
-    };
-    let line_text = text[start..].split('\n').next()?.trim_end_matches('\r');
-    let mut units = 0;
-    for (at, ch) in line_text.char_indices() {
-        if units == character {
-            return Some(start + at);
-        }
-        units += ch.len_utf16();
-        if units > character {
-            return None;
-        }
-    }
-    Some(start + line_text.len())
+    LineIndex::new(text).offset(position)
 }
 
 pub fn position(text: &str, at: usize) -> Value {
-    let at = at.min(text.len());
-    let prefix = &text[..text.floor_char_boundary(at)];
-    let line = prefix.bytes().filter(|byte| *byte == b'\n').count();
-    let start = prefix.rfind('\n').map_or(0, |at| at + 1);
-    json!({"line":line,"character":prefix[start..].encode_utf16().count()})
-}
-fn range(text: &str, span: Span) -> Value {
-    json!({"start":position(text,span.start),"end":position(text,span.end())})
+    LineIndex::new(text).position(at)
 }
 
 // Every response path releases queued cancellation state, including unknown
@@ -730,69 +864,5 @@ impl Drop for RequestRegistration {
         let mut schedule = self.schedule.lock().unwrap();
         schedule.pending.remove(&self.id);
         schedule.cancelled.remove(&self.id);
-    }
-}
-
-// Poll precisely the acquired input set, including absent candidates and files
-// outside the root workspace. This also serves clients without dynamic watched-
-// file registration. Open-buffer changes still arrive immediately via LSP.
-struct Watcher {
-    inputs: Arc<Mutex<HashMap<PathBuf, Option<String>>>>,
-    stop: Sender<()>,
-    thread: Option<std::thread::JoinHandle<()>>,
-}
-impl Watcher {
-    fn new(sender: Sender<Envelope>, schedule: Arc<Mutex<Schedule>>) -> Self {
-        let inputs = Arc::new(Mutex::new(HashMap::<PathBuf, Option<String>>::new()));
-        let watched = inputs.clone();
-        let (stop, receive) = crossbeam_channel::bounded(1);
-        let thread = std::thread::spawn(move || {
-            while receive
-                .recv_timeout(std::time::Duration::from_millis(500))
-                .is_err()
-            {
-                let mut inputs = watched.lock().unwrap();
-                let mut changed = false;
-                for (path, before) in inputs.iter_mut() {
-                    let current = std::fs::read_to_string(path).ok();
-                    if *before != current {
-                        *before = current;
-                        changed = true;
-                    }
-                }
-                if changed {
-                    let mut schedule = schedule.lock().unwrap();
-                    schedule.revision += 1;
-                    if let Some((token, _)) = &schedule.active {
-                        token.cancel();
-                    }
-                    if sender
-                        .send(Envelope {
-                            revision: schedule.revision,
-                            message: Message::Notification(Notification::new(
-                                "workspace/didChangeWatchedFiles".into(),
-                                json!({"changes":[]}),
-                            )),
-                        })
-                        .is_err()
-                    {
-                        break;
-                    }
-                }
-            }
-        });
-        Self {
-            inputs,
-            stop,
-            thread: Some(thread),
-        }
-    }
-}
-impl Drop for Watcher {
-    fn drop(&mut self) {
-        let _ = self.stop.send(());
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
-        }
     }
 }

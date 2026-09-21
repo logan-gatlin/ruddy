@@ -2505,6 +2505,34 @@ pub mod text {
         out.push('\n');
         out
     }
+
+    /// Canonical interface text for editor caches that do not need executable
+    /// bodies. It uses the artifact header's existing schema and compiler stamp.
+    pub fn print_header(value: &Header) -> String {
+        let mut out = layout(&header(value));
+        out.push('\n');
+        out
+    }
+
+    /// Read an interface with the same structural and binder validation used
+    /// for an artifact header, without allocating or decoding any LIR.
+    pub fn try_parse_header(input: &str) -> Result<Header, ParseError> {
+        let mut parser = Parser { input, at: 0 };
+        let value = parser.value()?;
+        parser.space();
+        if parser.at != input.len() {
+            return Err(ParseError::syntax("trailing interface text", parser.at));
+        }
+        let reader = Reader::new();
+        let header = reader.read_header(value);
+        if let Err(error) = super::regions::validate(&header) {
+            reader.fail(error);
+        }
+        match reader.error.into_inner() {
+            Some(error) => Err(error),
+            None => Ok(header),
+        }
+    }
     /// Decode an artifact's own portable tree through the reader, which is
     /// what parsing its canonical text would do minus the text.
     pub(crate) fn decode_parts(header: &Header, lir: &Lir) -> Result<Artifact, ParseError> {

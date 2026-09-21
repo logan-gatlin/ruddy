@@ -48,6 +48,7 @@ mod ui;
 
 mod analysis;
 mod lsp;
+mod workspace;
 
 mod git_fixture;
 
