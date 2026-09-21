@@ -285,6 +285,13 @@ impl Namespace {
 }
 
 impl Mint {
+    /// Prepare one definition to mint its locals again with the same identities.
+    /// Other definitions' local namespaces are independent of this owner.
+    pub(crate) fn reset_definition(&mut self, owner: Symbol) {
+        self.locals.retain(|(known, ..), _| *known != Some(owner));
+        self.symbols.retain(|_, data| data.owner != Some(owner));
+    }
+
     /// A read-only name snapshot for one query. Keep owner/module paths, but
     /// avoid retaining the complete source mint for every edited definition.
     pub(crate) fn project(&self, symbols: impl IntoIterator<Item = Symbol>) -> Self {

@@ -18,6 +18,7 @@ use std::{collections::HashMap, sync::Arc};
 #[salsa::input]
 struct File {
     text: Option<String>,
+    id: FileID,
 }
 
 #[salsa::tracked(no_eq)]
@@ -25,10 +26,10 @@ fn syntax(db: &dyn salsa::Database, file: File, id: FileID) -> bundle::Syntax {
     let lexed = token::lex(file.text(db).as_deref().unwrap_or_default(), id);
     let parsed = parse::parse(lexed.tokens.clone());
     bundle::Syntax {
-        tokens: lexed.tokens,
-        lex_errors: lexed.errors,
-        stmts: parsed.stmts,
-        parse_errors: parsed.errors,
+        tokens: lexed.tokens.into(),
+        lex_errors: lexed.errors.into(),
+        stmts: parsed.stmts.into(),
+        parse_errors: parsed.errors.into(),
     }
 }
 
@@ -37,12 +38,18 @@ pub struct Host {
     db: salsa::DatabaseImpl,
     files: HashMap<String, File>,
     inference: inference::Session,
+    lowering: ir::Session,
     focus: Option<String>,
+    focus_offset: Option<usize>,
     generation: u64,
+    inference_generation: u64,
     owner: std::sync::Arc<()>,
 }
 
 impl Files for Host {
+    fn file_id(&self, path: &str) -> Option<FileID> {
+        self.files.get(path).map(|file| *file.id(&self.db))
+    }
     fn read(&self, path: &str) -> Option<String> {
         self.files
             .get(path)
@@ -80,13 +87,20 @@ impl Host {
                 file.set_text(&mut self.db).to(text);
             }
         } else {
+            let id = FileID::from_index(self.files.len() + 1);
             self.files
-                .insert(path.to_owned(), File::new(&self.db, text));
+                .insert(path.to_owned(), File::new(&self.db, text, id));
         }
     }
 
     pub fn focus(&mut self, path: Option<&str>) {
+        self.focus_at(path, None);
+    }
+
+    /// Focus a request on its containing definition; no offset requests the file.
+    pub fn focus_at(&mut self, path: Option<&str>, offset: Option<usize>) {
         self.focus = path.map(str::to_owned);
+        self.focus_offset = offset;
     }
 
     pub fn complete(&mut self, analysis: &mut Analysis) {
@@ -94,20 +108,63 @@ impl Host {
         if analysis.complete {
             return;
         }
-        analysis.inferred = self.inference.complete(inference::Trace::Off);
-        analysis.finish_checks();
+        analysis.publish_inferred(self.inference.complete(inference::Trace::Off));
         analysis.complete = true;
     }
 
     fn assert_current(&self, analysis: &Analysis) {
         assert!(
-            std::sync::Arc::ptr_eq(&self.owner, &analysis.owner)
-                && analysis.generation == self.generation,
+            self.is_current(analysis),
             "request the current host revision"
         );
     }
 
+    /// Whether a retained publication belongs to this host's current inputs.
+    pub fn is_current(&self, analysis: &Analysis) -> bool {
+        Arc::ptr_eq(&self.owner, &analysis.owner) && analysis.generation == self.generation
+    }
+
     pub fn request_file(&mut self, analysis: &mut Analysis, path: &str) -> bool {
+        self.request_selected(analysis, path, None)
+    }
+
+    /// Infer only the definition containing the editor position and its dependencies.
+    pub fn request_at(&mut self, analysis: &mut Analysis, path: &str, offset: usize) -> bool {
+        self.request_selected(analysis, path, Some(offset))
+    }
+
+    /// Infer the current body and only visible completion candidates matching
+    /// the prefix (or the receiver of a field completion).
+    pub fn request_completion(
+        &mut self,
+        analysis: &mut Analysis,
+        path: &str,
+        offset: usize,
+    ) -> bool {
+        self.assert_current(analysis);
+        if analysis.complete {
+            return false;
+        }
+        let mut selected = selected_terms(&analysis.built, &analysis.paths, path, Some(offset));
+        selected.extend(analysis.completion_symbols(path, offset));
+        self.request_symbols(analysis, selected)
+    }
+
+    fn request_selected(
+        &mut self,
+        analysis: &mut Analysis,
+        path: &str,
+        offset: Option<usize>,
+    ) -> bool {
+        let selected = selected_terms(&analysis.built, &analysis.paths, path, offset);
+        self.request_symbols(analysis, selected)
+    }
+
+    fn request_symbols(
+        &mut self,
+        analysis: &mut Analysis,
+        requested: std::collections::HashSet<Symbol>,
+    ) -> bool {
         self.assert_current(analysis);
         if analysis.complete {
             return false;
@@ -120,30 +177,24 @@ impl Host {
             .copied()
             .collect();
         let before = selected.len();
-        selected.extend(
-            analysis
-                .built
-                .program
-                .terms
-                .iter()
-                .filter(|(_, decl)| {
-                    analysis
-                        .paths
-                        .get(&analysis.built.source.span(decl.name_at).file_id)
-                        .is_some_and(|known| known == path)
-                })
-                .map(|(symbol, _)| *symbol),
-        );
+        selected.extend(requested);
         if selected.len() == before {
             return false;
         }
-        analysis.inferred = self.inference.request(&selected);
-        analysis.finish_checks();
+        analysis.publish_inferred(self.inference.request(&selected));
         true
     }
 
     pub fn solved_groups(&self) -> usize {
         self.inference.solved_groups()
+    }
+
+    pub fn lowering_stats(&self) -> ir::LoweringStats {
+        self.lowering.stats()
+    }
+
+    pub fn fingerprinted_bodies(&self) -> usize {
+        self.inference.fingerprinted_bodies()
     }
 
     pub fn analyze(
@@ -203,6 +254,9 @@ impl Host {
             provider: &'a dyn Files,
         }
         impl Files for Inputs<'_> {
+            fn file_id(&self, path: &str) -> Option<FileID> {
+                self.host.borrow().file_id(path)
+            }
             fn read(&self, path: &str) -> Option<String> {
                 let text = self.provider.read(path);
                 self.host.borrow_mut().set_file(path, text.clone());
@@ -241,7 +295,7 @@ impl Host {
             .iter()
             .map(|file| (file.id, file.path.clone()))
             .collect();
-        let sources = loaded
+        let sources: HashMap<String, String> = loaded
             .loaded
             .iter()
             .map(|file| (file.path.clone(), self.read(&file.path).unwrap_or_default()))
@@ -257,7 +311,17 @@ impl Host {
         }
         let syntax_clean = diagnostics.is_empty();
         let mut mint = Mint::new(identity);
-        let mut built = ir::build_with_interfaces(&mut mint, loaded.stmts, imports, linked);
+        let source_files = paths
+            .iter()
+            .map(|(id, path)| (*id, sources[path].clone()))
+            .collect();
+        let mut built = self.lowering.build_with_interfaces(
+            &mut mint,
+            loaded.stmts,
+            imports,
+            linked,
+            &source_files,
+        );
         built.errors.extend(
             built.program.terms.values().filter_map(|declaration| {
                 crate::externs::export_request(&declaration.metadata).err()
@@ -274,28 +338,25 @@ impl Host {
         );
         let mint = Arc::new(mint);
         let built = Prepared {
-            program: Arc::new(built.program),
+            program: built.program,
             source: built.source,
             names: built.names,
             errors: built.errors,
         };
-        let selected = self.focus.as_ref().map(|path| {
-            built
-                .program
-                .terms
-                .iter()
-                .filter(|(_, decl)| {
-                    paths.get(&built.source.span(decl.name_at).file_id) == Some(path)
-                })
-                .map(|(symbol, _)| *symbol)
-                .collect()
-        });
-        let inferred = self.inference.infer_shared(
+        let selected = self
+            .focus
+            .as_ref()
+            .map(|path| selected_terms(&built, &paths, path, self.focus_offset));
+        let inferred = self.inference.infer_shared_changed(
             mint.clone(),
             built.program.clone(),
             inference::Trace::Off,
             selected.as_ref(),
+            (self.inference_generation + 1 == self.generation)
+                .then(|| self.lowering.changed_symbols())
+                .flatten(),
         );
+        self.inference_generation = self.generation;
         let mut file_terms: HashMap<String, Vec<Symbol>> = HashMap::new();
         for (symbol, decl) in &built.program.terms {
             if let Some(path) = paths.get(&built.source.span(decl.name_at).file_id) {
@@ -303,6 +364,18 @@ impl Host {
             }
         }
         let mut analysis = Analysis {
+            syntax: paths
+                .values()
+                .filter_map(|path| {
+                    let file = self.files.get(path)?;
+                    Some((
+                        path.clone(),
+                        syntax(&self.db, *file, *file.id(&self.db)).clone(),
+                    ))
+                })
+                .collect(),
+            lint_cache: Default::default(),
+            diagnostic_revision: 0,
             file_terms,
             module_files: loaded.module_files,
             mint,
@@ -342,7 +415,34 @@ struct Prepared {
     errors: Vec<ir::Error>,
 }
 
+fn selected_terms(
+    built: &Prepared,
+    paths: &HashMap<FileID, String>,
+    path: &str,
+    offset: Option<usize>,
+) -> std::collections::HashSet<Symbol> {
+    let definitions = built.program.terms.iter().filter_map(|(symbol, decl)| {
+        let name = built.source.span(decl.name_at);
+        (paths.get(&name.file_id).is_some_and(|known| known == path))
+            .then_some((*symbol, name.start))
+    });
+    match offset {
+        // Recovery can omit an unfinished expression's final tokens. Select
+        // the preceding declaration even when its recovered body ends early.
+        Some(offset) => definitions
+            .filter(|(_, start)| *start <= offset)
+            .max_by_key(|(_, start)| *start)
+            .map(|(symbol, _)| symbol)
+            .into_iter()
+            .collect(),
+        None => definitions.map(|(symbol, _)| symbol).collect(),
+    }
+}
+
 pub struct Analysis {
+    syntax: HashMap<String, bundle::Syntax>,
+    lint_cache: std::sync::Mutex<HashMap<String, Arc<[TailRecursion]>>>,
+    diagnostic_revision: u64,
     file_terms: HashMap<String, Vec<Symbol>>,
     module_files: HashMap<Span, FileID>,
     mint: Arc<Mint>,
@@ -371,34 +471,56 @@ pub struct Hover {
 }
 
 impl Analysis {
+    /// Identifies the source revision and expansion of its semantic diagnostics.
+    pub fn diagnostic_revision(&self) -> (u64, u64) {
+        (self.generation, self.diagnostic_revision)
+    }
+
+    /// Identity of the host issuing these revisions. Retain this token alongside
+    /// a revision when caching results across project removal and recreation.
+    pub fn cache_identity(&self) -> std::sync::Arc<()> {
+        self.owner.clone()
+    }
+
     fn finish_checks(&mut self) {
-        self.diagnostics = self.frontend.clone();
-        self.diagnostics.extend(
-            self.inferred
+        self.publish_inferred(self.inferred.clone());
+    }
+
+    fn publish_inferred(&mut self, inferred: inference::Output) {
+        // A cancelled expansion must leave the previous publication coherent:
+        // later requests use its schemes to decide which checks are still due.
+        let mut diagnostics = self.frontend.clone();
+        diagnostics.extend(
+            inferred
                 .errors()
                 .iter()
                 .map(|error| error.diagnostic(&self.built.source)),
         );
-        if self.inferred.errors().is_empty() {
-            self.diagnostics.extend(
-                crate::externs::review(self.inferred.semantics())
+        if inferred.errors().is_empty() {
+            diagnostics.extend(
+                crate::externs::review(inferred.semantics())
                     .into_iter()
                     .chain(crate::testing::review(
                         &self.built.program,
-                        self.inferred.semantics(),
+                        inferred.semantics(),
                     ))
                     .map(|error| error.diagnostic(&self.built.source)),
             );
         }
         // Unrequested bodies explicitly retain undecided types and do not have
         // the semantic promises pattern checking requires.
-        self.checks = patterns::check_inferred(&self.built.program, &self.inferred);
-        self.diagnostics.extend(
-            self.checks
+        let checks = patterns::check_inferred(&self.built.program, &inferred);
+        diagnostics.extend(
+            checks
                 .errors
                 .iter()
                 .map(|error| error.diagnostic(&self.built.source)),
         );
+        self.inferred = inferred;
+        self.checks = checks;
+        self.diagnostics = diagnostics;
+        self.diagnostic_revision += 1;
+        self.lint_cache.get_mut().unwrap().clear();
     }
 
     pub fn mint(&self) -> &Mint {
@@ -891,6 +1013,22 @@ pub struct Completion {
 
 impl Analysis {
     pub fn completions(&self, path: &str, offset: usize) -> Vec<Completion> {
+        self.completion_items(path, offset, None)
+    }
+
+    fn completion_symbols(&self, path: &str, offset: usize) -> std::collections::HashSet<Symbol> {
+        let mut selected = std::collections::HashSet::new();
+        self.completion_items(path, offset, Some(&mut selected));
+        selected
+    }
+
+    fn completion_items(
+        &self,
+        path: &str,
+        offset: usize,
+        mut requested: Option<&mut std::collections::HashSet<Symbol>>,
+    ) -> Vec<Completion> {
+        crate::cancellation::checkpoint();
         use crate::symbol::Namespace;
         use crate::types::Ty;
         let Some(text) = self
@@ -905,7 +1043,8 @@ impl Analysis {
             .map_or(0, |at| at + text[at..].chars().next().unwrap().len_utf8());
         let prefix = &text[start..];
         let before = &text[..start];
-        let mut candidates: Vec<(String, Option<std::sync::Arc<Ty>>, CompletionKind)> = Vec::new();
+        type Candidate = (String, Option<Arc<Ty>>, CompletionKind, Option<Symbol>);
+        let mut candidates: Vec<Candidate> = Vec::new();
         let owner = self
             .terms_in(path)
             .filter(|(_, decl)| {
@@ -969,7 +1108,7 @@ impl Analysis {
                     "Int8", "Int16", "Int32", "Int64",
                 ]
                 .into_iter()
-                .map(|name| (name.to_owned(), None, CompletionKind::Type)),
+                .map(|name| (name.to_owned(), None, CompletionKind::Type, None)),
             );
         }
         let visible: Vec<_> = match qualified {
@@ -1007,6 +1146,7 @@ impl Analysis {
             names.extend(self.built.names.local_import_names(*file, offset));
         }
         for (namespace, name, symbol) in names {
+            crate::cancellation::checkpoint();
             let kind = match namespace {
                 Namespace::Terms if !type_context && !effect_context => CompletionKind::Value,
                 Namespace::Types if type_context => CompletionKind::Type,
@@ -1024,7 +1164,7 @@ impl Analysis {
                         .or_else(|| self.built.program.external_schemes.get(&symbol))
                 })
                 .map(|scheme| scheme.body().clone());
-            candidates.push((name.to_owned(), ty, kind));
+            candidates.push((name.to_owned(), ty, kind, symbol));
         }
         if qualified.is_none() && !type_context && !effect_context {
             for term in self.terms_in(path).flat_map(|(_, decl)| decl.value.walk()) {
@@ -1048,6 +1188,7 @@ impl Analysis {
                             self.mint.name(arg.anchored).to_owned(),
                             ty,
                             CompletionKind::Value,
+                            Some(arg.anchored),
                         ));
                     }
                     ir::TermKind::Let { name, .. } => {
@@ -1061,6 +1202,7 @@ impl Analysis {
                             self.mint.name(name.anchored).to_owned(),
                             ty,
                             CompletionKind::Value,
+                            Some(name.anchored),
                         ));
                     }
                     ir::TermKind::Match { arms, .. } => {
@@ -1073,6 +1215,7 @@ impl Analysis {
                                             self.mint.name(name.anchored).to_owned(),
                                             None,
                                             CompletionKind::Value,
+                                            Some(name.anchored),
                                         )
                                     },
                                 ));
@@ -1092,6 +1235,7 @@ impl Analysis {
                                     self.mint.name(binder.anchored).to_owned(),
                                     None,
                                     CompletionKind::Value,
+                                    Some(binder.anchored),
                                 ));
                             }
                         }
@@ -1108,11 +1252,17 @@ impl Analysis {
                 });
             let mut components = receiver[start..].split('.');
             let name = components.next().unwrap_or_default();
-            let mut ty = candidates
+            let candidate = candidates
                 .iter()
                 .rev()
-                .find(|(label, _, _)| label == name)
-                .and_then(|(_, ty, _)| ty.clone());
+                .find(|(label, _, _, _)| label == name);
+            if let Some(selected) = requested.as_deref_mut()
+                && let Some(symbol) = candidate.and_then(|(_, _, _, symbol)| *symbol)
+                && self.built.program.terms.contains_key(&symbol)
+            {
+                selected.insert(symbol);
+            }
+            let mut ty = candidate.and_then(|(_, ty, _, _)| ty.clone());
             for field in components {
                 ty = ty.and_then(|ty| {
                     record_fields(&self.inferred, &ty)
@@ -1144,16 +1294,24 @@ impl Analysis {
         let mut out: Vec<_> = candidates
             .into_iter()
             .rev()
-            .filter(|(label, _, _)| label.starts_with(prefix))
-            .map(|(label, ty, kind)| Completion {
+            .filter(|(label, _, _, _)| label.starts_with(prefix))
+            .collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out.dedup_by(|a, b| a.0 == b.0);
+        if let Some(selected) = requested {
+            selected.extend(
+                out.iter()
+                    .filter_map(|(_, _, _, symbol)| *symbol)
+                    .filter(|symbol| self.built.program.terms.contains_key(symbol)),
+            );
+        }
+        out.into_iter()
+            .map(|(label, ty, kind, _)| Completion {
                 label,
                 detail: ty.map(|ty| ty.to_string()),
                 kind,
             })
-            .collect();
-        out.sort_by(|a, b| a.label.cmp(&b.label));
-        out.dedup_by(|a, b| a.label == b.label);
-        out
+            .collect()
     }
 }
 

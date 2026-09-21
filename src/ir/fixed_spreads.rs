@@ -90,8 +90,9 @@ struct Argument {
     active: HashSet<Symbol>,
 }
 
-pub(super) struct Expander<'a> {
-    imported: HashMap<Symbol, (&'a artifact::Type, usize)>,
+#[derive(Clone)]
+pub(super) struct Expander {
+    imported: HashMap<Symbol, (Arc<artifact::Type>, usize)>,
     symbols: HashMap<(Namespace, String), Symbol>,
     effect_rows: ImportedEffectRows,
     declarations: HashMap<Symbol, Type>,
@@ -100,10 +101,10 @@ pub(super) struct Expander<'a> {
     pub errors: Vec<Error>,
 }
 
-impl<'a> Expander<'a> {
+impl Expander {
     pub fn new(
         program: &Program,
-        imported: &HashMap<Symbol, (&'a artifact::Type, usize)>,
+        imported: &HashMap<Symbol, (Arc<artifact::Type>, usize)>,
         symbols: &HashMap<(Namespace, String), Symbol>,
         effect_rows: &ImportedEffectRows,
     ) -> Self {

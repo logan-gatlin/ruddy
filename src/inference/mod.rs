@@ -130,8 +130,8 @@ pub enum Trace {
 /// cannot be paired with facts that came out of another.
 #[derive(Debug, Clone)]
 pub struct Output {
-    semantics: Semantics,
-    diagnostics: Diagnostics,
+    semantics: Arc<Semantics>,
+    diagnostics: Arc<Diagnostics>,
 }
 
 /// The two sides of every declared operation, keyed by the effect that declares
@@ -225,7 +225,7 @@ impl Output {
         let aliases = self.semantics.aliases.clone();
         let requirements = reification.callables.graph.solve();
         let construction = reification.callables.graph.solve_construction();
-        let semantics = &mut self.semantics;
+        let semantics = Arc::make_mut(&mut self.semantics);
         for schemes in [
             &mut semantics.schemes,
             &mut semantics.externs,
@@ -307,21 +307,23 @@ impl Output {
         &mut self,
         facts: impl IntoIterator<Item = crate::artifact::RecoveryFact>,
     ) {
-        self.diagnostics.recovery_facts.extend(facts);
+        Arc::make_mut(&mut self.diagnostics)
+            .recovery_facts
+            .extend(facts);
     }
 
     /// Crate-private mutable access, for tests that deliberately corrupt an
     /// otherwise coherent publication to reach a defensive branch.
     #[cfg(test)]
     pub(crate) fn semantics_mut(&mut self) -> &mut Semantics {
-        &mut self.semantics
+        Arc::make_mut(&mut self.semantics)
     }
 
     /// Crate-private mutable access, for tests that synthesize diagnostic
     /// records beyond what any real solve would publish.
     #[cfg(test)]
     pub(crate) fn diagnostics_mut(&mut self) -> &mut Diagnostics {
-        &mut self.diagnostics
+        Arc::make_mut(&mut self.diagnostics)
     }
 }
 
@@ -7625,16 +7627,16 @@ fn assemble(
         },
     };
     let mut output = Output {
-        semantics,
-        diagnostics,
+        semantics: Arc::new(semantics),
+        diagnostics: Arc::new(diagnostics),
     };
     if output.errors().is_empty() {
         let mut requirements = crate::reification::Analysis::infer(program, output.semantics());
-        if defaults::instantiate(&mut output.semantics, &requirements) {
+        if defaults::instantiate(Arc::make_mut(&mut output.semantics), &requirements) {
             requirements = crate::reification::Analysis::infer(program, output.semantics());
         }
         output.reify(&requirements);
-        output.semantics.reification = requirements.clone();
+        Arc::make_mut(&mut output.semantics).reification = requirements.clone();
         for (index, error) in requirements
             .review(program, output.semantics())
             .into_iter()
@@ -7643,7 +7645,7 @@ fn assemble(
             let ir::ErrorKind::RuntimeTypeInformation { message } = error.kind else {
                 unreachable!("representation review reports representation errors")
             };
-            output.diagnostics.errors.push(Error {
+            Arc::make_mut(&mut output.diagnostics).errors.push(Error {
                 id: ErrorId {
                     scope: Symbol::GENERATED,
                     index: index as u32,

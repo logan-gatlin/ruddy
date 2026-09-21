@@ -22,7 +22,7 @@
 //! compiles what is in its own map — and neither has to invent a directory to
 //! do it. [`Disk`] is the implementation that reads a real one.
 
-use std::{path::PathBuf, time::Instant};
+use std::{path::PathBuf, sync::Arc, time::Instant};
 
 use indexmap::IndexMap;
 
@@ -54,6 +54,11 @@ pub trait Files {
     /// `src/main.rud` looks for `src/Math.rud`.
     fn read(&self, path: &str) -> Option<String>;
 
+    /// Persistent editor drivers keep identities stable as modules move.
+    fn file_id(&self, _path: &str) -> Option<FileID> {
+        None
+    }
+
     /// A source-backed driver may supply its per-file syntax query here.
     fn cached_syntax(&self, _path: &str, _id: FileID) -> Option<Syntax> {
         None
@@ -62,10 +67,10 @@ pub trait Files {
 
 #[derive(Debug, Clone)]
 pub struct Syntax {
-    pub tokens: Vec<Token>,
-    pub lex_errors: Vec<token::Error>,
-    pub stmts: Vec<Stmt>,
-    pub parse_errors: Vec<parse::Error>,
+    pub tokens: Arc<[Token]>,
+    pub lex_errors: Arc<[token::Error]>,
+    pub stmts: Arc<[Stmt]>,
+    pub parse_errors: Arc<[parse::Error]>,
 }
 
 /// [`Files`] over a real directory.
@@ -84,9 +89,9 @@ pub struct Loaded {
     pub id: FileID,
     /// The path it was read from in the [`Files`] coordinate space.
     pub path: String,
-    pub tokens: Vec<Token>,
-    pub lex_errors: Vec<token::Error>,
-    pub parse_errors: Vec<parse::Error>,
+    pub tokens: Arc<[Token]>,
+    pub lex_errors: Arc<[token::Error]>,
+    pub parse_errors: Arc<[parse::Error]>,
     /// How long lexing this file took, in microseconds. Kept per file so a
     /// reporter showing one figure for the phase can add them up; the load as a
     /// whole is the caller's to time.
@@ -275,9 +280,14 @@ impl Loader<'_> {
     fn file(&mut self, path: &str) -> Vec<Stmt> {
         crate::cancellation::checkpoint();
         let source = self.fs.read(path).unwrap_or_default();
-        let id = self
-            .files
-            .register_new_file(path.to_string(), source.clone());
+        let id = if let Some(id) = self.fs.file_id(path) {
+            self.files
+                .register_file(id, path.to_string(), source.clone());
+            id
+        } else {
+            self.files
+                .register_new_file(path.to_string(), source.clone())
+        };
 
         let started = Instant::now();
         let (syntax, lex_micros, parse_micros) =
@@ -290,10 +300,10 @@ impl Loader<'_> {
                 let parsed = parse::parse(lexed.tokens.clone());
                 (
                     Syntax {
-                        tokens: lexed.tokens,
-                        lex_errors: lexed.errors,
-                        stmts: parsed.stmts,
-                        parse_errors: parsed.errors,
+                        tokens: lexed.tokens.into(),
+                        lex_errors: lexed.errors.into(),
+                        stmts: parsed.stmts.into(),
+                        parse_errors: parsed.errors.into(),
                     },
                     lex_micros,
                     started.elapsed().as_micros() as u64,
@@ -308,7 +318,7 @@ impl Loader<'_> {
             lex_micros,
             parse_micros,
         });
-        syntax.stmts
+        syntax.stmts.to_vec()
     }
 
     /// Drop every definition in `stmts` whose guard does not hold, fill in the

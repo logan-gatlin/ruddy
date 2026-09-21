@@ -19,13 +19,17 @@
 //!
 //! Nothing here can fail a build. A cache that cannot be read is a miss, and
 //! one that cannot be written is left alone.
+//!
+//! Editors may persist the validated interface independently of executable
+//! bodies. The sidecar uses the same compiler directory and content key; full
+//! artifacts are materialized only for background backend validation.
 
 use std::{
     fs,
     path::{Path, PathBuf},
 };
 
-use ruddy::artifact::{Artifact, COMPILER_HASH, text};
+use ruddy::artifact::{Artifact, COMPILER_HASH, Header, text};
 use twox_hash::XxHash3_64;
 
 use crate::Build;
@@ -65,11 +69,56 @@ impl ArtifactCache {
         (header.compiler.is_current() && header.identity.name == name).then_some(artifact)
     }
 
+    /// Read only the source-facing interface during editor startup. Older
+    /// complete artifacts migrate once; subsequent startups never decode LIR.
+    pub(crate) fn load_interface(&mut self, key: u64, name: &str) -> Option<Header> {
+        if let Some(header) = fs::read_to_string(self.path(key).with_extension("interface"))
+            .ok()
+            .and_then(|source| text::try_parse_header(&source).ok())
+            .filter(|header| header.compiler.is_current() && header.identity.name == name)
+        {
+            return Some(header);
+        }
+        let artifact = self.load(key, name)?;
+        let header = artifact.header().clone();
+        self.store_interface(key, &header);
+        Some(header)
+    }
+
+    pub(crate) fn store_interface(&mut self, key: u64, interface: &Header) {
+        if self.prepare() {
+            let _ = crate::replace_file(
+                &self.path(key).with_extension("interface"),
+                text::print_header(interface).as_bytes(),
+            );
+        }
+    }
+
+    /// Include absent competing module paths, which directory enumeration alone
+    /// cannot recover from an already compiled interface.
+    pub(crate) fn load_inputs(&self, key: u64) -> Option<Vec<PathBuf>> {
+        serde_json::from_slice(&fs::read(self.path(key).with_extension("inputs")).ok()?).ok()
+    }
+
+    pub(crate) fn store_inputs(&mut self, key: u64, paths: &[PathBuf]) {
+        if self.prepare()
+            && let Ok(bytes) = serde_json::to_vec(paths)
+        {
+            let _ = crate::replace_file(&self.path(key).with_extension("inputs"), &bytes);
+        }
+    }
+
     /// Keep `artifact` under `key`, and drop every other compiler's cache
     /// the first time this compiler stores anything.
     pub(crate) fn store(&mut self, key: u64, artifact: &Artifact) {
+        if self.prepare() {
+            let _ = crate::replace_file(&self.path(key), artifact.print().as_bytes());
+        }
+    }
+
+    fn prepare(&mut self) -> bool {
         if fs::create_dir_all(&self.directory).is_err() {
-            return;
+            return false;
         }
         if !self.pruned {
             self.pruned = true;
@@ -81,7 +130,7 @@ impl ArtifactCache {
                 }
             }
         }
-        let _ = crate::replace_file(&self.path(key), artifact.print().as_bytes());
+        true
     }
 }
 
@@ -89,6 +138,11 @@ impl ArtifactCache {
 /// sources, the keys of the artifacts it was compiled against, and every fact
 /// of the build it was compiled for.
 pub(crate) fn key(directory: &Path, dependencies: &[u64], build: Build) -> u64 {
+    key_from_fingerprint(fingerprint(&[directory.to_path_buf()]), dependencies, build)
+}
+
+/// The editor supplies the same content digest from its acquired input store.
+pub(crate) fn key_from_fingerprint(fingerprint: u64, dependencies: &[u64], build: Build) -> u64 {
     let mut bytes = Vec::new();
     bytes.extend_from_slice(COMPILER_HASH.as_bytes());
     for (fact, value) in build.environment().facts() {
@@ -97,9 +151,7 @@ pub(crate) fn key(directory: &Path, dependencies: &[u64], build: Build) -> u64 {
         bytes.extend_from_slice(value.as_bytes());
         bytes.push(0);
     }
-    bytes.extend_from_slice(
-        &fingerprint(std::slice::from_ref(&directory.to_path_buf())).to_le_bytes(),
-    );
+    bytes.extend_from_slice(&fingerprint.to_le_bytes());
     for dependency in dependencies {
         bytes.extend_from_slice(&dependency.to_le_bytes());
     }

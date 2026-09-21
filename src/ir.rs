@@ -1,4 +1,6 @@
 mod fixed_spreads;
+mod incremental;
+pub use incremental::{LoweringStats, Session, SharedOutput};
 
 use std::{
     collections::{HashMap, HashSet},
@@ -2265,6 +2267,7 @@ mod using;
 struct Builder<'a> {
     mint: &'a mut Mint,
     builtin_mut: Option<(Symbol, Symbol)>,
+    mutation_uses: usize,
     parameter_kinds: HashMap<Symbol, Vec<ParamKind>>,
     /// The module being lowered into: `None` at the top level of the bundle,
     /// which is a real position in the tree rather than a missing one. Every
@@ -2348,10 +2351,10 @@ struct Builder<'a> {
     lifted_aliases: HashSet<Symbol>,
     // Private type declarations installed before kind inference.
     row_templates: IndexMap<Symbol, Decl<Type>>,
-    imported_row_sources: HashMap<Symbol, (&'a artifact::Type, usize)>,
+    imported_row_sources: HashMap<Symbol, (Arc<artifact::Type>, usize)>,
     imported_symbols: HashMap<(Namespace, String), Symbol>,
     imported_effect_rows: ImportedEffectRows,
-    fixed_spreads: Option<fixed_spreads::Expander<'a>>,
+    fixed_spreads: Option<fixed_spreads::Expander>,
     /// The aliases being expanded, innermost last: an alias met again while it
     /// is on this stack is a cycle.
     expanding: Vec<Symbol>,
@@ -2429,6 +2432,7 @@ struct Flat {
 }
 
 /// An alias declaration as written, waiting to be lowered on first use.
+#[derive(Clone)]
 struct PendingAlias {
     module: Option<Module>,
     params: Vec<Param>,
@@ -2504,7 +2508,7 @@ type Body = Tracked<Expr>;
 
 /// One name a variable statement declared, while its own annotation is being
 /// lowered.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct Declared {
     /// Where the name was written, which is what a repeat points back at and
     /// what an unused declaration is reported at.
@@ -2528,14 +2532,14 @@ struct Declared {
 /// Locals only. A global is reached through the module it was declared in, and
 /// which modules a name may be looked for in is a walk outward rather than a
 /// position on a stack — see [`Builder::globals`].
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 struct Names {
     /// Most recent binding last. A lambda's arguments are pushed for the length
     /// of its body and released after it, which is the whole of the stack.
     bindings: Vec<Binding>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct Binding {
     name: String,
     symbol: Symbol,
@@ -3080,6 +3084,16 @@ pub fn build_with_interfaces(
     dependencies: &[InterfaceImport<'_>],
     linked: &[&artifact::Header],
 ) -> Output {
+    build_captured(mint, stmts, dependencies, linked, None)
+}
+
+fn build_captured(
+    mint: &mut Mint,
+    stmts: Vec<Stmt>,
+    dependencies: &[InterfaceImport<'_>],
+    linked: &[&artifact::Header],
+    mut capture: Option<&mut incremental::Capture>,
+) -> Output {
     let mut b = Builder {
         mint,
         module: None,
@@ -3089,6 +3103,7 @@ pub fn build_with_interfaces(
         globals: HashMap::new(),
         source: SourceMap::default(),
         builtin_mut: None,
+        mutation_uses: 0,
         parameter_kinds: HashMap::new(),
         current: Symbol::GENERATED,
         current_base: 0,
@@ -3565,8 +3580,18 @@ pub fn build_with_interfaces(
                             .next()
                             .expect("a bare name declares one symbol");
                         b.define(symbol, name.span.start);
+                        let rigid_start = b.rigids;
+                        let mutation_start = b.mutation_uses;
                         let annotation = ty.map(|ty| b.written(ty, Place::Annotation));
                         let value = b.term(body.tracked);
+                        if let Some(capture) = capture.as_mut()
+                            && let Some(symbol) = symbol
+                        {
+                            capture.rigids.insert(symbol, (rigid_start, b.rigids));
+                            capture
+                                .mutation_uses
+                                .insert(symbol, b.mutation_uses - mutation_start);
+                        }
                         if let Some(symbol) = symbol {
                             program.terms.insert(
                                 symbol,
@@ -3740,7 +3765,12 @@ pub fn build_with_interfaces(
     // What the arguments handed to a row parameter are allowed to be. Last of
     // all, because an annotation is as much a place to write one as a
     // declaration's body is, and annotations are only just lowered.
-    b.errors.extend(row_arguments(&mut program, &kinds));
+    let rows = row_checks(&program);
+    b.errors
+        .extend(row_arguments_selected(&mut program, &kinds, &rows, None));
+    if let Some(capture) = capture.as_mut() {
+        capture.rows = Some(rows);
+    }
     // Which parameters survive unfolding, read off the bodies as they finally
     // stand: every erasure above is a position a parameter no longer reaches,
     // and calling one relevant that nothing keeps would let the solver decide
@@ -3766,6 +3796,9 @@ pub fn build_with_interfaces(
     // In the order the reader would meet them: by where they point, which
     // anchors alone do not say once a hoist-time complaint sits beside one
     // from inside a definition.
+    if let Some(capture) = capture {
+        capture.resolver = Some(incremental::Resolver::capture(&b));
+    }
     let source = std::mem::take(&mut b.source);
     b.errors.sort_by_key(|error| source.span(error.at));
     Output {
@@ -9246,7 +9279,26 @@ fn constrain(
 /// [`TypeKind::Error`] as row-shaped and [`row_summary`] reads it as naming
 /// nothing, so nothing complains about the erasure, and it lowers to the
 /// undecided type, which row-tail checks already allow.
-fn row_arguments(program: &mut Program, kinds: &HashMap<Symbol, Vec<ParamKind>>) -> Vec<Error> {
+type RowChecks = HashMap<Sense, HashMap<Symbol, RowSummary>>;
+
+fn row_checks(program: &Program) -> RowChecks {
+    [Sense::Row, Sense::Effects]
+        .into_iter()
+        .map(|shape| {
+            (
+                shape,
+                row_summaries(&program.types, &program.external_types, shape),
+            )
+        })
+        .collect()
+}
+
+fn row_arguments_selected(
+    program: &mut Program,
+    kinds: &HashMap<Symbol, Vec<ParamKind>>,
+    carries: &RowChecks,
+    selected: Option<&HashSet<Symbol>>,
+) -> Vec<Error> {
     fn walk(
         ty: &mut Type,
         kinds: &HashMap<Symbol, Vec<ParamKind>>,
@@ -9420,21 +9472,8 @@ fn row_arguments(program: &mut Program, kinds: &HashMap<Symbol, Vec<ParamKind>>)
         }
     }
 
-    // What each declaration's fields come to, read once over the whole table
-    // before anything is walked: an argument written at a struct's `..` carries
-    // whatever the declaration it names carries, which is what the repeated
-    // field check is asked against. See [`row_summaries`].
-    let carries: HashMap<Sense, HashMap<Symbol, RowSummary>> = [Sense::Row, Sense::Effects]
-        .into_iter()
-        .map(|shape| {
-            (
-                shape,
-                row_summaries(&program.types, &program.external_types, shape),
-            )
-        })
-        .collect();
     let mut out = Vec::new();
-    for decl in program.types.values_mut() {
+    for decl in program.types.values_mut().filter(|_| selected.is_none()) {
         // Which of this declaration's own parameters are a sum's rest, so one
         // handed straight on is recognised as one. Read out first, so that
         // walking the body borrows nothing the kinds are still held in.
@@ -9452,35 +9491,38 @@ fn row_arguments(program: &mut Program, kinds: &HashMap<Symbol, Vec<ParamKind>>)
             })
             .map(|param| (param.symbol, param.kind.sense()))
             .collect();
-        walk(&mut decl.value, kinds, &carries, &rows, &mut out);
+        walk(&mut decl.value, kinds, carries, &rows, &mut out);
     }
     // An annotation binds no parameters, so nothing in one can be a sum's rest
     // by being a parameter — but it is every bit as much a place to apply a
     // declaration, and was the way this check was first written round.
-    for decl in program.terms.values_mut() {
+    for (symbol, decl) in &mut program.terms {
+        if selected.is_some_and(|selected| !selected.contains(symbol)) {
+            continue;
+        }
         if let Some(annotation) = decl.annotation.as_mut().map(|it| &mut it.ty) {
-            walk(annotation, kinds, &carries, &HashMap::new(), &mut out);
+            walk(annotation, kinds, carries, &HashMap::new(), &mut out);
         }
         // And so is a nested binding's, which is a place to write one as much
         // as a definition's is. An annotation this walk never reaches is a
         // [`ErrorKind::RepeatedRowField`] never reported.
         annotations(&mut decl.value, &mut |annotation| {
-            walk(annotation, kinds, &carries, &HashMap::new(), &mut out);
+            walk(annotation, kinds, carries, &HashMap::new(), &mut out);
         });
     }
-    for decl in program.externs.values_mut() {
+    for decl in program.externs.values_mut().filter(|_| selected.is_none()) {
         let annotation = &mut decl
             .annotation
             .as_mut()
             .expect("an extern always has a written annotation")
             .ty;
-        walk(annotation, kinds, &carries, &HashMap::new(), &mut out);
+        walk(annotation, kinds, carries, &HashMap::new(), &mut out);
     }
     // Operation inputs and outputs are source-written types too. They are not
     // annotations on terms, so reach them explicitly rather than letting this
     // well-formedness check silently omit one of the language's type-bearing
     // positions.
-    for decl in program.effects.values_mut() {
+    for decl in program.effects.values_mut().filter(|_| selected.is_none()) {
         let rows: HashMap<Symbol, Sense> = decl
             .params
             .iter()
@@ -9493,11 +9535,11 @@ fn row_arguments(program: &mut Program, kinds: &HashMap<Symbol, Vec<ParamKind>>)
         match &mut decl.value {
             Effect::Operations(operations) => {
                 for operation in operations.values_mut() {
-                    walk(&mut operation.from, kinds, &carries, &rows, &mut out);
-                    walk(&mut operation.to, kinds, &carries, &rows, &mut out);
+                    walk(&mut operation.from, kinds, carries, &rows, &mut out);
+                    walk(&mut operation.to, kinds, carries, &rows, &mut out);
                 }
             }
-            Effect::Alias(alias) => walk(&mut alias.expanded, kinds, &carries, &rows, &mut out),
+            Effect::Alias(alias) => walk(&mut alias.expanded, kinds, carries, &rows, &mut out),
         }
     }
     out
@@ -11066,8 +11108,10 @@ impl<'a> Builder<'a> {
                     crate::types::Formula::True
                 };
                 let scheme = Scheme::declaration(params.len() as u32, body, formula);
-                self.imported_row_sources
-                    .insert(symbol, (&declaration.scheme.body, params.len()));
+                self.imported_row_sources.insert(
+                    symbol,
+                    (Arc::new(declaration.scheme.body.clone()), params.len()),
+                );
                 self.arities.insert(symbol, params.len());
                 program.external_types.insert(
                     symbol,
@@ -11422,6 +11466,7 @@ impl<'a> Builder<'a> {
 
     /// Intern the builtin independently of the standard library.
     fn mutation_symbol(&mut self) -> Symbol {
+        self.mutation_uses += 1;
         if let Some((symbol, _)) = self.builtin_mut {
             return symbol;
         }

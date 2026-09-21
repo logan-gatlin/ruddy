@@ -5,6 +5,187 @@ use ruddy::{
     token,
 };
 
+#[test]
+fn position_requests_infer_only_the_needed_group_then_expand_diagnostics() {
+    let text = "let id = fn x => x\nlet answer = id 1n\nlet unrelated = true + 1n";
+    let mut host = ruddy::analysis::Host::default();
+    host.set_file("main.rud", Some(text.into()));
+    let position = text.find("answer").unwrap();
+    host.focus_at(Some("main.rud"), Some(position));
+    let mut analysis = host.analyze(
+        Bundle::new("focused", Version::new(0, 0, 0)).unwrap(),
+        "main.rud",
+        &ruddy::bundle::Environment::new([]),
+    );
+    assert!(analysis.diagnostics.is_empty());
+    assert_eq!(host.solved_groups(), 2);
+    assert_eq!(analysis.hover("main.rud", position).unwrap().ty, "Nat");
+    let revision = analysis.diagnostic_revision();
+    assert!(!host.request_at(&mut analysis, "main.rud", position));
+    assert_eq!(analysis.diagnostic_revision(), revision);
+    host.complete(&mut analysis);
+    assert_eq!(host.solved_groups(), 3);
+    assert!(!analysis.diagnostics.is_empty());
+    assert_eq!(analysis.hover("main.rud", position).unwrap().ty, "Nat");
+}
+
+#[test]
+fn completion_requests_infer_matching_candidates_and_record_receivers() {
+    for (text, label, detail) in [
+        (
+            "let useful = true\nlet unwanted = false + 1n\nlet current = use",
+            "useful",
+            "Bool",
+        ),
+        (
+            "module M = let useful = true let unwanted = false + 1n end\nlet current = M::use",
+            "useful",
+            "Bool",
+        ),
+        (
+            "let record = { count: 1n, label: \"x\" }\nlet unwanted = false + 1n\nlet current = record.co",
+            "count",
+            "Nat",
+        ),
+    ] {
+        let mut host = ruddy::analysis::Host::default();
+        host.set_file("main.rud", Some(text.into()));
+        host.focus_at(Some("main.rud"), Some(text.len()));
+        let mut analysis = host.analyze(
+            Bundle::new("completion", Version::new(0, 0, 0)).unwrap(),
+            "main.rud",
+            &ruddy::bundle::Environment::new([]),
+        );
+        assert!(!host.request_completion(&mut analysis, "missing.rud", 0));
+        host.request_completion(&mut analysis, "main.rud", text.len());
+        let items = analysis.completions("main.rud", text.len());
+        let item = items.iter().find(|item| item.label == label).unwrap();
+        assert_eq!(item.detail.as_deref(), Some(detail), "{text}: {items:?}");
+        assert_eq!(
+            host.solved_groups(),
+            2,
+            "the unrelated invalid definition stays lazy: {text}"
+        );
+        assert!(!host.request_completion(&mut analysis, "main.rud", text.len()));
+        host.complete(&mut analysis);
+        assert!(!host.request_completion(&mut analysis, "main.rud", text.len()));
+    }
+}
+
+#[test]
+fn completion_inference_respects_local_shadowing() {
+    let text = "let item = false + 1n\nlet current = fn item => ite";
+    let mut host = ruddy::analysis::Host::default();
+    host.set_file("main.rud", Some(text.into()));
+    host.focus_at(Some("main.rud"), Some(text.len()));
+    let mut analysis = host.analyze(
+        Bundle::new("shadowing", Version::new(0, 0, 0)).unwrap(),
+        "main.rud",
+        &ruddy::bundle::Environment::new([]),
+    );
+    assert!(!host.request_completion(&mut analysis, "main.rud", text.len()));
+    assert!(
+        analysis
+            .completions("main.rud", text.len())
+            .iter()
+            .any(|item| item.label == "item")
+    );
+    assert_eq!(host.solved_groups(), 1);
+}
+
+#[test]
+fn file_identities_survive_module_insertion_and_reordering() {
+    let mut host = ruddy::analysis::Host::default();
+    host.set_file(
+        "main.rud",
+        Some("module A\nmodule B\nlet answer = A::value".into()),
+    );
+    host.set_file("A.rud", Some("let value = 1n".into()));
+    host.set_file("B.rud", Some("let value = true".into()));
+    let identity = Bundle::new("files", Version::new(0, 0, 0)).unwrap();
+    let env = ruddy::bundle::Environment::new([]);
+    let first = host.analyze(identity.clone(), "main.rud", &env);
+    let ids: std::collections::HashMap<_, _> = first
+        .paths
+        .iter()
+        .map(|(id, path)| (path.clone(), *id))
+        .collect();
+    host.set_file("C.rud", Some("let value = ()".into()));
+    host.set_file(
+        "main.rud",
+        Some("module C\nmodule B\nmodule A\nlet answer = A::value".into()),
+    );
+    let second = host.analyze(identity, "main.rud", &env);
+    assert!(second.diagnostics.is_empty());
+    for (id, path) in &second.paths {
+        if let Some(before) = ids.get(path) {
+            assert_eq!(id, before, "persistent identity for {path}");
+        }
+    }
+    assert_eq!(second.hover("A.rud", 5).unwrap().ty, "Nat");
+}
+
+#[test]
+fn body_edits_do_not_relower_or_fingerprint_unrelated_definitions() {
+    let original = "let id = fn x => x\nlet answer = id 1n\nlet independent = true";
+    let mut host = ruddy::analysis::Host::default();
+    host.set_file("main.rud", Some(original.into()));
+    let identity = Bundle::new("budgets", Version::new(0, 0, 0)).unwrap();
+    let env = ruddy::bundle::Environment::new([]);
+    let first = host.analyze(identity.clone(), "main.rud", &env);
+    assert!(first.diagnostics.is_empty());
+    let before = host.lowering_stats();
+    let fingerprints = host.fingerprinted_bodies();
+    let edited = original.replace("id 1n", "id 12345n");
+    host.set_file("main.rud", Some(edited.clone()));
+    let actual = host.analyze(identity.clone(), "main.rud", &env);
+    assert!(actual.diagnostics.is_empty());
+    let after = host.lowering_stats();
+    assert_eq!(after.lowered_bodies - before.lowered_bodies, 1);
+    assert_eq!(after.group_builds, before.group_builds);
+    assert_eq!(host.fingerprinted_bodies() - fingerprints, 1);
+    let mut fresh = ruddy::analysis::Host::default();
+    fresh.set_file("main.rud", Some(edited.clone()));
+    let expected = fresh.analyze(identity, "main.rud", &env);
+    for name in ["id", "answer", "independent"] {
+        let at = edited.find(name).unwrap();
+        assert_eq!(actual.hover("main.rud", at), expected.hover("main.rud", at));
+    }
+}
+
+#[test]
+fn inference_publications_share_immutable_semantics_when_cloned() {
+    let (mint, input) = program("let value = { count: 1n }");
+    let output = inference::infer(&mint, &input, Trace::Off);
+    let copy = output.clone();
+    assert!(std::ptr::eq(output.semantics(), copy.semantics()));
+    assert_eq!(
+        format!("{:?}", output.errors()),
+        format!("{:?}", copy.errors())
+    );
+}
+
+#[test]
+fn diagnostic_cache_revisions_are_scoped_to_their_host() {
+    let identity = Bundle::new("cache", Version::new(0, 0, 0)).unwrap();
+    let env = ruddy::bundle::Environment::new([]);
+    let mut first = ruddy::analysis::Host::default();
+    let mut second = ruddy::analysis::Host::default();
+    first.set_file("main.rud", Some("let value = 1n".into()));
+    second.set_file("main.rud", Some("let value = 1n".into()));
+    let first = first.analyze(identity.clone(), "main.rud", &env);
+    let second = second.analyze(identity, "main.rud", &env);
+    assert_eq!(first.diagnostic_revision(), second.diagnostic_revision());
+    assert!(!std::sync::Arc::ptr_eq(
+        &first.cache_identity(),
+        &second.cache_identity(),
+    ));
+    assert!(std::sync::Arc::ptr_eq(
+        &first.cache_identity(),
+        &first.cache_identity(),
+    ));
+}
+
 fn program(text: &str) -> (Mint, ir::Program) {
     let mut files = ruddy::tracking::FileManager::new();
     let file = files.register_new_file("main.rud".into(), text.into());
