@@ -1074,8 +1074,11 @@ module.exports = grammar({
      */
     rest: $ => seq('..', optional(field('name', $.type_variable))),
 
-    /** `when 'a`, or the `when _` that no formula may name. */
-    when_clause: $ => seq('when', field('name', choice($.type_variable, $.wildcard))),
+    /** `when 'a`, anonymous `when _`, or fresh presence bounded by `'a`. */
+    when_clause: $ => seq('when', choice(
+      field('name', choice($.type_variable, $.wildcard)),
+      seq('<=', field('bound', $.type_variable)),
+    )),
 
     optional_presence: $ => '?',
 

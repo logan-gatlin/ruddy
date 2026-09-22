@@ -102,9 +102,7 @@ fn run_bundle(fixture: &str, script: &str) {
         return;
     }
 
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .expect("the workspace root");
+    let root = crate::standard_fixture::path();
     let source = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("bundles")
         .join(fixture);

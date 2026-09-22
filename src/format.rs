@@ -2963,6 +2963,12 @@ impl<'a> Printer<'a> {
         if when.short {
             return self.with_comments(when.span, text("?"));
         }
+        if let Some(bound) = &when.upper_bound {
+            return self.with_comments(
+                when.span,
+                text(format!("when <= {}", self.slice(bound.span))),
+            );
+        }
         self.with_comments(
             when.span,
             match &when.name {

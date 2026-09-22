@@ -10,8 +10,12 @@ modules of their own, so tests reach the code through the same public API any
 other consumer would; a test that needs an item the crate does not export means
 the item should be exported.
 
-100% code coverage in tests (including branches) is required for the compiler
-crate. The source of truth for this is `just cov`.
+Validate changes with focused regression tests. Run Rust tests through
+`just test` so test executables and their children stay within the memory limit.
+For example, `just test -p ruddy-tests --lib inference::` selects the inference
+tests without building unrelated test harnesses. With no package selection,
+`just test` includes the whole workspace and its doctests. Tests use a persistent
+cache in `target/test-ruddy-home` unless `RUDDY_HOME` is explicitly set.
 
 The type system is designed around three constraints
 1. Inference/checking must provably terminate

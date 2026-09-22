@@ -840,6 +840,9 @@ fn clause_kids(ids: &mut Ids, cx: &Cx, mint: &Mint, clause: &Clause) -> Vec<Node
 fn when_text(when: &Option<Box<When>>, mint: &Mint) -> String {
     match when {
         None => String::new(),
+        Some(when) if when.upper_bound.is_some() => {
+            format!(" when <= '{}", when.upper_bound.as_ref().unwrap().anchored)
+        }
         Some(when) if when.argument.is_some() => format!(
             " when {}",
             print::ir::ty(&when.argument.as_ref().unwrap().anchored, mint)

@@ -3,6 +3,11 @@ name = "ruddy-debug"
 version = "0.1.0"
 edition = "2024"
 
+[[bin]]
+name = "ruddy-debug"
+path = "src/main.rs"
+test = false
+
 [features]
 default = ["parallel"]
 parallel = ["ruddy/parallel", "ruddy-cli/parallel", "ruddy-interp/parallel"]

@@ -152,7 +152,7 @@ fn executable_main_drains_console_output_and_saturates_exit_codes() {
          end",
         None,
     );
-    let standard = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+    let standard = crate::standard_fixture::path();
     let manifest = fs::read_to_string(directory.path().join("Ruddy.toml")).unwrap();
     fs::write(
         directory.path().join("Ruddy.toml"),

@@ -4,7 +4,7 @@
 //! does, with its own value representation, so these tests are about what a
 //! Ruddy program means rather than about what one backend happens to do.
 
-use std::{fs, path::Path, process::Command};
+use std::{fs, process::Command};
 
 use ruddy_interp::{Program, Value, render};
 
@@ -411,9 +411,6 @@ fn project(
     javascript: bool,
 ) -> tempfile::TempDir {
     let project = tempfile::tempdir().expect("a temporary interpreter project");
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .expect("the workspace root");
     let mut manifest = String::from(
         "name = \"interp-test\"\nversion = \"0.1.0\"\nkind = \"library\"\nroot = \"main.rud\"\n",
     );
@@ -425,6 +422,7 @@ fn project(
     }
     manifest.push_str("\n[dependencies]\n");
     if standard {
+        let root = crate::standard_fixture::path();
         manifest.push_str(&format!("std = {root:?}\n"));
     } else {
         manifest.push_str("std = false\n");
@@ -462,7 +460,11 @@ fn both(source: &str, exports: &[&str], integers: Option<u32>) -> (Vec<String>, 
         serde_json::from_slice(&output.stdout).expect("the probe prints JSON");
     let node = values.iter().map(|value| value.to_string()).collect();
 
-    let linked = ruddy_cli::compile(project.path()).expect("the consumer compiles");
+    // Interpret the same linked artifact that build_project gave the JS backend.
+    let linked = ruddy::artifact::text::try_parse(
+        &fs::read_to_string(artifact).expect("the built artifact is readable"),
+    )
+    .expect("the built artifact parses");
     let program = Program::load(&linked).expect("the linked artifact loads");
     let interpreted = exports
         .iter()

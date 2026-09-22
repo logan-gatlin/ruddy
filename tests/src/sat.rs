@@ -132,6 +132,93 @@ fn presentation_preserves_nonbinary_channel_constraints() {
 }
 
 #[test]
+fn presentation_recovers_signed_conjunction_and_disjunction_definitions() {
+    for disjunction in [false, true] {
+        for signs in 0..8 {
+            let inputs = (0..3).map(|at| {
+                if signs & (1 << at) == 0 {
+                    var(at)
+                } else {
+                    var(at).not()
+                }
+            });
+            let definition = if disjunction {
+                Formula::any(inputs)
+            } else {
+                Formula::all(inputs)
+            };
+            let formula = var(3).iff(definition);
+            // Inference has already expanded the original relationship.
+            let projected = sat::project(&formula, &atoms(&formula), 16).unwrap();
+            let groups = sat::presentation_groups(&projected);
+            let cnf = &groups[0].cnf;
+            assert!(matches!(cnf, Formula::Iff(..)), "{formula}: {cnf}");
+            assert!(sat::entails(&formula, cnf));
+            assert!(sat::entails(cnf, &formula));
+        }
+    }
+}
+
+fn conjuncts(formula: &Formula) -> usize {
+    match formula {
+        Formula::And(left, right) => conjuncts(left) + conjuncts(right),
+        _ => 1,
+    }
+}
+
+/// Padding four tuple positions has one prefix chain and four output
+/// definitions. Its projected DNF used to print many transitive consequences
+/// of those seven requirements instead of recovering the definitions.
+#[test]
+fn presentation_recovers_padding_equations_without_redundant_clauses() {
+    let prefix = Formula::all((1..4).map(|at| var(at).not().or(var(at - 1))));
+    let formula = prefix.and(Formula::all(
+        (0..4).map(|at| var(8 + at).iff(var(at).not().or(var(4 + at)))),
+    ));
+    let projected = sat::project(&formula, &atoms(&formula), 256).unwrap();
+    let groups = sat::presentation_groups(&projected);
+    assert_eq!(groups.len(), 1);
+    let cnf = &groups[0].cnf;
+    assert_eq!(conjuncts(cnf), 7, "{cnf}");
+    assert_eq!(cnf.to_string().matches(" = ").count(), 4, "{cnf}");
+    assert!(sat::entails(&formula, cnf));
+    assert!(sat::entails(cnf, &formula));
+}
+
+/// Selecting a channel makes its output present and preserves the other
+/// fields. The extra pairwise input requirements follow from those rules:
+/// they must disappear even though they are not syntactically absorbed.
+#[test]
+fn presentation_removes_redundant_setter_requirements() {
+    let rules = Formula::all((0..4).map(|channel| {
+        var(channel).not().or(Formula::all((0..4).map(|field| {
+            if field == channel {
+                var(8 + field)
+            } else {
+                var(4 + field).iff(var(8 + field))
+            }
+        })))
+    }));
+    let pairs = Formula::all((0..4).flat_map(|one| {
+        (one + 1..4).map(move |other| {
+            var(one)
+                .and(var(other))
+                .not()
+                .or(var(4 + one).and(var(4 + other)))
+        })
+    }));
+    let groups = sat::presentation_groups(&rules.clone().and(pairs));
+    assert_eq!(groups.len(), 1);
+    let cnf = &groups[0].cnf;
+    // Each of the four rules contributes three guarded equalities and one
+    // output presence, ready for the printer's common-premise factoring.
+    assert_eq!(conjuncts(cnf), 16, "{cnf}");
+    assert_eq!(cnf.to_string().matches(" = ").count(), 12, "{cnf}");
+    assert!(sat::entails(&rules, cnf));
+    assert!(sat::entails(cnf, &rules));
+}
+
+#[test]
 fn presentation_is_exact_for_every_three_atom_truth_table() {
     // Covers constants, fixed atoms, both polarities of binary relationships,
     // and formulas whose binary consequences are not a complete description.

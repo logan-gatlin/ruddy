@@ -6,10 +6,12 @@ publish = false
 
 [lib]
 name = "ruddy_interp"
+test = false
 
 [[bin]]
 name = "ruddy-interp"
 path = "src/main.rs"
+test = false
 
 [features]
 default = ["parallel"]

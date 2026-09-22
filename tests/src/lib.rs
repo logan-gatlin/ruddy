@@ -37,6 +37,7 @@ mod sat;
 mod session;
 mod snapshot;
 mod stage;
+mod standard_fixture;
 mod stdlib;
 mod stdlib_apis;
 mod stdlib_fs;

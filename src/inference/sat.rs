@@ -90,6 +90,11 @@ const PRESENTATION_BINARY_ATOMS: usize = 64;
 /// Keep redundancy elimination on a recovered binary cover small as well.
 const PRESENTATION_BINARY_CLAUSES: usize = 256;
 
+/// SAT-backed clause reduction and gate recognition are presentation extras.
+/// Larger covers retain the bounded, purely syntactic normal-form fallback.
+const PRESENTATION_REDUCTION_CLAUSES: usize = 128;
+const PRESENTATION_REDUCTION_LITERALS: usize = 1024;
+
 /// One product term over the atoms a projection kept: what each position is
 /// fixed to, and `None` where the term does not look at it.
 ///
@@ -294,11 +299,11 @@ pub fn presentation_groups(formula: &Formula) -> Vec<PresentationGroup> {
             let cnf = binary
                 .or_else(|| {
                     formula_cover(&component, false, &positions, PRESENTATION_MAX_TERMS)
-                        .map(|cover| readable_cnf(&atoms, presentation_minimized(cover)))
+                        .map(|cover| presentation_cnf(&atoms, cover))
                 })
                 .or_else(|| {
                     eliminate(&component.clone().not(), &atoms, PRESENTATION_MAX_TERMS)
-                        .map(|cover| readable_cnf(&atoms, presentation_minimized(cover)))
+                        .map(|cover| presentation_cnf(&atoms, cover))
                 })
                 .unwrap_or_else(|| component.clone());
             PresentationGroup {
@@ -1063,9 +1068,99 @@ fn readable_cnf(atoms: &[Atom], mut complement: Vec<Cube>) -> Formula {
     {
         return Formula::False;
     }
-    let mut parts = relations(atoms, &mut complement, true);
+    let mut parts = gates(atoms, &mut complement);
+    parts.extend(relations(atoms, &mut complement, true));
     parts.extend(complement.iter().map(|cube| clause(atoms, cube)));
     Formula::all(parts)
+}
+
+/// Clauses can follow from several others even when no pair combines or
+/// absorbs. Remove those consequences before recognizing relationships: a
+/// padding equation, for example, otherwise generates many redundant clauses
+/// through the tuple's prefix constraints. The SAT pass removes a clause only
+/// when the remaining clauses entail it, so each step preserves equivalence.
+fn presentation_cnf(atoms: &[Atom], cover: Vec<Cube>) -> Formula {
+    let mut cover = presentation_minimized(cover);
+    if atoms.len() <= PRESENTATION_BINARY_ATOMS
+        && cover.len() <= PRESENTATION_REDUCTION_CLAUSES
+        && cover.iter().map(|cube| literals(cube).len()).sum::<usize>()
+            <= PRESENTATION_REDUCTION_LITERALS
+    {
+        cover = irredundant(atoms, cover);
+    }
+    readable_cnf(atoms, cover)
+}
+
+/// Recover definitions of conjunctions and disjunctions from their exact CNF
+/// encoding, with either polarity on every input. For example, three clauses
+/// `a -> z`, `b -> z`, `z -> a or b` become `z = (a or b)`. A wide forbidden
+/// cube supplies the last clause; each of its inputs needs a two-literal cube
+/// with both polarities reversed. Consuming only this complete encoding makes
+/// the rewrite exact without another SAT query.
+fn gates(atoms: &[Atom], cover: &mut Vec<Cube>) -> Vec<Formula> {
+    if atoms.len() > PRESENTATION_BINARY_ATOMS || cover.len() > PRESENTATION_REDUCTION_CLAUSES {
+        return Vec::new();
+    }
+    let mut parts = Vec::new();
+    let mut used = vec![false; cover.len()];
+    for at in 0..cover.len() {
+        crate::cancellation::checkpoint();
+        if used[at] {
+            continue;
+        }
+        let terms = literals(&cover[at]);
+        if terms.len() < 3 {
+            continue;
+        }
+        for &(pivot, there) in &terms {
+            let mut matching = Vec::new();
+            for &(input, value) in &terms {
+                if input == pivot {
+                    continue;
+                }
+                let mut spoke = vec![None; atoms.len()];
+                spoke[pivot] = Some(!there);
+                spoke[input] = Some(!value);
+                match cover
+                    .iter()
+                    .enumerate()
+                    .position(|(other, cube)| !used[other] && *cube == spoke)
+                {
+                    Some(other) => matching.push(other),
+                    None => break,
+                }
+            }
+            if matching.len() != terms.len() - 1 {
+                continue;
+            }
+            let inputs =
+                terms
+                    .iter()
+                    .filter(|(input, _)| *input != pivot)
+                    .map(|&(input, value)| {
+                        let input = Formula::Atom(atoms[input]);
+                        if value == there { input.not() } else { input }
+                    });
+            let definition = if there {
+                Formula::any(inputs)
+            } else {
+                Formula::all(inputs)
+            };
+            parts.push(Formula::Atom(atoms[pivot]).iff(definition));
+            used[at] = true;
+            for other in matching {
+                used[other] = true;
+            }
+            break;
+        }
+    }
+    *cover = std::mem::take(cover)
+        .into_iter()
+        .enumerate()
+        .filter(|(at, _)| !used[*at])
+        .map(|(_, cube)| cube)
+        .collect();
+    parts
 }
 
 /// The formula a cover stands for, written in the canonical order.

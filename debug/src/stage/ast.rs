@@ -693,6 +693,9 @@ fn when_text(when: &Option<Box<When>>) -> String {
     match when {
         None => String::new(),
         Some(when) if when.short => "?".to_string(),
+        Some(when) if when.upper_bound.is_some() => {
+            format!(" when <= '{}", when.upper_bound.as_ref().unwrap().tracked)
+        }
         Some(when) => match &when.name {
             Some(name) => format!(" when '{}", name.tracked),
             None => " when _".to_string(),

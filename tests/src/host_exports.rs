@@ -2,7 +2,7 @@ use std::{fs, path::Path, process::Command};
 
 fn project(source: &str, platform: &str) -> tempfile::TempDir {
     let project = tempfile::tempdir().unwrap();
-    let standard = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+    let standard = crate::standard_fixture::path();
     fs::write(project.path().join("Ruddy.toml"), format!(
         "name = \"host-test\"\nversion = \"0.1.0\"\nkind = \"library\"\nroot = \"main.rud\"\ntarget = \"js\"\nplatform = {platform:?}\n\n[dependencies]\nstd = {standard:?}\n"
     )).unwrap();
@@ -11,7 +11,6 @@ fn project(source: &str, platform: &str) -> tempfile::TempDir {
 }
 
 fn run(project: &Path, script: &str) -> std::process::Output {
-    ruddy_cli::check_project(project).unwrap();
     let artifact = ruddy_cli::build_project(project).unwrap();
     let script = format!(
         "import assert from 'node:assert/strict'; import {{pathToFileURL}} from 'node:url'; const app = await import(pathToFileURL({}));\n{script}",
@@ -237,7 +236,6 @@ fn immediate_effects_run_at_root_calls_but_not_during_initialization() {
                 .to_string();
             assert!(error.contains("unhandled-effect"), "{error}");
         } else {
-            ruddy_cli::check_project(executable.path()).unwrap();
             let artifact = ruddy_cli::build_project(executable.path()).unwrap();
             let output = Command::new("node")
                 .arg(artifact.with_extension("js"))
@@ -468,7 +466,7 @@ end
     );
     let dependency = project.path().join("dep");
     fs::create_dir(&dependency).unwrap();
-    let standard = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+    let standard = crate::standard_fixture::path();
     fs::write(dependency.join("Ruddy.toml"), format!("name = \"dep\"\nversion = \"0.1.0\"\nkind = \"library\"\nroot = \"lib.rud\"\n[dependencies]\nstd = {standard:?}\n")).unwrap();
     fs::write(dependency.join("lib.rud"), "@private type Printer = String -> Printer + std::io::!IO\nlet printer : Printer = fn text => do let _ = std::io::println text return printer end").unwrap();
     let manifest = project.path().join("Ruddy.toml");

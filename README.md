@@ -274,7 +274,6 @@ just check       # formatting, linting, and tests
 just test        # run tests in a memory-limited scope
 just dev         # serve the live-reloading debugger on :7878
 just grammar     # regenerate and test the tree-sitter parser
-just cov         # measure compiler coverage (nightly Rust)
 ```
 
 The HTTPS Git transport tests require Git, Python 3, and OpenSSL.

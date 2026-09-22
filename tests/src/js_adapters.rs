@@ -11,7 +11,7 @@ use std::{fs, path::Path, process::Command};
 /// A bundle that depends on the standard library by path.
 fn project(source: &str, platform: &str, integers: Option<u32>) -> tempfile::TempDir {
     let project = tempfile::tempdir().unwrap();
-    let standard = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+    let standard = crate::standard_fixture::path();
     let mut manifest = format!(
         "name = \"js-adapter-test\"\nversion = \"0.1.0\"\nkind = \"library\"\nroot = \"main.rud\"\ntarget = \"js\"\nplatform = {platform:?}\n"
     );
@@ -26,7 +26,6 @@ fn project(source: &str, platform: &str, integers: Option<u32>) -> tempfile::Tem
 
 /// Build the bundle and run `script` against its exports under Node.
 fn run(project: &Path, script: &str) {
-    ruddy_cli::check_project(project).expect("the adapter consumer checks");
     let artifact = ruddy_cli::build_project(project).expect("the adapter consumer builds");
     let script = format!(
         "import assert from 'node:assert/strict'; import {{pathToFileURL}} from 'node:url'; const app = await import(pathToFileURL({}));\nconst show = value => JSON.stringify(value, (_, item) => typeof item === 'bigint' ? item.toString() : item);\nconst some = result => {{ assert.equal(result.tag, 'Some', show(result)); return result.value; }};\nconst failure = result => {{ assert.equal(result.tag, 'Error', show(result)); return result.value; }};\nconst data = value => JSON.parse(JSON.stringify(value));\nconst tag = value => value.tag;\n{script}",

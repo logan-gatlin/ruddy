@@ -50,6 +50,119 @@ fn implication_chains_require_every_adjacent_link() {
 }
 
 #[test]
+fn bounded_presence_annotations_enforce_implications_without_correlating_choices() {
+    for mask in 0..8u32 {
+        let fields = ["x", "y", "r"]
+            .into_iter()
+            .enumerate()
+            .filter(|(at, _)| mask & (1 << at) != 0)
+            .map(|(_, name)| format!("{name}: 1n"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let source = format!(
+            "let take: {{ x when <= 'r: Nat, y when <= 'r: Nat, r when 'r: Nat }} -> () = fn _ => ()\nlet result = take {{ {fields} }}"
+        );
+        let (_, lowered, output) = infer_src(&source);
+        assert!(lowered.errors.is_empty(), "{:#?}", lowered.errors);
+        assert_eq!(
+            output.errors().is_empty(),
+            mask == 0 || mask & 4 != 0,
+            "{source}: {:#?}",
+            output.errors()
+        );
+    }
+}
+
+#[test]
+fn bounded_channel_selector_annotations_check_the_selected_field() {
+    let definition = "let get: (#Red (when <= 'r) | #Green (when <= 'g)) -> { r when 'r: Nat, g when 'g: Nat } -> Nat = fn channel image => match channel with | #Red => image.r | #Green => image.g end\n";
+    inferred(&format!(
+        "{definition}let red = get #Red {{r: 1n}}\nlet green = get #Green {{g: 2n}}"
+    ));
+    let (_, lowered, output) = infer_src(&format!("{definition}let bad = get #Red {{g: 2n}}"));
+    assert!(lowered.errors.is_empty(), "{:#?}", lowered.errors);
+    assert!(!output.errors().is_empty());
+}
+
+#[test]
+fn bounded_presence_annotations_can_name_presence_arguments_of_aliases() {
+    let definition = "type Field 'p = { y when 'p: Nat }\nlet take: { x when <= 'p: Nat } -> Field 'p -> () = fn _ _ => ()\n";
+    inferred(&format!(
+        "{definition}let absent = take {{}} {{}}\nlet present = take {{x: 1n}} {{y: 2n}}\nlet unselected = take {{}} {{y: 3n}}"
+    ));
+    let (_, lowered, output) = infer_src(&format!("{definition}let bad = take {{x: 1n}} {{}}"));
+    assert!(lowered.errors.is_empty(), "{:#?}", lowered.errors);
+    assert!(!output.errors().is_empty());
+}
+
+#[test]
+fn bounded_presence_annotations_match_explicit_contracts_and_ownership() {
+    for (inline, explicit, body) in [
+        (
+            "{ x when <= 'r: Nat, r when 'r: Nat } -> ()",
+            "{ x when 'p: Nat, r when 'r: Nat } -> () where 'p -> 'r",
+            "fn _ => ()",
+        ),
+        (
+            "(Nat when <= 'r, Nat when 'r) -> ()",
+            "(Nat when 'p, Nat when 'r) -> () where 'p -> 'r",
+            "fn _ => ()",
+        ),
+        (
+            "{ r when 'r: Nat } -> { x when <= 'r: Nat }",
+            "{ r when 'r: Nat } -> { x when 'p: Nat } where 'p -> 'r",
+            "fn _ => {}",
+        ),
+        (
+            "{ r when 'r: Nat } -> () + !Log (when <= 'r)",
+            "{ r when 'r: Nat } -> () + !Log (when 'p) where 'p -> 'r",
+            "fn _ => ()",
+        ),
+    ] {
+        let (mint, _, output) = inferred(&format!(
+            "effect Log = {{ write: () -> () }}\nlet inline: {inline} = {body}\nlet explicit: {explicit} = {body}"
+        ));
+        assert_eq!(
+            scheme(&mint, &output, "inline"),
+            scheme(&mint, &output, "explicit"),
+            "{inline}"
+        );
+    }
+}
+
+#[test]
+fn bounded_presence_contracts_are_fresh_at_recursive_calls() {
+    inferred(
+        "let take: Bool -> { x when <= 'r: Nat, r when 'r: Nat } -> () = fn stop value => if stop then () else do let _ = take true {} return take true { x: 1n, r: 1n } end end\nlet result = take false {}",
+    );
+}
+
+#[test]
+fn bounded_presence_projection_rejects_an_absent_optional_field() {
+    for annotation in [
+        "{ x when <= 'r: Nat, r when 'r: Nat } -> Nat",
+        "{ x when 'p: Nat, r when 'r: Nat } -> Nat where 'p -> 'r",
+    ] {
+        let (_, lowered, output) = infer_src(&format!(
+            "let get: {annotation} = fn value => value.x\nlet bad = get {{ r: 1n }}",
+        ));
+        assert!(lowered.errors.is_empty(), "{:#?}", lowered.errors);
+        assert!(!output.errors().is_empty(), "{annotation}");
+    }
+}
+
+#[test]
+fn bounded_presence_projections_match_explicit_annotation_specialization() {
+    let (mint, _, output) = inferred(
+        "let inline: (#Red (when <= 'r) | #None) -> { r when 'r: Nat } -> Nat = fn channel image => image.r\nlet explicit: (#Red (when 'p) | #None) -> { r when 'r: Nat } -> Nat where 'p -> 'r = fn channel image => image.r",
+    );
+    assert_eq!(
+        scheme(&mint, &output, "inline"),
+        scheme(&mint, &output, "explicit")
+    );
+}
+
+#[test]
 fn channel_accessors_infer_tag_conditional_fields() {
     let (mint, _, output) = inferred(
         "let get_channel = fn channel img => match channel with
@@ -6638,11 +6751,11 @@ fn field_types_unify_across_arms() {
         inferred("let f = fn v => match v with | {a} => a | {a, b} => b | {} => 2n end");
     // `a` is typed by arm one's use as the result, `b` by arm two's, and the
     // result `Nat` reaches both through the bodies.
-    // And the arms' coverage rides along as a `where` clause: an `a`, or no
-    // `b` — which is exactly the three subsets the three arms name.
+    // The arms' coverage bounds `b` by `a`: an `a`, or no `b` — exactly the
+    // three subsets the three arms name.
     assert_eq!(
         scheme(&mint, &output, "f"),
-        "{ a when 'input_0_a: Nat, b when 'input_0_b: Nat } -> Nat where 'input_0_b -> 'input_0_a"
+        "{ a when 'input_0_a: Nat, b when <= 'input_0_a: Nat } -> Nat"
     );
 
     // Disagreeing across arms is the mismatch it sounds like.
@@ -8021,7 +8134,7 @@ fn every_clause_connective_lowers() {
     );
     assert_eq!(
         scheme(&mint, &output, "i"),
-        "{ x when 'input_0_x: Nat, y when 'input_0_y: Nat, ..'a } -> Nat where 'input_0_x -> 'input_0_y"
+        "{ x when <= 'input_0_y: Nat, y when 'input_0_y: Nat, ..'a } -> Nat"
     );
     // `when _` mints a presence like any other; what it does not do is give it
     // a name, so nothing constrains it and it generalizes on its own.

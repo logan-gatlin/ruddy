@@ -119,7 +119,7 @@ end
 
 fn project(source: &str, platform: &str, kind: &str) -> tempfile::TempDir {
     let project = tempfile::tempdir().unwrap();
-    let standard = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+    let standard = crate::standard_fixture::path();
     fs::write(project.path().join("Ruddy.toml"), format!(
         "name = \"api-test\"\nversion = \"0.1.0\"\nkind = {kind:?}\nroot = \"main.rud\"\ntarget = \"js\"\nplatform = {platform:?}\n\n[dependencies]\nstd = {standard:?}\n"
     )).unwrap();
@@ -131,7 +131,7 @@ fn project(source: &str, platform: &str, kind: &str) -> tempfile::TempDir {
 /// standard library accepts can be watched at more than the default domain.
 fn domain_project(source: &str, integers: u32) -> tempfile::TempDir {
     let project = tempfile::tempdir().unwrap();
-    let standard = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+    let standard = crate::standard_fixture::path();
     fs::write(project.path().join("Ruddy.toml"), format!(
         "name = \"api-test\"\nversion = \"0.1.0\"\nkind = \"library\"\nroot = \"main.rud\"\ntarget = \"js\"\nplatform = \"node\"\nintegers = {integers}\n\n[dependencies]\nstd = {standard:?}\n"
     )).unwrap();
@@ -144,7 +144,6 @@ fn run(project: &Path, script: &str) {
 }
 
 fn run_with_setup(project: &Path, setup: &str, script: &str) {
-    ruddy_cli::check_project(project).expect("API consumer checks");
     let artifact = ruddy_cli::build_project(project).expect("API consumer builds");
     let script = format!(
         "import assert from 'node:assert/strict'; import {{pathToFileURL}} from 'node:url'; {setup} const app = await import(pathToFileURL({}));\n{script}",

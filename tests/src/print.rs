@@ -1072,7 +1072,7 @@ fn a_printed_scheme_reads_back_as_source() {
 /// The original wide-channel regression, through inference and the scheme
 /// printer rather than only the propositional presentation helpers.
 #[test]
-fn swizzle_prints_channel_requirements_as_implications() {
+fn swizzle_prints_independent_channel_requirements_as_inline_bounds() {
     let source = r#"
 let get_channel = fn channel img => match channel with
 | #Red => img.r | #Green => img.g | #Blue => img.b | #Alpha => img.a end
@@ -1102,17 +1102,16 @@ end
         "tuple input must stay a tuple: {signature}"
     );
     let compact = presented_scheme(source);
-    assert!(!compact.definitions.is_empty(), "{compact}");
-    assert!(compact.to_string().len() < signature.len(), "{compact}");
+    assert!(compact.to_string().len() <= signature.len(), "{compact}");
     let annotated = source.replace(
         "let swizzle =",
         &format!("{} =", compact.declaration("let swizzle: ")),
     );
     printed_scheme(&annotated);
-    assert_eq!(constraints.lines().count(), 6, "{constraints}");
+    assert_eq!(signature.matches("when <=").count(), 34, "{signature}");
+    assert_eq!(constraints.lines().count(), 2, "{constraints}");
     for input in 0..2 {
-        let chain =
-            format!("'input_{input}_3 <= 'input_{input}_2 <= 'input_{input}_1 <= 'input_{input}_0");
+        let chain = format!("'input_{input}_2 <= 'input_{input}_1 <= 'input_{input}_0");
         assert!(
             constraints
                 .lines()
@@ -1121,17 +1120,14 @@ end
         );
     }
     for (color, field) in [("red", "r"), ("green", "g"), ("blue", "b"), ("alpha", "a")] {
-        let premises = (0..2)
-            .flat_map(|input| (0..4).map(move |slot| format!("'input_{input}_{slot}_{color}")))
-            .collect::<Vec<_>>()
-            .join(" or ");
-        let clause = format!("{premises} -> 'input_2_{field}");
-        assert!(
-            constraints
-                .lines()
-                .any(|line| line.trim().trim_end_matches(';') == clause),
-            "missing {clause}: {constraints}"
-        );
+        let tag = match color {
+            "red" => "Red",
+            "green" => "Green",
+            "blue" => "Blue",
+            _ => "Alpha",
+        };
+        let marker = format!("#{tag} (when <= 'input_2_{field})");
+        assert_eq!(signature.matches(&marker).count(), 8, "{signature}");
     }
     let annotated = source.replace("let swizzle =", &format!("let swizzle: {signature} ="));
     // Reading the signature back must type-check and retain its body. The
@@ -1166,6 +1162,9 @@ fn extend4_prints_its_input_prefix_as_an_implication_chain() {
         signature.contains("'input_0_3 <= 'input_0_2 <= 'input_0_1 <= 'input_0_0"),
         "{signature}"
     );
+    let constraints = signature.split_once("\nwhere\n").expect("constraints").1;
+    assert_eq!(constraints.lines().count(), 5, "{signature}");
+    assert_eq!(constraints.matches(" = ").count(), 4, "{signature}");
     let annotated = source.replace("let extend4 =", &format!("let extend4: {signature} ="));
     let roundtrip = printed_scheme(&annotated);
     assert_eq!(
@@ -1240,11 +1239,160 @@ fn optional_presences_do_not_erase_sharing_or_constraints() {
         "let f: { x when 'p: Nat, y when 'q: Nat } -> () where 'p -> 'q = fn _ => ()",
     );
     assert!(!linked.contains('?'), "{linked}");
-    assert!(linked.contains("where"), "{linked}");
+    assert!(linked.contains("x when <= 'input_0_y"), "{linked}");
+    assert!(!linked.contains("where"), "{linked}");
     assert_eq!(
         printed_scheme("let f: (#A? | #B?) -> () = fn _ => ()"),
         "#A? | #B? -> ()"
     );
+}
+
+#[test]
+fn independent_presence_bounds_print_inline_and_roundtrip_in_both_directions() {
+    for (definitions, original) in [
+        (
+            "",
+            "(#Red (when 'red) | #Green (when 'green)) -> { r when 'r: 'v, g when 'g: 'v } -> 'v where 'red -> 'r; 'green -> 'g",
+        ),
+        ("", "(Nat when 'p, String when 'q) -> () where 'p -> 'q"),
+        (
+            "effect Log = () -> ()\n",
+            "(() -> () + !Log (when 'p)) -> { enabled when 'q: () } -> () where 'p -> 'q",
+        ),
+    ] {
+        let source = if definitions.is_empty() {
+            format!("extern original: {original} = \"host.original\"")
+        } else {
+            format!("{definitions}let original: {original} = fn _ _ => ()")
+        };
+        // `with_scheme` selects terms, so preserve the extern's contract through
+        // an ordinary binding before inspecting the generated annotation.
+        let signature = printed_scheme(&format!("{source}\nlet f = original"));
+        assert!(signature.contains("when <= "), "{signature}");
+        assert!(!signature.contains("where"), "{signature}");
+        let roundtrip = printed_scheme(&format!(
+            "{source}\nlet forward: {signature} = original\nlet backward: {original} = forward"
+        ));
+        assert_eq!(roundtrip, signature);
+        let compact = presented_scheme(&format!("{source}\nlet f = original"));
+        printed_scheme(&format!(
+            "{source}\n{} = original\nlet backward: {original} = forward",
+            compact.declaration("let forward: ")
+        ));
+    }
+}
+
+#[test]
+fn inline_presence_bounds_keep_shared_or_multiply_constrained_sources_named() {
+    for original in [
+        "{ x when 'p: Nat, y when 'p: Nat, z when 'q: Nat } -> () where 'p -> 'q",
+        "{ x when 'p: Nat, y when 'q: Nat, z when 'r: Nat } -> () where 'p -> 'q; 'p -> 'r",
+        "{ x when 'p: Nat, y when 'q: Nat } -> () where 'p = 'q",
+    ] {
+        let signature = printed_scheme(&format!("let f: {original} = fn _ => ()"));
+        assert!(!signature.contains("when <="), "{signature}");
+        assert!(signature.contains("where"), "{signature}");
+    }
+}
+
+#[test]
+fn inline_presence_chains_keep_the_middle_presence_named() {
+    let original = "{ x when 'p: Nat, y when 'q: Nat, z when 'r: Nat } -> () where 'p <= 'q <= 'r";
+    let source = format!("extern original: {original} = \"host.original\"");
+    let signature = printed_scheme(&format!("{source}\nlet f = original"));
+    assert_eq!(signature.matches("when <=").count(), 1, "{signature}");
+    assert!(signature.contains("x when <= 'input_0_y"), "{signature}");
+    assert!(signature.contains("y when 'input_0_y"), "{signature}");
+    assert!(
+        signature.contains("'input_0_y -> 'input_0_z"),
+        "{signature}"
+    );
+    let roundtrip = printed_scheme(&format!(
+        "{source}\nlet forward: {signature} = original\nlet backward: {original} = forward"
+    ));
+    assert_eq!(roundtrip, signature);
+}
+
+#[test]
+fn inline_presence_presentation_keeps_producer_owned_choices_explicit() {
+    let original = "{ r when 'r: Nat } -> { x when 'p: Nat } where 'p -> 'r";
+    let signature = printed_scheme(&format!(
+        "extern original: {original} = \"host.original\"\nlet f = original"
+    ));
+    assert!(!signature.contains("when <="), "{signature}");
+    assert!(signature.contains("x when 'output_x"), "{signature}");
+}
+
+#[test]
+fn inline_bounds_count_obligations_across_package_ownership_scopes() {
+    use ruddy::types::{Atom, RowField};
+    let record = Arc::new(Ty::Struct(Row {
+        labels: [("selected", 0), ("owned", 1), ("ordinary", 2)]
+            .into_iter()
+            .map(|(name, index)| {
+                (
+                    name.to_string(),
+                    RowField {
+                        presence: Presence::Bound(index),
+                        ty: Arc::new(Ty::Nat),
+                    },
+                )
+            })
+            .collect(),
+        rest: Rest::Closed,
+    }));
+    let implication = |target| {
+        Formula::Atom(Atom::Bound(0))
+            .not()
+            .or(Formula::Atom(Atom::Bound(target)))
+    };
+    let body = Arc::new(Ty::pure(record, Arc::new(Ty::unit())));
+    let one = Scheme::existential(
+        3,
+        3,
+        [1].into_iter().collect(),
+        body.clone(),
+        implication(1),
+    );
+    assert!(
+        one.to_string().contains("selected when <= 'input_0_owned"),
+        "{one}"
+    );
+    assert!(!one.to_string().contains("where"), "{one}");
+    let two = Scheme::existential(
+        3,
+        3,
+        [1].into_iter().collect(),
+        body,
+        implication(1).and(implication(2)),
+    );
+    assert!(!two.to_string().contains("when <="), "{two}");
+    assert!(
+        two.to_string().contains("selected when 'input_0_selected"),
+        "{two}"
+    );
+}
+
+#[test]
+fn inline_presence_bounds_remain_visible_when_other_structures_are_aliased() {
+    let long = "{ first_long_field: 'v, second_long_field: 'v, third_long_field: 'v }";
+    let original =
+        format!("(#Red (when 'p)) -> {{ r when 'q: {long}, old: {long} }} -> () where 'p -> 'q");
+    let source = format!("extern original: {original} = \"host.original\"\nlet f = original");
+    let compact = presented_scheme(&source);
+    assert!(compact.annotation.contains("when <="), "{compact}");
+    assert!(!compact.definitions.is_empty(), "{compact}");
+    assert!(
+        compact
+            .definitions
+            .iter()
+            .all(|definition| !definition.contains("when <=")),
+        "inline bounds cannot be moved into type declarations: {compact}"
+    );
+    printed_scheme(&format!(
+        "extern original: {original} = \"host.original\"\n{} = original\nlet backward: {original} = forward",
+        compact.declaration("let forward: ")
+    ));
 }
 
 #[test]

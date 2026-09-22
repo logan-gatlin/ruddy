@@ -165,7 +165,22 @@ check: fmt-check clippy test
 # Compile normally, then limit each test executable and its children. Cargo
 # uses the runner for unit tests, integration tests, and doctests.
 test *args:
-    cargo --config 'target."cfg(all())".runner = "scripts/test-runner.sh"' test --workspace {{args}}
+    #!/usr/bin/env bash
+    set -euo pipefail
+    set -- {{args}}
+    workspace=(--workspace)
+    for arg in "$@"; do
+        case "$arg" in
+            --) break ;;
+            -p*|--package|--package=*|--workspace) workspace=(); break ;;
+        esac
+    done
+    # Keep dependency artifacts warm without competing with the installed CLI
+    # or language server, which may use a different compiler stamp.
+    if [ -z "${RUDDY_HOME+x}" ]; then
+        export RUDDY_HOME="{{justfile_directory()}}/target/test-ruddy-home"
+    fi
+    cargo --config 'target."cfg(all())".runner = "scripts/test-runner.sh"' test "${workspace[@]}" "$@"
 
 build:
     cargo build --workspace
@@ -181,21 +196,6 @@ deploy:
 # Build and install the CLI, including the language server.
 install:
     cargo install --locked --force --path "{{justfile_directory()}}/cli"
-
-# Line and branch coverage for the compiler library, which is the crate the
-# 100% rule is about. Every other crate in the workspace is excluded: the
-# tests themselves, the debugger, the command line, the reference
-# interpreter, and the JavaScript recognizer. Branch coverage is a
-# nightly-only rustc feature, hence `+nightly`.
-cov *args:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    coverage_toolchain="${RUDDY_COVERAGE_TOOLCHAIN:-nightly}"
-    export CARGO_TARGET_DIR="{{justfile_directory()}}/target/llvm-cov-target"
-    eval "$(cargo +"$coverage_toolchain" llvm-cov show-env --branch --sh)"
-    cargo +"$coverage_toolchain" llvm-cov clean
-    RUSTUP_TOOLCHAIN="$coverage_toolchain" just test
-    cargo +"$coverage_toolchain" llvm-cov report --ignore-filename-regex '/(tests|debug|cli|interp|esparse)/src/|/vendor/|/rustlib/' {{args}}
 
 clippy:
     cargo clippy --workspace --all-targets

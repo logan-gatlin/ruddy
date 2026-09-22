@@ -970,9 +970,7 @@ fn apply_tail_action(source: &str, action: &serde_json::Value) -> String {
 }
 
 fn tail_manifest() -> String {
-    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .unwrap();
+    let root = crate::standard_fixture::path();
     format!(
         "name = \"editor\"\nversion = \"0.0.0\"\nkind = \"library\"\nroot = \"main.rud\"\ntarget = \"js\"\n[dependencies]\nstd = {root:?}\n"
     )

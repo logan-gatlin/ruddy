@@ -877,6 +877,9 @@ fn mark(when: &Option<Box<When>>) -> Option<Mark> {
     if when.short {
         return Some(Mark::Undecided);
     }
+    if let Some(bound) = &when.upper_bound {
+        return Some(Mark::When(format!("<= '{}", bound.tracked)));
+    }
     // The sigil is written back on: a presence is a variable, and one printing
     // bare would read as a type's name. The anonymous `when _` names none.
     Some(Mark::When(match &when.name {

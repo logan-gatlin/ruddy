@@ -20,10 +20,29 @@ impl TypePresentation {
         scheme: &Scheme,
         aliases: impl IntoIterator<Item = (&'a str, &'a Scheme)>,
     ) -> Self {
+        let aliases: Vec<_> = aliases.into_iter().collect();
+        let plan = PresencePlan::new(scheme);
+        let compact = Self::with_plan(scheme, &aliases, &plan);
+        if plan.bounds.is_empty() {
+            return compact;
+        }
+        // An inline bound cannot be moved into an ordinary alias definition.
+        // Compare against keeping its parameter explicit and abbreviating the
+        // surrounding structure; count helper definitions in both choices.
+        let explicit = Self::with_plan(scheme, &aliases, &PresencePlan::explicit(scheme));
+        if cost(&explicit.definitions, &explicit.annotation)
+            < cost(&compact.definitions, &compact.annotation)
+        {
+            explicit
+        } else {
+            compact
+        }
+    }
+
+    fn with_plan(scheme: &Scheme, aliases: &[(&str, &Scheme)], plan: &PresencePlan) -> Self {
         let names = scheme_names(scheme);
         let mut replacements = HashMap::new();
         let mut definitions = Vec::new();
-        let aliases: Vec<_> = aliases.into_iter().collect();
         let mut reserved: HashSet<String> =
             aliases.iter().map(|(name, _)| name.to_string()).collect();
         // Bounded optimization, not bounded display. Large or recovery types
@@ -52,7 +71,7 @@ impl TypePresentation {
                 if template
                     .bounds
                     .iter()
-                    .any(|index| scheme.is_existential(*index))
+                    .any(|index| scheme.is_existential(*index) || plan.bounds.contains_key(index))
                 {
                     continue;
                 }
@@ -77,12 +96,13 @@ impl TypePresentation {
                 (template.bounds.len() == alias.count() as usize).then_some((*name, template))
             })
             .collect();
-        let mut annotation = render_scheme(scheme, &names, &replacements);
+        let mut annotation = render_scheme(scheme, &names, &replacements, plan);
         let body = Render {
             ty: scheme.body(),
             names: &names,
             replacements: &replacements,
-            scheme: None,
+            formula: None,
+            bounds: &plan.bounds,
         }
         .to_string();
         let constraints = annotation[body.len()..].to_string();
@@ -151,7 +171,8 @@ impl TypePresentation {
                         ty: scheme.body(),
                         names: &names,
                         replacements: &trial,
-                        scheme: None,
+                        formula: None,
+                        bounds: &plan.bounds,
                     }
                     .to_string()
                         + &constraints;
@@ -215,7 +236,8 @@ struct Render<'a> {
     ty: &'a Ty,
     names: &'a [String],
     replacements: &'a HashMap<usize, String>,
-    scheme: Option<&'a Scheme>,
+    formula: Option<&'a Formula>,
+    bounds: &'a HashMap<u32, u32>,
 }
 
 impl fmt::Display for Render<'_> {
@@ -225,9 +247,10 @@ impl fmt::Display for Render<'_> {
             SemanticRoot::Ty(self.ty),
             Some(self.names),
             self.replacements,
+            self.bounds,
         )?;
-        if let Some(scheme) = self.scheme {
-            format_scheme_constraints(f, scheme, self.names)?;
+        if let Some(formula) = self.formula {
+            format_scheme_constraints(f, formula, self.names)?;
         }
         Ok(())
     }
@@ -237,12 +260,14 @@ fn render_scheme(
     scheme: &Scheme,
     names: &[String],
     replacements: &HashMap<usize, String>,
+    plan: &PresencePlan,
 ) -> String {
     Render {
         ty: scheme.body(),
         names,
         replacements,
-        scheme: Some(scheme),
+        formula: Some(&plan.formula),
+        bounds: &plan.bounds,
     }
     .to_string()
 }
@@ -276,7 +301,8 @@ impl<'a> Template<'a> {
             ty,
             names: &names,
             replacements: &HashMap::new(),
-            scheme: None,
+            formula: None,
+            bounds: &HashMap::new(),
         }
         .to_string();
         Some(Self {
@@ -293,6 +319,7 @@ struct Scan<'a> {
     types: Vec<&'a Ty>,
     bounds: Vec<u32>,
     presences: Vec<u32>,
+    presence_arguments: HashSet<u32>,
     safe: bool,
     rows: HashMap<u32, bool>,
     effects: Vec<String>,
@@ -311,6 +338,7 @@ fn scan(ty: &Ty, limit: usize) -> Option<Scan<'_>> {
         types: Vec::new(),
         bounds: Vec::new(),
         presences: Vec::new(),
+        presence_arguments: HashSet::new(),
         safe: true,
         rows: HashMap::new(),
         effects: Vec::new(),
@@ -327,7 +355,12 @@ fn scan(ty: &Ty, limit: usize) -> Option<Scan<'_>> {
                 out.types.push(ty);
                 match ty {
                     Ty::Bound(index) => out.bounds.push(*index),
-                    Ty::Presence(p) => work.push(Job::Presence(p)),
+                    Ty::Presence(p) => {
+                        if let Presence::Bound(index) = p {
+                            out.presence_arguments.insert(*index);
+                        }
+                        work.push(Job::Presence(p));
+                    }
                     Ty::Struct(row) | Ty::Sum(row) => work.push(Job::Row(row, false)),
                     Ty::Arrow(from, to, effects) => {
                         work.push(Job::Row(effects, true));
@@ -414,4 +447,210 @@ pub(super) fn anonymous_presences(scheme: &Scheme) -> Vec<u32> {
                 .then_some(index)
         })
         .collect()
+}
+
+/// Inline only an independent, universally quantified presence whose entire
+/// relationship is one implication to a named presence. Keeping every shared
+/// source, every ownership boundary, and every other constraint explicit makes
+/// the shorthand an alpha-renaming plus relocation of that same implication.
+pub(super) struct PresencePlan {
+    pub bounds: HashMap<u32, u32>,
+    pub formula: Formula,
+}
+
+impl PresencePlan {
+    fn explicit(scheme: &Scheme) -> Self {
+        Self {
+            bounds: HashMap::new(),
+            formula: scheme.formula().clone(),
+        }
+    }
+
+    pub fn new(scheme: &Scheme) -> Self {
+        let mut plan = Self::explicit(scheme);
+        if scheme.presences() == 0 || scheme.formula().is_true() {
+            return plan;
+        }
+        let Some(scan) = scan(scheme.body(), 4096) else {
+            return plan;
+        };
+        // Alias extraction also rejects absent entries and row extensions, but
+        // those are ordinary inference artifacts that the semantic formatter
+        // flattens. Only count an inline source if its mark will really print.
+        let Some(visible) = visible_presence_marks(scheme.body()) else {
+            return plan;
+        };
+        let Some(scopes) = presence_constraint_scopes(
+            scheme.formula(),
+            matches!(scheme.body().as_ref(), Ty::Package(_)),
+        ) else {
+            return plan;
+        };
+        let mut occurrences = HashMap::<u32, usize>::new();
+        for index in scan.presences {
+            *occurrences.entry(index).or_default() += 1;
+        }
+        let eligible = |index: u32| {
+            index < scheme.presences()
+                && occurrences.get(&index) == Some(&1)
+                && !scheme.is_existential(index)
+                && !scan.presence_arguments.contains(&index)
+                && visible.contains(&index)
+        };
+        let groups: Vec<_> = scopes
+            .into_iter()
+            .flat_map(|(owner, parts)| {
+                inference::sat::presentation_groups(&Formula::all(parts))
+                    .into_iter()
+                    .map(move |group| (owner, group))
+            })
+            .collect();
+        // A source used in two different ownership scopes still represents
+        // one presence. Count all constraints before choosing any shorthand.
+        let mut constraints = HashMap::<Atom, usize>::new();
+        for (_, group) in &groups {
+            let mut conjuncts = Vec::new();
+            formula_conjuncts(&group.cnf, &mut conjuncts);
+            for part in conjuncts {
+                let mut atoms = Vec::new();
+                part.atoms(&mut atoms);
+                for atom in atoms {
+                    *constraints.entry(atom).or_default() += 1;
+                }
+            }
+        }
+        let mut remainder = Vec::new();
+        for (owner, group) in groups {
+            let mut conjuncts = Vec::new();
+            formula_conjuncts(&group.cnf, &mut conjuncts);
+            let mut changed = false;
+            let mut kept = Vec::new();
+            for part in conjuncts {
+                if let Some((Atom::Bound(source), Atom::Bound(target))) = atomic_implication(part)
+                    && source != target
+                    && eligible(source)
+                    && constraints.get(&Atom::Bound(source)) == Some(&1)
+                    && target < scheme.presences()
+                    && visible.contains(&target)
+                {
+                    plan.bounds.insert(source, target);
+                    changed = true;
+                } else {
+                    kept.push(part.clone());
+                }
+            }
+            let retained = if changed {
+                Formula::all(kept)
+            } else {
+                group.relationships
+            };
+            if retained.is_true() {
+                continue;
+            }
+            remainder.push(match owner {
+                Some(owner) => Formula::owned(owner, retained),
+                None => retained,
+            });
+        }
+        if !plan.bounds.is_empty() {
+            plan.formula = Formula::all(remainder);
+        }
+        plan
+    }
+}
+
+/// Follow the semantic formatter's visible rows, rather than counting fields
+/// that an outer absent label masks. An outer package is transparent to the
+/// existing formatter; nested packages and opaque/recovery types stay explicit.
+fn visible_presence_marks(ty: &Ty) -> Option<HashSet<u32>> {
+    enum Job<'a> {
+        Ty(&'a Ty),
+        Row(&'a Row),
+    }
+    let mut visible = HashSet::new();
+    let root = match ty {
+        Ty::Package(inner) => inner,
+        _ => ty,
+    };
+    let mut work = vec![Job::Ty(root)];
+    while let Some(job) = work.pop() {
+        match job {
+            Job::Ty(ty) => match ty {
+                Ty::Struct(row) | Ty::Sum(row) => work.push(Job::Row(row)),
+                Ty::Arrow(from, to, effects) => {
+                    work.push(Job::Row(effects));
+                    work.push(Job::Ty(to));
+                    work.push(Job::Ty(from));
+                }
+                Ty::Array(inner) | Ty::Mirror(inner) | Ty::TypeInfo(inner) => {
+                    work.push(Job::Ty(inner));
+                }
+                Ty::Mut(region, inner) => {
+                    work.push(Job::Ty(region));
+                    work.push(Job::Ty(inner));
+                }
+                Ty::Package(_)
+                | Ty::Hidden { .. }
+                | Ty::Named { .. }
+                | Ty::Var(_)
+                | Ty::Rigid { .. }
+                | Ty::HiddenVar { .. }
+                | Ty::Undecided => return None,
+                _ => {}
+            },
+            Job::Row(row) => {
+                let (fields, _) = flattened_row(row);
+                for (_, field) in fields {
+                    if let Presence::Bound(index) = field.presence {
+                        visible.insert(index);
+                    }
+                    work.push(Job::Ty(&field.ty));
+                }
+            }
+        }
+    }
+    Some(visible)
+}
+
+/// Keep root-package guarantees separate from ordinary requirements while
+/// simplifying them. More deeply nested ownership keeps the explicit fallback.
+fn presence_constraint_scopes(
+    formula: &Formula,
+    root_package: bool,
+) -> Option<Vec<(Option<u32>, Vec<Formula>)>> {
+    let mut scopes: Vec<(Option<u32>, Vec<Formula>)> = Vec::new();
+    let mut work = vec![(None, formula)];
+    while let Some((owner, part)) = work.pop() {
+        match part {
+            Formula::And(left, right) => {
+                work.push((owner, right));
+                work.push((owner, left));
+            }
+            Formula::Owned(0, inner) if root_package => work.push((Some(0), inner)),
+            Formula::Owned(..) => return None,
+            part => {
+                let mut nested = vec![part];
+                while let Some(inner) = nested.pop() {
+                    match inner {
+                        Formula::Owned(..) => return None,
+                        Formula::Not(inner) => nested.push(inner),
+                        Formula::And(left, right)
+                        | Formula::Or(left, right)
+                        | Formula::Iff(left, right)
+                        | Formula::Xor(left, right) => {
+                            nested.push(left);
+                            nested.push(right);
+                        }
+                        _ => {}
+                    }
+                }
+                if let Some((_, parts)) = scopes.iter_mut().find(|(scope, _)| *scope == owner) {
+                    parts.push(part.clone());
+                } else {
+                    scopes.push((owner, vec![part.clone()]));
+                }
+            }
+        }
+    }
+    Some(scopes)
 }

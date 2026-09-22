@@ -244,7 +244,7 @@ The type `Optional String` supplies `String` as the argument for `'a`.
 Parameters can stand for whole types, struct/sum rows, effect rows, regions, or
 presences. Their kinds are inferred from the definition's body and `where`
 constraints. Every free variable must appear in the header; anonymous `..`,
-`when _`, and `_` holes are not allowed in definitions. A `hide` binder still
+`when _`, `when <= 'p`, and `_` holes are not allowed in definitions. A `hide` binder still
 introduces its own whole-type variable within its body.
 
 Presence arguments are `true`, `false`, or a variable:
@@ -373,11 +373,24 @@ Semicolons separate multiple constraints, and parentheses group them.
 | `#Some (when 'p) String` | A case whose presence is controlled by `'p` |
 | `!Log (when 'p)` | An effect whose presence is controlled by `'p` |
 | `when _` | A presence left unnamed |
+| `when <= 'p` | A fresh unnamed presence that implies `'p` |
 | `{ \sprite, .. }` | An open struct type excluding a field |
 | `\#None \| ..'r` | A sum row excluding a case |
 | `\!Log + ..'e` | An effect row excluding an effect |
 | `where 'p = 'q` | Require two presences to agree |
 | `where 'p != 'q` | Require two presences to differ |
+
+In annotations, `when <= 'p` introduces a fresh presence and constrains it to
+imply the named presence `'p`. For example, `{ x when <= 'p: Nat }` abbreviates
+`{ x when 'x: Nat } where 'x -> 'p`, with a fresh name for `'x`.
+The same notation applies to tuple slots `(Nat when <= 'p,)`, sum cases
+`#Some (when <= 'p) Nat`, and effects `!Log (when <= 'p)`.
+The bound must name a presence elsewhere in the same annotation, including a
+later occurrence; it cannot be a Boolean expression or `_`.
+Every occurrence is independent, even when several share the same bound;
+use `when 'p` to connect entries with exactly the same presence.
+The anonymous presence makes this shorthand available in annotations only;
+type definitions still require explicit presence parameters.
 
 ## Effects and handlers
 

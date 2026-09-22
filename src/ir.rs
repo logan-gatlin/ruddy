@@ -880,17 +880,86 @@ pub enum TypeField {
 /// The name stays a string for the reason [`Row::Named`] does: it is scoped to
 /// the one written type it appears in, resolved by inference into the presence
 /// variable the type's labels share, and nothing outside that type can refer to
-/// it. `None` is `when _`, the anonymous presence — a variable minted like any
-/// other and named by nothing, so no [`Clause`] can mention it.
+/// it. Anonymous and inline bounded marks have no name of their own, so no
+/// written [`Clause`] can mention them. An inline bound contributes its own
+/// implication and participates in the annotation's quantified interface.
 #[derive(Debug, Clone)]
 pub struct When {
     pub at: Anchor,
     /// A declared parameter or its substituted argument; annotations use name/id.
     pub argument: Option<Box<Type>>,
     pub name: Option<String>,
-    /// Program-unique even for `when _`; anonymous occurrences must never
+    /// A reference to a named presence elsewhere in the annotation.
+    /// This mark has its own fresh `id`, constrained to imply that presence.
+    pub upper_bound: Option<Anchored<String>>,
+    /// Program-unique even for `when _` and `when <= 'p`; fresh occurrences must never
     /// accidentally share an inferred package slot.
     pub id: u32,
+}
+
+/// Bounded presences written anywhere in a type. Their names
+/// resolve only after the annotation's ordinary presence binders are known.
+fn bounded_presences<'a>(ty: &'a Type) -> Vec<&'a When> {
+    let mut bounds = Vec::new();
+    let mut seen = HashSet::new();
+    let mut work = vec![ty];
+    while let Some(ty) = work.pop() {
+        let mut mark = |when: &'a Option<Box<When>>| {
+            if let Some(when) = when.as_deref()
+                && when.upper_bound.is_some()
+                && seen.insert(when.id)
+            {
+                bounds.push(when);
+            }
+        };
+        match &ty.anchored {
+            TypeKind::Struct {
+                fields, spreads, ..
+            } => {
+                for field in fields.values() {
+                    if let TypeField::Written { when, value, .. } = field {
+                        mark(when);
+                        work.push(value);
+                    }
+                }
+                work.extend(spreads.iter().map(|spread| &spread.value));
+            }
+            TypeKind::Sum { cases, spreads, .. } => {
+                for case in cases.values() {
+                    if let SumCase::Written { when, payload, .. } = case {
+                        mark(when);
+                        work.extend(payload);
+                    }
+                }
+                work.extend(spreads.iter().map(|spread| &spread.value));
+            }
+            TypeKind::Arrow { from, to, effects } => {
+                work.extend([to.as_ref(), from.as_ref()]);
+                for label in effects.effects.values() {
+                    if let EffectLabel::Written { when, .. } = label {
+                        mark(when);
+                    }
+                    work.extend(label.args());
+                }
+            }
+            TypeKind::Effects(effects) => {
+                for label in effects.effects.values() {
+                    if let EffectLabel::Written { when, .. } = label {
+                        mark(when);
+                    }
+                    work.extend(label.args());
+                }
+            }
+            TypeKind::Apply { args, .. } => work.extend(args),
+            TypeKind::Hidden { body, .. }
+            | TypeKind::Array(body)
+            | TypeKind::Mirror(body)
+            | TypeKind::TypeInfo(body) => work.push(body),
+            TypeKind::Mut(region, body) => work.extend([region.as_ref(), body.as_ref()]),
+            _ => {}
+        }
+    }
+    bounds
 }
 
 /// Visit the parameter/constant arguments of this node's presence marks.
@@ -971,7 +1040,8 @@ pub struct Annotation {
     /// which is every annotation the language had before this.
     pub variables: Vec<Variable>,
     /// Anonymous positive-only occurrences and their exact producer boundary.
-    /// Each `when _` has its own id even when several share a boundary.
+    /// Anonymous and inline bounded marks have distinct ids even when several
+    /// share a boundary.
     pub anonymous_existentials: Vec<(u32, Anchor)>,
     pub clause: Option<Clause>,
 }
@@ -12580,6 +12650,25 @@ impl<'a> Builder<'a> {
             .clause
             .map_or_else(Vec::new, |clause| clause.clauses);
         let ty = self.ty(written.ty, place);
+        let bounded = bounded_presences(&ty);
+        // Bounds are references, not binders. Resolve after the complete type
+        // so an inline selector can refer to a later argument's field.
+        if place == Place::Annotation {
+            for when in &bounded {
+                let bound = when.upper_bound.as_ref().expect("bounded presence");
+                let name = &bound.anchored;
+                if self.vars.contains_key(name) && !self.used(name, bound.at, Sense::Presence) {
+                    continue;
+                }
+                if !self
+                    .vars
+                    .get(name)
+                    .is_some_and(|variable| variable.labelled)
+                {
+                    self.error_at(bound.at, ErrorKind::UnboundPresence { name: name.clone() });
+                }
+            }
+        }
         // Then the constraints, which are resolved against what the type just
         // read: a formula is written about presences, and which variables are
         // presences follows both label guards and application parameter kinds.
@@ -12771,6 +12860,7 @@ impl<'a> Builder<'a> {
                 return Some(Box::new(When {
                     at,
                     name: Some(name.tracked.clone()),
+                    upper_bound: None,
                     id: index,
                     argument: Some(Box::new(at.anchor(TypeKind::Param { symbol, index }))),
                 }));
@@ -12790,6 +12880,9 @@ impl<'a> Builder<'a> {
                 at: self.anchor(when.span),
                 argument: None,
                 name: when.name.map(|name| name.tracked),
+                upper_bound: when
+                    .upper_bound
+                    .map(|bound| self.anchor(bound.span).anchor(bound.tracked)),
                 id,
             }));
         }
@@ -12817,6 +12910,9 @@ impl<'a> Builder<'a> {
             at: self.anchor(when.span),
             argument: None,
             name,
+            upper_bound: when
+                .upper_bound
+                .map(|bound| self.anchor(bound.span).anchor(bound.tracked)),
             id,
         }))
     }

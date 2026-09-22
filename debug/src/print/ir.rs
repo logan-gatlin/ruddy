@@ -1068,6 +1068,9 @@ impl fmt::Display for Effects {
 /// spelled back as the `_` it was written as.
 fn mark(when: &Option<Box<When>>, mint: &Mint) -> Option<Mark> {
     let when = when.as_ref()?;
+    if let Some(bound) = &when.upper_bound {
+        return Some(Mark::When(format!("<= '{}", bound.anchored)));
+    }
     if let Some(argument) = &when.argument {
         return Some(Mark::When(ty(&argument.anchored, mint).to_string()));
     }

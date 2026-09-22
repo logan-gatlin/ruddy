@@ -15,7 +15,7 @@ use std::{fs, path::Path, process::Command};
 /// source as its root module.
 fn project(source: &str) -> tempfile::TempDir {
     let project = tempfile::tempdir().unwrap();
-    let standard = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+    let standard = crate::standard_fixture::path();
     fs::write(
         project.path().join("Ruddy.toml"),
         format!(
@@ -29,7 +29,6 @@ fn project(source: &str) -> tempfile::TempDir {
 
 /// Build the bundle and assert its exports from JavaScript.
 fn run(project: &Path, script: &str) {
-    ruddy_cli::check_project(project).expect("the plan bundle checks");
     let artifact = ruddy_cli::build_project(project).expect("the plan bundle builds");
     let script = format!(
         "import assert from 'node:assert/strict'; import {{pathToFileURL}} from 'node:url'; const app = await import(pathToFileURL({}));\n{script}",

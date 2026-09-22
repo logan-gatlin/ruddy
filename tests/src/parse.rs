@@ -519,6 +519,33 @@ fn optional_presence_suffixes_roundtrip() {
 }
 
 #[test]
+fn bounded_presence_annotations_roundtrip_in_every_row_shape() {
+    for source in [
+        "let f : { x when <= 'r: Nat, r when 'r: Nat } -> () = value",
+        "let f : #Red (when <= 'r) | #None -> { r when 'r: Nat } -> Nat = value",
+        "let f : (Nat when <= 'r, String when 'r) -> () = value",
+        "let f : (() -> () + !Log (when <= 'r)) -> { r when 'r: Nat } -> () = value",
+    ] {
+        assert_eq!(parse_one(source), source);
+    }
+}
+
+#[test]
+fn bounded_presence_annotations_require_one_named_bound() {
+    for source in [
+        "let f : { x when <=: Nat } = value",
+        "let f : { x when <= _: Nat } = value",
+        "let f : { x when <= true: Nat } = value",
+        "let f : { x when <= 'r <= 's: Nat } = value",
+        "let f : (#Red (when <= 'r Nat)) = value",
+        "let f : (Nat when <= _,) = value",
+    ] {
+        let parsed = parse(lex(source, FileID::GENERATED).tokens);
+        assert!(!parsed.errors.is_empty(), "{source}");
+    }
+}
+
+#[test]
 fn tuple_type_presence_markers_roundtrip() {
     for source in [
         "let f : (Nat?,) -> () = value",

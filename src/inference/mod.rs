@@ -13238,6 +13238,9 @@ struct Tails {
     /// together, and what the `where` clause beside them resolves against.
     presences: HashMap<String, Presence>,
     anonymous: HashMap<u32, Presence>,
+    /// Inline upper bounds use anonymous names but publish quantified slots,
+    /// just like the explicitly named presence and implication they replace.
+    bounded: IndexMap<u32, String>,
     /// Fixed spread operands still impose requirements after their rows expand.
     spread_uses: Vec<Arc<Ty>>,
 }
@@ -13254,6 +13257,7 @@ fn extern_annotation_sources(
     ) {
         let Some(when) = when else { return };
         if when.name.is_none()
+            && when.upper_bound.is_none()
             && let Some(identity) = presence_variable_identity(presence)
         {
             // Anonymous presence holes are declaration-local inference sites,
@@ -13517,6 +13521,11 @@ fn lower_annotation(mint: &Mint, table: &mut Table, annotation: &Annotation) -> 
         )
         .collect();
     let ty = lower_scoped(mint, table, &mut tails, &annotation.ty, Some(&boundaries));
+    for (id, bound) in &tails.bounded {
+        if let Some(upper) = tails.presences.get(bound) {
+            formula = formula.and(tails.anonymous[id].formula().not().or(upper.formula()));
+        }
+    }
     formula = formula.and(declaration_requirements(&ty, &table.signatures.aliases));
     for operand in &tails.spread_uses {
         formula = formula.and(declaration_requirements(operand, &table.signatures.aliases));
@@ -13538,8 +13547,9 @@ fn lower_annotation(mint: &Mint, table: &mut Table, annotation: &Annotation) -> 
     // producer-owned slots open as fresh hidden witnesses, while universal
     // slots open as fresh caller choices. Leaving the latter free made all
     // recursive invocations share one solver variable and let one invocation
-    // choose the supposedly universal presence for its siblings. Anonymous
-    // holes remain the shared decisions of the surrounding definition.
+    // choose the supposedly universal presence for its siblings.
+    // Unbounded anonymous holes remain shared decisions of the surrounding
+    // definition; inline bounded presences publish fresh slots as well.
     let mut presence_subst = HashMap::new();
     let mut existential_slots = IndexSet::new();
     for variable in &annotation.variables {
@@ -13565,6 +13575,13 @@ fn lower_annotation(mint: &Mint, table: &mut Table, annotation: &Annotation) -> 
         let index = presence_subst.len() as u32;
         presence_subst.insert(*var, index);
         existential_slots.insert(index);
+    }
+    for id in tails.bounded.keys() {
+        let Some(Presence::Var(var)) = tails.anonymous.get(id) else {
+            continue;
+        };
+        let index = presence_subst.len() as u32;
+        presence_subst.entry(*var).or_insert(index);
     }
     let presences = presence_subst.len() as u32;
     let subst = Subst {
@@ -13970,6 +13987,9 @@ fn presence(table: &mut Table, tails: &mut Tails, when: &Option<Box<ir::When>>) 
         };
     }
     let Some(name) = &when.name else {
+        if let Some(bound) = &when.upper_bound {
+            tails.bounded.insert(when.id, bound.anchored.clone());
+        }
         return tails
             .anonymous
             .entry(when.id)

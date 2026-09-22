@@ -38,6 +38,21 @@ Group a sum or function type before marking the whole element, for example
 `((#Red | #Blue)?, (Nat -> Nat) when 'p)`. This distinguishes an optional tuple
 slot `((#Red)?,)` from a required slot containing an optional variant `(#Red?,)`.
 
+The marker `when <= 'p` introduces a fresh anonymous presence constrained to
+imply `'p`. For example, `{ x when <= 'p: Nat }` means
+`{ x when 'x: Nat } where 'x -> 'p`, with a fresh name for `'x`.
+Tuple slots, sum cases, and effects accept the same marker. Every occurrence
+is independent: two entries bounded by `'p` can still have different presences.
+The bound must name a presence elsewhere in the same annotation; that named
+occurrence can come later, as in the channel accessor below.
+Inferred signatures use it when a presence occurs once and its only remaining
+constraint is an implication to a named presence. Repeated presences and more
+complex relationships keep their names and `where` constraints.
+
+This shorthand is available in annotations. Type definitions still require
+explicit parameters for their presences; `when <= 'p` does not introduce a
+new kind of type definition or implicit alias parameters.
+
 Long signatures can also introduce ordinary `type` definitions before the
 signature, or reuse an equivalent definition already in scope. For example:
 
@@ -337,6 +352,24 @@ The inferred relationship says that admitting `#Red` requires `r`, and admitting
 `#Green` requires `g`. A channel typed as `#Red | #Green` therefore requires both
 fields. The branch results still share one type; this inference relates case
 and field presences, rather than selecting different scalar types at runtime.
+
+Using inline bounds, the relationship fits in the type itself:
+
+```ruddy
+let get_channel:
+  (#Red (when <= 'r) | #Green (when <= 'g))
+  -> { r when 'r: 'value, g when 'g: 'value, ..'rest }
+  -> 'value = fn channel image => match channel with
+| #Red => image.r
+| #Green => image.g
+end
+```
+
+There are no named selector presences or separate `where` clauses here.
+The bound only requires the corresponding field when the selector admits that
+case. Having a red field does not itself require the selector to admit red.
+Two selectors written with the same bounds can independently admit different
+cases; preserving the exact selector type would require named shared presences.
 
 ## Parameters and effect rows
 

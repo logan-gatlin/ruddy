@@ -151,9 +151,7 @@ fn fixed_integer_artifacts_reject_out_of_range_literal_payloads() {
 
 #[test]
 fn fixed_integer_std_arithmetic_runs_exactly_through_imports_and_javascript() {
-    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .unwrap();
+    let root = crate::standard_fixture::path();
     let project = tempfile::tempdir().unwrap();
     fs::write(project.path().join("Ruddy.toml"), format!(
         "name = \"fixed-test\"\nversion = \"0.1.0\"\nkind = \"library\"\nroot = \"main.rud\"\ntarget = \"js\"\n[dependencies]\nstd = {:?}\n", root

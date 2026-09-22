@@ -4618,21 +4618,43 @@
           "value": "when"
         },
         {
-          "type": "FIELD",
-          "name": "name",
-          "content": {
-            "type": "CHOICE",
-            "members": [
-              {
-                "type": "SYMBOL",
-                "name": "type_variable"
-              },
-              {
-                "type": "SYMBOL",
-                "name": "wildcard"
+          "type": "CHOICE",
+          "members": [
+            {
+              "type": "FIELD",
+              "name": "name",
+              "content": {
+                "type": "CHOICE",
+                "members": [
+                  {
+                    "type": "SYMBOL",
+                    "name": "type_variable"
+                  },
+                  {
+                    "type": "SYMBOL",
+                    "name": "wildcard"
+                  }
+                ]
               }
-            ]
-          }
+            },
+            {
+              "type": "SEQ",
+              "members": [
+                {
+                  "type": "STRING",
+                  "value": "<="
+                },
+                {
+                  "type": "FIELD",
+                  "name": "bound",
+                  "content": {
+                    "type": "SYMBOL",
+                    "name": "type_variable"
+                  }
+                }
+              ]
+            }
+          ]
         }
       ]
     },

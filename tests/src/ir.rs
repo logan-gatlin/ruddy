@@ -4661,6 +4661,102 @@ fn the_anonymous_presence_binds_no_name() {
     );
 }
 
+#[test]
+fn bounded_presences_resolve_forward_names_and_keep_distinct_ids() {
+    let (mint, out) =
+        built("let f: { x when <= 'r: Nat, y when <= 'r: Nat, r when 'r: Nat } -> () = fn _ => ()");
+    let annotation = annotation_of(&mint, &out, "f");
+    assert_eq!(annotation.variables.len(), 1);
+    assert_eq!(annotation.variables[0].name, "r");
+    let TypeKind::Arrow { from, .. } = &annotation.ty.anchored else {
+        panic!("arrow")
+    };
+    let TypeKind::Struct { fields, .. } = &from.anchored else {
+        panic!("struct")
+    };
+    let marks: Vec<_> = fields
+        .values()
+        .filter_map(|field| match field {
+            TypeField::Written { when, .. } => when.as_ref(),
+            _ => None,
+        })
+        .collect();
+    assert_ne!(marks[0].id, marks[1].id);
+    assert_ne!(marks[0].id, marks[2].id);
+    assert!(marks[0].name.is_none() && marks[1].name.is_none());
+    assert_eq!(marks[0].upper_bound.as_ref().unwrap().anchored, "r");
+    assert!(annotation.anonymous_existentials.is_empty());
+    assert!(
+        print::ir::ty(&annotation.ty.anchored, &mint)
+            .to_string()
+            .contains("when <= 'r")
+    );
+}
+
+#[test]
+fn bounded_presences_reject_dangling_and_wrong_sort_bounds() {
+    for (source, expected) in [
+        (
+            "let f: { x when <= 'r: Nat } -> () = fn _ => ()",
+            "unbound-presence",
+        ),
+        (
+            "let f: { x when <= 'r: Nat, y when <= 'r: Nat } -> () = fn _ => ()",
+            "unbound-presence",
+        ),
+        (
+            "let f: { x when <= 'r: Nat } -> 'r = fn _ => ()",
+            "mixed-tail",
+        ),
+        (
+            "let f: { x when <= 'r: Nat, ..'r } -> () = fn _ => ()",
+            "mixed-tail",
+        ),
+        ("type Bad 'r = { x when <= 'r: Nat }", "open-declared-type"),
+    ] {
+        let (_, out) = build_src(source);
+        assert!(!out.errors.is_empty(), "{source}");
+        assert!(
+            out.errors.iter().all(|error| error.kind.code() == expected),
+            "{source}: {:#?}",
+            out.errors
+        );
+    }
+}
+
+#[test]
+fn bounded_presences_keep_polarity_ownership() {
+    let (mint, out) = built("let f: { r when 'r: Nat } -> { x when <= 'r: Nat } = fn _ => {}");
+    let annotation = annotation_of(&mint, &out, "f");
+    assert!(matches!(
+        annotation.variables[0].ownership,
+        PresenceOwnership::Universal
+    ));
+    let TypeKind::Arrow { to, .. } = &annotation.ty.anchored else {
+        panic!("arrow")
+    };
+    assert_eq!(annotation.anonymous_existentials.len(), 1);
+    assert_eq!(annotation.anonymous_existentials[0].1, to.at);
+}
+
+#[test]
+fn bounded_presences_match_named_ownership_through_fixed_spreads() {
+    let mut errors = Vec::new();
+    for mark in ["when <= 'r", "when 'p"] {
+        let source = format!(
+            "type Results 'a = {{ one: Nat -> 'a, two: Nat -> 'a }}\nlet bad: {{ r when 'r: Nat, ..(Results {{ x {mark}: Nat }}) }} = {{}}"
+        );
+        let (_, out) = build_src(&source);
+        errors.push(
+            out.errors
+                .iter()
+                .map(|error| error.kind.code())
+                .collect::<Vec<_>>(),
+        );
+    }
+    assert_eq!(errors[0], errors[1]);
+}
+
 /// A clause names presences the type beside it binds, and nothing else: a name
 /// no `when` bound stands for nothing at all, so it is refused where it was
 /// written and the clause absorbs whole.

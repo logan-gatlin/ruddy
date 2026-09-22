@@ -2346,7 +2346,7 @@ fn format_semantic_named(
     root: SemanticRoot<'_>,
     names: Option<&[String]>,
 ) -> fmt::Result {
-    format_semantic_replacing(f, root, names, &HashMap::new())
+    format_semantic_replacing(f, root, names, &HashMap::new(), &HashMap::new())
 }
 
 fn format_semantic_replacing(
@@ -2354,6 +2354,7 @@ fn format_semantic_replacing(
     root: SemanticRoot<'_>,
     names: Option<&[String]>,
     replacements: &HashMap<usize, String>,
+    bounds: &HashMap<u32, u32>,
 ) -> fmt::Result {
     let first = match root {
         SemanticRoot::Ty(ty) => SemanticJob::Ty(ty, false),
@@ -2579,7 +2580,7 @@ fn format_semantic_replacing(
             SemanticJob::Tail(rest) => work.push(SemanticJob::Rest(rest)),
             SemanticJob::Field(name, field) => {
                 write_field_label(f, name)?;
-                write_semantic_mark(f, &field.presence, false, names)?;
+                write_semantic_mark(f, &field.presence, false, names, bounds)?;
                 f.write_str(": ")?;
                 work.push(SemanticJob::Ty(&field.ty, false));
             }
@@ -2593,7 +2594,9 @@ fn format_semantic_replacing(
                 work.push(SemanticJob::TupleMark(&field.presence));
                 work.push(SemanticJob::Ty(&field.ty, grouped));
             }
-            SemanticJob::TupleMark(presence) => write_semantic_mark(f, presence, false, names)?,
+            SemanticJob::TupleMark(presence) => {
+                write_semantic_mark(f, presence, false, names, bounds)?
+            }
             SemanticJob::Case(name, field, strip_interface) => {
                 let name = if strip_interface {
                     EffectId::parse_canonical_row_key(name).map_or(name, |pair| pair.0)
@@ -2601,7 +2604,7 @@ fn format_semantic_replacing(
                     name
                 };
                 write_tag_label(f, name)?;
-                write_semantic_mark(f, &field.presence, true, names)?;
+                write_semantic_mark(f, &field.presence, true, names, bounds)?;
                 if !unit_type(&field.ty) {
                     f.write_str(" ")?;
                     let grouped = field.ty.prec() < Prec::Atom
@@ -2634,7 +2637,7 @@ fn format_semantic_replacing(
                     }
                 }
             }
-            SemanticJob::Mark(presence) => write_semantic_mark(f, presence, true, names)?,
+            SemanticJob::Mark(presence) => write_semantic_mark(f, presence, true, names, bounds)?,
         }
     }
     Ok(())
@@ -2686,6 +2689,7 @@ fn write_semantic_mark(
     presence: &Presence,
     parenthesized: bool,
     names: Option<&[String]>,
+    bounds: &HashMap<u32, u32>,
 ) -> fmt::Result {
     let (open, close) = match parenthesized {
         true => (" (when ", ")"),
@@ -2696,6 +2700,9 @@ fn write_semantic_mark(
         Presence::Recovered(_) | Presence::Undecided => f.write_str("?"),
         Presence::Var(var) => write!(f, "{open}?{var}{close}"),
         Presence::Bound(index) => {
+            if let Some(bound) = bounds.get(index) {
+                return write!(f, "{open}<= {}{close}", bound_name(*bound, names));
+            }
             let name = bound_name(*index, names);
             if name.is_empty() {
                 f.write_str("?")
@@ -3432,20 +3439,27 @@ fn presentation_lines(formula: &Formula, names: &[String]) -> Vec<String> {
 impl fmt::Display for Scheme {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let names = scheme_names(self);
-        format_semantic_named(f, SemanticRoot::Ty(self.body()), Some(&names))?;
-        format_scheme_constraints(f, self, &names)
+        let plan = presentation::PresencePlan::new(self);
+        format_semantic_replacing(
+            f,
+            SemanticRoot::Ty(self.body()),
+            Some(&names),
+            &HashMap::new(),
+            &plan.bounds,
+        )?;
+        format_scheme_constraints(f, &plan.formula, &names)
     }
 }
 
 fn format_scheme_constraints(
     f: &mut fmt::Formatter<'_>,
-    scheme: &Scheme,
+    formula: &Formula,
     names: &[String],
 ) -> fmt::Result {
-    if scheme.formula().is_true() {
+    if formula.is_true() {
         return Ok(());
     }
-    let lines = presentation_lines(scheme.formula(), names);
+    let lines = presentation_lines(formula, names);
     if lines.len() == 1 && lines[0].chars().count() <= 60 {
         return write!(f, " where {}", lines[0]);
     }

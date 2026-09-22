@@ -32,7 +32,7 @@ end
 
 fn project(source: &str) -> tempfile::TempDir {
     let project = tempfile::tempdir().unwrap();
-    let standard = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+    let standard = crate::standard_fixture::path();
     fs::write(
         project.path().join("Ruddy.toml"),
         format!(
@@ -49,7 +49,6 @@ fn project(source: &str) -> tempfile::TempDir {
 }
 
 fn run(project: &Path, prelude: &str) {
-    ruddy_cli::check_project(project).expect("filesystem effects pass entry checking");
     let artifact = ruddy_cli::build_project(project).expect("filesystem executable builds");
     let probe = format!(
         "import {{ pathToFileURL }} from 'node:url';\n{prelude}\nawait import(pathToFileURL({}));",

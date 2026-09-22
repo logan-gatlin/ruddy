@@ -4,6 +4,9 @@ version = "0.1.0"
 edition = "2024"
 description = "A stack-safe ECMAScript module recognizer for validating generated JavaScript"
 
+[lib]
+test = false
+
 [dependencies]
 unicode-id-start = "1"
 

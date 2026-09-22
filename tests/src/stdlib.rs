@@ -2,9 +2,7 @@ use std::{fs, process::Command};
 
 #[test]
 fn reification_standard_modules_compile_decode_and_downcast_across_artifacts() {
-    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .unwrap();
+    let root = crate::standard_fixture::path();
     let project = tempfile::tempdir().unwrap();
     fs::write(project.path().join("Ruddy.toml"), format!("name = \"any-test\"\nversion = \"0.1.0\"\nkind = \"library\"\nroot = \"main.rud\"\ntarget = \"js\"\n[dependencies]\nstd = {:?}\n", root)).unwrap();
     fs::write(

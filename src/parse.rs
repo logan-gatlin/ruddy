@@ -887,10 +887,11 @@ pub enum EffectLabel {
 /// The `when` clause on one label of a written type: the name it binds a
 /// presence variable to.
 ///
-/// Named rather than anonymous, which is the whole of what retired the old `?`.
 /// A presence a `where` clause has to be able to talk about needs a name, the
 /// way a type variable needs a name. `when _`, also writable as the suffix
 /// `?`, introduces a fresh presence that no formula may name.
+/// `when <= 'p` introduces a fresh presence constrained to imply `'p`, whose
+/// name must be bound elsewhere in the same annotation.
 ///
 /// The span covers the whole clause — the `when` and the name after it — which
 /// is what a complaint about the label's openness underlines.
@@ -903,8 +904,10 @@ pub struct When {
     pub span: Span,
     /// Preserve the writable `?` shorthand through source formatting.
     pub short: bool,
-    /// The name, or `None` for the anonymous `when _`.
+    /// The name introduced by `when 'p`, absent for anonymous or bounded marks.
     pub name: Option<TrackedString>,
+    /// `when <= 'p` introduces a fresh presence that implies this named one.
+    pub upper_bound: Option<TrackedString>,
 }
 
 #[derive(Debug, Clone)]
@@ -4090,13 +4093,15 @@ impl Parser {
     /// `parens` says whether the clause is bracketed, which is the one thing
     /// the two positions differ in: a struct field writes it bare between the
     /// label and the colon, and a sum case has no colon to end it, so it takes
-    /// parentheses. Both bind a name, and both allow `_`.
+    /// parentheses. Both bind a name, allow `_`, or introduce an independent
+    /// presence bounded by a name after `<=`.
     fn when(&mut self, parens: bool) -> Option<When> {
         if let Some(token) = self.eat_if(&Kind::Question) {
             return Some(When {
                 span: token.span,
                 short: true,
                 name: None,
+                upper_bound: None,
             });
         }
         let open = match parens {
@@ -4110,7 +4115,8 @@ impl Parser {
         };
         // `when _` is the anonymous presence: this definition decides it, and
         // no formula may name it.
-        let name = match self.at_wildcard() {
+        let bounded = self.eat_if(&Kind::LessEqual).is_some();
+        let name = match !bounded && self.at_wildcard() {
             true => {
                 let discard = self.advance().expect("just peeked `_`");
                 span = span.merge(discard.span);
@@ -4136,9 +4142,11 @@ impl Parser {
             )?;
             span = span.merge(close.span);
         }
+        let (name, upper_bound) = if bounded { (None, name) } else { (name, None) };
         Some(When {
             span,
             name,
+            upper_bound,
             short: false,
         })
     }
@@ -4559,7 +4567,10 @@ impl Parser {
             || (self.type_before_presence
                 && self.at_keyword("when")
                 && self.toks.get(self.pos + 1).is_some_and(|token| {
-                    matches!(token.tracked, Kind::Variable(_) | Kind::Underscore)
+                    matches!(
+                        token.tracked,
+                        Kind::Variable(_) | Kind::Underscore | Kind::LessEqual
+                    )
                 }))
             || (!self.type_before_value && self.at_discard_stmt())
         {

@@ -1,0 +1,20 @@
+let f: {
+  x when <= 'p: Nat,
+--  ^^^^ @keyword
+--       ^^ @operator
+--          ^^ @variable.parameter
+  y when 'p: Nat,
+} -> (
+  Nat when <= 'p,
+--    ^^^^ @keyword
+--         ^^ @operator
+--            ^^ @variable.parameter
+) -> (
+  #Some (when <= 'p) Nat
+--       ^^^^ @keyword
+--            ^^ @operator
+--               ^^ @variable.parameter
+) + !Log (when <= 'p) = value
+--        ^^^^ @keyword
+--             ^^ @operator
+--                ^^ @variable.parameter

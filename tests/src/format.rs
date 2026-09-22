@@ -46,6 +46,23 @@ fn optional_presence_suffixes_stay_attached() {
 }
 
 #[test]
+fn bounded_presence_annotations_format_and_keep_comments() {
+    let output = fmt(
+        "let f:{x when<= 'r:Nat,r when 'r:Nat}->(Nat when <= 'r,)->(#A (when<= 'r))->()->()+!Log (when<= 'r)=value",
+    );
+    for expected in [
+        "x when <= 'r: Nat",
+        "Nat when <= 'r,",
+        "#A (when <= 'r)",
+        "!Log (when <= 'r)",
+    ] {
+        assert!(output.contains(expected), "{output}");
+    }
+    let output = fmt("let f: { x when (* bounded *) <= 'r: Nat, r when 'r: Nat } -> () = value");
+    assert!(output.contains("(* bounded *)"), "{output}");
+}
+
+#[test]
 fn tuple_type_presence_markers_format_with_unambiguous_grouping() {
     let output =
         fmt("let f: (Nat?, String when 'p, (Nat -> Nat)?, (#A | #B) when 'q) -> () = value");
