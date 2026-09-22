@@ -507,6 +507,33 @@ fn a_label_may_be_called_when() {
     );
 }
 
+#[test]
+fn optional_presence_suffixes_roundtrip() {
+    for source in [
+        "let x : { a?: Nat, b?: String } = y",
+        "let x : #A? Nat | #B? = y",
+        "let x : () -> () + !Log? + !Ask Nat? = y",
+    ] {
+        assert_eq!(parse_one(source), source);
+    }
+}
+
+#[test]
+fn tuple_type_presence_markers_roundtrip() {
+    for source in [
+        "let f : (Nat?,) -> () = value",
+        "let f : (Nat when 'p, String?) -> () where 'p = value",
+        "let f : ((#A | #B)?, (Nat -> Nat) when 'p) -> () = value",
+        "let f : (((Nat?,) -> Nat + !Log)?,) -> () = value",
+        "let f : (#A?, (#A)?,) -> () = value",
+        "let f : (Nat when _, String) -> () = value",
+        "type T 'p 'a = ('a when 'p,)",
+        "type T = (Box when, Bool)",
+    ] {
+        parse_one(source);
+    }
+}
+
 /// `when` and `where` are contextual, but Bool operators are reserved
 /// wherever an expression may appear.
 #[test]
@@ -573,6 +600,8 @@ fn where_clauses_read_at_every_level() {
         "let x : { a when 'a: A } where not not 'a = y",
         "let x : { a when 'a: A, b when 'b: B } where 'a and 'b = y",
         "let x : { a when 'a: A, b when 'b: B } where 'a or 'b = y",
+        "let x : { a when 'a: A, b when 'b: B } where 'a -> 'b = y",
+        "let x : { a when 'a: A, b when 'b: B, c when 'c: C } where 'a -> 'b -> 'c = y",
         "let x : { a when 'a: A, b when 'b: B } where 'a = 'b = y",
         "let x : { a when 'a: A, b when 'b: B } where 'a != 'b = y",
         // `and` binds tighter than `or`, which binds tighter than the
@@ -626,6 +655,44 @@ fn a_comparison_does_not_chain() {
         parse_one("let x : { a when 'a: A } where 'a = y"),
         "let x : { a when 'a: A } where 'a = y"
     );
+}
+
+#[test]
+fn implication_chains_parse_with_explicit_comparison_grouping() {
+    for clause in [
+        "'a <= 'b",
+        "'a <= 'b <= 'c <= 'd",
+        "'a or 'b <= 'c and 'd",
+        "'a <= 'b -> 'c <= 'd",
+        "('a -> 'b) <= 'c",
+        "'a <= ('b -> 'c)",
+        "('a <= 'b) <= 'c",
+        "'a <= ('b <= 'c)",
+        "('a = 'b) <= 'c",
+        "('a <= 'b) = 'c",
+        "not ('a <= 'b)",
+        "('a <= 'b) and ('c <= 'd)",
+    ] {
+        let source = format!("let f : Nat where {clause} = y");
+        assert_eq!(parse_one(&source), source);
+    }
+    for clause in [
+        "'a <=",
+        "<= 'a",
+        "'a <= <= 'b",
+        "'a <= 'b = 'c",
+        "'a = 'b <= 'c",
+        "'a <= 'b != 'c",
+        "'a != 'b <= 'c",
+    ] {
+        let source = format!("type T = Nat where {clause}");
+        assert!(
+            !parse(lex(&source, FileID::GENERATED).tokens)
+                .errors
+                .is_empty(),
+            "{source}"
+        );
+    }
 }
 
 /// A `where` clause is a `;`-separated list of constraints, conjoined in

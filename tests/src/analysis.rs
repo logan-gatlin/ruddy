@@ -6,6 +6,26 @@ use ruddy::{
 };
 
 #[test]
+fn declaration_hover_includes_writable_local_type_definitions() {
+    let row = "{ first_long_field: 'a, second_long_field: 'a, third_long_field: 'a }";
+    let text = format!("let identity: {row} -> {row} = fn x => x");
+    let mut host = ruddy::analysis::Host::default();
+    host.set_file("main.rud", Some(text.into()));
+    let analysis = host.analyze(
+        Bundle::new("presentation", Version::new(0, 0, 0)).unwrap(),
+        "main.rud",
+        &ruddy::bundle::Environment::new([]),
+    );
+    assert!(analysis.diagnostics.is_empty());
+    let hover = analysis.hover("main.rud", 5).unwrap().ty;
+    assert!(hover.starts_with("type InferredRecord 'a ="), "{hover}");
+    assert!(
+        hover.ends_with("InferredRecord 'a -> InferredRecord 'a"),
+        "{hover}"
+    );
+}
+
+#[test]
 fn position_requests_infer_only_the_needed_group_then_expand_diagnostics() {
     let text = "let id = fn x => x\nlet answer = id 1n\nlet unrelated = true + 1n";
     let mut host = ruddy::analysis::Host::default();

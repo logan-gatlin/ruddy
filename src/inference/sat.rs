@@ -45,6 +45,22 @@ pub struct TermLimitExceeded {
     pub max_terms: usize,
 }
 
+/// Presentation alternatives for one connected presence-constraint group.
+///
+/// Inference keeps its canonical sum of products; this pair exists only so a
+/// human-facing printer can choose the less expensive spelling without making
+/// semantic identity depend on presentation. DNF and CNF are exact whenever
+/// bounded construction completes; `relationships` preserves a compact exact
+/// spelling and is also the safe fallback.
+#[derive(Debug, Clone)]
+pub struct PresentationGroup {
+    pub dnf: Formula,
+    pub cnf: Formula,
+    /// The connected source form, which may already expose relationships that
+    /// expanding either normal form would obscure.
+    pub relationships: Formula,
+}
+
 /// The most rows the exact minimizer will expand a cover into.
 ///
 /// Quine–McCluskey reads a truth table, and a truth table is what the
@@ -55,6 +71,24 @@ pub struct TermLimitExceeded {
 /// far as it will go and the ones nothing needs dropped — which is prime and
 /// irredundant but not always smallest.
 const MINTERMS: usize = 256;
+
+/// Presentation explores both sides of every group, so keep its exact
+/// truth-table minimization smaller than inference's one-directional pass.
+/// Beyond this, exact cube combination and absorption still preserve meaning
+/// while avoiding a printer whose cost can dominate type checking.
+const PRESENTATION_MINTERMS: usize = 32;
+
+/// The bounded search may compare forms larger than an inferred projection is
+/// allowed to publish. This is high enough for the image-channel constraints
+/// that motivated the presentation pass while still making printing finite.
+const PRESENTATION_MAX_TERMS: usize = 2048;
+
+/// Pairwise relationship recovery is quadratic in atoms and linear in cover
+/// size. Wider groups keep the existing bounded normal-form path.
+const PRESENTATION_BINARY_ATOMS: usize = 64;
+
+/// Keep redundancy elimination on a recovered binary cover small as well.
+const PRESENTATION_BINARY_CLAUSES: usize = 256;
 
 /// One product term over the atoms a projection kept: what each position is
 /// fixed to, and `None` where the term does not look at it.
@@ -231,6 +265,246 @@ pub fn project(
         answer = answer.and(rebuild(&kept, minimized(&kept, cover)));
     }
     Ok(answer)
+}
+
+/// DNF, CNF and relationship-aware alternatives for each connected component.
+///
+/// Each direction is bounded independently. A component whose opposite truth
+/// set is too broad to enumerate falls back to its existing exact formula;
+/// presentation must never make a successfully inferred scheme unprintable.
+pub fn presentation_groups(formula: &Formula) -> Vec<PresentationGroup> {
+    components(formula)
+        .into_iter()
+        .map(|component| {
+            let mut atoms = Vec::new();
+            component.atoms(&mut atoms);
+            let positions = atoms
+                .iter()
+                .enumerate()
+                .map(|(at, atom)| (*atom, at))
+                .collect();
+            let cover = formula_cover(&component, true, &positions, PRESENTATION_MAX_TERMS)
+                .or_else(|| eliminate(&component, &atoms, PRESENTATION_MAX_TERMS));
+            let binary = cover
+                .as_ref()
+                .and_then(|cover| binary_cnf(&component, &atoms, cover));
+            let dnf = cover
+                .map(|cover| readable_dnf(&atoms, presentation_minimized(cover)))
+                .unwrap_or_else(|| component.clone());
+            let cnf = binary
+                .or_else(|| {
+                    formula_cover(&component, false, &positions, PRESENTATION_MAX_TERMS)
+                        .map(|cover| readable_cnf(&atoms, presentation_minimized(cover)))
+                })
+                .or_else(|| {
+                    eliminate(&component.clone().not(), &atoms, PRESENTATION_MAX_TERMS)
+                        .map(|cover| readable_cnf(&atoms, presentation_minimized(cover)))
+                })
+                .unwrap_or_else(|| component.clone());
+            PresentationGroup {
+                dnf,
+                cnf,
+                relationships: component,
+            }
+        })
+        .collect()
+}
+
+/// Recover unit and binary clauses without distributing the opposite normal
+/// form. A one- or two-atom assignment absent from every DNF cube is forbidden
+/// by the formula, giving a clause (often an implication). Looking at cubes
+/// includes their free atoms without enumerating any of their full models.
+///
+/// These clauses are consequences, not necessarily a complete description:
+/// a genuine three-way condition has no binary equivalent. Check the reverse
+/// entailment before using this candidate, otherwise keep the normal-form
+/// fallback. This also keeps presentation from weakening inferred types.
+fn binary_cnf(formula: &Formula, atoms: &[Atom], cover: &[Cube]) -> Option<Formula> {
+    if atoms.len() > PRESENTATION_BINARY_ATOMS {
+        return None;
+    }
+    if cover.is_empty() {
+        return Some(Formula::False);
+    }
+    let values = |value| match value {
+        Some(false) => 0b01u8,
+        Some(true) => 0b10,
+        None => 0b11,
+    };
+    let allowed: Vec<_> = (0..atoms.len())
+        .map(|at| cover.iter().fold(0, |seen, cube| seen | values(cube[at])))
+        .collect();
+    let mut forbidden = Vec::new();
+    for (at, seen) in allowed.iter().enumerate() {
+        if *seen != 0b11 {
+            let mut cube = vec![None; atoms.len()];
+            cube[at] = Some(*seen == 0b01);
+            forbidden.push(cube);
+        }
+    }
+    for left in 0..atoms.len() {
+        crate::cancellation::checkpoint();
+        if allowed[left] != 0b11 {
+            continue; // Its unit clause already excludes every forbidden pair.
+        }
+        for right in left + 1..atoms.len() {
+            if allowed[right] != 0b11 {
+                continue;
+            }
+            let mut seen = 0u8;
+            for cube in cover {
+                let right_values = values(cube[right]);
+                let left_values = values(cube[left]);
+                if left_values & 0b01 != 0 {
+                    seen |= right_values;
+                }
+                if left_values & 0b10 != 0 {
+                    seen |= right_values << 2;
+                }
+                if seen == 0b1111 {
+                    break;
+                }
+            }
+            for assignment in 0..4 {
+                if seen & (1 << assignment) == 0 {
+                    if forbidden.len() == PRESENTATION_BINARY_CLAUSES {
+                        return None;
+                    }
+                    let mut cube = vec![None; atoms.len()];
+                    cube[left] = Some(assignment & 2 != 0);
+                    cube[right] = Some(assignment & 1 != 0);
+                    forbidden.push(cube);
+                }
+            }
+        }
+    }
+    let candidate = readable_cnf(atoms, forbidden.clone());
+    if !entails(&candidate, formula) {
+        return None;
+    }
+    // Pairwise consequences also include transitive implications. Removing
+    // redundant forbidden products removes redundant CNF clauses by duality;
+    // otherwise even a short implication chain could lose to its old DNF.
+    Some(readable_cnf(atoms, irredundant(atoms, forbidden)))
+}
+
+/// A bounded cover read directly from a formula's syntax.
+///
+/// Presentation does this instead of repeatedly solving the formula. Inferred
+/// formulas are already normal-form shaped, so walking and distributing that
+/// shape is dramatically cheaper; absorption after every operation also lets
+/// a small opposite normal form emerge without first enumerating all models.
+fn formula_cover(
+    formula: &Formula,
+    want: bool,
+    positions: &HashMap<Atom, usize>,
+    max_terms: usize,
+) -> Option<Vec<Cube>> {
+    let width = positions.len();
+    match formula {
+        Formula::True => Some(if want {
+            vec![vec![None; width]]
+        } else {
+            Vec::new()
+        }),
+        Formula::False => Some(if want {
+            Vec::new()
+        } else {
+            vec![vec![None; width]]
+        }),
+        Formula::Atom(atom) => {
+            let mut cube = vec![None; width];
+            cube[positions[atom]] = Some(want);
+            Some(vec![cube])
+        }
+        Formula::Owned(_, inner) => formula_cover(inner, want, positions, max_terms),
+        Formula::Not(inner) => formula_cover(inner, !want, positions, max_terms),
+        Formula::And(left, right) => match want {
+            true => cover_and(
+                formula_cover(left, true, positions, max_terms)?,
+                formula_cover(right, true, positions, max_terms)?,
+                max_terms,
+            ),
+            false => cover_or(
+                formula_cover(left, false, positions, max_terms)?,
+                formula_cover(right, false, positions, max_terms)?,
+                max_terms,
+            ),
+        },
+        Formula::Or(left, right) => match want {
+            true => cover_or(
+                formula_cover(left, true, positions, max_terms)?,
+                formula_cover(right, true, positions, max_terms)?,
+                max_terms,
+            ),
+            false => cover_and(
+                formula_cover(left, false, positions, max_terms)?,
+                formula_cover(right, false, positions, max_terms)?,
+                max_terms,
+            ),
+        },
+        Formula::Iff(left, right) | Formula::Xor(left, right) => {
+            let equal = matches!(formula, Formula::Iff(..)) == want;
+            let left_true = formula_cover(left, true, positions, max_terms)?;
+            let left_false = formula_cover(left, false, positions, max_terms)?;
+            let right_true = formula_cover(right, true, positions, max_terms)?;
+            let right_false = formula_cover(right, false, positions, max_terms)?;
+            let (one, other) = match equal {
+                true => (
+                    cover_and(left_true, right_true, max_terms)?,
+                    cover_and(left_false, right_false, max_terms)?,
+                ),
+                false => (
+                    cover_and(left_true, right_false, max_terms)?,
+                    cover_and(left_false, right_true, max_terms)?,
+                ),
+            };
+            cover_or(one, other, max_terms)
+        }
+    }
+}
+
+fn push_cube(cover: &mut Vec<Cube>, cube: Cube, max_terms: usize) -> Option<()> {
+    if cover.iter().any(|existing| covers(existing, &cube)) {
+        return Some(());
+    }
+    cover.retain(|existing| !covers(&cube, existing));
+    if cover.len() == max_terms {
+        return None;
+    }
+    cover.push(cube);
+    Some(())
+}
+
+fn cover_or(mut left: Vec<Cube>, right: Vec<Cube>, max_terms: usize) -> Option<Vec<Cube>> {
+    for cube in right {
+        push_cube(&mut left, cube, max_terms)?;
+    }
+    Some(left)
+}
+
+fn cover_and(left: Vec<Cube>, right: Vec<Cube>, max_terms: usize) -> Option<Vec<Cube>> {
+    let mut product = Vec::new();
+    for one in &left {
+        for other in &right {
+            let mut merged = one.clone();
+            let mut agrees = true;
+            for at in 0..merged.len() {
+                match (merged[at], other[at]) {
+                    (None, known) => merged[at] = known,
+                    (Some(one), Some(other)) if one != other => {
+                        agrees = false;
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            if agrees {
+                push_cube(&mut product, merged, max_terms)?;
+            }
+        }
+    }
+    Some(product)
 }
 
 /// Conjuncts connected by an atom must be projected together. In particular,
@@ -417,20 +691,58 @@ fn minimized(atoms: &[Atom], cover: Vec<Cube>) -> Vec<Cube> {
     }
 }
 
+/// Minimize a presentation cover without introducing more SAT work merely to
+/// print a type. Small truth sets take the same exact path as inference. For a
+/// larger set, combining two adjacent cubes is an exact local rewrite, and
+/// absorption keeps applying it to a fixed point within the bounded cover.
+fn presentation_minimized(mut cover: Vec<Cube>) -> Vec<Cube> {
+    if let Some(rows) = rows_up_to(&cover, PRESENTATION_MINTERMS) {
+        return chosen(&rows, &primes(&rows));
+    }
+    cover.sort_by_key(literals);
+    loop {
+        let mut combined = None;
+        'pairs: for one in 0..cover.len() {
+            for other in (one + 1)..cover.len() {
+                if let Some(differ) = combines(&cover[one], &cover[other]) {
+                    let mut cube = cover[one].clone();
+                    cube[differ] = None;
+                    combined = Some((one, other, cube));
+                    break 'pairs;
+                }
+            }
+        }
+        let Some((one, other, cube)) = combined else {
+            break;
+        };
+        cover.remove(other);
+        cover.remove(one);
+        // Combining cannot grow the cover, so this limit cannot be reached.
+        push_cube(&mut cover, cube, PRESENTATION_MAX_TERMS)
+            .expect("combining two presentation cubes leaves room for one");
+        cover.sort_by_key(literals);
+    }
+    cover
+}
+
 /// Every full assignment `cover` covers, in the order counting them out would
 /// give — or `None` where there are more than [`MINTERMS`] of them.
 fn rows(cover: &[Cube]) -> Option<Vec<Cube>> {
+    rows_up_to(cover, MINTERMS)
+}
+
+fn rows_up_to(cover: &[Cube], limit: usize) -> Option<Vec<Cube>> {
     let mut rows: Vec<Cube> = Vec::new();
     for cube in cover {
         let free: Vec<usize> = (0..cube.len()).filter(|at| cube[*at].is_none()).collect();
         // Two to the power of what the product does not look at. Asked before
         // the shift rather than after it, which is the whole difference between
         // a budget and a wrapped counter.
-        if free.len() > MINTERMS.trailing_zeros() as usize {
+        if free.len() > limit.trailing_zeros() as usize {
             return None;
         }
         let count = 1usize << free.len();
-        if rows.len() + count > MINTERMS {
+        if rows.len() + count > limit {
             return None;
         }
         for filling in 0..count {
@@ -617,6 +929,143 @@ fn product(atoms: &[Atom], cube: &Cube) -> Formula {
         true => Formula::Atom(atoms[at]),
         false => Formula::Atom(atoms[at]).not(),
     }))
+}
+
+/// A two-literal relation represented by a pair of opposite assignments,
+/// optionally under literals the two assignments share.
+///
+/// In DNF the assignments are the rows where the relation holds. In CNF they
+/// are the rows it forbids, so equality and complement exchange places.
+fn paired_relation(atoms: &[Atom], one: &Cube, other: &Cube, cnf: bool) -> Option<Formula> {
+    let mut common = vec![None; one.len()];
+    let mut differ = Vec::new();
+    for at in 0..one.len() {
+        match (one[at], other[at]) {
+            (one, other) if one == other => common[at] = one,
+            (Some(one), Some(other)) if one != other => differ.push((at, one)),
+            _ => return None,
+        }
+    }
+    if differ.len() != 2 {
+        return None;
+    }
+    let left = Formula::Atom(atoms[differ[0].0]);
+    let right = Formula::Atom(atoms[differ[1].0]);
+    let equal_rows = differ[0].1 == differ[1].1;
+    let relation = match equal_rows ^ cnf {
+        true => left.iff(right),
+        false => left.xor(right),
+    };
+    Some(match cnf {
+        true => Formula::any(
+            literals(&common)
+                .into_iter()
+                .map(|(at, there)| match there {
+                    true => Formula::Atom(atoms[at]).not(),
+                    false => Formula::Atom(atoms[at]),
+                })
+                .chain(std::iter::once(relation)),
+        ),
+        false => product(atoms, &common).and(relation),
+    })
+}
+
+/// Pull local two-atom equality/complement relations out of a cover. Unlike
+/// [`rebuild`]'s whole-component special case, this recognizes a chain of such
+/// relationships inside a larger connected group.
+fn relations(atoms: &[Atom], cover: &mut Vec<Cube>, cnf: bool) -> Vec<Formula> {
+    cover.sort_by_key(literals);
+    let mut related = Vec::new();
+    let mut used = vec![false; cover.len()];
+    for at in 0..cover.len() {
+        if used[at] {
+            continue;
+        }
+        for other in (at + 1)..cover.len() {
+            if used[other] {
+                continue;
+            }
+            if let Some(relation) = paired_relation(atoms, &cover[at], &cover[other], cnf) {
+                used[at] = true;
+                used[other] = true;
+                related.push(relation);
+                break;
+            }
+        }
+    }
+    let mut retained = Vec::with_capacity(cover.len());
+    for (at, cube) in std::mem::take(cover).into_iter().enumerate() {
+        if !used[at] {
+            retained.push(cube);
+        }
+    }
+    *cover = retained;
+    related
+}
+
+fn readable_dnf(atoms: &[Atom], mut cover: Vec<Cube>) -> Formula {
+    if cover.is_empty() {
+        return Formula::False;
+    }
+    if cover.iter().any(|cube| cube.iter().all(Option::is_none)) {
+        return Formula::True;
+    }
+    let mut parts = relations(atoms, &mut cover, false);
+    parts.extend(cover.iter().map(|cube| product(atoms, cube)));
+    Formula::any(parts)
+}
+
+/// One forbidden product as the clause that excludes it. When the clause has
+/// one positive conclusion and otherwise-negative premises, retain that
+/// familiar implication instead of spelling a flat disjunction.
+fn clause(atoms: &[Atom], cube: &Cube) -> Formula {
+    let literals = literals(cube);
+    if literals.len() < 2 {
+        return Formula::any(literals.into_iter().map(|(at, there)| match there {
+            true => Formula::Atom(atoms[at]).not(),
+            false => Formula::Atom(atoms[at]),
+        }));
+    }
+    let conclusions: Vec<_> = literals
+        .iter()
+        .filter(|(_, there)| !there)
+        .map(|(at, _)| *at)
+        .collect();
+    if conclusions.len() <= 1 {
+        let (conclusion_at, conclusion) = match conclusions.first() {
+            Some(at) => (*at, Formula::Atom(atoms[*at])),
+            None => {
+                let (at, _) = literals[literals.len() - 1];
+                (at, Formula::Atom(atoms[at]).not())
+            }
+        };
+        let premises = Formula::all(
+            literals
+                .into_iter()
+                .filter(|(at, there)| *there && *at != conclusion_at)
+                .map(|(at, _)| Formula::Atom(atoms[at])),
+        );
+        return premises.not().or(conclusion);
+    }
+    Formula::any(literals.into_iter().map(|(at, there)| match there {
+        true => Formula::Atom(atoms[at]).not(),
+        false => Formula::Atom(atoms[at]),
+    }))
+}
+
+fn readable_cnf(atoms: &[Atom], mut complement: Vec<Cube>) -> Formula {
+    if complement.is_empty() {
+        return Formula::True;
+    }
+    if complement
+        .iter()
+        .any(|cube| cube.iter().all(Option::is_none))
+    {
+        return Formula::False;
+    }
+    let mut parts = relations(atoms, &mut complement, true);
+    parts.extend(complement.iter().map(|cube| clause(atoms, cube)));
+    Formula::all(parts)
 }
 
 /// The formula a cover stands for, written in the canonical order.

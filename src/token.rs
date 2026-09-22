@@ -72,6 +72,8 @@ pub enum Kind {
     /// which introduces a lambda body.
     Arrow,
     Colon,
+    /// `?`, shorthand for an anonymous `when _` presence on a label.
+    Question,
     /// `::`, separating the module segments of a path from each other and from
     /// the name at the end of it. One token rather than two
     /// [`Colon`](Kind::Colon)s, the way [`DotDot`](Kind::DotDot) is one: the
@@ -282,6 +284,10 @@ pub fn lex(input: &str, file_id: FileID) -> Output {
     while let Some(&(start, c)) = chars.peek() {
         crate::cancellation::checkpoint();
         match c {
+            '?' => {
+                chars.next();
+                tokens.push(file_id.span(start, 1).track(Kind::Question));
+            }
             // Whitespace is not significant.
             c if c.is_whitespace() => {
                 chars.next();

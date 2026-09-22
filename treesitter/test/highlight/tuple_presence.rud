@@ -1,0 +1,9 @@
+let f : (
+  Thing?,
+--^^^^^ @type
+--     ^ @operator
+  M::Thing when 'p
+--   ^^^^^ @type
+--         ^^^^ @keyword
+--              ^^ @variable.parameter
+) -> () = fn value => ()

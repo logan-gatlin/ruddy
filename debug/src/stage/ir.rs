@@ -818,9 +818,11 @@ fn clause_text(mint: &Mint, clause: &Clause) -> String {
 fn clause_kids(ids: &mut Ids, cx: &Cx, mint: &Mint, clause: &Clause) -> Vec<Node> {
     let parts: Vec<&Clause> = match &clause.anchored {
         ClauseKind::Name(_) => Vec::new(),
+        ClauseKind::Chain(parts) => parts.iter().collect(),
         ClauseKind::Not(inner) => vec![inner],
         ClauseKind::And(left, right)
         | ClauseKind::Or(left, right)
+        | ClauseKind::Implies(left, right)
         | ClauseKind::Equal(left, right)
         | ClauseKind::NotEqual(left, right) => vec![left, right],
     };

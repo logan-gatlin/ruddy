@@ -21,6 +21,35 @@ fn dummy_mint() -> Mint {
 }
 
 #[test]
+fn implication_chains_require_every_adjacent_link() {
+    for mask in 0..16u32 {
+        let fields = ["a", "b", "c", "d"]
+            .into_iter()
+            .enumerate()
+            .filter(|(at, _)| mask & (1 << at) != 0)
+            .map(|(_, name)| format!("{name}: 1n"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        for (clause, accepted) in [
+            ("'d <= 'c <= 'b <= 'a", [0, 1, 3, 7, 15].contains(&mask)),
+            ("'d -> 'c -> 'b -> 'a", mask != 14),
+        ] {
+            let source = format!(
+                "let accept: {{ a when 'a: Nat, b when 'b: Nat, c when 'c: Nat, d when 'd: Nat }} -> () where {clause} = fn _ => ()\nlet result = accept {{ {fields} }}"
+            );
+            let (_, built, output) = infer_src(&source);
+            assert!(built.errors.is_empty(), "{:#?}", built.errors);
+            assert_eq!(
+                output.errors().is_empty(),
+                accepted,
+                "{source}: {:#?}",
+                output.errors()
+            );
+        }
+    }
+}
+
+#[test]
 fn channel_accessors_infer_tag_conditional_fields() {
     let (mint, _, output) = inferred(
         "let get_channel = fn channel img => match channel with
@@ -585,14 +614,14 @@ fn a_struct_spread_of_an_open_value_keeps_its_rest_and_replaces_by_name() {
     );
     assert_eq!(
         scheme(&mint, &output, "set_a"),
-        "{ a when 'a: 'b, ..'c } -> { a: Nat, ..'c }"
+        "{ a?: 'a, ..'b } -> { a: Nat, ..'b }"
     );
     assert_eq!(scheme(&mint, &output, "copy"), "{ ..'a } -> { ..'a }");
     assert_eq!(scheme(&mint, &output, "added"), "{ a: Nat, b: String }");
     assert_eq!(scheme(&mint, &output, "replaced"), "{ a: Nat, b: Bool }");
     assert_eq!(
         scheme(&mint, &output, "kept"),
-        "{ a when 'a: 'b, b: 'c, ..'d } -> 'c"
+        "{ a?: 'a, b: 'b, ..'c } -> 'b"
     );
     // The demand is one constraint of its own, shown as the value against
     // what the literal asks of it and then what the literal is.
@@ -716,10 +745,7 @@ fn array_patterns_never_refine_a_later_binder_out_of_a_case() {
     assert_eq!(scheme(&mint, &output, "f"), "#A [Nat] | ..'a -> Nat");
     assert_eq!(scheme(&mint, &output, "g"), "#A ['a] | ..'b -> Nat");
     assert_eq!(scheme(&mint, &output, "h"), "[#A | ..'a] -> Nat");
-    assert_eq!(
-        scheme(&mint, &output, "k"),
-        "#A (when 'a) [Nat] | #B (when 'b) -> Nat"
-    );
+    assert_eq!(scheme(&mint, &output, "k"), "#A? [Nat] | #B? -> Nat");
 }
 
 #[test]
@@ -771,7 +797,7 @@ fn positive_result_presences_can_forget_input_correlations() {
     );
     assert_eq!(
         scheme(&mint, &output, "forget"),
-        "{ left when 'a: 'e, right when 'b: 'e } -> { left when 'c: 'e, right when 'd: 'e } where ('a != 'b) and ('c != 'd)"
+        "{ left when 'input_0_left: 'a, right when 'input_0_right: 'a } -> { left when 'output_left: 'a, right when 'output_right: 'a }\nwhere\n  'input_0_left != 'input_0_right;\n  'output_left != 'output_right"
     );
     let symbol = symbol_named(
         &mint,
@@ -1691,7 +1717,7 @@ fn an_optional_field_may_be_absent_present_or_wrong() {
     // alphabet as the `when a` on its field — the tail is still `a`.
     assert_eq!(
         scheme(&mint, &output, "f"),
-        "{ x when 'a: Nat, y: Nat, ..'b } -> Nat"
+        "{ x?: Nat, y: Nat, ..'a } -> Nat"
     );
     assert_eq!(scheme(&mint, &output, "a"), "Nat");
     assert_eq!(scheme(&mint, &output, "b"), "Nat");
@@ -1812,7 +1838,7 @@ fn an_annotation_the_definition_keeps_open_is_no_complaint() {
     );
     assert_eq!(
         scheme(&mint, &output, "f"),
-        "{ x when 'a: Nat, y: Nat, ..'b } -> Nat"
+        "{ x?: Nat, y: Nat, ..'a } -> Nat"
     );
     assert_eq!(scheme(&mint, &output, "a"), "Nat");
     assert_eq!(scheme(&mint, &output, "b"), "Nat");
@@ -1843,7 +1869,7 @@ fn an_annotation_the_definition_keeps_open_is_no_complaint() {
         let (mint, _, output) = inferred(&src);
         assert_eq!(
             scheme(&mint, &output, "f"),
-            "{ x when 'a: Nat, y when 'b: Nat } -> () where 'a != 'b"
+            "{ x when 'input_0_x: Nat, y when 'input_0_y: Nat } -> () where 'input_0_x != 'input_0_y"
         );
     }
 
@@ -3674,10 +3700,7 @@ fn an_assumption_is_read_against_what_has_since_been_decided() {
          let peek : Tree { x when 'a: Nat } -> Forest = fn t => t.kids\n\
          let q : Wood { x: Nat } -> Grove = fn w => peek w",
     );
-    assert_eq!(
-        scheme(&mint, &output, "peek"),
-        "Tree { x when 'a: Nat } -> Forest"
-    );
+    assert_eq!(scheme(&mint, &output, "peek"), "Tree { x?: Nat } -> Forest");
     assert_eq!(
         steps(&mint, &output, "q")[..9],
         [
@@ -4726,10 +4749,7 @@ fn a_presence_against_itself_is_already_the_same_presence() {
     // meets itself: one `when` on both sides, and one tail on both sides.
     // Named presences are declared interface variables and instantiate freshly.
     let (mint, _, output) = inferred("let f : { x when _: Nat, .. } -> Nat = fn p => f p");
-    assert_eq!(
-        scheme(&mint, &output, "f"),
-        "{ x when 'a: Nat, ..'b } -> Nat"
-    );
+    assert_eq!(scheme(&mint, &output, "f"), "{ x?: Nat, ..'a } -> Nat");
     assert_eq!(
         steps(&mint, &output, "f"),
         [
@@ -4816,7 +4836,7 @@ fn an_assumption_matches_through_a_variable_the_two_sides_share() {
     );
     assert_eq!(
         scheme(&mint, &output, "q"),
-        "Tree { x when 'a: Nat } -> { a: Nat, b: Nat }"
+        "Tree { x?: Nat } -> { a: Nat, b: Nat }"
     );
 }
 
@@ -4975,7 +4995,7 @@ fn an_assumption_is_not_reused_at_an_argument_it_was_not_pushed_for() {
     );
     assert_eq!(
         scheme(&mint, &output, "f"),
-        "Tree { a when 'a: Nat } -> { p: Nat, q: Nat }"
+        "Tree { a?: Nat } -> { p: Nat, q: Nat }"
     );
 }
 
@@ -5229,10 +5249,7 @@ fn variables_are_numbered_in_the_order_they_are_read() {
     let (mint, _, output) = inferred(
         "let f : { x when 'a: Nat, .. } -> Nat = fn p => 1n\nlet g = fn p => { got: p.y, more: p }",
     );
-    assert_eq!(
-        scheme(&mint, &output, "f"),
-        "{ x when 'a: Nat, ..'b } -> Nat"
-    );
+    assert_eq!(scheme(&mint, &output, "f"), "{ x?: Nat, ..'a } -> Nat");
     assert_eq!(
         scheme(&mint, &output, "g"),
         "{ y: 'a, ..'b } -> { got: 'a, more: { y: 'a, ..'b } }"
@@ -5844,7 +5861,7 @@ fn a_local_leaves_every_sort_of_outer_variable_alone() {
         ),
         (
             "let f : { a when _: Nat } -> Nat = fn r => do let q = r return 1n end",
-            "{ a when 'a: Nat }",
+            "{ a?: Nat }",
         ),
     ] {
         let (mint, _, output) = inferred(src);
@@ -5877,7 +5894,7 @@ fn a_published_scheme_keeps_its_presences_below_its_types() {
     let scheme = &output.semantics().locals()[&symbol];
     // `b` is the argument `inner` quantifies of its own; `a` is the presence
     // the enclosing lambda's record left free, and `c` what that field holds.
-    assert_eq!(scheme.to_string(), "'b -> { x when 'a: 'c }");
+    assert_eq!(scheme.to_string(), "'a -> { x?: 'b }");
     assert_eq!(scheme.presences(), 1);
     assert_eq!(scheme.count(), 3);
     for (at, sense) in positions(scheme.body()) {
@@ -6075,10 +6092,7 @@ fn a_match_without_a_default_closes_the_sum() {
         "type Option 'T = #Some 'T | #None\n\
          let get = fn opt => match opt with | #Some x => x | #None => 0n end",
     );
-    assert_eq!(
-        scheme(&mint, &output, "get"),
-        "#Some (when 'a) Nat | #None (when 'b) -> Nat"
-    );
+    assert_eq!(scheme(&mint, &output, "get"), "#Some? Nat | #None? -> Nat");
 }
 
 /// With a default the row stays open — the rest a fresh tail lacking the
@@ -6143,7 +6157,7 @@ fn payloads_flow_to_binders_and_a_bare_tag_means_unit() {
     );
     assert_eq!(
         scheme(&mint, &output, "pick"),
-        "#Cons (when 'a) { head: #Some Nat | #None, tail: 'c } | #Nil (when 'b) -> Nat"
+        "#Cons? { head: #Some Nat | #None, tail: 'a } | #Nil? -> Nat"
     );
     // The bare `#None` and `#Nil` both carry unit: supplying a
     // payload to one is the ordinary mismatch.
@@ -6292,7 +6306,7 @@ fn a_catch_all_keeps_struct_payload_rows_open() {
     );
     assert_eq!(
         scheme(&mint, &output, "f"),
-        "#P (#A { x when 'a: #X | ..'b, ..'c } | ..'d) | ..'e -> Nat"
+        "#P (#A { x?: #X | ..'a, ..'b } | ..'c) | ..'d -> Nat"
     );
 }
 
@@ -6348,7 +6362,7 @@ fn a_column_closes_over_every_listed_case() {
     );
     assert_eq!(
         scheme(&mint, &output, "f"),
-        "#T (when 'a) { a: #A | #B, b: Nat } -> Nat"
+        "#T? { a: #A | #B, b: Nat } -> Nat"
     );
 
     // The same three shapes with a trailing catch-all still build clean.
@@ -6488,10 +6502,7 @@ fn a_wildcard_arm_types_as_a_named_catch_all() {
     // payload to the scrutinee.
     let (mint, _, output) =
         inferred("let has = fn opt => match opt with | #Some _ => 1n | #None => 0n end");
-    assert_eq!(
-        scheme(&mint, &output, "has"),
-        "#Some (when 'a) 'c | #None (when 'b) -> Nat"
-    );
+    assert_eq!(scheme(&mint, &output, "has"), "#Some? 'a | #None? -> Nat");
 }
 
 /// The motivating program of the exactness spec: exact arms over every
@@ -6505,10 +6516,7 @@ fn the_motivating_program_infers_optional_fields() {
         "let p = fn a => match a with \
          | {a, b} => () | {a} => {} | {b} => {} | {} => {} end",
     );
-    assert_eq!(
-        scheme(&mint, &output, "p"),
-        "{ a when 'a: 'c, b when 'b: 'd } -> ()"
-    );
+    assert_eq!(scheme(&mint, &output, "p"), "{ a?: 'a, b?: 'b } -> ()");
 }
 
 /// R5's closed half: a single exact arm mentions every field in every entry,
@@ -6546,10 +6554,7 @@ fn a_rest_or_binder_entry_opens_the_row() {
          let ok = g { a: 1n, b: 2n }",
     );
     // The binder opens the row and un-pins the presence: `a` may be there.
-    assert_eq!(
-        scheme(&mint, &output, "g"),
-        "{ a when 'a: Nat, ..'b } -> Nat"
-    );
+    assert_eq!(scheme(&mint, &output, "g"), "{ a?: Nat, ..'a } -> Nat");
 }
 
 /// The spec's open example: `x` is presence-variable — `{}` does not mention
@@ -6558,10 +6563,7 @@ fn a_rest_or_binder_entry_opens_the_row() {
 #[test]
 fn the_open_example_types_through_both_arms() {
     let (mint, _, output) = inferred("let f = fn v => match v with | {x, ..} => x | {} => 0n end");
-    assert_eq!(
-        scheme(&mint, &output, "f"),
-        "{ x when 'a: Nat, ..'b } -> Nat"
-    );
+    assert_eq!(scheme(&mint, &output, "f"), "{ x?: Nat, ..'a } -> Nat");
 }
 
 /// R2 on a `let`, the breaking change: an exact pattern demands exactly its
@@ -6598,7 +6600,7 @@ fn unit_and_empty_braces_demand_the_same() {
     assert_eq!(scheme(&mint, &output, "f"), "() -> Nat");
 
     let (mint, _, output) = inferred("let g = fn v => match v with | {a} => a | () => 0n end");
-    assert_eq!(scheme(&mint, &output, "g"), "{ a when 'a: Nat } -> Nat");
+    assert_eq!(scheme(&mint, &output, "g"), "{ a?: Nat } -> Nat");
 
     let (_, _, output) = infer_src("let {} = 5n");
     assert_eq!(output.errors().len(), 1, "{:#?}", output.errors());
@@ -6640,7 +6642,7 @@ fn field_types_unify_across_arms() {
     // `b` — which is exactly the three subsets the three arms name.
     assert_eq!(
         scheme(&mint, &output, "f"),
-        "{ a when 'a: Nat, b when 'b: Nat } -> Nat where 'a or not 'b"
+        "{ a when 'input_0_a: Nat, b when 'input_0_b: Nat } -> Nat where 'input_0_b -> 'input_0_a"
     );
 
     // Disagreeing across arms is the mismatch it sounds like.
@@ -6706,20 +6708,20 @@ fn the_motivating_programs_infer_their_constraints() {
     let (mint, _, output) = inferred("let p = fn a => match a with | {x} => {} | {y} => {} end");
     assert_eq!(
         scheme(&mint, &output, "p"),
-        "{ x when 'a: 'c, y when 'b: 'd } -> () where 'a != 'b"
+        "{ x when 'input_0_x: 'a, y when 'input_0_y: 'b } -> () where 'input_0_x != 'input_0_y"
     );
 
     let (mint, _, output) = inferred("let q = fn v => match v with | {x, y} => {} | {} => {} end");
     assert_eq!(
         scheme(&mint, &output, "q"),
-        "{ x when 'a: 'c, y when 'b: 'd } -> () where 'a = 'b"
+        "{ x when 'input_0_x: 'a, y when 'input_0_y: 'b } -> () where 'input_0_x = 'input_0_y"
     );
 
     let (mint, _, output) =
         inferred("let r = fn v => match v with | {x, ..} => {} | {y, ..} => {} end");
     assert_eq!(
         scheme(&mint, &output, "r"),
-        "{ x when 'a: 'c, y when 'b: 'd, ..'e } -> () where 'a or 'b"
+        "{ x when 'input_0_x: 'a, y when 'input_0_y: 'b, ..'c } -> () where 'input_0_x or 'input_0_y"
     );
 }
 
@@ -6731,7 +6733,7 @@ fn a_presence_match_refines_annotated_and_inferred_results() {
     let (mint, _, output) = inferred(annotated);
     assert_eq!(
         scheme(&mint, &output, "swap"),
-        "{ a when 'a: Nat, b when 'b: Nat } -> { a when 'b: Nat, b when 'a: Nat } where 'a != 'b"
+        "{ a when 'input_0_a: Nat, b when 'input_0_b: Nat } -> { a when 'input_0_b: Nat, b when 'input_0_a: Nat } where 'input_0_a != 'input_0_b"
     );
 
     let (mint, _, output) = inferred(
@@ -6740,7 +6742,7 @@ fn a_presence_match_refines_annotated_and_inferred_results() {
     );
     assert_eq!(
         scheme(&mint, &output, "swap"),
-        "{ a when 'a: 'c, b when 'b: 'd } -> { b when 'a: 'c, a when 'b: 'd } where 'a != 'b"
+        "{ a when 'input_0_a: 'a, b when 'input_0_b: 'b } -> { b when 'input_0_a: 'a, a when 'input_0_b: 'b } where 'input_0_a != 'input_0_b"
     );
 }
 
@@ -6779,11 +6781,11 @@ fn a_presence_arm_refines_scrutinee_uses_and_exact_absence() {
     );
     assert_eq!(
         scheme(&mint, &output, "direct"),
-        "{ a when 'a: 'c, b when 'b: 'c } -> 'c where 'a != 'b"
+        "{ a when 'input_0_a: 'a, b when 'input_0_b: 'a } -> 'a where 'input_0_a != 'input_0_b"
     );
     assert_eq!(
         scheme(&mint, &output, "whole"),
-        "{ a when 'a: Nat, b when 'b: Nat } -> Nat where 'a != 'b"
+        "{ a when 'input_0_a: Nat, b when 'input_0_b: Nat } -> Nat where 'input_0_a != 'input_0_b"
     );
 }
 
@@ -6801,7 +6803,7 @@ fn ordered_fallback_facts_discharge_indirect_and_constrained_calls() {
     );
     assert_eq!(
         scheme(&mint, &output, "route"),
-        "{ x when 'a: Nat, y when 'b: Nat, ..'c } -> ()"
+        "{ x?: Nat, y?: Nat, ..'a } -> ()"
     );
 
     let (mint, _, output) = inferred(
@@ -6811,7 +6813,7 @@ fn ordered_fallback_facts_discharge_indirect_and_constrained_calls() {
     );
     assert_eq!(
         scheme(&mint, &output, "fallback"),
-        "{ x when 'a: Nat, y when 'b: Nat } -> Nat where 'a != 'b"
+        "{ x when 'input_0_x: Nat, y when 'input_0_y: Nat } -> Nat where 'input_0_x != 'input_0_y"
     );
 }
 
@@ -6823,7 +6825,7 @@ fn an_undischarged_arm_requirement_escapes_only_as_an_implication() {
     );
     assert_eq!(
         scheme(&mint, &output, "route"),
-        "{ x when 'a: Nat, y when 'b: Nat, ..'c } -> () where not 'a or not 'b"
+        "{ x when 'input_0_x: Nat, y when 'input_0_y: Nat, ..'a } -> () where 'input_0_x -> not 'input_0_y"
     );
     assert!(
         output
@@ -6913,7 +6915,7 @@ fn overlap_uses_exclusion_and_arm_assumptions_do_not_leak() {
     );
     assert_eq!(
         scheme(&mint, &output, "f"),
-        "{ x when 'a: Nat, y when 'b: Nat, ..'c } -> () where 'a != 'b"
+        "{ x when 'input_0_x: Nat, y when 'input_0_y: Nat, ..'a } -> () where 'input_0_x != 'input_0_y"
     );
 }
 
@@ -6957,7 +6959,7 @@ fn non_identifier_scrutinees_and_unrelated_presences_remain_total() {
     );
     assert_eq!(
         scheme(&mint, &output, "swap"),
-        "{ a when 'a: 'c, b when 'b: 'd } -> { b when 'a: 'c, a when 'b: 'd } where 'a != 'b"
+        "{ a when 'input_0_a: 'a, b when 'input_0_b: 'b } -> { b when 'input_0_a: 'a, a when 'input_0_b: 'b } where 'input_0_a != 'input_0_b"
     );
 
     let (mint, _, output) = inferred(
@@ -6967,7 +6969,7 @@ fn non_identifier_scrutinees_and_unrelated_presences_remain_total() {
     );
     assert_eq!(
         scheme(&mint, &output, "unrelated"),
-        "{ x when 'a: Nat, y when 'b: Nat, z when 'c: Nat, ..'d } -> Nat where 'a != 'b"
+        "{ x when 'input_0_x: Nat, y when 'input_0_y: Nat, z?: Nat, ..'a } -> Nat where 'input_0_x != 'input_0_y"
     );
 }
 
@@ -7017,7 +7019,7 @@ fn structural_result_families_cover_arrows_sums_names_and_absence() {
     );
     assert_eq!(
         scheme(&mint, &output, "named"),
-        "{ x when 'a: 'c, y when 'b: 'd } -> { value: { a when 'a: Nat, b when 'b: Nat } } where 'a != 'b"
+        "{ x when 'input_0_x: 'a, y when 'input_0_y: 'b } -> { value: { a when 'input_0_x: Nat, b when 'input_0_y: Nat } } where 'input_0_x != 'input_0_y"
     );
     for name in ["same_named", "mixed_named"] {
         let printed = scheme(&mint, &output, name);
@@ -7084,7 +7086,7 @@ fn structural_result_families_cover_arrows_sums_names_and_absence() {
     );
     assert_eq!(
         scheme(&mint, &output, "absent"),
-        "{ x when 'a: Nat, y when 'b: Nat } -> { ..'c } -> { ..'c } where 'a != 'b"
+        "{ x when 'input_0_x: Nat, y when 'input_0_y: Nat } -> { ..'a } -> { ..'a } where 'input_0_x != 'input_0_y"
     );
 }
 
@@ -7273,7 +7275,7 @@ fn guarded_assignments_leave_absent_payloads_irrelevant() {
          | {y} => 2n end",
     );
     let printed = scheme(&mint, &output, "f");
-    assert!(!printed.contains("gone:"), "{printed}");
+    assert!(!printed.contains("{ gone:"), "{printed}");
 
     // Recovery likewise abandons only semantic payloads. Walking this failed
     // annotation reaches its absent slot, but never treats the slot's unknown
@@ -7544,7 +7546,7 @@ fn a_nested_column_contributes_to_the_enclosing_disjunct() {
         inferred("let n = fn v => match v with | {x: {a}} => {} | {y} => {} end");
     assert_eq!(
         scheme(&mint, &output, "n"),
-        "{ x when 'a: { a: 'c }, y when 'b: 'd } -> () where 'a != 'b"
+        "{ x when 'input_0_x: { a: 'a }, y when 'input_0_y: 'b } -> () where 'input_0_x != 'input_0_y"
     );
     assert_eq!(store(&output).len(), 1, "{:#?}", output.semantics().store());
 }
@@ -7558,7 +7560,7 @@ fn a_shared_presence_prints_one_name() {
         inferred("let f : { x when 'a: Nat } -> { x when 'a: Nat } = fn v => v");
     assert_eq!(
         scheme(&mint, &output, "f"),
-        "{ x when 'a: Nat } -> { x when 'a: Nat }"
+        "{ x when 'input_0_x: Nat } -> { x when 'input_0_x: Nat }"
     );
 }
 
@@ -7676,7 +7678,7 @@ fn an_annotation_is_the_contract_for_its_presences() {
     );
     assert_eq!(
         scheme(&mint, &output, "p2"),
-        "{ x when 'a: Nat, y when 'b: Nat } -> () where 'a != 'b"
+        "{ x when 'input_0_x: Nat, y when 'input_0_y: Nat } -> () where 'input_0_x != 'input_0_y"
     );
 
     let src = "let loose : { x when 'a: Nat, y when 'b: Nat } -> {} where 'a or 'b = fn v =>\n\
@@ -7725,7 +7727,7 @@ fn a_clause_covers_what_the_body_needs_of_the_names_it_uses() {
     );
     assert_eq!(
         scheme(&mint, &output, "f"),
-        "{ x when 'a: Nat, y when 'b: Nat } -> () where 'a != 'b"
+        "{ x when 'input_0_x: Nat, y when 'input_0_y: Nat } -> () where 'input_0_x != 'input_0_y"
     );
 }
 
@@ -7813,7 +7815,7 @@ fn a_nested_annotation_is_the_contract_for_its_presences() {
         locals,
         [(
             "g",
-            "{ x when 'a: Nat, y when 'b: Nat, ..'c } -> () where 'a != 'b".to_string()
+            "{ x when 'input_0_x: Nat, y when 'input_0_y: Nat, ..'a } -> () where 'input_0_x != 'input_0_y".to_string()
         )]
     );
 }
@@ -7849,7 +7851,7 @@ fn a_flipped_store_silences_a_nested_clause() {
     assert_eq!(error.kind.code(), "presence-required");
     assert_eq!(
         locals(&output, &mint),
-        [("g".to_string(), "{ x when 'a: Nat } -> ()".to_string())]
+        [("g".to_string(), "{ x?: Nat } -> ()".to_string())]
     );
 
     let src = "let p = fn a => match a with | {x} => {} | {y} => {} end\n\
@@ -7864,7 +7866,7 @@ fn a_flipped_store_silences_a_nested_clause() {
         locals(&output, &mint),
         [(
             "g".to_string(),
-            "{ x when 'a: Nat } -> () where 'a".to_string()
+            "{ x when 'input_0_x: Nat } -> () where 'input_0_x".to_string()
         )]
     );
 }
@@ -7876,10 +7878,7 @@ fn a_flipped_store_silences_a_nested_clause() {
 fn a_non_qualifying_column_constrains_nothing() {
     let (mint, _, output) =
         infer_src("let m = fn v => match v with | {x: 1n} => {} | {y} => {} end");
-    assert_eq!(
-        scheme(&mint, &output, "m"),
-        "{ x when 'a: Nat, y when 'b: 'c } -> ()"
-    );
+    assert_eq!(scheme(&mint, &output, "m"), "{ x?: Nat, y?: 'a } -> ()");
     assert!(
         store(&output).is_empty(),
         "{:#?}",
@@ -8008,23 +8007,25 @@ fn every_clause_connective_lowers() {
         "let f : { x when 'a: Nat, y when 'b: Nat, .. } -> Nat where not 'a and 'b = fn v => 1n\n\
          let g : { x when 'a: Nat, y when 'b: Nat, .. } -> Nat where 'a = 'b = fn v => 1n\n\
          let h : { x when 'a: Nat, y when 'b: Nat, .. } -> Nat where 'a or 'b = fn v => 1n\n\
+         let i : { x when 'a: Nat, y when 'b: Nat, .. } -> Nat where 'a -> 'b = fn v => 1n\n\
          let k : { x when _: Nat, .. } -> Nat = fn v => 1n",
     );
     assert_eq!(scheme(&mint, &output, "f"), "{ y: Nat, ..'a } -> Nat");
     assert_eq!(
         scheme(&mint, &output, "g"),
-        "{ x when 'a: Nat, y when 'b: Nat, ..'c } -> Nat where 'a = 'b"
+        "{ x when 'input_0_x: Nat, y when 'input_0_y: Nat, ..'a } -> Nat where 'input_0_x = 'input_0_y"
     );
     assert_eq!(
         scheme(&mint, &output, "h"),
-        "{ x when 'a: Nat, y when 'b: Nat, ..'c } -> Nat where 'a or 'b"
+        "{ x when 'input_0_x: Nat, y when 'input_0_y: Nat, ..'a } -> Nat where 'input_0_x or 'input_0_y"
+    );
+    assert_eq!(
+        scheme(&mint, &output, "i"),
+        "{ x when 'input_0_x: Nat, y when 'input_0_y: Nat, ..'a } -> Nat where 'input_0_x -> 'input_0_y"
     );
     // `when _` mints a presence like any other; what it does not do is give it
     // a name, so nothing constrains it and it generalizes on its own.
-    assert_eq!(
-        scheme(&mint, &output, "k"),
-        "{ x when 'a: Nat, ..'b } -> Nat"
-    );
+    assert_eq!(scheme(&mint, &output, "k"), "{ x?: Nat, ..'a } -> Nat");
 }
 
 /// An annotation the definition under it rules out: the clause's own batch is
@@ -8084,7 +8085,7 @@ fn an_annotation_that_rules_itself_out_is_refused() {
             .values()
             .all(|s| s.formula().is_true())
     );
-    assert_eq!(scheme(&mint, &output, "f"), "{ x when 'a: Nat } -> ()");
+    assert_eq!(scheme(&mint, &output, "f"), "{ x?: Nat } -> ()");
 }
 
 /// A use-site complaint quotes its formula in whatever labels the instantiated
@@ -8165,7 +8166,7 @@ fn an_annotation_after_the_flip_is_not_checked() {
     );
     assert_eq!(
         scheme(&mint, &output, "after"),
-        "{ x when 'a: Nat, y when 'b: Nat } -> ()"
+        "{ x?: Nat, y?: Nat } -> ()"
     );
 
     let (_, _, output) = infer_src(
@@ -8197,8 +8198,8 @@ fn a_scheme_requires_the_whole_component_it_reaches() {
     // require together rather than either alone.
     assert_eq!(
         scheme(&mint, &output, "f"),
-        "{ x when 'a: 'd, y when 'b: 'e, z when 'c: 'f, ..'g } -> { a: Nat, b: Nat } \
-         where 'a and 'c or 'b"
+        "{ x when 'input_0_x: 'a, y when 'input_0_y: 'b, z when 'input_0_z: 'c, ..'d } -> { a: Nat, b: Nat } \
+         where 'input_0_x and 'input_0_z or 'input_0_y"
     );
 }
 
@@ -8600,11 +8601,11 @@ fn rethrowing_preserves_written_presence_formulas_and_negative_labels() {
     ));
     assert_eq!(
         scheme(&mint, &output, "conditional"),
-        "(() -> 'b + !Log (when 'a)) -> 'b + !Log (when 'a)"
+        "(() -> 'a + !Log (when 'input_0_effects_log)) -> 'a + !Log (when 'input_0_effects_log)"
     );
     assert_eq!(
         scheme(&mint, &output, "formula"),
-        "(() -> 'c + !IO (when 'a)) -> 'c + !Log (when 'b) + !IO (when 'a) where 'a != 'b"
+        "(() -> 'a + !IO (when 'input_0_effects_io)) -> 'a + !Log (when 'input_0_effects_log) + !IO (when 'input_0_effects_io) where 'input_0_effects_io != 'input_0_effects_log"
     );
     assert_eq!(scheme(&mint, &output, "negative"), "() -> () + ..'a");
     assert_eq!(
@@ -8688,7 +8689,7 @@ fn presence_written_on_an_effect_survives_into_the_scheme() {
     ));
     assert_eq!(
         scheme(&mint, &output, "f"),
-        "Nat -> Nat + !Log (when 'a) + !IO (when 'b) where 'a != 'b"
+        "Nat -> Nat + !Log (when 'input_0_effects_log) + !IO (when 'input_0_effects_io) where 'input_0_effects_log != 'input_0_effects_io"
     );
 }
 
@@ -9042,7 +9043,7 @@ fn the_written_examples_publish_what_they_say() {
              \x20   | {} => {}\n\
              \x20 end",
             "both",
-            "{ x when 'a: 'c, y when 'b: 'd } -> () where 'a = 'b",
+            "{ x when 'input_0_x: 'a, y when 'input_0_y: 'b } -> () where 'input_0_x = 'input_0_y",
         ),
         // Polymorphic recursion over a declared rest: the recursive use
         // instantiates `r` freshly, so a closed `Nest` is no conflict.
@@ -9419,10 +9420,7 @@ fn a_recursive_use_instantiates_what_was_declared() {
     // definitely-present field does not settle the caller's conditional one.
     let (mint, _, output) =
         inferred("let inspect : { x when 'p: Nat } -> Nat = fn value => inspect { x: 1n }");
-    assert_eq!(
-        scheme(&mint, &output, "inspect"),
-        "{ x when 'a: Nat } -> Nat"
-    );
+    assert_eq!(scheme(&mint, &output, "inspect"), "{ x?: Nat } -> Nat");
 
     // Monomorphic in what was left to inference: one hole, shared across every
     // recursive use, so two uses that disagree are a mismatch.
@@ -10234,7 +10232,7 @@ fn extern_callback_coverage_preserves_conditional_presence() {
         .find(|(symbol, _)| mint.name(**symbol) == "install")
         .expect("the extern scheme is published");
     assert!(
-        declared.to_string().contains("(when"),
+        declared.to_string().contains("!Fail?"),
         "coverage decided the callback condition: {declared}"
     );
 }
@@ -12386,6 +12384,36 @@ let identity: Field 'p -> Field 'p = fn x => x",
     );
     assert!(lowered.errors.is_empty(), "{:#?}", lowered.errors);
     assert!(inferred.errors().is_empty(), "{:#?}", inferred.errors());
+}
+
+#[test]
+fn tuple_presence_annotations_preserve_independent_slots_and_alias_parameters() {
+    let (mint, _, output) = inferred(
+        "type Pair 'p 'a = ('a when 'p, String)\n\
+         let consume: Pair 'p Nat -> () = fn _ => ()\n\
+         let absent = consume { 1: \"s\" }\n\
+         let present = consume (1n, \"s\")\n\
+         let empty: (Nat?, String?) -> () = fn _ => ()\n\
+         let accepted = empty ()",
+    );
+    assert_eq!(scheme(&mint, &output, "accepted"), "()");
+    assert_eq!(scheme(&mint, &output, "empty"), "(Nat?, String?) -> ()");
+    let (_, lowered, rejected) =
+        infer_src("let get: (Nat when 'p,) -> Nat = fn xs => xs.0\nlet bad = get ()");
+    assert!(lowered.errors.is_empty(), "{:#?}", lowered.errors);
+    assert!(
+        !rejected.errors().is_empty(),
+        "projection must reject an absent tuple slot"
+    );
+    let (_, lowered, _) = infer_src("type Bad = (Nat?,)");
+    assert!(
+        lowered
+            .errors
+            .iter()
+            .any(|error| error.kind.code() == "open-declared-type"),
+        "{:#?}",
+        lowered.errors
+    );
 }
 
 #[test]

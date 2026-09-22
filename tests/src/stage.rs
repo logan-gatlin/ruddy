@@ -516,7 +516,7 @@ fn branch_refinement_is_coherent_across_the_debugger_tabs() {
         .expect("the inferred scheme");
     assert_eq!(
         scheme.text,
-        "{ a when 'a: 'c, b when 'b: 'd } -> { b when 'a: 'c, a when 'b: 'd } where 'a != 'b"
+        "{ a when 'input_0_a: 'a, b when 'input_0_b: 'b } -> { b when 'input_0_a: 'a, a when 'input_0_b: 'b } where 'input_0_a != 'input_0_b"
     );
 
     let patterns = tab("patterns", source);

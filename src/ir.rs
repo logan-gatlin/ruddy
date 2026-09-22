@@ -942,6 +942,10 @@ pub enum ClauseKind {
     Not(Box<Clause>),
     And(Box<Clause>, Box<Clause>),
     Or(Box<Clause>, Box<Clause>),
+    /// `a -> b` — when `a` is there, `b` must be there.
+    Implies(Box<Clause>, Box<Clause>),
+    /// `a <= b <= c` — the conjunction of adjacent implications.
+    Chain(Vec<Clause>),
     /// `a = b` — both there or neither.
     Equal(Box<Clause>, Box<Clause>),
     /// `a != b` — exactly one of them there.
@@ -12717,6 +12721,18 @@ impl<'a> Builder<'a> {
                 let (left, right) = (self.clause(*left, place), self.clause(*right, place));
                 ClauseKind::Or(Box::new(left?), Box::new(right?))
             }
+            parse::ClauseKind::Implies(left, right) => {
+                let (left, right) = (self.clause(*left, place), self.clause(*right, place));
+                ClauseKind::Implies(Box::new(left?), Box::new(right?))
+            }
+            parse::ClauseKind::Chain(parts) => {
+                // Visit every operand even when an earlier one is unbound.
+                let parts: Vec<_> = parts
+                    .into_iter()
+                    .map(|part| self.clause(part, place))
+                    .collect();
+                ClauseKind::Chain(parts.into_iter().collect::<Option<_>>()?)
+            }
             parse::ClauseKind::Equal(left, right) => {
                 let (left, right) = (self.clause(*left, place), self.clause(*right, place));
                 ClauseKind::Equal(Box::new(left?), Box::new(right?))
@@ -13836,26 +13852,36 @@ impl<'a> Builder<'a> {
                 let element = self.ty(*element, place);
                 here.anchor(TypeKind::Array(Box::new(element)))
             }
-            // A tuple type is a closed struct with unconditional, zero-based
+            // A tuple type is a closed struct with zero-based
             // decimal fields. As with tuple terms, an element's span is the
             // best source location for its generated label.
             parse::TypeKind::Tuple(elements) => {
-                let fields = elements
+                let fields: IndexMap<String, TypeField> = elements
                     .into_iter()
                     .enumerate()
                     .map(|(index, element)| {
                         let name_span = element.span;
-                        let value = self.ty(element, place);
+                        let value = self.ty(element.value, place);
+                        let when = self.when(element.when, place);
                         (
                             index.to_string(),
                             TypeField::Written {
                                 name_at: self.anchor(name_span),
-                                when: None,
+                                when,
                                 value,
                             },
                         )
                     })
                     .collect();
+                let marks = fields.values().filter_map(|field| match field {
+                    TypeField::Written {
+                        when: Some(when), ..
+                    } if when.argument.is_none() => Some(when.at),
+                    _ => None,
+                });
+                if !self.closed(place, Shape::Struct, marks, &None) {
+                    return here.anchor(TypeKind::Error);
+                }
                 here.anchor(TypeKind::Struct {
                     fields,
                     tail: None,

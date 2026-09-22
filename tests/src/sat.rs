@@ -20,6 +20,138 @@ fn exactly_one(n: u32) -> Formula {
     }))
 }
 
+/// Human-facing normal forms are computed independently for one connected
+/// group. This formula's DNF has four products while its CNF has two clauses;
+/// both remain exactly equivalent to the input.
+#[test]
+fn presentation_computes_both_normal_forms() {
+    let formula = var(0)
+        .or(var(1))
+        .or(var(6))
+        .and(var(2).or(var(3)).or(var(6)))
+        .and(var(4).or(var(5)).or(var(6)));
+    let groups = sat::presentation_groups(&formula);
+    assert_eq!(groups.len(), 1);
+    assert!(sat::entails(&formula, &groups[0].dnf));
+    assert!(sat::entails(&groups[0].dnf, &formula));
+    assert!(sat::entails(&formula, &groups[0].cnf));
+    assert!(sat::entails(&groups[0].cnf, &formula));
+    assert_ne!(groups[0].dnf, groups[0].cnf);
+    assert_eq!(
+        groups[0].cnf.to_string(),
+        "(?0 or ?1 or ?6) and (?6 or ?2 or ?3) and (?6 or ?4 or ?5)"
+    );
+}
+
+/// Opposite two-row assignments are rendered as the relationships they mean,
+/// including when several such relationships share an atom in one group.
+#[test]
+fn presentation_recognizes_equality_and_complement() {
+    let formula = var(0).iff(var(1)).and(var(1).xor(var(2)));
+    let groups = sat::presentation_groups(&formula);
+    assert_eq!(groups.len(), 1);
+    let printed = groups[0].relationships.to_string();
+    assert!(printed.contains("?0 = ?1"), "{printed}");
+    assert!(printed.contains("?1 != ?2"), "{printed}");
+    assert!(sat::entails(&formula, &groups[0].relationships));
+    assert!(sat::entails(&groups[0].relationships, &formula));
+}
+
+#[test]
+fn presentation_recognizes_implication() {
+    let formula = var(0).not().or(var(1));
+    let groups = sat::presentation_groups(&formula);
+    assert_eq!(groups.len(), 1);
+    assert_eq!(groups[0].relationships.to_string(), "?0 -> ?1");
+
+    let formula = var(0).not().or(var(1).not()).or(var(2));
+    let groups = sat::presentation_groups(&formula);
+    assert_eq!(groups[0].cnf.to_string(), "?0 and ?1 -> ?2");
+
+    let formula = var(0).not().or(var(1).iff(var(2)));
+    let groups = sat::presentation_groups(&formula);
+    assert_eq!(groups[0].cnf.to_string(), "?0 -> ?1 = ?2");
+    assert!(sat::entails(&formula, &groups[0].cnf));
+    assert!(sat::entails(&groups[0].cnf, &formula));
+}
+
+/// Eight channel slots (four inputs and four outputs) require their selected
+/// image fields. Generalization has expanded these 32 implications to 16 DNF
+/// products; printing must recover the small CNF without enumerating models.
+fn channel_requirements() -> Formula {
+    Formula::any((0..16u32).map(|mask| {
+        Formula::all(
+            (0..32)
+                .filter(|at| mask & (1 << (3 - at % 4)) == 0)
+                .map(|at| var(at).not())
+                .chain(
+                    (0..4)
+                        .filter(|color| mask & (1 << (3 - color)) != 0)
+                        .map(|color| var(32 + color)),
+                ),
+        )
+    }))
+}
+
+#[test]
+fn presentation_recovers_channel_implications() {
+    let formula = channel_requirements();
+    let groups = sat::presentation_groups(&formula);
+    assert_eq!(groups.len(), 1);
+    let cnf = &groups[0].cnf;
+    assert!(sat::entails(&formula, cnf));
+    assert!(sat::entails(cnf, &formula));
+    let expected = Formula::all((0..32).map(|at| var(at).not().or(var(32 + at % 4))));
+    assert_eq!(cnf.to_string(), expected.to_string());
+}
+
+#[test]
+fn presentation_removes_transitive_implications() {
+    let formula = Formula::any((0..=4).map(|length| {
+        Formula::all((0..4).map(|at| if at < length { var(at) } else { var(at).not() }))
+    }));
+    let groups = sat::presentation_groups(&formula);
+    assert_eq!(groups.len(), 1);
+    assert_eq!(
+        groups[0].cnf.to_string(),
+        "(?1 -> ?0) and (?2 -> ?1) and (?3 -> ?2)"
+    );
+    assert!(sat::entails(&formula, &groups[0].cnf));
+    assert!(sat::entails(&groups[0].cnf, &formula));
+}
+
+#[test]
+fn presentation_preserves_nonbinary_channel_constraints() {
+    // Binary consequences alone cannot express this additional clause. It
+    // shares atoms with the channel constraints, so all belong to one group.
+    let formula = channel_requirements().and(var(0).or(var(1)).or(var(2)));
+    let groups = sat::presentation_groups(&formula);
+    assert_eq!(groups.len(), 1);
+    assert!(sat::entails(&formula, &groups[0].cnf));
+    assert!(sat::entails(&groups[0].cnf, &formula));
+}
+
+#[test]
+fn presentation_is_exact_for_every_three_atom_truth_table() {
+    // Covers constants, fixed atoms, both polarities of binary relationships,
+    // and formulas whose binary consequences are not a complete description.
+    for table in 0..256u32 {
+        let formula = Formula::any((0..8).filter(|row| table & (1 << row) != 0).map(|row| {
+            Formula::all((0..3).map(|at| {
+                if row & (1 << at) != 0 {
+                    var(at)
+                } else {
+                    var(at).not()
+                }
+            }))
+        }));
+        let groups = sat::presentation_groups(&formula);
+        let cnf = Formula::all(groups.iter().map(|group| group.cnf.clone()));
+        assert!(sat::entails(&formula, &cnf), "table {table}");
+        assert!(sat::entails(&cnf, &formula), "table {table}");
+    }
+}
+
 /// Every atom a formula names, as a canonical form is read off them: in the
 /// order the formula first names them, which is the order the printed alphabet
 /// follows.
@@ -236,7 +368,7 @@ fn a_wide_projection_is_answered_exactly() {
         sat::project(&one, &[Atom::Var(0), Atom::Var(1)], sat::DEFAULT_MAX_TERMS)
             .unwrap()
             .to_string(),
-        "not ?0 or not ?1"
+        "?0 -> not ?1"
     );
 
     // The width is the formula's own, not the caller's: keeping atoms it never

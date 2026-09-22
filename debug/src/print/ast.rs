@@ -377,15 +377,16 @@ impl fmt::Display for Ast<'_, ClauseKind> {
     }
 }
 
-/// How tightly one clause binds: `0` for a comparison, `1` for `or`, `2` for
-/// `and`, `3` for `not`, `4` for a name.
+/// How tightly one clause binds: `0` for implication, `1` for a comparison,
+/// `2` for `or`, `3` for `and`, `4` for `not`, `5` for a name.
 fn clause_prec(clause: &ClauseKind) -> u8 {
     match clause {
-        ClauseKind::Equal(..) | ClauseKind::NotEqual(..) => 0,
-        ClauseKind::Or(..) => 1,
-        ClauseKind::And(..) => 2,
-        ClauseKind::Not(_) => 3,
-        ClauseKind::Name(_) => 4,
+        ClauseKind::Implies(..) => 0,
+        ClauseKind::Equal(..) | ClauseKind::NotEqual(..) | ClauseKind::Chain(..) => 1,
+        ClauseKind::Or(..) => 2,
+        ClauseKind::And(..) => 3,
+        ClauseKind::Not(_) => 4,
+        ClauseKind::Name(_) => 5,
     }
 }
 
@@ -402,29 +403,42 @@ fn clause_at(f: &mut fmt::Formatter<'_>, clause: &ClauseKind, level: u8) -> fmt:
         ClauseKind::Name(name) => write!(f, "'{name}")?,
         ClauseKind::Not(inner) => {
             f.write_str("not ")?;
-            clause_at(f, &inner.tracked, 3)?;
+            clause_at(f, &inner.tracked, 4)?;
         }
         // Left-associative, so the right side is written one level tighter.
         ClauseKind::And(left, right) => {
-            clause_at(f, &left.tracked, 2)?;
+            clause_at(f, &left.tracked, 3)?;
             f.write_str(" and ")?;
-            clause_at(f, &right.tracked, 3)?;
+            clause_at(f, &right.tracked, 4)?;
         }
         ClauseKind::Or(left, right) => {
-            clause_at(f, &left.tracked, 1)?;
+            clause_at(f, &left.tracked, 2)?;
             f.write_str(" or ")?;
-            clause_at(f, &right.tracked, 2)?;
+            clause_at(f, &right.tracked, 3)?;
+        }
+        ClauseKind::Implies(left, right) => {
+            clause_at(f, &left.tracked, 1)?;
+            f.write_str(" -> ")?;
+            clause_at(f, &right.tracked, 0)?;
+        }
+        ClauseKind::Chain(parts) => {
+            for (at, part) in parts.iter().enumerate() {
+                if at > 0 {
+                    f.write_str(" <= ")?;
+                }
+                clause_at(f, &part.tracked, 2)?;
+            }
         }
         // Non-associative, so both sides go one level tighter.
         ClauseKind::Equal(left, right) => {
-            clause_at(f, &left.tracked, 1)?;
+            clause_at(f, &left.tracked, 2)?;
             f.write_str(" = ")?;
-            clause_at(f, &right.tracked, 1)?;
+            clause_at(f, &right.tracked, 2)?;
         }
         ClauseKind::NotEqual(left, right) => {
-            clause_at(f, &left.tracked, 1)?;
+            clause_at(f, &left.tracked, 2)?;
             f.write_str(" != ")?;
-            clause_at(f, &right.tracked, 1)?;
+            clause_at(f, &right.tracked, 2)?;
         }
     }
     if parens {
@@ -736,7 +750,7 @@ impl fmt::Display for Ast<'_, TypeKind> {
                 if tail.is_none()
                     && fields
                         .values()
-                        .all(|field| matches!(field, TypeField::Written { when: None, .. }))
+                        .all(|field| matches!(field, TypeField::Written { .. }))
                     && let Some(order) =
                         tuple_field_order(fields.keys().map(|name| name.tracked.as_str()))
                 {
@@ -744,10 +758,10 @@ impl fmt::Display for Ast<'_, TypeKind> {
                         f,
                         order.into_iter().map(|insertion| {
                             let field = fields.get_index(insertion).expect("tuple field index").1;
-                            let TypeField::Written { value, .. } = field else {
+                            let TypeField::Written { value, when } = field else {
                                 unreachable!("tuple fields were checked as written")
                             };
-                            Ast(&value.tracked)
+                            ruddy::ui::tuple_type_element(Ast(&value.tracked), mark(when))
                         }),
                     );
                 }
@@ -822,9 +836,12 @@ impl fmt::Display for Ast<'_, TypeKind> {
                     tail.as_ref().map(|tail| tail as &dyn fmt::Display),
                 )
             }
-            TypeKind::Tuple(elements) => {
-                write_tuple(f, elements.iter().map(|element| Ast(&element.tracked)))
-            }
+            TypeKind::Tuple(elements) => write_tuple(
+                f,
+                elements.iter().map(|element| {
+                    ruddy::ui::tuple_type_element(Ast(&element.value.tracked), mark(&element.when))
+                }),
+            ),
             TypeKind::Mut(region, element) => write!(
                 f,
                 "mut {} ({})",
@@ -854,11 +871,12 @@ impl fmt::Display for Ast<'_, TypeKind> {
 }
 
 /// The `when` clause a written label wears, as the compiler's own row printer
-/// takes it. `when _` is the anonymous presence, spelled back as the `_` it was
-/// written as; nothing in a parse tree is ever the undecided-presence artifact,
-/// which only a failed inference produces.
+/// takes it. Preserve both spellings of anonymous presence: `when _` and `?`.
 fn mark(when: &Option<Box<When>>) -> Option<Mark> {
     let when = when.as_ref()?;
+    if when.short {
+        return Some(Mark::Undecided);
+    }
     // The sigil is written back on: a presence is a variable, and one printing
     // bare would read as a type's name. The anonymous `when _` names none.
     Some(Mark::When(match &when.name {
@@ -977,10 +995,7 @@ impl fmt::Display for Effects {
                 Entry::Written { name, mark, .. } => {
                     f.write_str(name)?;
                     match mark {
-                        // The `?` no syntax reads. Nothing in a parse tree is
-                        // ever one — only a failed inference produces it — so
-                        // this arm is here to keep the two writers the same
-                        // shape rather than because a row can reach it.
+                        // The anonymous presence suffix, preserved as written.
                         Some(Mark::Undecided) => f.write_str("?")?,
                         // Parenthesized for the reason a sum case's is: an
                         // effect has no colon to end a bare clause.
@@ -1108,6 +1123,7 @@ fn type_atom_text(ty: &TypeKind) -> String {
 
 fn when_text(when: &Option<Box<When>>, grouped: bool) -> String {
     match mark(when) {
+        Some(Mark::Undecided) => "?".to_string(),
         Some(Mark::When(name)) if grouped => format!(" (when {name})"),
         Some(Mark::When(name)) => format!(" when {name}"),
         _ => String::new(),

@@ -831,17 +831,17 @@ impl fmt::Display for Show<'_, TypeKind> {
                 if tail.is_none()
                     && fields
                         .values()
-                        .all(|field| matches!(field, TypeField::Written { when: None, .. }))
+                        .all(|field| matches!(field, TypeField::Written { .. }))
                     && let Some(order) = tuple_field_order(fields.keys().map(String::as_str))
                 {
                     return write_tuple(
                         f,
                         order.into_iter().map(|insertion| {
                             let field = fields.get_index(insertion).expect("tuple field index").1;
-                            let TypeField::Written { value, .. } = field else {
+                            let TypeField::Written { value, when, .. } = field else {
                                 unreachable!("tuple fields were checked as written")
                             };
-                            self.show(value)
+                            ruddy::ui::tuple_type_element(self.show(value), mark(when, self.mint))
                         }),
                     );
                 }
@@ -902,15 +902,16 @@ impl fmt::Display for Show<'_, ClauseKind> {
     }
 }
 
-/// How tightly one clause binds: `0` for a comparison, `1` for `or`, `2` for
-/// `and`, `3` for `not`, `4` for a name.
+/// How tightly one clause binds: `0` for implication, `1` for a comparison,
+/// `2` for `or`, `3` for `and`, `4` for `not`, `5` for a name.
 fn clause_prec(clause: &ClauseKind) -> u8 {
     match clause {
-        ClauseKind::Equal(..) | ClauseKind::NotEqual(..) => 0,
-        ClauseKind::Or(..) => 1,
-        ClauseKind::And(..) => 2,
-        ClauseKind::Not(_) => 3,
-        ClauseKind::Name(_) => 4,
+        ClauseKind::Implies(..) => 0,
+        ClauseKind::Equal(..) | ClauseKind::NotEqual(..) | ClauseKind::Chain(..) => 1,
+        ClauseKind::Or(..) => 2,
+        ClauseKind::And(..) => 3,
+        ClauseKind::Not(_) => 4,
+        ClauseKind::Name(_) => 5,
     }
 }
 
@@ -927,29 +928,42 @@ fn clause_at(f: &mut fmt::Formatter<'_>, clause: &ClauseKind, level: u8) -> fmt:
         ClauseKind::Name(name) => write!(f, "'{name}")?,
         ClauseKind::Not(inner) => {
             f.write_str("not ")?;
-            clause_at(f, &inner.anchored, 3)?;
+            clause_at(f, &inner.anchored, 4)?;
         }
         // Left-associative, so the right side is written one level tighter.
         ClauseKind::And(left, right) => {
-            clause_at(f, &left.anchored, 2)?;
+            clause_at(f, &left.anchored, 3)?;
             f.write_str(" and ")?;
-            clause_at(f, &right.anchored, 3)?;
+            clause_at(f, &right.anchored, 4)?;
         }
         ClauseKind::Or(left, right) => {
-            clause_at(f, &left.anchored, 1)?;
+            clause_at(f, &left.anchored, 2)?;
             f.write_str(" or ")?;
-            clause_at(f, &right.anchored, 2)?;
+            clause_at(f, &right.anchored, 3)?;
+        }
+        ClauseKind::Implies(left, right) => {
+            clause_at(f, &left.anchored, 1)?;
+            f.write_str(" -> ")?;
+            clause_at(f, &right.anchored, 0)?;
+        }
+        ClauseKind::Chain(parts) => {
+            for (at, part) in parts.iter().enumerate() {
+                if at > 0 {
+                    f.write_str(" <= ")?;
+                }
+                clause_at(f, &part.anchored, 2)?;
+            }
         }
         // Non-associative, so both sides go one level tighter.
         ClauseKind::Equal(left, right) => {
-            clause_at(f, &left.anchored, 1)?;
+            clause_at(f, &left.anchored, 2)?;
             f.write_str(" = ")?;
-            clause_at(f, &right.anchored, 1)?;
+            clause_at(f, &right.anchored, 2)?;
         }
         ClauseKind::NotEqual(left, right) => {
-            clause_at(f, &left.anchored, 1)?;
+            clause_at(f, &left.anchored, 2)?;
             f.write_str(" != ")?;
-            clause_at(f, &right.anchored, 1)?;
+            clause_at(f, &right.anchored, 2)?;
         }
     }
     if parens {

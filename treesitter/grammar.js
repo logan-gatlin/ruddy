@@ -1059,7 +1059,7 @@ module.exports = grammar({
 
     struct_type_field: $ => seq(
       field('name', fieldLabel($)),
-      optional(field('when', $.when_clause)),
+      optional(field('when', choice($.when_clause, $.optional_presence))),
       ':',
       field('type', $._type),
     ),
@@ -1077,20 +1077,29 @@ module.exports = grammar({
     /** `when 'a`, or the `when _` that no formula may name. */
     when_clause: $ => seq('when', field('name', choice($.type_variable, $.wildcard))),
 
+    optional_presence: $ => '?',
+
     /** The same clause where there is no colon to end it: `(when 'a)`. */
-    parenthesized_when: $ => seq('(', $.when_clause, ')'),
+    parenthesized_when: $ => choice(seq('(', $.when_clause, ')'), $.optional_presence),
 
     /** `(A, B)` — a closed positional struct type. */
     tuple_type: $ => seq(
       '(',
-      field('element', $._type),
+      field('element', $._tuple_type_element),
       ',',
       optional(seq(
-        field('element', $._type),
-        repeat(seq(',', field('element', $._type))),
+        field('element', $._tuple_type_element),
+        repeat(seq(',', field('element', $._tuple_type_element))),
         optional(','),
       )),
       ')',
+    ),
+
+    _tuple_type_element: $ => choice($._type, $.marked_tuple_type_element),
+
+    marked_tuple_type_element: $ => seq(
+      field('type', $._type),
+      field('when', choice($.when_clause, $.optional_presence)),
     ),
 
     /** `[T]` — the type of immutable homogeneous arrays of `T`. */
@@ -1104,7 +1113,17 @@ module.exports = grammar({
 
     where_clause: $ => seq('where', sepBy1(';', $._clause)),
 
-    _clause: $ => choice($.clause_comparison, $._clause_or),
+    _clause: $ => choice($.clause_implication, $.clause_comparison, $.clause_chain, $._clause_or),
+
+    /** Ordinary implication remains right-associative. */
+    clause_implication: $ => prec.right(seq(
+      field('left', choice($.clause_comparison, $.clause_chain, $._clause_or)),
+      '->',
+      field('right', $._clause),
+    )),
+
+    /** Each adjacent pair is an implication, not a nested implication. */
+    clause_chain: $ => seq($._clause_or, repeat1(seq('<=', $._clause_or))),
 
     /** `a = b` or `a != b`. Non-associative: `a = b = c` has no reading. */
     clause_comparison: $ => seq(

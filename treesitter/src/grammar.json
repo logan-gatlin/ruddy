@@ -4514,8 +4514,17 @@
               "type": "FIELD",
               "name": "when",
               "content": {
-                "type": "SYMBOL",
-                "name": "when_clause"
+                "type": "CHOICE",
+                "members": [
+                  {
+                    "type": "SYMBOL",
+                    "name": "when_clause"
+                  },
+                  {
+                    "type": "SYMBOL",
+                    "name": "optional_presence"
+                  }
+                ]
               }
             },
             {
@@ -4627,20 +4636,33 @@
         }
       ]
     },
+    "optional_presence": {
+      "type": "STRING",
+      "value": "?"
+    },
     "parenthesized_when": {
-      "type": "SEQ",
+      "type": "CHOICE",
       "members": [
         {
-          "type": "STRING",
-          "value": "("
+          "type": "SEQ",
+          "members": [
+            {
+              "type": "STRING",
+              "value": "("
+            },
+            {
+              "type": "SYMBOL",
+              "name": "when_clause"
+            },
+            {
+              "type": "STRING",
+              "value": ")"
+            }
+          ]
         },
         {
           "type": "SYMBOL",
-          "name": "when_clause"
-        },
-        {
-          "type": "STRING",
-          "value": ")"
+          "name": "optional_presence"
         }
       ]
     },
@@ -4656,7 +4678,7 @@
           "name": "element",
           "content": {
             "type": "SYMBOL",
-            "name": "_type"
+            "name": "_tuple_type_element"
           }
         },
         {
@@ -4674,7 +4696,7 @@
                   "name": "element",
                   "content": {
                     "type": "SYMBOL",
-                    "name": "_type"
+                    "name": "_tuple_type_element"
                   }
                 },
                 {
@@ -4691,7 +4713,7 @@
                         "name": "element",
                         "content": {
                           "type": "SYMBOL",
-                          "name": "_type"
+                          "name": "_tuple_type_element"
                         }
                       }
                     ]
@@ -4719,6 +4741,49 @@
         {
           "type": "STRING",
           "value": ")"
+        }
+      ]
+    },
+    "_tuple_type_element": {
+      "type": "CHOICE",
+      "members": [
+        {
+          "type": "SYMBOL",
+          "name": "_type"
+        },
+        {
+          "type": "SYMBOL",
+          "name": "marked_tuple_type_element"
+        }
+      ]
+    },
+    "marked_tuple_type_element": {
+      "type": "SEQ",
+      "members": [
+        {
+          "type": "FIELD",
+          "name": "type",
+          "content": {
+            "type": "SYMBOL",
+            "name": "_type"
+          }
+        },
+        {
+          "type": "FIELD",
+          "name": "when",
+          "content": {
+            "type": "CHOICE",
+            "members": [
+              {
+                "type": "SYMBOL",
+                "name": "when_clause"
+              },
+              {
+                "type": "SYMBOL",
+                "name": "optional_presence"
+              }
+            ]
+          }
         }
       ]
     },
@@ -4824,11 +4889,86 @@
       "members": [
         {
           "type": "SYMBOL",
+          "name": "clause_implication"
+        },
+        {
+          "type": "SYMBOL",
           "name": "clause_comparison"
         },
         {
           "type": "SYMBOL",
+          "name": "clause_chain"
+        },
+        {
+          "type": "SYMBOL",
           "name": "_clause_or"
+        }
+      ]
+    },
+    "clause_implication": {
+      "type": "PREC_RIGHT",
+      "value": 0,
+      "content": {
+        "type": "SEQ",
+        "members": [
+          {
+            "type": "FIELD",
+            "name": "left",
+            "content": {
+              "type": "CHOICE",
+              "members": [
+                {
+                  "type": "SYMBOL",
+                  "name": "clause_comparison"
+                },
+                {
+                  "type": "SYMBOL",
+                  "name": "clause_chain"
+                },
+                {
+                  "type": "SYMBOL",
+                  "name": "_clause_or"
+                }
+              ]
+            }
+          },
+          {
+            "type": "STRING",
+            "value": "->"
+          },
+          {
+            "type": "FIELD",
+            "name": "right",
+            "content": {
+              "type": "SYMBOL",
+              "name": "_clause"
+            }
+          }
+        ]
+      }
+    },
+    "clause_chain": {
+      "type": "SEQ",
+      "members": [
+        {
+          "type": "SYMBOL",
+          "name": "_clause_or"
+        },
+        {
+          "type": "REPEAT1",
+          "content": {
+            "type": "SEQ",
+            "members": [
+              {
+                "type": "STRING",
+                "value": "<="
+              },
+              {
+                "type": "SYMBOL",
+                "name": "_clause_or"
+              }
+            ]
+          }
         }
       ]
     },

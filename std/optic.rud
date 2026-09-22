@@ -1,0 +1,78 @@
+@doc "A total focus into part of an immutable value. Lawful lenses restore a whole when its viewed part is set, view a part just set, and let the last set win."
+type Lens 'whole 'part = {
+  view: 'whole -> 'part,
+  set: 'part -> 'whole -> 'whole,
+}
+
+@doc "Creates a lens from functions that view and replace its focused part."
+let lens:
+  ('whole -> 'part) -> ('part -> 'whole -> 'whole) -> Lens 'whole 'part =
+  fn view_part set_part => { view: view_part, set: set_part }
+
+@doc "Views the part focused by a lens."
+let view: Lens 'whole 'part -> 'whole -> 'part = fn optic whole => optic.view whole
+
+@doc "Replaces the part focused by a lens."
+let set: Lens 'whole 'part -> 'part -> 'whole -> 'whole =
+  fn optic part whole => optic.set part whole
+
+@doc "Transforms the part focused by a lens."
+let over:
+  Lens 'whole 'part
+  -> ('part -> 'part + ..'effects)
+  -> 'whole
+  -> 'whole + ..'effects =
+  fn optic function whole => optic.set (function (optic.view whole)) whole
+
+@doc "Composes an outer lens with a lens into its focused part."
+let compose_lens:
+  Lens 'whole 'middle -> Lens 'middle 'part -> Lens 'whole 'part =
+  fn outer inner => lens
+    (fn whole => inner.view (outer.view whole))
+    (fn part whole => outer.set (inner.set part (outer.view whole)) whole)
+
+@doc "A focus into one alternative of an immutable value. Lawful prisms preview values they review, and leave values outside their alternative unchanged when transformed."
+type Prism 'whole 'part = {
+  preview: 'whole -> Option 'part,
+  review: 'part -> 'whole,
+}
+
+@doc "Creates a prism from functions that preview its alternative and construct that alternative."
+let prism:
+  ('whole -> Option 'part) -> ('part -> 'whole) -> Prism 'whole 'part =
+  fn preview_part review_part => { preview: preview_part, review: review_part }
+
+@doc "Returns the part selected by a prism, or `#None` when its alternative does not match."
+let preview: Prism 'whole 'part -> 'whole -> Option 'part =
+  fn optic whole => optic.preview whole
+
+@doc "Constructs the alternative selected by a prism."
+let review: Prism 'whole 'part -> 'part -> 'whole = fn optic part => optic.review part
+
+@doc "Replaces a prism's part when its alternative matches, leaving other alternatives unchanged."
+let set_prism: Prism 'whole 'part -> 'part -> 'whole -> 'whole =
+  fn optic replacement whole => match optic.preview whole with
+  | #Some _ => optic.review replacement
+  | #None => whole
+  end
+
+@doc "Transforms a prism's part when its alternative matches, leaving other alternatives unchanged."
+let over_prism:
+  Prism 'whole 'part
+  -> ('part -> 'part + ..'effects)
+  -> 'whole
+  -> 'whole + ..'effects =
+  fn optic function whole => match optic.preview whole with
+  | #Some part => optic.review (function part)
+  | #None => whole
+  end
+
+@doc "Composes an outer prism with a prism into its selected alternative."
+let compose_prism:
+  Prism 'whole 'middle -> Prism 'middle 'part -> Prism 'whole 'part =
+  fn outer inner => prism
+    (fn whole => match outer.preview whole with
+    | #Some middle => inner.preview middle
+    | #None => #None
+    end)
+    (fn part => outer.review (inner.review part))

@@ -42,10 +42,16 @@
 //! and nothing may make the dependency run back.
 
 pub const TAIL_RECURSION_CODE: &str = "tail-recursion-opportunity";
+mod presentation;
+pub use presentation::TypePresentation;
 pub const TAIL_RECURSION_MESSAGE: &str = "This function can be rewritten as tail recursion. Accumulate the numeric operation before each recursive call instead of retaining work after it.";
 pub const TAIL_RECURSION_ACTION: &str = "Convert to tail recursion";
 
-use std::{collections::HashSet, fmt, path::Path as FsPath};
+use std::{
+    collections::{HashMap, HashSet},
+    fmt,
+    path::Path as FsPath,
+};
 
 use crate::{
     bundle,
@@ -357,9 +363,7 @@ pub enum Entry<K, V> {
 /// names it.
 #[derive(Debug, Clone)]
 pub enum Mark {
-    /// `?` — the undecided-presence failure artifact. Nothing parses it, so a
-    /// type wearing one does not read back, and that is exactly what it is
-    /// reporting.
+    /// `?` — anonymous presence, also used for undecided recovery artifacts.
     Undecided,
     /// `when a`, or `when ?3` for one the solve still owns: the presence has a
     /// name, and the `where` clause beside the type can talk about it.
@@ -379,6 +383,10 @@ struct Named<'a> {
     /// spells every atom as the presence itself, which is what a scheme's
     /// clause wants.
     labels: &'a [(String, Presence)],
+    /// Alpha-renamed quantified variables for a scheme presentation. Absent
+    /// for diagnostics and bare formulas, which retain their established
+    /// spellings.
+    bound_names: Option<&'a [String]>,
 }
 
 /// One piece of source text explained by a diagnostic.
@@ -705,6 +713,7 @@ impl fmt::Display for Kind {
             Kind::FatArrow => f.write_str("=>"),
             Kind::Arrow => f.write_str("->"),
             Kind::Colon => f.write_str(":"),
+            Kind::Question => f.write_str("?"),
             Kind::ColonColon => f.write_str("::"),
             Kind::Comma => f.write_str(","),
             Kind::Semicolon => f.write_str(";"),
@@ -2321,6 +2330,7 @@ enum SemanticJob<'a> {
     Tail(&'a Rest),
     Field(&'a str, &'a RowField),
     TupleField(&'a RowField),
+    TupleMark(&'a Presence),
     Case(&'a str, &'a RowField, bool),
     Effect(&'a str, &'a RowField),
     Mark(&'a Presence),
@@ -2328,6 +2338,23 @@ enum SemanticJob<'a> {
 }
 
 fn format_semantic(f: &mut fmt::Formatter<'_>, root: SemanticRoot<'_>) -> fmt::Result {
+    format_semantic_named(f, root, None)
+}
+
+fn format_semantic_named(
+    f: &mut fmt::Formatter<'_>,
+    root: SemanticRoot<'_>,
+    names: Option<&[String]>,
+) -> fmt::Result {
+    format_semantic_replacing(f, root, names, &HashMap::new())
+}
+
+fn format_semantic_replacing(
+    f: &mut fmt::Formatter<'_>,
+    root: SemanticRoot<'_>,
+    names: Option<&[String]>,
+    replacements: &HashMap<usize, String>,
+) -> fmt::Result {
     let first = match root {
         SemanticRoot::Ty(ty) => SemanticJob::Ty(ty, false),
         SemanticRoot::Row(row) => SemanticJob::Row(row),
@@ -2339,6 +2366,15 @@ fn format_semantic(f: &mut fmt::Formatter<'_>, root: SemanticRoot<'_>) -> fmt::R
         match part {
             SemanticJob::Text(text) => f.write_str(text)?,
             SemanticJob::Ty(ty, grouped) => {
+                if let Some(text) = replacements.get(&(ty as *const Ty as usize)) {
+                    // Applications are safe in all type positions with grouping.
+                    if grouped {
+                        write!(f, "({text})")?;
+                    } else {
+                        f.write_str(text)?;
+                    }
+                    continue;
+                }
                 if grouped {
                     f.write_str("(")?;
                     work.push(SemanticJob::Text(")"));
@@ -2378,7 +2414,10 @@ fn format_semantic(f: &mut fmt::Formatter<'_>, root: SemanticRoot<'_>) -> fmt::R
                     Ty::Presence(p) => match p {
                         Presence::Present => f.write_str("true")?,
                         Presence::Absent => f.write_str("false")?,
-                        Presence::Bound(index) => f.write_str(&name_at(*index))?,
+                        Presence::Bound(index) => {
+                            let name = bound_name(*index, names);
+                            f.write_str(if name.is_empty() { "_" } else { &name })?;
+                        }
                         Presence::Var(var) | Presence::Recovered(var) => write!(f, "?{var}")?,
                         Presence::Undecided => f.write_str("_")?,
                     },
@@ -2406,12 +2445,20 @@ fn format_semantic(f: &mut fmt::Formatter<'_>, root: SemanticRoot<'_>) -> fmt::R
                         f.write_str(name)?;
                     }
                     Ty::Var(var) => write!(f, "?{var}")?,
-                    Ty::Bound(index) => f.write_str(&name_at(*index))?,
+                    Ty::Bound(index) => f.write_str(&bound_name(*index, names))?,
                     Ty::Rigid { name, .. } => write!(f, "'{name}")?,
                     Ty::Undecided => f.write_str("?")?,
                 }
             }
             SemanticJob::Applied(ty) => {
+                if let Some(text) = replacements.get(&(ty as *const Ty as usize)) {
+                    if text.contains(' ') {
+                        write!(f, "({text})")?;
+                    } else {
+                        f.write_str(text)?;
+                    }
+                    continue;
+                }
                 let grouped = ty.prec() < Prec::Atom;
                 if grouped {
                     f.write_str("(")?;
@@ -2439,7 +2486,7 @@ fn format_semantic(f: &mut fmt::Formatter<'_>, root: SemanticRoot<'_>) -> fmt::R
             SemanticJob::Rest(rest) => match rest {
                 Rest::Closed => f.write_str("∅")?,
                 Rest::Var(var) => write!(f, "?{var}")?,
-                Rest::Bound(index) => f.write_str(&name_at(*index))?,
+                Rest::Bound(index) => f.write_str(&bound_name(*index, names))?,
                 Rest::Rigid { name, .. } => write!(f, "'{name}")?,
                 Rest::Undecided => f.write_str("?")?,
                 Rest::More(row) => work.push(SemanticJob::Row(row)),
@@ -2447,11 +2494,7 @@ fn format_semantic(f: &mut fmt::Formatter<'_>, root: SemanticRoot<'_>) -> fmt::R
             SemanticJob::Fields(row) => {
                 let (fields, rest) = flattened_row(row);
                 let tail = semantic_tail(Shape::Struct, rest);
-                let tuple = if tail.is_none()
-                    && fields
-                        .iter()
-                        .all(|(_, field)| matches!(field.presence, Presence::Present))
-                {
+                let tuple = if tail.is_none() {
                     tuple_field_order(fields.iter().map(|(name, _)| *name))
                 } else {
                     None
@@ -2536,13 +2579,21 @@ fn format_semantic(f: &mut fmt::Formatter<'_>, root: SemanticRoot<'_>) -> fmt::R
             SemanticJob::Tail(rest) => work.push(SemanticJob::Rest(rest)),
             SemanticJob::Field(name, field) => {
                 write_field_label(f, name)?;
-                write_semantic_mark(f, &field.presence, false)?;
+                write_semantic_mark(f, &field.presence, false, names)?;
                 f.write_str(": ")?;
                 work.push(SemanticJob::Ty(&field.ty, false));
             }
             SemanticJob::TupleField(field) => {
-                work.push(SemanticJob::Ty(&field.ty, false));
+                let marked = !matches!(field.presence, Presence::Present | Presence::Absent);
+                let grouped = marked
+                    && (field.ty.prec() < Prec::Atom
+                        || replacements
+                            .get(&(field.ty.as_ref() as *const Ty as usize))
+                            .is_some_and(|text| text.contains(' ')));
+                work.push(SemanticJob::TupleMark(&field.presence));
+                work.push(SemanticJob::Ty(&field.ty, grouped));
             }
+            SemanticJob::TupleMark(presence) => write_semantic_mark(f, presence, false, names)?,
             SemanticJob::Case(name, field, strip_interface) => {
                 let name = if strip_interface {
                     EffectId::parse_canonical_row_key(name).map_or(name, |pair| pair.0)
@@ -2550,10 +2601,14 @@ fn format_semantic(f: &mut fmt::Formatter<'_>, root: SemanticRoot<'_>) -> fmt::R
                     name
                 };
                 write_tag_label(f, name)?;
-                write_semantic_mark(f, &field.presence, true)?;
+                write_semantic_mark(f, &field.presence, true, names)?;
                 if !unit_type(&field.ty) {
                     f.write_str(" ")?;
-                    work.push(SemanticJob::Ty(&field.ty, field.ty.prec() < Prec::Atom));
+                    let grouped = field.ty.prec() < Prec::Atom
+                        || replacements
+                            .get(&(field.ty.as_ref() as *const Ty as usize))
+                            .is_some_and(|text| text.contains(' '));
+                    work.push(SemanticJob::Ty(&field.ty, grouped));
                 }
             }
             // An applied effect: the label, its arguments as a type
@@ -2579,7 +2634,7 @@ fn format_semantic(f: &mut fmt::Formatter<'_>, root: SemanticRoot<'_>) -> fmt::R
                     }
                 }
             }
-            SemanticJob::Mark(presence) => write_semantic_mark(f, presence, true)?,
+            SemanticJob::Mark(presence) => write_semantic_mark(f, presence, true, names)?,
         }
     }
     Ok(())
@@ -2630,6 +2685,7 @@ fn write_semantic_mark(
     f: &mut fmt::Formatter<'_>,
     presence: &Presence,
     parenthesized: bool,
+    names: Option<&[String]>,
 ) -> fmt::Result {
     let (open, close) = match parenthesized {
         true => (" (when ", ")"),
@@ -2639,7 +2695,14 @@ fn write_semantic_mark(
         Presence::Present | Presence::Absent => Ok(()),
         Presence::Recovered(_) | Presence::Undecided => f.write_str("?"),
         Presence::Var(var) => write!(f, "{open}?{var}{close}"),
-        Presence::Bound(index) => write!(f, "{open}{}{close}", name_at(*index)),
+        Presence::Bound(index) => {
+            let name = bound_name(*index, names);
+            if name.is_empty() {
+                f.write_str("?")
+            } else {
+                write!(f, "{open}{name}{close}")
+            }
+        }
     }
 }
 
@@ -2745,9 +2808,209 @@ fn name_at(index: u32) -> String {
     }
 }
 
+fn bound_name(index: u32, names: Option<&[String]>) -> String {
+    names
+        .and_then(|names| names.get(index as usize))
+        .cloned()
+        .unwrap_or_else(|| name_at(index))
+}
+
+fn path_segment(name: &str) -> String {
+    let mut out = String::new();
+    let mut underscore = false;
+    let mut previous_lower_or_digit = false;
+    for ch in name.chars() {
+        if ch.is_alphanumeric() {
+            if ch.is_uppercase() && previous_lower_or_digit && !underscore {
+                out.push('_');
+            }
+            for lower in ch.to_lowercase() {
+                out.push(lower);
+            }
+            underscore = false;
+            previous_lower_or_digit = ch.is_lowercase() || ch.is_numeric();
+        } else if !out.is_empty() && !underscore {
+            out.push('_');
+            underscore = true;
+            previous_lower_or_digit = false;
+        }
+    }
+    while out.ends_with('_') {
+        out.pop();
+    }
+    if out.is_empty() {
+        out.push_str("label");
+    }
+    out
+}
+
+/// Give each quantified presence a stable name from the path of the label it
+/// controls. Other quantified sorts keep a compact alphabet, independent of
+/// how many presences came before them.
+fn scheme_names(scheme: &Scheme) -> Vec<String> {
+    enum Work<'a> {
+        Root(&'a Ty),
+        Ty(&'a Ty),
+        Row(&'a Row, Shape),
+        Presence(&'a Presence),
+        Push(String),
+        Pop,
+    }
+
+    fn schedule<'a>(work: &mut Vec<Work<'a>>, segment: String, job: Work<'a>) {
+        work.push(Work::Pop);
+        work.push(job);
+        work.push(Work::Push(segment));
+    }
+
+    let mut candidates: HashMap<u32, String> = HashMap::new();
+    let mut path: Vec<String> = Vec::new();
+    let mut work = vec![Work::Root(scheme.body())];
+    while let Some(job) = work.pop() {
+        match job {
+            Work::Push(segment) => path.push(segment),
+            Work::Pop => {
+                path.pop();
+            }
+            Work::Presence(Presence::Bound(index)) if *index < scheme.presences() => {
+                candidates.entry(*index).or_insert_with(|| {
+                    let mut name = path.join("_");
+                    if name.is_empty() {
+                        name.push_str("presence");
+                    } else if name.starts_with(char::is_numeric) {
+                        name.insert_str(0, "field_");
+                    }
+                    name
+                });
+            }
+            Work::Presence(_) => {}
+            Work::Root(ty) => {
+                let mut inputs = Vec::new();
+                let mut result = ty;
+                while let Ty::Arrow(argument, next, effects) = unpackaged(result) {
+                    inputs.push((argument.as_ref(), effects));
+                    result = next;
+                }
+                if inputs.is_empty() {
+                    work.push(Work::Ty(ty));
+                    continue;
+                }
+                schedule(&mut work, "output".to_string(), Work::Ty(result));
+                for (at, (argument, effects)) in inputs.into_iter().enumerate().rev() {
+                    let input = format!("input_{at}");
+                    if effect_row_shown(effects) {
+                        schedule(
+                            &mut work,
+                            format!("{input}_effects"),
+                            Work::Row(effects, Shape::Effect),
+                        );
+                    }
+                    schedule(&mut work, input, Work::Ty(argument));
+                }
+            }
+            Work::Ty(ty) => match unpackaged(ty) {
+                Ty::Arrow(from, to, effects) => {
+                    schedule(&mut work, "output".to_string(), Work::Ty(to));
+                    if effect_row_shown(effects) {
+                        schedule(
+                            &mut work,
+                            "effects".to_string(),
+                            Work::Row(effects, Shape::Effect),
+                        );
+                    }
+                    schedule(&mut work, "input".to_string(), Work::Ty(from));
+                }
+                Ty::Hidden { body, .. }
+                | Ty::Array(body)
+                | Ty::Mirror(body)
+                | Ty::TypeInfo(body)
+                | Ty::Package(body) => work.push(Work::Ty(body)),
+                Ty::Mut(region, element) => {
+                    schedule(&mut work, "value".to_string(), Work::Ty(element));
+                    schedule(&mut work, "region".to_string(), Work::Ty(region));
+                }
+                Ty::Struct(row) => work.push(Work::Row(row, Shape::Struct)),
+                Ty::Sum(row) => work.push(Work::Row(row, Shape::Sum)),
+                Ty::Presence(presence) => work.push(Work::Presence(presence)),
+                Ty::Named { name, args, .. } => {
+                    let base = path_segment(name);
+                    for (at, argument) in args.iter().enumerate().rev() {
+                        schedule(&mut work, format!("{base}_{at}"), Work::Ty(argument));
+                    }
+                }
+                _ => {}
+            },
+            Work::Row(row, shape) => {
+                let (fields, rest) = flattened_row(row);
+                if let Rest::More(more) = rest {
+                    work.push(Work::Row(more, shape));
+                }
+                for (name, field) in fields.into_iter().rev() {
+                    let name = match shape {
+                        Shape::Effect => EffectId::parse_row_key(name)
+                            .map_or(name, |(name, _)| name)
+                            .to_string(),
+                        Shape::Struct | Shape::Sum => name.to_string(),
+                    };
+                    let segment = path_segment(&name);
+                    work.push(Work::Pop);
+                    work.push(Work::Ty(&field.ty));
+                    work.push(Work::Presence(&field.presence));
+                    work.push(Work::Push(segment));
+                }
+            }
+        }
+    }
+
+    let mut names = Vec::with_capacity(scheme.count() as usize);
+    let mut used = HashSet::new();
+    for index in 0..scheme.presences() {
+        let base = candidates
+            .remove(&index)
+            .unwrap_or_else(|| format!("presence_{index}"));
+        let mut candidate = format!("'{base}");
+        let mut suffix = 2;
+        while !used.insert(candidate.clone()) {
+            candidate = format!("'{base}_{suffix}");
+            suffix += 1;
+        }
+        names.push(candidate);
+    }
+    let mut alpha = 0;
+    while names.len() < scheme.count() as usize {
+        let candidate = name_at(alpha);
+        alpha += 1;
+        if used.insert(candidate.clone()) {
+            names.push(candidate);
+        }
+    }
+    for index in presentation::anonymous_presences(scheme) {
+        names[index as usize].clear();
+    }
+    names
+}
+
+fn without_owner(mut formula: &Formula) -> &Formula {
+    while let Formula::Owned(_, inner) = formula {
+        formula = inner;
+    }
+    formula
+}
+
+/// `not a or b`, the normal-form spelling of `a -> b`.
+fn implication(formula: &Formula) -> Option<(&Formula, &Formula)> {
+    let Formula::Or(left, right) = without_owner(formula) else {
+        return None;
+    };
+    let Formula::Not(left) = without_owner(left) else {
+        return None;
+    };
+    Some((left, right))
+}
+
 /// How tightly a printed formula binds, on the `where` grammar's own ladder:
-/// `0` for the non-associative `=` and `!=`, `1` for `or`, `2` for `and`, `3`
-/// for `not`, `4` for a name.
+/// `0` for implication, `1` for non-associative `=` and `!=`, `2` for `or`,
+/// `3` for `and`, `4` for `not`, `5` for a name.
 ///
 /// A number rather than a [`Prec`] of its own, because it is its own grammar:
 /// nothing in a formula can be a type and nothing in a type can be a formula,
@@ -2755,13 +3018,16 @@ fn name_at(index: u32) -> String {
 /// and there is nothing here for a named level to disambiguate that the four
 /// call sites do not already say.
 fn prec(formula: &Formula) -> u8 {
+    if implication(formula).is_some() {
+        return 0;
+    }
     match formula {
         Formula::Owned(_, inner) => prec(inner),
-        Formula::Iff(..) | Formula::Xor(..) => 0,
-        Formula::Or(..) => 1,
-        Formula::And(..) => 2,
-        Formula::Not(_) => 3,
-        Formula::True | Formula::False | Formula::Atom(_) => 4,
+        Formula::Iff(..) | Formula::Xor(..) => 1,
+        Formula::Or(..) => 2,
+        Formula::And(..) => 3,
+        Formula::Not(_) => 4,
+        Formula::True | Formula::False | Formula::Atom(_) => 5,
     }
 }
 
@@ -2801,6 +3067,12 @@ impl Named<'_> {
                         f.write_str("(")?;
                         work.push(Work::Close);
                     }
+                    if let Some((left, right)) = implication(formula) {
+                        work.push(Work::Formula(right, 0));
+                        work.push(Work::Text(" -> "));
+                        work.push(Work::Formula(left, 1));
+                        continue;
+                    }
                     match formula {
                         // Neither constant has a spelling in the grammar, and
                         // neither has to: they are debugger/recovery readings.
@@ -2810,31 +3082,31 @@ impl Named<'_> {
                         Formula::Owned(..) => unreachable!("handled before precedence"),
                         Formula::Not(inner) => {
                             f.write_str("not ")?;
-                            work.push(Work::Formula(inner, 3));
+                            work.push(Work::Formula(inner, 4));
                         }
                         // Left-associative, so the right side is written one
                         // level tighter and retains required parentheses.
                         Formula::And(left, right) => {
-                            work.push(Work::Formula(right, 3));
+                            work.push(Work::Formula(right, 4));
                             work.push(Work::Text(" and "));
-                            work.push(Work::Formula(left, 2));
+                            work.push(Work::Formula(left, 3));
                         }
                         Formula::Or(left, right) => {
-                            work.push(Work::Formula(right, 2));
+                            work.push(Work::Formula(right, 3));
                             work.push(Work::Text(" or "));
-                            work.push(Work::Formula(left, 1));
+                            work.push(Work::Formula(left, 2));
                         }
                         // Comparisons are non-associative, so both operands are
                         // one precedence level tighter.
                         Formula::Iff(left, right) => {
-                            work.push(Work::Formula(right, 1));
+                            work.push(Work::Formula(right, 2));
                             work.push(Work::Text(" = "));
-                            work.push(Work::Formula(left, 1));
+                            work.push(Work::Formula(left, 2));
                         }
                         Formula::Xor(left, right) => {
-                            work.push(Work::Formula(right, 1));
+                            work.push(Work::Formula(right, 2));
                             work.push(Work::Text(" != "));
-                            work.push(Work::Formula(left, 1));
+                            work.push(Work::Formula(left, 2));
                         }
                     }
                 }
@@ -2854,7 +3126,10 @@ impl Named<'_> {
             .iter()
             .find(|(_, decides)| *decides == presence)
             .map(|(label, _)| label.to_string())
-            .unwrap_or_else(|| atom.to_string())
+            .unwrap_or_else(|| match atom {
+                Atom::Bound(index) => bound_name(index, self.bound_names),
+                Atom::Var(_) => atom.to_string(),
+            })
     }
 }
 
@@ -2864,7 +3139,12 @@ impl Named<'_> {
 /// An empty `labels` spells every atom as the presence itself, which is what a
 /// scheme's own `where` clause wants.
 pub fn in_labels(formula: &Formula, labels: &[(String, Presence)]) -> String {
-    Named { formula, labels }.to_string()
+    Named {
+        formula,
+        labels,
+        bound_names: None,
+    }
+    .to_string()
 }
 
 /// A formula as a scheme's `where` clause writes it: its presences by the names
@@ -2874,9 +3154,268 @@ impl fmt::Display for Formula {
         Named {
             formula: self,
             labels: &[],
+            bound_names: None,
         }
         .fmt(f)
     }
+}
+
+fn formula_tokens(formula: &Formula) -> usize {
+    let mut tokens = 0;
+    let mut work = vec![formula];
+    while let Some(formula) = work.pop() {
+        if let Some((left, right)) = implication(formula) {
+            tokens += 1;
+            work.push(right);
+            work.push(left);
+            continue;
+        }
+        match formula {
+            Formula::True | Formula::False | Formula::Atom(_) => tokens += 1,
+            Formula::Owned(_, inner) => work.push(inner),
+            Formula::Not(inner) => {
+                tokens += 1;
+                work.push(inner);
+            }
+            Formula::And(left, right)
+            | Formula::Or(left, right)
+            | Formula::Iff(left, right)
+            | Formula::Xor(left, right) => {
+                tokens += 1;
+                work.push(right);
+                work.push(left);
+            }
+        }
+    }
+    tokens
+}
+
+fn named_formula(formula: &Formula, names: &[String]) -> String {
+    Named {
+        formula,
+        labels: &[],
+        bound_names: Some(names),
+    }
+    .to_string()
+}
+
+fn formula_conjuncts<'a>(formula: &'a Formula, out: &mut Vec<&'a Formula>) {
+    match formula {
+        Formula::Owned(_, inner) => formula_conjuncts(inner, out),
+        Formula::And(left, right) => {
+            formula_conjuncts(left, out);
+            formula_conjuncts(right, out);
+        }
+        formula => out.push(formula),
+    }
+}
+
+/// Factor conjunctions of implications without changing the stored scheme:
+/// `(a -> c) and (b -> c)` is `(a or b) -> c`, and
+/// `(a -> b) and (a -> c)` is `a -> (b and c)`.
+/// Keep groups at their first occurrence so presentation remains stable, and
+/// leave unrelated conjuncts intact. These are candidates, not mandatory
+/// rewrites: rendered cost still decides which spelling reaches the reader.
+fn factor_implications(formula: &Formula, common_conclusion: bool) -> Option<Formula> {
+    let mut conjuncts = Vec::new();
+    formula_conjuncts(formula, &mut conjuncts);
+    let mut positions: HashMap<&Formula, usize> = HashMap::new();
+    let mut groups: Vec<(Option<&Formula>, Vec<&Formula>)> = Vec::new();
+    let mut changed = false;
+    for conjunct in conjuncts {
+        let Some((premise, conclusion)) = implication(conjunct) else {
+            groups.push((None, vec![conjunct]));
+            continue;
+        };
+        let (key, part) = if common_conclusion {
+            (conclusion, premise)
+        } else {
+            (premise, conclusion)
+        };
+        if let Some(&at) = positions.get(key) {
+            groups[at].1.push(part);
+            changed = true;
+        } else {
+            positions.insert(key, groups.len());
+            groups.push((Some(key), vec![part]));
+        }
+    }
+    changed.then(|| {
+        Formula::all(groups.into_iter().map(|(key, parts)| {
+            match key {
+                None => parts[0].clone(),
+                Some(key) if common_conclusion => Formula::any(parts.into_iter().cloned())
+                    .not()
+                    .or(key.clone()),
+                Some(key) => key
+                    .clone()
+                    .not()
+                    .or(Formula::all(parts.into_iter().cloned())),
+            }
+        }))
+    })
+}
+
+fn atomic_implication(formula: &Formula) -> Option<(Atom, Atom)> {
+    let (left, right) = implication(formula)?;
+    match (without_owner(left), without_owner(right)) {
+        (Formula::Atom(left), Formula::Atom(right)) => Some((*left, *right)),
+        _ => None,
+    }
+}
+
+/// Remove an atomic implication only when another retained path proves it.
+/// This exposes chains even when a larger, nonbinary CNF contains transitive
+/// consequences. Removing edges sequentially preserves paths through cycles;
+/// no SAT queries or changes to the canonical inferred formula are needed.
+fn reduce_implications(formula: &Formula) -> Option<Formula> {
+    let mut conjuncts = Vec::new();
+    formula_conjuncts(formula, &mut conjuncts);
+    let edges: Vec<_> = conjuncts
+        .iter()
+        .map(|part| atomic_implication(part))
+        .collect();
+    let mut outgoing: HashMap<Atom, Vec<usize>> = HashMap::new();
+    for (at, edge) in edges.iter().enumerate() {
+        if let Some((left, _)) = edge {
+            outgoing.entry(*left).or_default().push(at);
+        }
+    }
+    let mut kept = vec![true; edges.len()];
+    for (at, edge) in edges.iter().enumerate() {
+        let Some((left, right)) = edge else {
+            continue;
+        };
+        if outgoing[left].len() < 2 {
+            continue;
+        }
+        crate::cancellation::checkpoint();
+        let mut seen = HashSet::from([*left]);
+        let mut work = vec![*left];
+        'search: while let Some(node) = work.pop() {
+            for &other in outgoing.get(&node).into_iter().flatten() {
+                if other == at || !kept[other] {
+                    continue;
+                }
+                let (_, next) = edges[other].unwrap();
+                if next == *right {
+                    kept[at] = false;
+                    break 'search;
+                }
+                if seen.insert(next) {
+                    work.push(next);
+                }
+            }
+        }
+    }
+    kept.iter().any(|keep| !keep).then(|| {
+        Formula::all(
+            conjuncts
+                .into_iter()
+                .zip(kept)
+                .filter(|(_, keep)| *keep)
+                .map(|(part, _)| part.clone()),
+        )
+    })
+}
+
+/// Render linear paths in the graph of atomic implications as `<=` chains.
+/// Only a vertex with one incoming and one outgoing edge can be internal to
+/// a path: branches remain explicit, and cycles without a starting vertex
+/// retain their original clauses. The formula itself is never rewritten.
+fn chained_constraints(formula: &Formula, names: &[String]) -> (usize, Vec<String>) {
+    let mut conjuncts = Vec::new();
+    formula_conjuncts(formula, &mut conjuncts);
+    let edges: Vec<_> = conjuncts
+        .iter()
+        .map(|part| atomic_implication(part))
+        .collect();
+    let mut incoming: HashMap<Atom, usize> = HashMap::new();
+    let mut outgoing: HashMap<Atom, Vec<usize>> = HashMap::new();
+    for (at, edge) in edges.iter().enumerate() {
+        if let Some((left, right)) = edge {
+            *incoming.entry(*right).or_default() += 1;
+            outgoing.entry(*left).or_default().push(at);
+        }
+    }
+    let interior = |atom: &Atom| {
+        incoming.get(atom) == Some(&1) && outgoing.get(atom).is_some_and(|edges| edges.len() == 1)
+    };
+    let mut parts: Vec<_> = conjuncts
+        .iter()
+        .map(|part| Some((formula_tokens(part), named_formula(part, names))))
+        .collect();
+    let mut visited = vec![false; edges.len()];
+    for (start, edge) in edges.iter().enumerate() {
+        let Some((left, _)) = edge else {
+            continue;
+        };
+        if visited[start] || interior(left) {
+            continue;
+        }
+        let mut nodes = vec![*left];
+        let mut path = Vec::new();
+        let mut at = start;
+        loop {
+            if visited[at] {
+                break;
+            }
+            visited[at] = true;
+            path.push(at);
+            let (_, right) = edges[at].unwrap();
+            nodes.push(right);
+            if !interior(&right) {
+                break;
+            }
+            at = outgoing[&right][0];
+        }
+        if path.len() < 2 {
+            continue;
+        }
+        let first = *path.iter().min().unwrap();
+        for at in path {
+            parts[at] = None;
+        }
+        let text = nodes
+            .iter()
+            .map(|atom| named_formula(&Formula::Atom(*atom), names))
+            .collect::<Vec<_>>()
+            .join(" <= ");
+        parts[first] = Some((2 * nodes.len() - 1, text));
+    }
+    let (costs, lines): (Vec<_>, Vec<_>) = parts.into_iter().flatten().unzip();
+    (
+        costs.iter().sum::<usize>() + lines.len().saturating_sub(1),
+        lines,
+    )
+}
+
+fn presentation_lines(formula: &Formula, names: &[String]) -> Vec<String> {
+    let mut lines = Vec::new();
+    for group in inference::sat::presentation_groups(formula) {
+        let mut candidates = [group.relationships, group.dnf, group.cnf]
+            .into_iter()
+            .flat_map(|formula| {
+                let reduced = reduce_implications(&formula);
+                [Some(formula), reduced].into_iter().flatten()
+            })
+            .flat_map(|formula| {
+                let conclusions = factor_implications(&formula, true);
+                let premises = factor_implications(&formula, false);
+                [Some(formula), conclusions, premises].into_iter().flatten()
+            })
+            .enumerate()
+            .map(|(order, formula)| {
+                let (tokens, lines) = chained_constraints(&formula, names);
+                let characters = lines.iter().map(|line| line.chars().count()).sum::<usize>()
+                    + 4 * lines.len().saturating_sub(1); // `;\n  ` between constraints.
+                ((tokens, characters, order), lines)
+            })
+            .collect::<Vec<_>>();
+        candidates.sort_by_key(|(cost, _)| *cost);
+        lines.extend(candidates.remove(0).1);
+    }
+    lines
 }
 
 /// A scheme prints as its body and what it requires of its presences.
@@ -2886,16 +3425,41 @@ impl fmt::Display for Formula {
 /// quantifier. `let id = fn x => x` reports `'a -> 'a`, and pasting that back
 /// as `let id : 'a -> 'a` re-lowers to the type it was printed from.
 ///
-/// A scheme requiring nothing prints no `where` at all, which is every scheme
-/// in a program that never wrote a `when`.
+/// A scheme requiring nothing prints no `where`. A single-use unconstrained
+/// presence prints as `?`; shared occurrences retain their common name.
+/// Declaration-level abbreviations belong to [`TypePresentation`], not here:
+/// this Display must remain usable inside an annotation.
 impl fmt::Display for Scheme {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.body().fmt(f)?;
-        if self.formula().is_true() {
-            return Ok(());
-        }
-        write!(f, " where {}", self.formula())
+        let names = scheme_names(self);
+        format_semantic_named(f, SemanticRoot::Ty(self.body()), Some(&names))?;
+        format_scheme_constraints(f, self, &names)
     }
+}
+
+fn format_scheme_constraints(
+    f: &mut fmt::Formatter<'_>,
+    scheme: &Scheme,
+    names: &[String],
+) -> fmt::Result {
+    if scheme.formula().is_true() {
+        return Ok(());
+    }
+    let lines = presentation_lines(scheme.formula(), names);
+    if lines.len() == 1 && lines[0].chars().count() <= 60 {
+        return write!(f, " where {}", lines[0]);
+    }
+    f.write_str("\nwhere\n")?;
+    for (at, line) in lines.iter().enumerate() {
+        write!(f, "  {line}")?;
+        if at + 1 != lines.len() {
+            f.write_str(";")?;
+        }
+        if at + 1 != lines.len() {
+            f.write_str("\n")?;
+        }
+    }
+    Ok(())
 }
 
 impl Rule {
@@ -4512,6 +5076,26 @@ pub fn write_tuple<V: fmt::Display>(
     f.write_str(")")
 }
 
+/// A positional type followed by its slot's presence. Grouping keeps a suffix
+/// from being claimed by a sum variant or the last effect of an arrow.
+pub fn tuple_type_element<V: Grouped>(value: V, mark: Option<Mark>) -> impl fmt::Display {
+    struct Element<V> {
+        value: V,
+        mark: Option<Mark>,
+    }
+    impl<V: Grouped> fmt::Display for Element<V> {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            if self.mark.is_some() && self.value.prec() < Prec::Atom {
+                write!(f, "({})", self.value)?;
+            } else {
+                write!(f, "{}", self.value)?;
+            }
+            write_row_mark(f, self.mark.as_ref())
+        }
+    }
+    Element { value, mark }
+}
+
 /// Render a tuple pattern, retaining its optional open struct rest.
 pub fn write_tuple_pattern<V: fmt::Display>(
     f: &mut fmt::Formatter<'_>,
@@ -4880,6 +5464,111 @@ mod tests {
         symbol::{Bundle, Mint, Namespace, Version},
         types::{Assigned, Formula, Presence, Rest, Row, RowField, Ty},
     };
+
+    #[test]
+    fn implication_factoring_preserves_meaning_and_order() {
+        let v = Formula::var;
+        let implies = |left: Formula, right: Formula| left.not().or(right);
+        for (formula, common_conclusion, expected) in [
+            (
+                implies(v(0), v(2)).and(implies(v(1), v(2))),
+                true,
+                "?0 or ?1 -> ?2",
+            ),
+            (
+                implies(v(0), v(1)).and(implies(v(0), v(2))),
+                false,
+                "?0 -> ?1 and ?2",
+            ),
+            (
+                implies(v(0), v(4))
+                    .and(v(6))
+                    .and(implies(v(1), v(5)))
+                    .and(implies(v(2), v(4)))
+                    .and(implies(v(3), v(5))),
+                true,
+                "(?0 or ?2 -> ?4) and ?6 and (?1 or ?3 -> ?5)",
+            ),
+            (
+                implies(implies(v(0), v(1)), v(3)).and(implies(v(2), v(3))),
+                true,
+                "(?0 -> ?1) or ?2 -> ?3",
+            ),
+        ] {
+            let factored = super::factor_implications(&formula, common_conclusion).unwrap();
+            assert_eq!(factored.to_string(), expected);
+            assert!(inference::sat::entails(&formula, &factored));
+            assert!(inference::sat::entails(&factored, &formula));
+        }
+        let disjunction = implies(v(0), v(2)).or(implies(v(1), v(2)));
+        assert!(super::factor_implications(&disjunction, true).is_none());
+        assert!(super::factor_implications(&disjunction, false).is_none());
+    }
+
+    #[test]
+    fn presentation_selects_factored_implications() {
+        let formula = Formula::var(0)
+            .not()
+            .or(Formula::var(2))
+            .and(Formula::var(1).not().or(Formula::var(2)));
+        assert_eq!(super::presentation_lines(&formula, &[]), ["?0 or ?1 -> ?2"]);
+        let formula = Formula::var(0)
+            .not()
+            .or(Formula::var(1))
+            .and(Formula::var(0).not().or(Formula::var(2)));
+        assert_eq!(
+            super::presentation_lines(&formula, &[]),
+            ["?0 -> ?1 and ?2"]
+        );
+    }
+
+    #[test]
+    fn implication_chains_preserve_edges_and_leave_branches_and_cycles_explicit() {
+        let implies = |a, b| Formula::var(a).not().or(Formula::var(b));
+        for (edges, expected) in [
+            (vec![(1, 0), (3, 2), (2, 1)], vec!["?3 <= ?2 <= ?1 <= ?0"]),
+            (
+                vec![(3, 2), (2, 1), (2, 0)],
+                vec!["?3 -> ?2", "?2 -> ?1", "?2 -> ?0"],
+            ),
+            (
+                vec![(3, 2), (2, 1), (2, 0), (1, 4)],
+                vec!["?3 -> ?2", "?2 <= ?1 <= ?4", "?2 -> ?0"],
+            ),
+            (vec![(0, 1), (1, 0)], vec!["?0 -> ?1", "?1 -> ?0"]),
+            (vec![(0, 0)], vec!["?0 -> ?0"]),
+        ] {
+            let formula = Formula::all(edges.into_iter().map(|(a, b)| implies(a, b)));
+            let (_, lines) = super::chained_constraints(&formula, &[]);
+            assert_eq!(lines, expected);
+        }
+        let nested = Formula::var(0).not().or(implies(1, 2));
+        assert_eq!(
+            super::chained_constraints(&nested, &[]).1,
+            ["?0 -> ?1 -> ?2"]
+        );
+    }
+
+    #[test]
+    fn implication_chains_reduce_transitive_edges_without_weakening_cycles() {
+        let implies = |a, b| Formula::var(a).not().or(Formula::var(b));
+        for edges in [
+            vec![(1, 0), (2, 0), (3, 0), (2, 1), (3, 1), (3, 2)],
+            vec![(0, 1), (1, 2), (2, 0), (0, 2), (1, 0), (2, 1)],
+        ] {
+            let formula = Formula::all(edges.into_iter().map(|(a, b)| implies(a, b)));
+            let reduced = super::reduce_implications(&formula).unwrap();
+            assert!(inference::sat::entails(&formula, &reduced));
+            assert!(inference::sat::entails(&reduced, &formula));
+        }
+        let formula =
+            Formula::all((1..4).flat_map(|left| (0..left).map(move |right| implies(left, right))));
+        let reduced = super::reduce_implications(&formula).unwrap();
+        assert_eq!(
+            super::chained_constraints(&reduced, &[]).1,
+            ["?3 <= ?2 <= ?1 <= ?0"]
+        );
+    }
 
     /// A constraint prints as what it demands, in the notation the Constraints tab
     /// shows it in. `~` is "must unify with".

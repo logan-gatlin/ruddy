@@ -1,0 +1,71 @@
+================================================================================
+Tuple slots support anonymous and named presence
+================================================================================
+
+let f: (Nat?, String when 'p) -> () = value
+type T 'p 'a = ('a when 'p,)
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (let_definition
+    (identifier)
+    (annotation
+      (function_type
+        (tuple_type
+          (marked_tuple_type_element
+            (identifier)
+            (optional_presence))
+          (marked_tuple_type_element
+            (identifier)
+            (when_clause
+              (type_variable))))
+        (unit)))
+    (identifier))
+  (type_definition
+    (identifier)
+    (type_variable)
+    (type_variable)
+    (annotation
+      (tuple_type
+        (marked_tuple_type_element
+          (type_variable)
+          (when_clause
+            (type_variable)))))))
+
+================================================================================
+Tuple slot markers are distinct from variant and effect markers
+================================================================================
+
+let f: (#A?, (#A)?, (Nat -> Nat + !Log)?) -> () = value
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (let_definition
+    (identifier)
+    (annotation
+      (function_type
+        (tuple_type
+          (sum_type
+            (sum_case
+              (tag)
+              (parenthesized_when
+                (optional_presence))))
+          (marked_tuple_type_element
+            (parenthesized_type
+              (sum_type
+                (sum_case
+                  (tag))))
+            (optional_presence))
+          (marked_tuple_type_element
+            (parenthesized_type
+              (function_type
+                (identifier)
+                (identifier)
+                (effect_row
+                  (effect_case
+                    (effect_label)))))
+            (optional_presence)))
+        (unit)))
+    (identifier)))

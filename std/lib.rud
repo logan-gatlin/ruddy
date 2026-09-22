@@ -248,6 +248,15 @@ module reflect
 \\  (fn value => std::nat::add value 1n)
 \\```
 module function
+@doc \\`optic` focuses immutable reads and updates through composable lenses and prisms.
+\\
+\\A lens can focus a nested field for both observation and replacement.
+\\
+\\```ruddy
+\\let name = std::optic::view name_lens person
+\\let renamed = std::optic::set name_lens "Grace" person
+\\```
+module optic
 @doc \\`tuple` constructs, reads, swaps, and transforms tuple values.
 \\
 \\The second value of a pair can be transformed without changing the first.

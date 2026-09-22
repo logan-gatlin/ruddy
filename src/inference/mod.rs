@@ -13646,6 +13646,20 @@ fn clause_formula(tails: &Tails, clause: &Clause) -> Formula {
             clause_formula(tails, left).and(clause_formula(tails, right))
         }
         ClauseKind::Or(left, right) => clause_formula(tails, left).or(clause_formula(tails, right)),
+        ClauseKind::Implies(left, right) => clause_formula(tails, left)
+            .not()
+            .or(clause_formula(tails, right)),
+        ClauseKind::Chain(parts) => {
+            let parts: Vec<_> = parts
+                .iter()
+                .map(|part| clause_formula(tails, part))
+                .collect();
+            Formula::all(
+                parts
+                    .windows(2)
+                    .map(|pair| pair[0].clone().not().or(pair[1].clone())),
+            )
+        }
         ClauseKind::Equal(left, right) => {
             clause_formula(tails, left).iff(clause_formula(tails, right))
         }

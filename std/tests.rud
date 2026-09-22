@@ -42,6 +42,7 @@ module randomness
 module randomness_sampling
 module primitives
 module functional
+module optics
 
 @if { platform: "node" }
 module platform

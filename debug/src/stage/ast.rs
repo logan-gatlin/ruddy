@@ -692,6 +692,7 @@ fn pattern_node(ids: &mut Ids, pattern: &Pattern) -> Node {
 fn when_text(when: &Option<Box<When>>) -> String {
     match when {
         None => String::new(),
+        Some(when) if when.short => "?".to_string(),
         Some(when) => match &when.name {
             Some(name) => format!(" when '{}", name.tracked),
             None => " when _".to_string(),
@@ -745,9 +746,11 @@ fn clause_text(clause: &Clause) -> String {
 fn clause_kids(ids: &mut Ids, clause: &Clause) -> Vec<Node> {
     let parts: Vec<&Clause> = match &clause.tracked {
         ClauseKind::Name(_) => Vec::new(),
+        ClauseKind::Chain(parts) => parts.iter().collect(),
         ClauseKind::Not(inner) => vec![inner],
         ClauseKind::And(left, right)
         | ClauseKind::Or(left, right)
+        | ClauseKind::Implies(left, right)
         | ClauseKind::Equal(left, right)
         | ClauseKind::NotEqual(left, right) => vec![left, right],
     };
@@ -941,7 +944,11 @@ fn type_node(ids: &mut Ids, ty: &Type) -> Node {
             label: "Tuple".into(),
             ..node
         }
-        .children(elements.iter().map(|element| type_node(ids, element))),
+        .children(elements.iter().map(|element| {
+            let mut node = type_node(ids, &element.value);
+            node.label.push_str(&when_text(&element.when));
+            node.at(element.span)
+        })),
         TypeKind::Mut(region, element) => Node {
             label: "Mut".into(),
             ..node

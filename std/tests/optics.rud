@@ -1,0 +1,80 @@
+@test
+let lenses_view_set_transform_and_compose: () -> () + test::!Assert = fn _ => do
+  let name_lens: optic::Lens { age: Nat, name: String } String = optic::lens
+    (fn person => person.name)
+    (fn name person => { name: name, ..person })
+  let profile_lens:
+    optic::Lens { active: Bool, profile: { city: String, score: Nat } } {
+      city: String,
+      score: Nat,
+    } =
+    optic::lens
+      (fn account => account.profile)
+      (fn profile account => { profile: profile, ..account })
+  let city_lens: optic::Lens { city: String, score: Nat } String = optic::lens
+    (fn profile => profile.city)
+    (fn city profile => { city: city, ..profile })
+  let account_city = optic::compose_lens profile_lens city_lens
+
+  let person = { age: 37n, name: "Ada" }
+  let renamed = optic::set name_lens "Grace" person
+  let celebrated = optic::over name_lens str::to_uppercase renamed
+  let account = { active: true, profile: { city: "London", score: 42n } }
+  let moved = optic::set account_city "Chicago" account
+
+  _ = test::assert
+    (match optic::view name_lens person with | "Ada" => true | _ => false end)
+    "optic: lens view"
+  _ = test::assert
+    (match renamed with | { age: 37n, name: "Grace" } => true | _ => false end)
+    "optic: lens set"
+  _ = test::assert
+    (match celebrated with | { age: 37n, name: "GRACE" } => true | _ => false end)
+    "optic: lens over"
+  _ = test::assert
+    (match moved with
+    | { active: true, profile: { city: "Chicago", score: 42n } } => true
+    | _ => false
+    end)
+    "optic: lens composition"
+  return ()
+end
+
+@test
+let prisms_preview_review_transform_and_compose: () -> () + test::!Assert = fn _ => do
+  let some_nat: optic::Prism (Option Nat) Nat = optic::prism
+    (fn value => match value with | #Some part => #Some part | #None => #None end)
+    (fn part => #Some part)
+  let some_option_nat: optic::Prism (Option (Option Nat)) (Option Nat) = optic::prism
+    (fn value => match value with | #Some part => #Some part | #None => #None end)
+    (fn part => #Some part)
+  let nested_some = optic::compose_prism some_option_nat some_nat
+
+  let incremented = optic::over_prism some_nat (nat::add 1n) (#Some 41n)
+  let untouched = optic::over_prism some_nat (nat::add 1n) #None
+  let replaced = optic::set_prism some_nat 7n (#Some 1n)
+  let nested = optic::over_prism nested_some (nat::add 1n) (#Some (#Some 41n))
+
+  _ = test::assert
+    (match optic::preview some_nat (#Some 42n) with | #Some 42n => true | _ => false end)
+    "optic: prism preview match"
+  _ = test::assert
+    (match optic::preview some_nat #None with | #None => true | _ => false end)
+    "optic: prism preview miss"
+  _ = test::assert
+    (match optic::review some_nat 42n with | #Some 42n => true | _ => false end)
+    "optic: prism review"
+  _ = test::assert
+    (match incremented with | #Some 42n => true | _ => false end)
+    "optic: prism over match"
+  _ = test::assert
+    (match untouched with | #None => true | _ => false end)
+    "optic: prism over miss"
+  _ = test::assert
+    (match replaced with | #Some 7n => true | _ => false end)
+    "optic: prism set"
+  _ = test::assert
+    (match nested with | #Some (#Some 42n) => true | _ => false end)
+    "optic: prism composition"
+  return ()
+end

@@ -437,9 +437,10 @@ pub enum Atom {
 /// whole reason this exists — see the `presence-sat` spec's motivation.
 ///
 /// A tree rather than a normal form, because it is written as one: the surface
-/// `where` grammar has `=`, `!=`, `or`, `and` and `not`, and an annotation that
-/// re-parses as itself has to keep them. [`Formula::canonical`] is where a
-/// normal form is taken, once, at generalization.
+/// `where` grammar has `->`, `=`, `!=`, `or`, `and` and `not`, and an annotation
+/// that re-parses as itself has to keep them. [`Formula::canonical`] is where a
+/// normal form is taken, once, at generalization. `a -> b` is represented by
+/// its ordinary `not a or b` formula.
 ///
 /// The constructors below simplify as they build — `and` with [`Formula::True`]
 /// is the other side — so the common case of a formula that says nothing is the

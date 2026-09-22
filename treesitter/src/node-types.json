@@ -1886,6 +1886,37 @@
     }
   },
   {
+    "type": "clause_chain",
+    "named": true,
+    "fields": {},
+    "children": {
+      "multiple": true,
+      "required": true,
+      "types": [
+        {
+          "type": "clause_and",
+          "named": true
+        },
+        {
+          "type": "clause_not",
+          "named": true
+        },
+        {
+          "type": "clause_or",
+          "named": true
+        },
+        {
+          "type": "parenthesized_clause",
+          "named": true
+        },
+        {
+          "type": "type_variable",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
     "type": "clause_comparison",
     "named": true,
     "fields": {
@@ -1935,6 +1966,84 @@
         "types": [
           {
             "type": "clause_and",
+            "named": true
+          },
+          {
+            "type": "clause_not",
+            "named": true
+          },
+          {
+            "type": "clause_or",
+            "named": true
+          },
+          {
+            "type": "parenthesized_clause",
+            "named": true
+          },
+          {
+            "type": "type_variable",
+            "named": true
+          }
+        ]
+      }
+    }
+  },
+  {
+    "type": "clause_implication",
+    "named": true,
+    "fields": {
+      "left": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "clause_and",
+            "named": true
+          },
+          {
+            "type": "clause_chain",
+            "named": true
+          },
+          {
+            "type": "clause_comparison",
+            "named": true
+          },
+          {
+            "type": "clause_not",
+            "named": true
+          },
+          {
+            "type": "clause_or",
+            "named": true
+          },
+          {
+            "type": "parenthesized_clause",
+            "named": true
+          },
+          {
+            "type": "type_variable",
+            "named": true
+          }
+        ]
+      },
+      "right": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "clause_and",
+            "named": true
+          },
+          {
+            "type": "clause_chain",
+            "named": true
+          },
+          {
+            "type": "clause_comparison",
+            "named": true
+          },
+          {
+            "type": "clause_implication",
             "named": true
           },
           {
@@ -4875,6 +4984,96 @@
     }
   },
   {
+    "type": "marked_tuple_type_element",
+    "named": true,
+    "fields": {
+      "type": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "array_type",
+            "named": true
+          },
+          {
+            "type": "boolean",
+            "named": true
+          },
+          {
+            "type": "effect_type",
+            "named": true
+          },
+          {
+            "type": "function_type",
+            "named": true
+          },
+          {
+            "type": "hidden_type",
+            "named": true
+          },
+          {
+            "type": "hole",
+            "named": true
+          },
+          {
+            "type": "identifier",
+            "named": true
+          },
+          {
+            "type": "mut_type",
+            "named": true
+          },
+          {
+            "type": "parenthesized_type",
+            "named": true
+          },
+          {
+            "type": "path",
+            "named": true
+          },
+          {
+            "type": "struct_type",
+            "named": true
+          },
+          {
+            "type": "sum_type",
+            "named": true
+          },
+          {
+            "type": "tuple_type",
+            "named": true
+          },
+          {
+            "type": "type_application",
+            "named": true
+          },
+          {
+            "type": "type_variable",
+            "named": true
+          },
+          {
+            "type": "unit",
+            "named": true
+          }
+        ]
+      },
+      "when": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "optional_presence",
+            "named": true
+          },
+          {
+            "type": "when_clause",
+            "named": true
+          }
+        ]
+      }
+    }
+  },
+  {
     "type": "match_arm",
     "named": true,
     "fields": {
@@ -5631,7 +5830,15 @@
           "named": true
         },
         {
+          "type": "clause_chain",
+          "named": true
+        },
+        {
           "type": "clause_comparison",
+          "named": true
+        },
+        {
+          "type": "clause_implication",
           "named": true
         },
         {
@@ -6017,6 +6224,10 @@
       "multiple": false,
       "required": true,
       "types": [
+        {
+          "type": "optional_presence",
+          "named": true
+        },
         {
           "type": "when_clause",
           "named": true
@@ -7111,6 +7322,10 @@
         "required": false,
         "types": [
           {
+            "type": "optional_presence",
+            "named": true
+          },
+          {
             "type": "when_clause",
             "named": true
           }
@@ -7627,6 +7842,10 @@
             "named": true
           },
           {
+            "type": "marked_tuple_type_element",
+            "named": true
+          },
+          {
             "type": "mut_type",
             "named": true
           },
@@ -7987,7 +8206,15 @@
           "named": true
         },
         {
+          "type": "clause_chain",
+          "named": true
+        },
+        {
           "type": "clause_comparison",
+          "named": true
+        },
+        {
+          "type": "clause_implication",
           "named": true
         },
         {
@@ -8221,6 +8448,10 @@
   },
   {
     "type": "numeric_field",
+    "named": true
+  },
+  {
+    "type": "optional_presence",
     "named": true
   },
   {

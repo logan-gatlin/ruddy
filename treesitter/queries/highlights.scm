@@ -28,6 +28,7 @@
 (parenthesized_type (identifier) @type)
 (tuple_type element: (identifier) @type)
 (struct_type_field type: (identifier) @type)
+(marked_tuple_type_element type: (identifier) @type)
 (fixed_type_spread type: (identifier) @type)
 (fixed_type_spread type: (path name: (identifier) @type))
 (fixed_type_spread ".." @operator)
@@ -54,6 +55,7 @@
 (parenthesized_type (path name: (identifier) @type))
 (tuple_type element: (path name: (identifier) @type))
 (struct_type_field type: (path name: (identifier) @type))
+(marked_tuple_type_element type: (path name: (identifier) @type))
 (sum_case payload: (path name: (identifier) @type))
 (effect_operation_field signature: (function_type from: (path name: (identifier) @type)))
 (effect_operation_field signature: (function_type to: (path name: (identifier) @type)))
@@ -221,6 +223,8 @@
   "\\"
   ".."
 ] @operator
+
+(optional_presence) @operator
 
 (rest_pattern "..") @operator
 (rest_pattern name: (identifier) @variable)

@@ -1818,16 +1818,18 @@ impl<'a> Printer<'a> {
     }
 
     /// A `where` clause's formula, with the parentheses re-parsing needs, by
-    /// the ladder the debugger's printer keeps: `0` for a comparison, `1`
-    /// for `or`, `2` for `and`, `3` for `not`, `4` for a name.
+    /// the ladder the debugger's printer keeps: `0` for implication, `1` for
+    /// a comparison, `2` for `or`, `3` for `and`, `4` for `not`, `5` for a
+    /// name.
     fn clause(&self, clause: &ClauseKind, level: u8) -> Doc {
         fn prec(clause: &ClauseKind) -> u8 {
             match clause {
-                ClauseKind::Equal(..) | ClauseKind::NotEqual(..) => 0,
-                ClauseKind::Or(..) => 1,
-                ClauseKind::And(..) => 2,
-                ClauseKind::Not(_) => 3,
-                ClauseKind::Name(_) => 4,
+                ClauseKind::Implies(..) => 0,
+                ClauseKind::Equal(..) | ClauseKind::NotEqual(..) | ClauseKind::Chain(..) => 1,
+                ClauseKind::Or(..) => 2,
+                ClauseKind::And(..) => 3,
+                ClauseKind::Not(_) => 4,
+                ClauseKind::Name(_) => 5,
             }
         }
         let parens = prec(clause) < level;
@@ -1836,18 +1838,26 @@ impl<'a> Printer<'a> {
         };
         let doc = match clause {
             ClauseKind::Name(name) => text(format!("'{name}")),
-            ClauseKind::Not(inner) => concat(vec![text("not "), side(inner, 3)]),
+            ClauseKind::Not(inner) => concat(vec![text("not "), side(inner, 4)]),
             ClauseKind::And(left, right) => {
-                concat(vec![side(left, 2), text(" and "), side(right, 3)])
+                concat(vec![side(left, 3), text(" and "), side(right, 4)])
             }
             ClauseKind::Or(left, right) => {
-                concat(vec![side(left, 1), text(" or "), side(right, 2)])
+                concat(vec![side(left, 2), text(" or "), side(right, 3)])
+            }
+            ClauseKind::Implies(left, right) => {
+                concat(vec![side(left, 1), text(" -> "), side(right, 0)])
+            }
+            ClauseKind::Chain(parts) => {
+                join(parts.iter().map(|part| side(part, 2)).collect(), || {
+                    text(" <= ")
+                })
             }
             ClauseKind::Equal(left, right) => {
-                concat(vec![side(left, 1), text(" = "), side(right, 1)])
+                concat(vec![side(left, 2), text(" = "), side(right, 2)])
             }
             ClauseKind::NotEqual(left, right) => {
-                concat(vec![side(left, 1), text(" != "), side(right, 1)])
+                concat(vec![side(left, 2), text(" != "), side(right, 2)])
             }
         };
         parenthesized(parens, doc)
@@ -2766,7 +2776,9 @@ impl<'a> Printer<'a> {
                             );
                             let mut parts = vec![self.label(name)];
                             if let Some(when) = when {
-                                parts.push(Doc::Space);
+                                if !when.short {
+                                    parts.push(Doc::Space);
+                                }
                                 parts.push(self.when(when));
                             }
                             parts.push(text(": "));
@@ -2815,8 +2827,7 @@ impl<'a> Printer<'a> {
                             SumCase::Written { when, payload } => {
                                 let mut parts = vec![text(self.slice(name.span))];
                                 if let Some(when) = when {
-                                    parts.push(Doc::Space);
-                                    parts.push(concat(vec![text("("), self.when(when), text(")")]));
+                                    parts.push(self.grouped_when(when));
                                 }
                                 if let Some(payload) = payload {
                                     parts.push(Doc::Space);
@@ -2903,7 +2914,22 @@ impl<'a> Printer<'a> {
                 self.brackets(
                     "(",
                     ")",
-                    elements.iter().map(|element| self.ty(element)).collect(),
+                    elements
+                        .iter()
+                        .map(|element| {
+                            let mut parts = vec![self.ty_in(
+                                &element.value,
+                                element.when.is_some() && prec(&element.value) < Prec::Atom,
+                            )];
+                            if let Some(when) = &element.when {
+                                if !when.short {
+                                    parts.push(Doc::Space);
+                                }
+                                parts.push(self.when(when));
+                            }
+                            self.with_comments(element.span, concat(parts))
+                        })
+                        .collect(),
                     trailing,
                     self.dangling_docs(ty.span),
                     signal,
@@ -2934,6 +2960,9 @@ impl<'a> Printer<'a> {
     }
 
     fn when(&self, when: &When) -> Doc {
+        if when.short {
+            return self.with_comments(when.span, text("?"));
+        }
         self.with_comments(
             when.span,
             match &when.name {
@@ -2941,6 +2970,14 @@ impl<'a> Printer<'a> {
                 None => text("when _"),
             },
         )
+    }
+
+    fn grouped_when(&self, when: &When) -> Doc {
+        if when.short {
+            self.when(when)
+        } else {
+            concat(vec![text(" ("), self.when(when), text(")")])
+        }
     }
 
     fn tail(&self, rest: &Rest) -> Doc {
@@ -2972,8 +3009,7 @@ impl<'a> Printer<'a> {
                 doc.push(self.ty_in(arg, ui::type_prec(&arg.tracked) < Prec::Atom));
             }
             if let Some(when) = when {
-                doc.push(Doc::Space);
-                doc.push(concat(vec![text("("), self.when(when), text(")")]));
+                doc.push(self.grouped_when(when));
             }
             parts.push(self.with_comments(span, concat(doc)));
         }
@@ -3420,8 +3456,10 @@ fn clause_skeleton(clause: &Clause) -> Skel {
     let kids = match &clause.tracked {
         ClauseKind::Name(_) => Vec::new(),
         ClauseKind::Not(inner) => vec![clause_skeleton(inner)],
+        ClauseKind::Chain(parts) => parts.iter().map(clause_skeleton).collect(),
         ClauseKind::And(left, right)
         | ClauseKind::Or(left, right)
+        | ClauseKind::Implies(left, right)
         | ClauseKind::Equal(left, right)
         | ClauseKind::NotEqual(left, right) => {
             vec![clause_skeleton(left), clause_skeleton(right)]
@@ -3579,9 +3617,14 @@ fn type_skeleton(ty: &Type) -> Skel {
             kids.extend(args.iter().map(type_skeleton));
             Skel::new(ty.span, kids)
         }
-        TypeKind::Tuple(elements) => {
-            Skel::new(ty.span, elements.iter().map(type_skeleton).collect()).closed()
-        }
+        TypeKind::Tuple(elements) => Skel::new(
+            ty.span,
+            elements
+                .iter()
+                .map(|element| Skel::new(element.span, vec![type_skeleton(&element.value)]))
+                .collect(),
+        )
+        .closed(),
         TypeKind::Array(element) => Skel::new(ty.span, vec![type_skeleton(element)]).closed(),
         TypeKind::Mut(region, element) => {
             Skel::new(ty.span, vec![type_skeleton(region), type_skeleton(element)])

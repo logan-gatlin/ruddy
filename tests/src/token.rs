@@ -441,21 +441,16 @@ fn lexes_the_effect_mark() {
     assert!(errors("+").is_empty());
 }
 
-/// The `?` that used to mark an optional field is gone from the language, so
-/// the character begins no token at all and is reported where it was written.
+/// Optional presence is a suffix token, not part of the preceding label.
 #[test]
-fn the_question_mark_is_no_longer_a_token() {
+fn the_question_mark_is_an_optional_presence_token() {
     let out = errors("a?: A");
-    assert_eq!(out.len(), 1, "errors: {out:#?}");
-    assert_eq!(out[0].kind, ErrorKind::InvalidCharacter { character: '?' });
-    assert_eq!(out[0].span.start, 1);
-    assert_eq!(out[0].span.width, 1);
-    // And nothing in the stream stands for it: the rest lexes as it always did.
+    assert!(out.is_empty(), "errors: {out:#?}");
     assert!(matches!(
         tokens_of("a?: A")[..],
         [
             Kind::Identifier(_),
-            Kind::Invalid,
+            Kind::Question,
             Kind::Colon,
             Kind::Identifier(_)
         ]

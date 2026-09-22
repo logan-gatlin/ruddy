@@ -1,0 +1,35 @@
+================================================================================
+Anonymous field, variant, and effect presence suffixes
+================================================================================
+
+let f: { x?: Nat } -> (#A? Nat | #B?) + !Log? = value
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (let_definition
+    (identifier)
+    (annotation
+      (function_type
+        (struct_type
+          (struct_type_field
+            (identifier)
+            (optional_presence)
+            (identifier)))
+        (parenthesized_type
+          (sum_type
+            (sum_case
+              (tag)
+              (parenthesized_when
+                (optional_presence))
+              (identifier))
+            (sum_case
+              (tag)
+              (parenthesized_when
+                (optional_presence)))))
+        (effect_row
+          (effect_case
+            (effect_label)
+            (parenthesized_when
+              (optional_presence))))))
+    (identifier)))

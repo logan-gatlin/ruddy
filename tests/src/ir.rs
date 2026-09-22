@@ -6767,6 +6767,20 @@ fn a_formula_names_only_what_a_when_wears() {
     }
 }
 
+#[test]
+fn implication_chains_report_every_unbound_operand() {
+    let (_, out) = build_src("let f: { x when 'a: Nat } -> () where 'a <= 'b <= 'c = fn _ => ()");
+    let names: Vec<_> = out
+        .errors
+        .iter()
+        .filter_map(|error| match &error.kind {
+            ErrorKind::UnboundPresence { name } => Some(name.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(names, ["b", "c"]);
+}
+
 /// A declaration's variables are its parameters, so a variable written in one's
 /// body or `where` clause must be declared in its header.
 /// Each undeclared use is reported at its own name, so a body with several

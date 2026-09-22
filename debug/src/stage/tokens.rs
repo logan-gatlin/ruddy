@@ -105,6 +105,7 @@ pub fn label(kind: &Kind) -> &'static str {
         Kind::FatArrow => "FatArrow",
         Kind::Arrow => "Arrow",
         Kind::Colon => "Colon",
+        Kind::Question => "Question",
         Kind::ColonColon => "ColonColon",
         Kind::Comma => "Comma",
         Kind::Semicolon => "Semicolon",

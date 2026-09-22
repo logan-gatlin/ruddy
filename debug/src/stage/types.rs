@@ -54,11 +54,25 @@ pub fn build(spec: &Spec, cx: &Cx) -> Stage {
             program.types.get(symbol).map(|decl| decl.name_at),
         )
     });
+    let presentation = |scheme: &Scheme, symbol: Symbol| {
+        ruddy::ui::TypePresentation::new(
+            scheme,
+            output
+                .aliases()
+                .iter()
+                .filter(|(alias, _)| {
+                    program.types.contains_key(*alias)
+                        && mint.parent(**alias) == mint.parent(symbol)
+                })
+                .map(|(alias, scheme)| (mint.name(*alias), scheme)),
+        )
+        .to_string()
+    };
     let externs = output.externs().iter().map(|(symbol, scheme)| {
         (
             "extern",
             *symbol,
-            scheme.to_string(),
+            presentation(scheme, *symbol),
             program.externs.get(symbol).map(|decl| decl.name_at),
         )
     });
@@ -66,7 +80,7 @@ pub fn build(spec: &Spec, cx: &Cx) -> Stage {
         (
             "let",
             *symbol,
-            scheme.to_string(),
+            presentation(scheme, *symbol),
             program.terms.get(symbol).map(|decl| decl.name_at),
         )
     });
@@ -136,7 +150,7 @@ pub fn build(spec: &Spec, cx: &Cx) -> Stage {
             if let Some(decl) = program.terms.get(&symbol) {
                 for local in locals(&decl.value) {
                     let scheme = match output.locals().get(&local.anchored) {
-                        Some(scheme) => scheme.to_string(),
+                        Some(scheme) => presentation(scheme, symbol),
                         // Nothing was published for it, which means inference
                         // never reached it: the definition failed to lower, and
                         // its value was erased.

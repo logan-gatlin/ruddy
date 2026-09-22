@@ -366,7 +366,7 @@ fn a_row_reads_as_written_and_as_quantified() {
         (
             "let h : { x when 'a: Nat, y: Nat } -> Nat = fn r => r.y",
             "{ x when 'a: Nat, y: Nat } -> Nat",
-            "{ x when 'a: Nat, y: Nat } -> Nat",
+            "{ x?: Nat, y: Nat } -> Nat",
         ),
     ] {
         let (as_written, as_inferred) = types_of(source);
@@ -670,6 +670,10 @@ fn both_trees_render_a_where_clause_the_same_way() {
     for source in [
         "let f : { x when 'a: Nat } where 'a = { x: 1n }",
         "let f : { x when 'a: Nat, y when 'b: Nat } where 'a != 'b = { x: 1n }",
+        "let f : { x when 'a: Nat, y when 'b: Nat } where 'a -> 'b = { x: 1n, y: 2n }",
+        "let f : { x when 'a: Nat, y when 'b: Nat, z when 'c: Nat } where 'c <= 'b <= 'a = { x: 1n }",
+        "let f : { x when 'a: Nat, y when 'b: Nat, z when 'c: Nat } where ('c -> 'b) <= 'a = { x: 1n }",
+        "let f : { x when 'a: Nat, y when 'b: Nat, z when 'c: Nat } where 'c <= ('b <= 'a) = { x: 1n }",
         "let f : { x when 'a: Nat, y when 'b: Nat } where 'a = 'b = { x: 1n }",
         "let f : { x when 'a: Nat, y when 'b: Nat } where not ('a and 'b) = { x: 1n }",
         "let f : { x when 'a: Nat, y when 'b: Nat } where 'a or 'b = { x: 1n }",
@@ -692,7 +696,7 @@ fn a_scheme_prints_the_clause_it_requires() {
     for (source, expected) in [
         (
             "let p = fn a => match a with | {x} => {} | {y} => {} end",
-            "{ x when 'a: 'c, y when 'b: 'd } -> () where 'a != 'b",
+            "{ x when 'input_0_x: 'a, y when 'input_0_y: 'b } -> () where 'input_0_x != 'input_0_y",
         ),
         ("let id = fn x => x", "'a -> 'a"),
     ] {
@@ -781,7 +785,7 @@ fn a_printed_effect_row_re_lowers_to_itself() {
         // A `where` clause on effect presences prints as it was written.
         (
             "Nat -> Nat + !Log (when 'a) + !IO (when 'b) where 'a != 'b",
-            "Nat -> Nat + !Log (when 'a) + !IO (when 'b) where 'a != 'b",
+            "Nat -> Nat + !Log (when 'input_0_effects_log) + !IO (when 'input_0_effects_io) where 'input_0_effects_log != 'input_0_effects_io",
         ),
     ] {
         // Two arguments where the annotation takes two, so that pushing the
@@ -851,9 +855,8 @@ fn both_trees_render_the_effect_forms() {
     assert_eq!(again, ir);
 }
 
-/// Every variable a scheme quantifies prints as the bare letter a `where 'let`
-/// declares it as — no prefix, whichever of the three sorts it is — and the
-/// clause beside the type is what says which letters those are.
+/// Presence variables take names from the paths they control, while the other
+/// quantified sorts retain compact letters.
 #[test]
 fn a_scheme_declares_the_letters_it_quantifies() {
     // A type, a struct's rest, a sum's rest and a presence, each in its own
@@ -883,10 +886,7 @@ fn a_scheme_declares_the_letters_it_quantifies() {
         }))),
     )));
     let scheme = Scheme::constrained(4, 1, body, Formula::True);
-    assert_eq!(
-        scheme.to_string(),
-        "{ x: 'b, ..'c } -> #A (when 'a) 'b | ..'d"
-    );
+    assert_eq!(scheme.to_string(), "{ x: 'a, ..'b } -> #A? 'a | ..'c");
 
     // A formula follows the declarations, separated by the `;` the grammar
     // reads the two statements apart with.
@@ -918,7 +918,7 @@ fn a_scheme_declares_the_letters_it_quantifies() {
     );
     assert_eq!(
         both.to_string(),
-        "{ x when 'a: Nat, y when 'b: Nat } where 'a != 'b"
+        "{ x when 'x: Nat, y when 'y: Nat } where 'x != 'y"
     );
 
     // A scheme requiring something of a presence it does not itself quantify
@@ -967,6 +967,86 @@ fn a_scheme_declares_the_letters_it_quantifies() {
     assert_eq!(solver.to_string(), "{ x when ?4: ?, ..?3 }");
 }
 
+/// Presentation compares normal forms per connected group. The eight products
+/// of this DNF are more expensive than its three connected CNF clauses, which
+/// become separate, path-named constraints.
+#[test]
+fn a_scheme_chooses_the_cheaper_normal_form_and_breaks_constraints() {
+    let body = Arc::new(Ty::Struct(Row {
+        labels: ["a", "b", "c", "d", "e", "f", "z"]
+            .into_iter()
+            .enumerate()
+            .map(|(at, name)| {
+                (
+                    name.to_string(),
+                    RowField {
+                        presence: Presence::Bound(at as u32),
+                        ty: Arc::new(Ty::plain(Ty::Nat)),
+                    },
+                )
+            })
+            .collect(),
+        rest: Rest::Closed,
+    }));
+    let formula = Formula::bound(6).or(Formula::any((0..8).map(|bits| {
+        Formula::all([
+            Formula::bound(if bits & 1 == 0 { 0 } else { 1 }),
+            Formula::bound(if bits & 2 == 0 { 2 } else { 3 }),
+            Formula::bound(if bits & 4 == 0 { 4 } else { 5 }),
+        ])
+    })));
+    let scheme = Scheme::constrained(7, 7, body, formula);
+
+    assert_eq!(
+        scheme.to_string(),
+        concat!(
+            "{ a when 'a: Nat, b when 'b: Nat, c when 'c: Nat, d when 'd: Nat, ",
+            "e when 'e: Nat, f when 'f: Nat, z when 'z: Nat }\n",
+            "where\n",
+            "  'z or 'a or 'b;\n",
+            "  'z or 'c or 'd;\n",
+            "  'z or 'e or 'f"
+        )
+    );
+}
+
+#[test]
+fn presence_names_follow_input_output_and_tuple_paths() {
+    let conditional = |name: &str, presence| {
+        Arc::new(Ty::Struct(Row {
+            labels: [(
+                name.to_string(),
+                RowField {
+                    presence: Presence::Bound(presence),
+                    ty: Arc::new(Ty::plain(Ty::Nat)),
+                },
+            )]
+            .into_iter()
+            .collect(),
+            rest: Rest::Closed,
+        }))
+    };
+    let output = Arc::new(Ty::Struct(Row {
+        labels: [
+            (
+                "0".to_string(),
+                RowField::present(Arc::new(Ty::Struct(Row::closed()))),
+            ),
+            ("1".to_string(), RowField::present(conditional("green", 1))),
+        ]
+        .into_iter()
+        .collect(),
+        rest: Rest::Closed,
+    }));
+    let body = Arc::new(Ty::plain(Ty::pure(conditional("red", 0), output)));
+    let scheme = Scheme::constrained(2, 2, body, Formula::bound(0).iff(Formula::bound(1)));
+
+    assert_eq!(
+        scheme.to_string(),
+        "{ red when 'input_0_red: Nat } -> ((), { green when 'output_1_green: Nat }) where 'input_0_red = 'output_1_green"
+    );
+}
+
 /// A printed scheme is valid source. `let id = fn x => x` reports
 /// `a -> a`, and pasting that back as an annotation re-lowers to
 /// the type it was printed from — which an implied quantifier could not do,
@@ -989,8 +1069,326 @@ fn a_printed_scheme_reads_back_as_source() {
     }
 }
 
+/// The original wide-channel regression, through inference and the scheme
+/// printer rather than only the propositional presentation helpers.
+#[test]
+fn swizzle_prints_channel_requirements_as_implications() {
+    let source = r#"
+let get_channel = fn channel img => match channel with
+| #Red => img.r | #Green => img.g | #Blue => img.b | #Alpha => img.a end
+let set_channel = fn channel value img => match channel with
+| #Red => { r: value, ..img } | #Green => { g: value, ..img }
+| #Blue => { b: value, ..img } | #Alpha => { a: value, ..img } end
+let try_get_set = fn get set img => match (get, set) with
+| (#None, _) => img | (_, #None) => img
+| (get, set) => set_channel set (get_channel get img) img end
+let extend4 = fn
+| () => (#None, #None, #None, #None)
+| (a,) => (a, #None, #None, #None)
+| (a, b) => (a, b, #None, #None)
+| (a, b, c) => (a, b, c, #None)
+| (a, b, c, d) => (a, b, c, d)
+let swizzle = fn in_channels out_channels img => do
+    let (in_a, in_b, in_c, in_d) = extend4 in_channels
+    let (out_a, out_b, out_c, out_d) = extend4 out_channels
+    return img |> try_get_set in_a out_a |> try_get_set in_b out_b
+               |> try_get_set in_c out_c |> try_get_set in_d out_d
+end
+"#;
+    let signature = printed_scheme(source);
+    let (_, constraints) = signature.split_once("\nwhere\n").expect("constraints");
+    assert!(
+        signature.starts_with('('),
+        "tuple input must stay a tuple: {signature}"
+    );
+    let compact = presented_scheme(source);
+    assert!(!compact.definitions.is_empty(), "{compact}");
+    assert!(compact.to_string().len() < signature.len(), "{compact}");
+    let annotated = source.replace(
+        "let swizzle =",
+        &format!("{} =", compact.declaration("let swizzle: ")),
+    );
+    printed_scheme(&annotated);
+    assert_eq!(constraints.lines().count(), 6, "{constraints}");
+    for input in 0..2 {
+        let chain =
+            format!("'input_{input}_3 <= 'input_{input}_2 <= 'input_{input}_1 <= 'input_{input}_0");
+        assert!(
+            constraints
+                .lines()
+                .any(|line| line.trim().trim_end_matches(';') == chain),
+            "{constraints}"
+        );
+    }
+    for (color, field) in [("red", "r"), ("green", "g"), ("blue", "b"), ("alpha", "a")] {
+        let premises = (0..2)
+            .flat_map(|input| (0..4).map(move |slot| format!("'input_{input}_{slot}_{color}")))
+            .collect::<Vec<_>>()
+            .join(" or ");
+        let clause = format!("{premises} -> 'input_2_{field}");
+        assert!(
+            constraints
+                .lines()
+                .any(|line| line.trim().trim_end_matches(';') == clause),
+            "missing {clause}: {constraints}"
+        );
+    }
+    let annotated = source.replace("let swizzle =", &format!("let swizzle: {signature} ="));
+    // Reading the signature back must type-check and retain its body. The
+    // annotation may give inference a different factoring of the constraints.
+    let roundtrip = printed_scheme(&annotated);
+    assert_eq!(
+        roundtrip.split_once("\nwhere\n").unwrap().0,
+        signature.split_once("\nwhere\n").unwrap().0
+    );
+}
+
+#[test]
+fn extend4_prints_its_input_prefix_as_an_implication_chain() {
+    let source = "let extend4 = fn
+        | () => (#None, #None, #None, #None)
+        | (a,) => (a, #None, #None, #None)
+        | (a, b) => (a, b, #None, #None)
+        | (a, b, c) => (a, b, c, #None)
+        | (a, b, c, d) => (a, b, c, d)";
+    let signature = printed_scheme(source);
+    assert!(
+        signature.starts_with('('),
+        "tuple input must stay a tuple: {signature}"
+    );
+    let compact = presented_scheme(source);
+    let compact_source = source.replace(
+        "let extend4 =",
+        &format!("{} =", compact.declaration("let extend4: ")),
+    );
+    printed_scheme(&compact_source);
+    assert!(
+        signature.contains("'input_0_3 <= 'input_0_2 <= 'input_0_1 <= 'input_0_0"),
+        "{signature}"
+    );
+    let annotated = source.replace("let extend4 =", &format!("let extend4: {signature} ="));
+    let roundtrip = printed_scheme(&annotated);
+    assert_eq!(
+        roundtrip.split_once("where").unwrap().0,
+        signature.split_once("where").unwrap().0
+    );
+}
+
 /// The scheme of the last definition in `source`, as it prints.
 fn printed_scheme(source: &str) -> String {
+    with_scheme(source, |scheme, _, _| scheme.to_string())
+}
+
+#[test]
+fn inferred_optional_tuple_elements_keep_tuple_syntax() {
+    let source = "let f = fn | () => () | (a,) => ()";
+    let signature = printed_scheme(source);
+    assert_eq!(signature, "('a?,) -> ()");
+    assert_eq!(
+        printed_scheme(&format!("let f: {signature} = fn | () => () | (a,) => ()")),
+        signature
+    );
+}
+
+#[test]
+fn named_tuple_presences_and_nested_markers_read_back() {
+    for ty in [
+        "(Nat when 'p, String when 'q) -> () where 'q <= 'p",
+        "((#A | #B)?, (Nat -> Nat) when 'p) -> ()",
+        "(#A?, (#A)?) -> ()",
+        "((Nat?,)?,) -> ()",
+    ] {
+        let source = format!("let f: {ty} = fn value => ()");
+        let signature = printed_scheme(&source);
+        assert!(!signature.contains("{ 0"), "{signature}");
+        assert_eq!(
+            printed_scheme(&format!("let f: {signature} = fn value => ()")),
+            signature
+        );
+        let (ast, ir) = printed(&source);
+        assert_eq!(reprinted(&ast), ast);
+        assert_eq!(reprinted(&ir), ir);
+    }
+    let (ast, ir) = printed("let f: { 0 when 'p: Nat, 1 when 'q: String } -> () = fn value => ()");
+    let expected = "let f : (Nat when 'p, String when 'q) -> () = fn value => ()";
+    assert_eq!(ast, expected);
+    assert_eq!(ir, expected);
+}
+
+fn presented_scheme(source: &str) -> ruddy::ui::TypePresentation {
+    with_scheme(source, |scheme, mint, semantics| {
+        ruddy::ui::TypePresentation::new(
+            scheme,
+            semantics
+                .aliases()
+                .iter()
+                .map(|(symbol, alias)| (mint.name(*symbol), alias)),
+        )
+    })
+}
+
+#[test]
+fn optional_presences_do_not_erase_sharing_or_constraints() {
+    assert_eq!(
+        printed_scheme("let f: { x when 'p: Nat } -> () = fn _ => ()"),
+        "{ x?: Nat } -> ()"
+    );
+    let shared = printed_scheme("let f: { x when 'p: Nat, y when 'p: Nat } -> () = fn _ => ()");
+    assert!(!shared.contains('?'), "{shared}");
+    assert_eq!(shared.matches("when 'input_0_x").count(), 2);
+    let linked = printed_scheme(
+        "let f: { x when 'p: Nat, y when 'q: Nat } -> () where 'p -> 'q = fn _ => ()",
+    );
+    assert!(!linked.contains('?'), "{linked}");
+    assert!(linked.contains("where"), "{linked}");
+    assert_eq!(
+        printed_scheme("let f: (#A? | #B?) -> () = fn _ => ()"),
+        "#A? | #B? -> ()"
+    );
+}
+
+#[test]
+fn local_type_abbreviations_preserve_type_row_and_presence_parameters() {
+    let row = "{ first_long_field when 'p: 'a, second_long_field when 'p: 'a, third_long_field when 'p: 'a, ..'r }";
+    let source = format!("let f: {row} -> {row} = fn x => x");
+    let compact = presented_scheme(&source);
+    assert_eq!(compact.definitions.len(), 1, "{compact}");
+    assert!(
+        compact.definitions[0].starts_with("type InferredRecord 'a 'b 'c ="),
+        "{compact}"
+    );
+    assert!(
+        compact.annotation.contains("'input_0_first_long_field"),
+        "{compact}"
+    );
+    let annotated = format!("{} = fn x => x", compact.declaration("let f: "));
+    printed_scheme(&annotated);
+    // Check both directions, not merely that a less general annotation happens
+    // to accept the same implementation.
+    let definitions = compact.definitions.join("\n");
+    printed_scheme(&format!(
+        "{definitions}\nextern original: {row} -> {row} = \"host.original\"\nlet forward: {} = original\nlet backward: {row} -> {row} = forward",
+        compact.annotation
+    ));
+}
+
+#[test]
+fn existing_aliases_are_instantiated_in_header_order() {
+    let row = "{ first_long_field when 'p: 'a, second_long_field when 'p: 'a, third_long_field when 'p: 'a }";
+    let source = format!("type Existing 'a 'p = {row}\nlet f: {row} -> {row} = fn x => x");
+    let compact = presented_scheme(&source);
+    assert!(compact.definitions.is_empty(), "{compact}");
+    assert_eq!(
+        compact
+            .annotation
+            .matches("Existing 'a 'input_0_first_long_field")
+            .count(),
+        2,
+        "{compact}"
+    );
+    printed_scheme(&format!(
+        "type Existing 'a 'p = {row}\n{} = fn x => x",
+        compact.declaration("let f: ")
+    ));
+}
+
+#[test]
+fn abbreviations_reserve_existing_names_and_do_not_capture_hidden_variables() {
+    let row = "{ first_long_field: 'a, second_long_field: 'a, third_long_field: 'a }";
+    let compact = presented_scheme(&format!(
+        "type InferredRecord = Nat\nlet f: {row} -> {row} = fn x => x"
+    ));
+    assert!(
+        compact.definitions[0].starts_with("type InferredRecord2 "),
+        "{compact}"
+    );
+    let compact = presented_scheme(
+        "let f: (hide 'a => { first_long_field: 'a, second_long_field: 'a, third_long_field: 'a }) -> () = fn _ => ()",
+    );
+    assert!(compact.definitions.is_empty(), "{compact}");
+    assert!(compact.annotation.contains("hide 'a"), "{compact}");
+}
+
+#[test]
+fn alias_applications_are_grouped_in_payloads_and_other_applications() {
+    let row = "{ first_long_field: 'a, second_long_field: 'a, third_long_field: 'a }";
+    let source =
+        format!("type Existing 'a = {row}\nlet f: (#A ({row}) | #B ({row})) -> () = fn _ => ()");
+    let compact = presented_scheme(&source);
+    assert!(compact.annotation.contains("#A (Existing 'a)"), "{compact}");
+    printed_scheme(&format!(
+        "type Existing 'a = {row}\n{} = fn _ => ()",
+        compact.declaration("let f: ")
+    ));
+}
+
+#[test]
+fn aliases_keep_effect_rows_and_regions_explicit() {
+    for (parameter, row) in [
+        (
+            "'e",
+            "{ first_long_field: () -> Nat + ..'e, second_long_field: () -> Nat + ..'e }",
+        ),
+        (
+            "'r",
+            "{ first_long_field: mut 'r Nat, second_long_field: mut 'r Nat }",
+        ),
+    ] {
+        let source =
+            format!("type Existing {parameter} = {row}\nlet f: {row} -> {row} = fn x => x");
+        let compact = presented_scheme(&source);
+        assert!(compact.annotation.contains("Existing"), "{compact}");
+        printed_scheme(&format!(
+            "type Existing {parameter} = {row}\n{} = fn x => x",
+            compact.declaration("let f: ")
+        ));
+    }
+}
+
+#[test]
+fn constrained_aliases_are_not_reused_without_their_requirements() {
+    let row = "{ first_long_field when 'p: Nat, second_long_field when 'p: Nat }";
+    let compact = presented_scheme(&format!(
+        "type Required 'p = {row} where 'p\nlet f: {row} -> {row} = fn x => x"
+    ));
+    assert!(!compact.annotation.contains("Required"), "{compact}");
+    printed_scheme(&format!("{} = fn x => x", compact.declaration("let f: ")));
+}
+
+#[test]
+fn aliases_do_not_match_effects_by_display_name_alone() {
+    let action = |interface: &str| {
+        Scheme::new(
+            0,
+            Arc::new(Ty::Arrow(
+                Arc::new(Ty::Struct(Row::closed())),
+                Arc::new(Ty::Nat),
+                Row {
+                    labels: [(
+                        ruddy::types::EffectId::structural("Log".into(), interface.into())
+                            .row_key(),
+                        RowField::present(Arc::new(Ty::Struct(Row::closed()))),
+                    )]
+                    .into_iter()
+                    .collect(),
+                    rest: Rest::Closed,
+                },
+            )),
+        )
+    };
+    let a = action("interface-a");
+    let b = action("interface-b");
+    assert_eq!(a.to_string(), b.to_string());
+    let shown = ruddy::ui::TypePresentation::new(&a, [("S", &b)]);
+    assert_eq!(shown.annotation, a.to_string());
+    let shown = ruddy::ui::TypePresentation::new(&a, [("S", &a)]);
+    assert_eq!(shown.annotation, "S");
+}
+
+fn with_scheme<R>(
+    source: &str,
+    result: impl FnOnce(&Scheme, &Mint, &inference::Semantics) -> R,
+) -> R {
     let mut files = FileManager::new();
     let file = files.register_new_file("<test>".to_string(), source.to_string());
     let lexed = token::lex(source, file);
@@ -1010,7 +1408,11 @@ fn printed_scheme(source: &str) -> String {
         inferred.errors()
     );
     let (symbol, _) = built.program.terms.last().expect("a definition");
-    inferred.semantics().schemes()[symbol].to_string()
+    result(
+        &inferred.semantics().schemes()[symbol],
+        &mint,
+        inferred.semantics(),
+    )
 }
 
 /// Both module forms and a path, rendered back as the source they were parsed

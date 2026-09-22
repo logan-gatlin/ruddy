@@ -113,6 +113,73 @@ type Several = { x when 'a: Nat } where 'a = 'b; 'c != 'd
           (type_variable))))))
 
 ================================================================================
+Presence implication chains use adjacent links
+================================================================================
+
+let f : Nat where 'd <= 'c <= 'b <= 'a = value
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (let_definition
+    (identifier)
+    (annotation
+      (identifier)
+      (where_clause
+        (clause_chain
+          (type_variable)
+          (type_variable)
+          (type_variable)
+          (type_variable))))
+    (identifier)))
+
+================================================================================
+Ordinary implication remains right associative alongside chains
+================================================================================
+
+type T = Nat where 'a <= 'b -> 'c -> 'd
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (type_definition
+    (identifier)
+    (annotation
+      (identifier)
+      (where_clause
+        (clause_implication
+          (clause_chain
+            (type_variable)
+            (type_variable))
+          (clause_implication
+            (type_variable)
+            (type_variable)))))))
+
+================================================================================
+Parenthesized chains remain separate operands
+================================================================================
+
+type T = Nat where ('a <= 'b) <= ('c = 'd)
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (type_definition
+    (identifier)
+    (annotation
+      (identifier)
+      (where_clause
+        (clause_chain
+          (parenthesized_clause
+            (clause_chain
+              (type_variable)
+              (type_variable)))
+          (parenthesized_clause
+            (clause_comparison
+              (type_variable)
+              (type_variable))))))))
+
+================================================================================
 A when clause may name nothing
 ================================================================================
 

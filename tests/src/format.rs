@@ -35,6 +35,32 @@ fn fmt(source: &str) -> String {
     out.text
 }
 
+#[test]
+fn optional_presence_suffixes_stay_attached() {
+    let source = "let f: { x?: Nat } -> (#A? Nat | #B?) + !Log? = value";
+    let output = fmt(source);
+    assert!(output.contains("x?: Nat"), "{output}");
+    assert!(output.contains("#A? Nat"), "{output}");
+    assert!(output.contains("!Log?"), "{output}");
+    fmt("let f: { x (* optional *) ?: Nat } -> () = value");
+}
+
+#[test]
+fn tuple_type_presence_markers_format_with_unambiguous_grouping() {
+    let output =
+        fmt("let f: (Nat?, String when 'p, (Nat -> Nat)?, (#A | #B) when 'q) -> () = value");
+    for text in [
+        "Nat?",
+        "String when 'p",
+        "(Nat -> Nat)?",
+        "(#A | #B) when 'q",
+    ] {
+        assert!(output.contains(text), "{output}");
+    }
+    fmt("let f: (Nat (* slot *) when 'p,\nString? (* next *),) -> () = value");
+    fmt("let f: ((Nat -> Nat + !Log)?,) -> () = value");
+}
+
 /// The parse tree of a source as the debugger prints it, one statement per
 /// line: what a formatter must leave untouched.
 fn printed_tree(source: &str) -> String {
@@ -52,6 +78,25 @@ fn printed_tree(source: &str) -> String {
         .map(|stmt| print::ast::stmt(stmt).to_string())
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+#[test]
+fn implication_chains_format_and_preserve_comments() {
+    assert_eq!(
+        fmt("type T 'a 'b 'c=Nat where 'a<='b<='c"),
+        "type T 'a 'b 'c = Nat where 'a <= 'b <= 'c\n"
+    );
+    for source in [
+        "type T 'a 'b 'c = Nat where ('a <= 'b) <= 'c",
+        "type T 'a 'b 'c = Nat where 'a <= ('b <= 'c)",
+        "type T 'a 'b 'c = Nat where ('a -> 'b) <= 'c",
+        "type T 'a 'b 'c = Nat where 'a <= 'b -- middle\n <= 'c",
+    ] {
+        let formatted = fmt(source);
+        if source.contains("-- middle") {
+            assert!(formatted.contains("-- middle"));
+        }
+    }
 }
 
 #[test]

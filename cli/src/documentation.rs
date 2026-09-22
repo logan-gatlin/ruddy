@@ -169,7 +169,19 @@ pub(crate) fn render(
     for (symbol, at, keyword, scheme) in values {
         let name = artifact::qualified(mint, *symbol);
         if let Some(export) = header.values.iter().find(|entry| entry.name == name) {
-            let signature = format!("{keyword} {}: {scheme}", mint.name(*symbol));
+            let aliases = semantics
+                .aliases()
+                .iter()
+                .filter(|(alias, _)| {
+                    program.types.contains_key(*alias)
+                        && mint.parent(**alias) == mint.parent(*symbol)
+                        && header.types.iter().any(|entry| {
+                            entry.exported && entry.name == artifact::qualified(mint, **alias)
+                        })
+                })
+                .map(|(alias, scheme)| (mint.name(*alias), scheme));
+            let signature = ruddy::ui::TypePresentation::new(scheme, aliases)
+                .declaration(&format!("{keyword} {}: ", mint.name(*symbol)));
             let (module, item) = item(
                 &name,
                 &export.metadata,

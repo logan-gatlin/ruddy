@@ -726,8 +726,9 @@ pub enum TypeKind {
         head: Box<Type>,
         args: Vec<Type>,
     },
-    /// `(A, B)` — a closed positional struct type with unconditional fields.
-    Tuple(Vec<Type>),
+    /// `(A?, B when 'p)` — a closed positional struct type. Each element may
+    /// carry the same presence marker as a named field.
+    Tuple(Vec<TupleTypeElement>),
     /// `[T]` — the type of an immutable homogeneous array.
     Array(Box<Type>),
     Mut(Box<Type>, Box<Type>),
@@ -888,9 +889,8 @@ pub enum EffectLabel {
 ///
 /// Named rather than anonymous, which is the whole of what retired the old `?`.
 /// A presence a `where` clause has to be able to talk about needs a name, the
-/// way a type variable needs a name, and `?` gave every one of them the same
-/// nothing. `when _` is what the `?` used to be: a presence this definition
-/// decides and no formula may name.
+/// way a type variable needs a name. `when _`, also writable as the suffix
+/// `?`, introduces a fresh presence that no formula may name.
 ///
 /// The span covers the whole clause — the `when` and the name after it — which
 /// is what a complaint about the label's openness underlines.
@@ -901,16 +901,26 @@ pub enum EffectLabel {
 #[derive(Debug, Clone)]
 pub struct When {
     pub span: Span,
+    /// Preserve the writable `?` shorthand through source formatting.
+    pub short: bool,
     /// The name, or `None` for the anonymous `when _`.
     pub name: Option<TrackedString>,
 }
 
+#[derive(Debug, Clone)]
+pub struct TupleTypeElement {
+    pub span: Span,
+    pub value: Type,
+    pub when: Option<Box<When>>,
+}
+
 /// A `where` clause's formula, as written.
 ///
-/// The surface grammar, loosest to tightest: `=` and `!=`, non-associative, at
-/// the top; then `or`, then `and`, then unary `not`, then parentheses and
-/// names. Nothing here is resolved — a name is the string it was written as,
-/// and whether the type binds it is [`ir`](crate::ir)'s to say.
+/// The surface grammar, loosest to tightest: right-associative `->`; `=` and
+/// `!=`, non-associative, and adjacent-implication chains `<=`; then `or`,
+/// `and`, unary `not`, parentheses and names.
+/// Nothing here is resolved — a name is the string it was written as, and
+/// whether the type binds it is [`ir`](crate::ir)'s to say.
 pub type Clause = Tracked<ClauseKind>;
 
 #[derive(Debug, Clone)]
@@ -921,6 +931,10 @@ pub enum ClauseKind {
     Not(Box<Clause>),
     And(Box<Clause>, Box<Clause>),
     Or(Box<Clause>, Box<Clause>),
+    /// `a -> b` — when `a` is there, `b` must be there.
+    Implies(Box<Clause>, Box<Clause>),
+    /// `a <= b <= c` — `a -> b` and `b -> c`, not nested implication.
+    Chain(Vec<Clause>),
     /// `a = b` — both there or neither.
     Equal(Box<Clause>, Box<Clause>),
     /// `a != b` — exactly one of them there.
@@ -1164,6 +1178,8 @@ struct Parser {
     /// context `Box _ = value` contains a type hole; after a type or effect
     /// declaration's body, the same `_ =` begins the next statement.
     type_before_value: bool,
+    /// A trailing `when` is an element marker while reading a tuple type.
+    type_before_presence: bool,
     /// The regions recovery has dropped so far; see [`Output::skipped`].
     skipped: Vec<Span>,
     /// How far [`Parser::mismatched_closer`] has folded the token prefix into
@@ -1235,6 +1251,7 @@ impl Parser {
             pos: 0,
             errors: Vec::new(),
             type_before_value: false,
+            type_before_presence: false,
             skipped: Vec::new(),
             scan_pos: 0,
             scan_open: Vec::new(),
@@ -3921,12 +3938,34 @@ impl Parser {
         self.clause(defined)
     }
 
-    /// `<or> [('='|'!=') <or>]` — the loosest level of a `where` clause, and
-    /// the one that does not associate: `a = b = c` is refused rather than
-    /// read one way or the other, since neither reading is what a person
-    /// writing it meant.
+    /// `<comparison> ['->' <clause>]` — right-associative implication, at the
+    /// loosest level of a `where` clause.
     fn clause(&mut self, defined: bool) -> Option<Clause> {
+        let left = self.clause_comparison(defined)?;
+        if self.eat_if(&Kind::Arrow).is_none() {
+            return Some(left);
+        }
+        let right = self.clause(defined)?;
+        let span = left.span.merge(right.span);
+        Some(span.track(ClauseKind::Implies(Box::new(left), Box::new(right))))
+    }
+
+    /// `<or> [('='|'!=') <or>]` or `<or> ('<=' <or>)+`. Equality remains
+    /// non-associative; `<=` alone chains adjacent implications. Mixing the
+    /// comparison operators requires parentheses.
+    fn clause_comparison(&mut self, defined: bool) -> Option<Clause> {
         let left = self.clause_or()?;
+        if self.at(&Kind::LessEqual) {
+            let mut parts = vec![left];
+            while self.eat_if(&Kind::LessEqual).is_some() {
+                parts.push(self.clause_or()?);
+            }
+            if self.at(&Kind::NotEqual) || (!defined && self.at(&Kind::Equal)) {
+                return self.expected(Expected::EndOfClause);
+            }
+            let span = parts[0].span.merge(parts.last().unwrap().span);
+            return Some(span.track(ClauseKind::Chain(parts)));
+        }
         let equal = match self.peek().map(|tok| &tok.tracked) {
             Some(Kind::Equal) => true,
             Some(Kind::NotEqual) => false,
@@ -3970,10 +4009,13 @@ impl Parser {
         // is never that, so a chain written with one is still reported wherever
         // it appears.
         let chained = match defined {
-            true => matches!(self.peek().map(|tok| &tok.tracked), Some(Kind::NotEqual)),
+            true => matches!(
+                self.peek().map(|tok| &tok.tracked),
+                Some(Kind::NotEqual | Kind::LessEqual)
+            ),
             false => matches!(
                 self.peek().map(|tok| &tok.tracked),
-                Some(Kind::Equal | Kind::NotEqual)
+                Some(Kind::Equal | Kind::NotEqual | Kind::LessEqual)
             ),
         };
         if chained {
@@ -4050,6 +4092,13 @@ impl Parser {
     /// label and the colon, and a sum case has no colon to end it, so it takes
     /// parentheses. Both bind a name, and both allow `_`.
     fn when(&mut self, parens: bool) -> Option<When> {
+        if let Some(token) = self.eat_if(&Kind::Question) {
+            return Some(When {
+                span: token.span,
+                short: true,
+                name: None,
+            });
+        }
         let open = match parens {
             true => Some(self.eat(&Kind::LeftParen).expect("the caller peeked `(`")),
             false => None,
@@ -4087,7 +4136,11 @@ impl Parser {
             )?;
             span = span.merge(close.span);
         }
-        Some(When { span, name })
+        Some(When {
+            span,
+            name,
+            short: false,
+        })
     }
 
     /// `<sum> [-> <type> [+ <effects>]]` — the arrow is right-associative, so
@@ -4294,7 +4347,9 @@ impl Parser {
                 let args = self.label_arguments(&mut span)?;
                 // A `when` takes parentheses here for the reason a sum case's
                 // does: an effect has no colon to end a bare clause.
-                let when = match self.at_left_paren() && self.keyword_at(self.pos + 1, "when") {
+                let when = match self.at(&Kind::Question)
+                    || (self.at_left_paren() && self.keyword_at(self.pos + 1, "when"))
+                {
                     true => {
                         let when = self.when(true)?;
                         span = span.merge(when.span);
@@ -4421,7 +4476,9 @@ impl Parser {
                 // parentheses — and two tokens of lookahead tell one from a
                 // parenthesized payload, since only the clause has `when`
                 // inside it.
-                let when = match self.at_left_paren() && self.keyword_at(self.pos + 1, "when") {
+                let when = match self.at(&Kind::Question)
+                    || (self.at_left_paren() && self.keyword_at(self.pos + 1, "when"))
+                {
                     true => {
                         let when = self.when(true)?;
                         span = span.merge(when.span);
@@ -4498,7 +4555,14 @@ impl Parser {
         // is this one, which is what "contextual" means here — so a type
         // application stops in front of one instead of taking it as another
         // argument.
-        if self.at_keyword("where") || (!self.type_before_value && self.at_discard_stmt()) {
+        if self.at_keyword("where")
+            || (self.type_before_presence
+                && self.at_keyword("when")
+                && self.toks.get(self.pos + 1).is_some_and(|token| {
+                    matches!(token.tracked, Kind::Variable(_) | Kind::Underscore)
+                }))
+            || (!self.type_before_value && self.at_discard_stmt())
+        {
             return false;
         }
         matches!(
@@ -4625,7 +4689,7 @@ impl Parser {
                 // One token of lookahead is the whole disambiguation: after a
                 // field's name, a `when` can only be the clause, because
                 // `{when: Nat}` has already spent its `when` on the name.
-                let when = match self.at_keyword("when") {
+                let when = match self.at(&Kind::Question) || self.at_keyword("when") {
                     true => Some(Box::new(self.when(false)?)),
                     false => None,
                 };
@@ -4659,20 +4723,40 @@ impl Parser {
         if self.at_type_boundary() {
             return self.expected_closer(open.span, &Kind::RightParen);
         }
-        let first = self.type_expr()?;
-        if self.eat_if(&Kind::Comma).is_none() {
+        let first = self.tuple_type_element()?;
+        if first.when.is_some() {
+            // A marker belongs to a tuple slot, never to a grouped type.
+            self.eat(&Kind::Comma)?;
+        } else if self.eat_if(&Kind::Comma).is_none() {
             let close = self.close_delimiter(open.span, &Kind::RightParen)?;
-            return Some(open.span.merge(close.span).track(first.tracked));
+            return Some(open.span.merge(close.span).track(first.value.tracked));
         }
         let mut elements = vec![first];
         while !self.at(&Kind::RightParen) && !self.at_type_boundary() {
-            elements.push(self.type_expr()?);
+            elements.push(self.tuple_type_element()?);
             if self.eat_if(&Kind::Comma).is_none() {
                 break;
             }
         }
         let close = self.close_delimiter(open.span, &Kind::RightParen)?;
         Some(open.span.merge(close.span).track(TypeKind::Tuple(elements)))
+    }
+
+    fn tuple_type_element(&mut self) -> Option<TupleTypeElement> {
+        let outer = self.type_before_presence;
+        self.type_before_presence = true;
+        let value = self.type_expr();
+        self.type_before_presence = outer;
+        let value = value?;
+        let when = if self.at(&Kind::Question) || self.at_keyword("when") {
+            Some(Box::new(self.when(false)?))
+        } else {
+            None
+        };
+        let span = when
+            .as_ref()
+            .map_or(value.span, |when| value.span.merge(when.span));
+        Some(TupleTypeElement { span, value, when })
     }
 
     /// `[T]`, the type of a homogeneous immutable array.

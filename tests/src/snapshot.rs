@@ -1480,7 +1480,7 @@ fn rows_reach_every_stage() {
         .iter()
         .map(|node| node.text.as_str())
         .collect();
-    assert_eq!(types, ["{ x when 'a: Nat, y: Nat, ..'b } -> Nat"]);
+    assert_eq!(types, ["{ x?: Nat, y: Nat, ..'a } -> Nat"]);
 }
 
 /// `()` is one piece of punctuation in the surface syntax, and the AST keeps

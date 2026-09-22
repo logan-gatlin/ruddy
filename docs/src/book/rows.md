@@ -19,6 +19,41 @@ Both need relationships between shapes, rather than only types for individual fi
 [Presence variables](../dictionary.md#presence-variable) describe whether particular entries belong to those collections.
 Together they let a function preserve information it does not inspect and state which combinations it can handle.
 
+### Compact inferred signatures
+
+The suffix `?` is shorthand for a fresh anonymous presence: `{ x?: Nat }`
+means `{ x when _: Nat }`, `#Some? Nat` means `#Some (when _) Nat`, and
+`!Log?` means `!Log (when _)`. Each occurrence is independent. It does not
+add an `undefined` value to a field's type: if `x` is present, it is a `Nat`.
+Inferred signatures use this shorthand only for presences occurring once and
+not mentioned by a constraint. A repeated presence keeps its name, even without
+a `where` clause, because its occurrences must stay linked.
+
+Tuple types support the same markers after an element: `(Nat?, String when 'p)`
+is the positional form of `{ 0?: Nat, 1 when 'p: String }`. A singleton keeps
+its comma: `(Nat?,)`. Markers describe independent slots; a prefix relationship
+must still be stated explicitly in `where`.
+
+Group a sum or function type before marking the whole element, for example
+`((#Red | #Blue)?, (Nat -> Nat) when 'p)`. This distinguishes an optional tuple
+slot `((#Red)?,)` from a required slot containing an optional variant `(#Red?,)`.
+
+Long signatures can also introduce ordinary `type` definitions before the
+signature, or reuse an equivalent definition already in scope. For example:
+
+```ruddy
+type Fields 'p 'value 'rest = {
+  first_long_field when 'p: 'value,
+  second_long_field when 'p: 'value,
+  ..'rest
+}
+let identity: Fields 'present 'a { ..'r } -> Fields 'present 'a { ..'r } = fn x => x
+```
+
+These are writable, fully parameterized definitions, not hidden display aliases.
+The presentation retains the original presence constraints and uses an
+abbreviation only when the complete output, including its definition, is shorter.
+
 ## From subtyping to row polymorphism
 
 Accepting a richer object through a smaller interface is familiar from class or interface subtyping.
@@ -193,9 +228,24 @@ The compiler rejects that mismatch instead of silently strengthening the annotat
 A `where` clause can appear on an annotation or a type definition.
 A type definition must declare every free variable in its header; its constraints
 apply at every use and are inherited by definitions that use it.
-It can use `not`, `and`, `or`, `=`, and `!=`; parentheses group relationships and semicolons separate constraints.
-For example, `not 'target or 'path` says that a target requires a path.
+It can use `not`, `and`, `or`, `->`, `<=`, `=`, and `!=`; parentheses group relationships and semicolons separate constraints.
+For example, `'target -> 'path` (equivalently `not 'target or 'path`) says that a target requires a path.
 Equality would require a target and a path to appear together, rejecting a stale path without its target as well.
+
+An implication chain abbreviates adjacent requirements:
+
+```ruddy
+'d <= 'c <= 'b <= 'a
+```
+
+This means `'d -> 'c; 'c -> 'b; 'b -> 'a`, as for the presences of an optional tuple suffix.
+Each link must hold. It is different from `'d -> 'c -> 'b -> 'a`, which remains
+right-associative nested implication: `'d -> ('c -> ('b -> 'a))`.
+The inferred-type printer uses chains for linear sequences of presence requirements.
+
+Chains bind at the same level as `=` and `!=`, below `or` and `and` but above `->`.
+Use parentheses to mix a chain with equality or to use a chain as another chain's operand.
+In value expressions, `<=` remains the ordinary less-than-or-equal comparison.
 
 This differs from `{ target: Option Nat, path: Option [Nat] }`.
 That struct always has both fields and independently allows `#Some` or `#None` in each payload.

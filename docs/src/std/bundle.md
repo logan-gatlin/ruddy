@@ -27,6 +27,7 @@ stdReference: true
 [json](json.md)\
 [map](map.md)\
 [nat](nat.md)\
+[optic](optic.md)\
 [option](option.md)\
 [order](order.md)\
 [path](path.md)\

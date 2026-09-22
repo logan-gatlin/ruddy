@@ -687,7 +687,20 @@ impl Analysis {
             .or_else(|| semantics.externs().get(&symbol))
             .or_else(|| semantics.aliases().get(&symbol))
         {
-            return Some(scheme.to_string());
+            // A type declaration's header binds positional parameters; leave
+            // that view intact. Value signatures can introduce local aliases.
+            if semantics.aliases().contains_key(&symbol) {
+                return Some(scheme.to_string());
+            }
+            let aliases = semantics
+                .aliases()
+                .iter()
+                .filter(|(alias, _)| {
+                    self.built.program.types.contains_key(*alias)
+                        && self.mint.parent(**alias) == self.mint.parent(symbol)
+                })
+                .map(|(alias, scheme)| (self.mint.name(*alias), scheme));
+            return Some(crate::ui::TypePresentation::new(scheme, aliases).to_string());
         }
         let name = self.mint.name(symbol);
         if self.built.program.modules.contains_key(&symbol) {
