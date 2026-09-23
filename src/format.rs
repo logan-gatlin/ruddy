@@ -2470,7 +2470,10 @@ impl<'a> Printer<'a> {
 
     /// [`expr_after`](Self::expr_after) for a type.
     fn ty_after(&self, ty: &Type, parens: bool) -> Doc {
-        parenthesized(parens, self.with_trailing(ty.span, self.type_kind(ty)))
+        parenthesized(
+            parens && !self.verbatim_type_is_grouped(ty),
+            self.with_trailing(ty.span, self.type_kind(ty)),
+        )
     }
 
     fn with_trailing(&self, span: Span, doc: Doc) -> Doc {
@@ -2705,12 +2708,48 @@ impl<'a> Printer<'a> {
     }
 
     fn ty_in(&self, ty: &Type, parens: bool) -> Doc {
-        parenthesized(parens, self.ty(ty))
+        parenthesized(parens && !self.verbatim_type_is_grouped(ty), self.ty(ty))
+    }
+
+    fn verbatim_type_is_grouped(&self, ty: &Type) -> bool {
+        matches!(&ty.tracked, TypeKind::Structural { .. }) && self.slice(ty.span).starts_with('(')
     }
 
     fn type_kind(&self, ty: &Type) -> Doc {
         let prec = |ty: &Type| ui::type_prec(&ty.tracked);
         match &ty.tracked {
+            TypeKind::Structural { .. } => self.verbatim(ty.span),
+            TypeKind::Match(arms) => {
+                let mut parts = vec![text("match")];
+                for (from, to) in arms {
+                    let grouped = matches!(&from.tracked, TypeKind::Sum { cases, spreads, tail }
+                        if cases.len() != 1 || !spreads.is_empty() || tail.is_some());
+                    parts.push(Doc::Line);
+                    parts.push(self.with_comments(
+                        from.span.merge(to.span),
+                        group(concat(vec![
+                            text("| "),
+                            self.ty_in(from, grouped),
+                            text(" =>"),
+                            // Arrow and hidden results can also end in a
+                            // shorthand whose arms would absorb the next `|`.
+                            nest(concat(vec![
+                                Doc::Line,
+                                self.ty_in(to, prec(to) <= Prec::Arrow),
+                            ])),
+                        ])),
+                    ));
+                }
+                parts.push(self.dangling_docs(ty.span));
+                parts.push(Doc::Line);
+                parts.push(text("end"));
+                let doc = concat(parts);
+                if self.newline_between(ty.span.start, ty.span.end()) {
+                    broken(doc)
+                } else {
+                    group(doc)
+                }
+            }
             TypeKind::Arrow { .. } => {
                 // Right-nested, and only an arrow carrying no row may fold
                 // the arrow after it into the chain: `A -> (B -> C) + E` puts
@@ -2837,7 +2876,16 @@ impl<'a> Printer<'a> {
                             }
                             SumCase::Absent => text(self.slice(name.span)),
                         };
-                        (span, self.with_trailing(span, doc))
+                        // A singleton sum shares its span with its only case.
+                        // The outer type already owns that span's comments.
+                        (
+                            span,
+                            if span == ty.span {
+                                doc
+                            } else {
+                                self.with_trailing(span, doc)
+                            },
+                        )
                     })
                     .collect();
                 entries.extend(spreads.iter().map(|spread| {
@@ -2845,13 +2893,24 @@ impl<'a> Printer<'a> {
                         text(".."),
                         self.ty_in(&spread.value, prec(&spread.value) < Prec::Atom),
                     ]);
-                    (spread.span, self.with_trailing(spread.span, doc))
+                    (
+                        spread.span,
+                        if spread.span == ty.span {
+                            doc
+                        } else {
+                            self.with_trailing(spread.span, doc)
+                        },
+                    )
                 }));
                 entries.sort_by_key(|(span, _)| span.start);
                 if let Some(tail) = tail {
                     entries.push((
                         tail.span,
-                        self.with_trailing(tail.span, self.tail(&tail.of)),
+                        if tail.span == ty.span {
+                            self.tail(&tail.of)
+                        } else {
+                            self.with_trailing(tail.span, self.tail(&tail.of))
+                        },
                     ));
                 }
                 // The empty sum, and the sum that is nothing but its tail:
@@ -2861,7 +2920,9 @@ impl<'a> Printer<'a> {
                     let mut parts = vec![text("|")];
                     for (span, doc) in entries {
                         parts.push(Doc::Space);
-                        parts.extend(self.leading_docs(span));
+                        if span != ty.span {
+                            parts.extend(self.leading_docs(span));
+                        }
                         parts.push(doc);
                     }
                     return concat(parts);
@@ -2874,7 +2935,9 @@ impl<'a> Printer<'a> {
                     if at > 0 {
                         parts.push(if_break(Doc::Line, nil()));
                     }
-                    parts.extend(self.leading_docs(span));
+                    if span != ty.span {
+                        parts.extend(self.leading_docs(span));
+                    }
                     parts.push(if_break(
                         text("| "),
                         if at == 0 {
@@ -3556,6 +3619,19 @@ fn pattern_skeleton(pattern: &Pattern) -> Skel {
 
 fn type_skeleton(ty: &Type) -> Skel {
     match &ty.tracked {
+        TypeKind::Structural { .. } => Skel::verbatim(ty.span),
+        TypeKind::Match(arms) => Skel::new(
+            ty.span,
+            arms.iter()
+                .map(|(from, to)| {
+                    Skel::new(
+                        from.span.merge(to.span),
+                        vec![type_skeleton(from), type_skeleton(to)],
+                    )
+                })
+                .collect(),
+        )
+        .closed(),
         TypeKind::Struct {
             fields,
             spreads,

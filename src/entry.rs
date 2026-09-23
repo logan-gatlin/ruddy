@@ -45,7 +45,7 @@ pub fn executable(artifact: &Artifact, dependencies: &[&Artifact]) -> Result<Art
         dependencies,
         "let invoke : () -> () + .. = fn _ => program::main ()",
     )?;
-    let Type::Arrow(_, _, effects) = &probe.header().values[0].scheme.body else {
+    let Type::Arrow(_, _, effects) = probe.header().values[0].scheme.body.unshared() else {
         unreachable!("the checked probe has an explicit function annotation")
     };
     let mut row = effects;

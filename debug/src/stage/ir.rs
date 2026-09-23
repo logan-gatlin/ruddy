@@ -1049,6 +1049,32 @@ fn type_node(ids: &mut Ids, cx: &Cx, mint: &Mint, ty: &Type, scope: &[Variable])
             }
             .children(kids)
         }
+        TypeKind::Structural {
+            captures,
+            arguments,
+            effect_sink,
+            ..
+        } => Node {
+            label: "Structural contract".into(),
+            ..node
+        }
+        .children(
+            captures
+                .iter()
+                .chain(arguments)
+                .chain(effect_sink.iter().map(|ty| ty.as_ref()))
+                .map(|ty| type_node(ids, cx, mint, ty, scope)),
+        ),
+        TypeKind::Match(arms) => Node {
+            label: "Match type".into(),
+            ..node
+        }
+        .children(arms.iter().map(|(from, to)| {
+            Node::new(ids.next(), "Arm", String::new())
+                .at(cx.source.span(from.at).merge(cx.source.span(to.at)))
+                .child(type_node(ids, cx, mint, from, scope))
+                .child(type_node(ids, cx, mint, to, scope))
+        })),
         TypeKind::Arrow { from, to, effects } => {
             let arrow = Node {
                 label: "Arrow".into(),

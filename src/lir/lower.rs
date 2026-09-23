@@ -462,6 +462,7 @@ struct Level {
 #[derive(Debug, Clone)]
 struct Known {
     lifted: FuncId,
+    callable: crate::reification::conventions::ShapeId,
     /// One per level, outermost first: `wrappers[k]` is the function that takes
     /// argument `k` given the `k` before it.
     wrappers: Vec<FuncId>,
@@ -528,6 +529,10 @@ struct Frame {
     prologue: Vec<Instr>,
     /// Effect name → the record of that effect's operation closures.
     evidence: IndexMap<String, Temp>,
+    /// A named conditional effect travels inside this arrow's tail bundle.
+    /// Keep its owner explicit so a callback uses invocation evidence even
+    /// when an enclosing construction scope also handles the same effect.
+    conditional_evidence: IndexMap<String, Temp>,
     /// The bundles standing in for the variable part of a row, by which
     /// variable part they stand for.
     tails: Vec<(RestKey, Temp)>,
@@ -827,6 +832,12 @@ struct Lower<'a> {
     /// Presence literals selected by enclosing match decision trees while an
     /// arm body is lowered. A nested match begins under this path condition.
     assumed: Formula,
+    /// Structural contracts can admit shapes beyond the checked fallback.
+    /// Their matches retain tests whenever both runtime paths have an arm.
+    structural_patterns: bool,
+    /// A specialized structural invocation may omit descriptor slots its
+    /// contract never observes, including parameters nested in an open row.
+    allow_unobserved_representations: bool,
 }
 
 /// Lower a typed, checked program.
@@ -882,6 +893,8 @@ fn lower_parts(
         callback_adapters: Vec::new(),
         definition: None,
         assumed: Formula::True,
+        structural_patterns: false,
+        allow_unobserved_representations: false,
     };
     let externs = low.lower_externs(extern_plan);
     let order = low.order();
@@ -1000,11 +1013,10 @@ fn spine(term: &Term) -> (&Term, Vec<Apply<'_>>) {
 
 /// A pattern as the decision matrix matches it.
 ///
-/// A case written bare is a wildcard rather than the empty exact struct the
-/// pattern checks read it as: inference has already pinned such a payload to
-/// unit, so there is nothing left here to test and extracting the payload at all
-/// would be an instruction with no reader.
-fn cell(pattern: &Pattern) -> Cell {
+/// Ordinary arrows pin a bare tag's payload to unit, allowing its payload
+/// test to disappear. Structural contracts can admit another payload in a
+/// later wildcard arm, so their bare tags retain the exact empty-record test.
+fn cell(pattern: &Pattern, structural: bool) -> Cell {
     match &pattern.anchored {
         PatternKind::Bind(name) => Cell::Wild(Some(name.anchored)),
         PatternKind::Wildcard => Cell::Wild(None),
@@ -1021,27 +1033,47 @@ fn cell(pattern: &Pattern) -> Cell {
         PatternKind::Struct { fields, rest } => Cell::Struct {
             fields: fields
                 .iter()
-                .map(|(name, field)| (name.clone(), cell(&field.value)))
+                .map(|(name, field)| (name.clone(), cell(&field.value, structural)))
                 .collect(),
             exact: rest.is_none(),
         },
         PatternKind::Tag { name, payload } => Cell::Tag {
             name: name.anchored.clone(),
-            payload: Box::new(payload.as_deref().map(cell).unwrap_or(Cell::Wild(None))),
+            payload: Box::new(
+                payload
+                    .as_deref()
+                    .map(|pattern| cell(pattern, structural))
+                    .unwrap_or_else(|| {
+                        if structural {
+                            Cell::Struct {
+                                fields: Vec::new(),
+                                exact: true,
+                            }
+                        } else {
+                            Cell::Wild(None)
+                        }
+                    }),
+            ),
         },
         // Opening a hidden type is no test and no projection: the value is
         // stored as its body, and the payload pattern reads it as such.
-        PatternKind::Hidden { pattern, .. } => cell(pattern),
+        PatternKind::Hidden { pattern, .. } => cell(pattern, structural),
         PatternKind::Array {
             before,
             rest,
             after,
         } => Cell::Array {
-            before: before.iter().map(cell).collect(),
+            before: before
+                .iter()
+                .map(|pattern| cell(pattern, structural))
+                .collect(),
             rest: rest
                 .as_ref()
                 .map(|rest| rest.name.as_ref().map(|name| name.anchored)),
-            after: after.iter().map(cell).collect(),
+            after: after
+                .iter()
+                .map(|pattern| cell(pattern, structural))
+                .collect(),
         },
     }
 }
@@ -1319,9 +1351,19 @@ impl Lower<'_> {
             let at = self
                 .frames
                 .iter()
-                .rposition(|frame| frame.representations.contains_key(&parameter))
-                .expect("accepted reflection has evidence for each type parameter");
-            arguments.push(self.thread(at, self.frames[at].representations[&parameter]));
+                .rposition(|frame| frame.representations.contains_key(&parameter));
+            if let Some(at) = at {
+                arguments.push(self.thread(at, self.frames[at].representations[&parameter]));
+            } else if self.allow_unobserved_representations {
+                // This slot is outside the contract's observed callable
+                // paths, but it sits inside a descriptor which can itself be
+                // projected. Give that unused position an authentic inert
+                // descriptor; the deliberately invalid absence sentinel is
+                // only safe for a top-level argument nobody can inspect.
+                arguments.push(self.representation(&Arc::new(Ty::unit()), body));
+            } else {
+                panic!("accepted reflection has evidence for each type parameter");
+            }
         }
         self.emit(
             body,
@@ -1351,6 +1393,20 @@ impl Lower<'_> {
         let held = self.callable_held[value as usize].unwrap_or(binding.value);
         self.contain(value, &have);
         self.hold(value, &have);
+        if matches!(
+            &*inference::unfold(self.inference.aliases(), &term.ty),
+            Ty::Contract { .. }
+        ) && matches!(
+            &*inference::unfold(self.inference.aliases(), &have),
+            Ty::Contract { .. }
+        ) {
+            // A contract's fallback can contain generalized conditional rows
+            // which are settled only when its structural program is applied.
+            // Keep the implementation's compiled convention here; `spun`
+            // supplies the concrete invocation descriptors at the call.
+            self.callable_held[value as usize] = Some(held);
+            return value;
+        }
         self.reified_fitted(&term.ty, desired, &have, held, value, body)
     }
 
@@ -1683,10 +1739,7 @@ impl Lower<'_> {
             // reveal a package whose body is another alias (including an
             // imported or recursive one), and either operation alone would
             // stop before the callback arrow.
-            let mut exposed = unfold(self.inference.aliases(), &cursor);
-            while let Ty::Package(body) | Ty::Hidden { body, .. } = &*exposed {
-                exposed = unfold(self.inference.aliases(), body);
-            }
+            let exposed = self.erased(&cursor);
             let Ty::Arrow(_, to, row) = &*exposed else {
                 break;
             };
@@ -2173,6 +2226,12 @@ impl Lower<'_> {
                 *symbol,
                 Known {
                     lifted,
+                    callable: self
+                        .reification
+                        .callables
+                        .bindings
+                        .get(symbol)
+                        .map_or(self.erased_callable, |binding| binding.value),
                     wrappers,
                     levels,
                     ty: decl.value.ty.clone(),
@@ -2313,7 +2372,10 @@ impl Lower<'_> {
 
     fn erased(&self, ty: &Arc<Ty>) -> Arc<Ty> {
         let mut ty = unfold(self.inference.aliases(), ty);
-        while let Ty::Package(body) | Ty::Hidden { body, .. } = &*ty {
+        while let Ty::Package(body)
+        | Ty::Hidden { body, .. }
+        | Ty::Contract { fallback: body, .. } = &*ty
+        {
             ty = unfold(self.inference.aliases(), body);
         }
         ty
@@ -2333,6 +2395,118 @@ impl Lower<'_> {
             panic!("LIR runs only on programs with no errors");
         };
         (from.clone(), to.clone(), flat(row))
+    }
+
+    /// The row information needed to emit runtime tests for records and sums.
+    fn representation_row(&self, ty: &Arc<Ty>, sum: bool) -> Option<Row> {
+        let exposed = self.erased(ty);
+        match (&*exposed, sum) {
+            (Ty::Struct(row), false) | (Ty::Sum(row), true) => Some(flat(row)),
+            _ => None,
+        }
+    }
+
+    /// A structural result has the semantic record/tag shape selected by its
+    /// inputs, while callable leaves constructed at a checked arrow retain
+    /// that arrow's actual closure convention. Erased leaves preserve the
+    /// caller's value unchanged and therefore use the semantic member type.
+    fn structural_result_type(&self, checked: &Arc<Ty>, actual: &Arc<Ty>) -> Arc<Ty> {
+        type RetainedResult = (Arc<Ty>, Arc<Ty>, Arc<Ty>);
+        enum Work {
+            Visit(Arc<Ty>, Arc<Ty>),
+            Remember(Arc<Ty>, Arc<Ty>),
+            Row(Row, bool),
+            Array,
+        }
+        let mut pending = vec![Work::Visit(checked.clone(), actual.clone())];
+        let mut values: Vec<Arc<Ty>> = Vec::new();
+        let mut memo: HashMap<(usize, usize), RetainedResult> = HashMap::new();
+        while let Some(work) = pending.pop() {
+            match work {
+                Work::Visit(checked, actual) => {
+                    let key = (
+                        Arc::as_ptr(&checked) as usize,
+                        Arc::as_ptr(&actual) as usize,
+                    );
+                    if let Some((_, _, value)) = memo.get(&key) {
+                        values.push(value.clone());
+                        continue;
+                    }
+                    pending.push(Work::Remember(checked.clone(), actual.clone()));
+                    if self.rep(&checked) == Rep::Fn {
+                        values.push(checked);
+                        continue;
+                    }
+                    if matches!((&*checked, &*actual), (Ty::Named { .. }, Ty::Named { .. })) {
+                        // Keep recursive aliases finite and retain the layout
+                        // under which their recursive values were produced.
+                        values.push(checked);
+                        continue;
+                    }
+                    let exposed = self.erased(&actual);
+                    let sum = matches!(&*exposed, Ty::Sum(_));
+                    if matches!(&*exposed, Ty::Struct(_) | Ty::Sum(_))
+                        && let (Some(from), Some(to)) = (
+                            self.representation_row(&checked, sum),
+                            self.representation_row(&actual, sum),
+                        )
+                    {
+                        let children: Vec<_> = to
+                            .labels
+                            .iter()
+                            .map(|(name, field)| {
+                                (
+                                    from.labels
+                                        .get(name)
+                                        .map(|field| field.ty.clone())
+                                        .unwrap_or_else(|| field.ty.clone()),
+                                    field.ty.clone(),
+                                )
+                            })
+                            .collect();
+                        pending.push(Work::Row(to, sum));
+                        pending.extend(
+                            children
+                                .into_iter()
+                                .rev()
+                                .map(|(from, to)| Work::Visit(from, to)),
+                        );
+                    } else if let (Ty::Array(from), Ty::Array(to)) =
+                        (&*self.erased(&checked), &*exposed)
+                    {
+                        pending.push(Work::Array);
+                        pending.push(Work::Visit(from.clone(), to.clone()));
+                    } else {
+                        values.push(actual);
+                    }
+                }
+                Work::Remember(checked, actual) => {
+                    memo.insert(
+                        (
+                            Arc::as_ptr(&checked) as usize,
+                            Arc::as_ptr(&actual) as usize,
+                        ),
+                        (
+                            checked,
+                            actual,
+                            values.last().expect("result representation").clone(),
+                        ),
+                    );
+                }
+                Work::Row(mut row, sum) => {
+                    let children = values.split_off(values.len() - row.labels.len());
+                    for (field, child) in row.labels.values_mut().zip(children) {
+                        field.ty = child;
+                    }
+                    values.push(Arc::new(if sum { Ty::Sum(row) } else { Ty::Struct(row) }));
+                }
+                Work::Array => {
+                    let child = values.pop().expect("array representation");
+                    values.push(Arc::new(Ty::Array(child)));
+                }
+            }
+        }
+        values.pop().expect("structural result representation")
     }
 
     /// The type reached by walking `steps` arrows down from `ty`, which is what
@@ -2452,6 +2626,11 @@ impl Lower<'_> {
         let decl = &program.terms[&symbol];
         let name = self.mint.name(symbol).to_string();
         self.stem = name.clone();
+        let outer_unobserved = self.allow_unobserved_representations;
+        self.allow_unobserved_representations |= matches!(
+            &*inference::unfold(self.inference.aliases(), &decl.value.ty),
+            Ty::Contract { .. }
+        );
         self.serial = self.known.get(&symbol).map_or(0, |known| {
             // The lifted function takes the bare name and each wrapper one
             // number, so anything lifted out of the body carries on from there.
@@ -2491,6 +2670,7 @@ impl Lower<'_> {
                 })
             }
         };
+        self.allow_unobserved_representations = outer_unobserved;
         self.globals.push(Global {
             symbol,
             name,
@@ -2504,6 +2684,13 @@ impl Lower<'_> {
     /// what it does.
     fn uncurried(&mut self, known: &Known, value: &Term) {
         let (fns, inner) = nest(value);
+        let outer_patterns = self.structural_patterns;
+        self.structural_patterns |= fns.iter().any(|(term, _)| {
+            matches!(
+                &*inference::unfold(self.inference.aliases(), &term.ty),
+                Ty::Contract { .. }
+            )
+        });
         self.frames.push(Frame::default());
         let mut params = Vec::new();
         for (level, (_, arg)) in known.levels.iter().zip(&fns) {
@@ -2516,6 +2703,7 @@ impl Lower<'_> {
         }
         let mut body = Body::default();
         let temp = self.term(inner, &mut body);
+        self.structural_patterns = outer_patterns;
         let frame = self.frames.pop().expect("the frame just pushed");
         let body = body.seal(Terminator {
             span: self.span(inner.at),
@@ -2647,6 +2835,14 @@ impl Lower<'_> {
                 rep: Rep::Struct,
             });
             self.top().tails.push((key, temp));
+            for (name, field) in &row.labels {
+                if *name != crate::types::mutation_effect().row_key()
+                    && possible(&field.presence)
+                    && !definite(&field.presence)
+                {
+                    self.top().conditional_evidence.insert(name.clone(), temp);
+                }
+            }
         }
     }
 
@@ -2664,7 +2860,7 @@ impl Lower<'_> {
     fn evidence_args(&mut self, declared: &Row, used: &Row, body: &mut Body) -> Vec<Temp> {
         let mut args = Vec::new();
         for name in shape(declared).names {
-            args.push(self.evidence_of(&name));
+            args.push(self.evidence_of(&name, body));
         }
         if tail_key(declared).is_some() {
             let key = tail_key(used).unwrap_or(RestKey::Open);
@@ -2960,14 +3156,28 @@ impl Lower<'_> {
     /// Never missing: an effect performed where nothing can handle it is what
     /// inference calls an unhandled effect, and this pass runs only on programs
     /// it accepted.
-    fn evidence_of(&mut self, name: &str) -> Temp {
+    fn evidence_of(&mut self, name: &str, body: &mut Body) -> Temp {
         let at = self
             .frames
             .iter()
-            .rposition(|frame| frame.evidence.contains_key(name))
+            .rposition(|frame| {
+                frame.evidence.contains_key(name) || frame.conditional_evidence.contains_key(name)
+            })
             .expect("inference refuses an effect nothing in scope can handle");
-        let temp = self.frames[at].evidence[name];
-        self.thread(at, temp)
+        if let Some(temp) = self.frames[at].evidence.get(name).copied() {
+            return self.thread(at, temp);
+        }
+        let bundle = self.frames[at].conditional_evidence[name];
+        let base = self.thread(at, bundle);
+        self.emit(
+            body,
+            Span::default(),
+            Rep::Struct,
+            Op::Project {
+                base,
+                field: FieldKey::named(name.to_owned()),
+            },
+        )
     }
 
     /// The bundle standing in for a row's variable part: the caller's own, when
@@ -3039,12 +3249,12 @@ impl Lower<'_> {
             let entries: IndexMap<String, Temp> = names
                 .iter()
                 .filter_map(|name| {
-                    let evidence_owner = self
-                        .frames
-                        .iter()
-                        .rposition(|frame| frame.evidence.contains_key(name));
+                    let evidence_owner = self.frames.iter().rposition(|frame| {
+                        frame.evidence.contains_key(name)
+                            || frame.conditional_evidence.contains_key(name)
+                    });
                     let value = if evidence_owner.is_some() && evidence_owner >= tail_owner {
-                        self.evidence_of(name)
+                        self.evidence_of(name, body)
                     } else {
                         self.emit(
                             body,
@@ -3119,7 +3329,7 @@ impl Lower<'_> {
             let entries: IndexMap<String, Temp> = names
                 .into_iter()
                 .map(|name| {
-                    let temp = self.evidence_of(&name);
+                    let temp = self.evidence_of(&name, body);
                     (name, temp)
                 })
                 .collect();
@@ -3662,6 +3872,11 @@ impl Lower<'_> {
         recursive: Option<Symbol>,
     ) -> Temp {
         let (from, _, row) = self.arrow(&term.ty);
+        let outer_patterns = self.structural_patterns;
+        self.structural_patterns |= matches!(
+            &*inference::unfold(self.inference.aliases(), &term.ty),
+            Ty::Contract { .. }
+        );
 
         self.frames.push(Frame {
             recursive: recursive.map(|symbol| Recursive {
@@ -3686,6 +3901,7 @@ impl Lower<'_> {
 
         let mut lifted = Body::default();
         let value = self.term(inner, &mut lifted);
+        self.structural_patterns = outer_patterns;
         let mut frame = self.frames.pop().expect("the frame just pushed");
         let name = self.lifted_name();
         let id = self.slot(name.clone());
@@ -3876,17 +4092,82 @@ impl Lower<'_> {
         let (from, to, declared) = self.arrow(&shape);
         let (_, _, used) = self.arrow(callee_ty);
         let profile = self.callable_held[callee as usize].unwrap_or(self.erased_callable);
-        let (arg_profile, result_profile) = self.callable_children(profile);
-        let mut args = self.callable_args(profile, body);
+        let (arg_profile, mut result_profile) = self.callable_children(profile);
+        let structural_result = self
+            .reification
+            .callables
+            .structural_results
+            .contains(&apply.node.at);
+        let result_type = if structural_result {
+            self.structural_result_type(&to, &apply.node.ty)
+        } else {
+            to.clone()
+        };
+        if structural_result && same_finite_syntax(&result_type, &apply.node.ty) {
+            result_profile = self.callable_shape(apply.node.at);
+        }
+        let invocation = self
+            .reification
+            .callables
+            .structural_invocations
+            .get(&apply.node.at)
+            .copied();
+        let structural_call = matches!(
+            &*inference::unfold(self.inference.aliases(), callee_ty),
+            Ty::Contract { .. }
+        );
+        let structural_argument = matches!(
+            &*inference::unfold(self.inference.aliases(), &apply.arg.ty),
+            Ty::Contract { .. }
+        );
+        let outer_unobserved = self.allow_unobserved_representations;
+        self.allow_unobserved_representations |= structural_call || structural_argument;
+        let mut args = if structural_call {
+            // The structural evaluator checked the actual argument without
+            // equating it with this representation fallback. Recover only the
+            // descriptor substitution needed by the emitted calling convention.
+            let mut substitution =
+                crate::reification::instantiate(&from, &apply.arg.ty, self.inference.aliases());
+            for (parameter, ty) in
+                crate::reification::instantiate(&to, &apply.node.ty, self.inference.aliases())
+            {
+                substitution.entry(parameter).or_insert(ty);
+            }
+            let invocation = invocation.map(|shape| self.callable_slots(shape));
+            self.callable_slots(profile)
+                .into_iter()
+                .map(|(parameter, mandatory)| {
+                    let ty = substitution
+                        .get(&parameter)
+                        .cloned()
+                        .unwrap_or_else(|| Arc::new(Ty::Bound(parameter)));
+                    let observed = mandatory
+                        || invocation.as_ref().is_none_or(|needed| {
+                            crate::reification::parameters(&ty)
+                                .iter()
+                                .any(|parameter| needed.contains_key(parameter))
+                        });
+                    if observed {
+                        self.representation(&ty, body)
+                    } else {
+                        self.absent_representation(body)
+                    }
+                })
+                .collect()
+        } else {
+            self.callable_args(profile, body)
+        };
         args.extend(self.evidence_args(&declared, &used, body));
-        args.push(self.reified_fitted(
+        let argument = self.reified_fitted(
             &from,
             arg_profile,
             &apply.arg.ty,
             self.callable_shape(apply.arg.at),
             arg,
             body,
-        ));
+        );
+        self.allow_unobserved_representations = outer_unobserved;
+        args.push(argument);
         let rep = self.rep(&apply.node.ty);
         let value = self.emit(
             body,
@@ -3900,7 +4181,7 @@ impl Lower<'_> {
         // Containers, like functions, retain the production type of the
         // callee's result. A later projection must read members at the stored
         // ABI before adapting them to this use's instantiation.
-        self.contain(value, &to);
+        self.contain(value, &result_type);
         // What comes back is shaped by the callee's own next level. Where that
         // level pins a function shape down, fit it to what this node stands
         // for; where it does not — an `any` nothing decided — the value is
@@ -3909,7 +4190,7 @@ impl Lower<'_> {
         self.reified_fitted(
             &apply.node.ty,
             self.callable_shape(apply.node.at),
-            &to,
+            &result_type,
             result_profile,
             value,
             body,
@@ -3927,7 +4208,7 @@ impl Lower<'_> {
         body: &mut Body,
     ) -> Temp {
         let name = self.program.effect_ids[&effect.anchored].row_key();
-        let record = self.evidence_of(&name);
+        let record = self.evidence_of(&name, body);
         let held = self.emit(
             body,
             self.span(head.at),
@@ -3984,11 +4265,31 @@ impl Lower<'_> {
         let span = applies[0].node.at;
         let mut full: Vec<Temp> = Vec::new();
         let mut here = used.clone();
+        let mut callable = known.callable;
         for ((level, apply), arg) in known.levels.iter().zip(applies).zip(&args) {
             let (_, rest, row) = self.arrow(&here);
+            let (expected, result) = self.callable_children(callable);
             full.extend(self.evidence_args(&level.row, &row, body));
-            full.push(self.fitted(&level.from, &apply.arg.ty, *arg, body));
+            // The direct-call optimization must adapt callbacks inside
+            // containers just as an indirect call does. Their effect bundles
+            // follow the definition's checked input layout.
+            let have = self.holding(*arg, &apply.arg.ty);
+            let offered =
+                self.callable_held[*arg as usize].unwrap_or(self.callable_shape(apply.arg.at));
+            let arg = if same_finite_syntax(&level.from, &have) {
+                // This exact type was already adapted while the argument was
+                // evaluated. Repeating the callable-shape fit here creates a
+                // second recursive adapter chain for the same semantic state.
+                self.fitted(&level.from, &have, *arg, body)
+            } else {
+                // Containers and distinct recursive aliases need the deeper
+                // walk: their callable members cross the direct-call boundary
+                // as a group and are not otherwise visited at this parameter.
+                self.reified_fitted(&level.from, expected, &have, offered, *arg, body)
+            };
+            full.push(arg);
             here = rest;
+            callable = result;
         }
 
         let value = match taken == arity {
@@ -4008,9 +4309,19 @@ impl Lower<'_> {
                 // definition's own last arrow, not by what this use
                 // instantiated it to — and it carries that shape wherever a
                 // binding or a further application takes it.
-                let to = known.levels[arity - 1].to.clone();
+                let to = if self
+                    .reification
+                    .callables
+                    .structural_results
+                    .contains(&node.at)
+                {
+                    self.structural_result_type(&known.levels[arity - 1].to, &node.ty)
+                } else {
+                    known.levels[arity - 1].to.clone()
+                };
                 self.hold(temp, &to);
                 self.contain(temp, &to);
+                self.callable_held[temp as usize] = Some(self.callable_shape(node.at));
                 temp
             }
             // Short of a full application, the arguments so far become the
@@ -4031,7 +4342,11 @@ impl Lower<'_> {
                     },
                 );
                 let have = self.walked(&known.ty, taken);
-                self.fitted(&node.ty, &have, temp, body)
+                let temp = self.fitted(&node.ty, &have, temp, body);
+                self.hold(temp, &node.ty);
+                self.contain(temp, &node.ty);
+                self.callable_held[temp as usize] = Some(self.callable_shape(node.at));
+                temp
             }
         };
         self.spun(value, &applies[taken - 1].node.ty, &applies[taken..], body)
@@ -4197,10 +4512,13 @@ impl Lower<'_> {
                 },
             );
         }
-        let allowed = self
-            .definition
-            .and_then(|symbol| self.inference.promises().get(&symbol).cloned())
-            .unwrap_or(Formula::True);
+        let allowed = if self.structural_patterns {
+            Formula::True
+        } else {
+            self.definition
+                .and_then(|symbol| self.inference.promises().get(&symbol).cloned())
+                .unwrap_or(Formula::True)
+        };
         let tree = Tree {
             callable: self.callable_shape(term.at),
             arms,
@@ -4218,7 +4536,7 @@ impl Lower<'_> {
                 .iter()
                 .enumerate()
                 .map(|(at, (pattern, _))| Line {
-                    cells: vec![cell(pattern)],
+                    cells: vec![cell(pattern, self.structural_patterns)],
                     arm: at,
                     binds: Vec::new(),
                 })
@@ -4302,6 +4620,9 @@ impl Lower<'_> {
             .lines
             .iter()
             .any(|line| matches!(line.cells[0], Cell::Tag { .. }));
+        if tags && let Some(row) = self.representation_row(&ty, true) {
+            return self.switch_tag(col.temp, &row, matrix, tree, body);
+        }
         match &*ty {
             Ty::Nat
             | Ty::Int
@@ -4314,10 +4635,6 @@ impl Lower<'_> {
                 if primitives =>
             {
                 self.switch_prim(col.temp, matrix, tree, body)
-            }
-            Ty::Sum(row) if tags => {
-                let row = flat(row);
-                self.switch_tag(col.temp, &row, matrix, tree, body)
             }
             // Nothing here to test: a unit, an arrow, a variable, or a position
             // every arm accepts whole. The column is consumed and whatever binds
@@ -4667,7 +4984,8 @@ impl Lower<'_> {
             })
             .collect();
 
-        let uncovered = !matches!(row.rest, Rest::Closed)
+        let uncovered = self.structural_patterns
+            || !matches!(row.rest, Rest::Closed)
             || row
                 .labels
                 .iter()
@@ -4703,27 +5021,38 @@ impl Lower<'_> {
         tree: &Tree,
         body: &mut Body,
     ) -> Temp {
-        let exposed = self.erased(ty);
-        let row = match &*exposed {
-            Ty::Struct(row) => flat(row),
-            // Imported recovery types can disagree with the already-recovered
-            // pattern matrix. Treat them as an open unknown row: the fields the
-            // pattern itself names are added below, and lowering remains total.
-            _ => Row::of(Rest::Undecided),
-        };
+        // Recovery types may have no structural information and therefore
+        // require real presence tests.
+        let mut row = self.representation_row(ty, false).unwrap_or_else(|| {
+            Row::of(if self.rep(ty) == Rep::Any {
+                Rest::Undecided
+            } else {
+                Rest::Closed
+            })
+        });
+        if self.structural_patterns && matches!(self.rep(ty), Rep::Any | Rep::Struct | Rep::Unit) {
+            row.rest = Rest::Undecided;
+            for field in row.labels.values_mut() {
+                field.presence = Presence::Undecided;
+            }
+        }
         let mut named: Vec<(String, Presence, Arc<Ty>)> = row
             .labels
             .iter()
             .map(|(name, field)| (name.clone(), field.presence.clone(), field.ty.clone()))
             .collect();
-        // A field an arm names that the type does not is provably absent — the
-        // pattern checks let it through over the fieldless unit alone — and
-        // still needs a column, with the one-value universe absence is.
+        // Only a closed row proves an unlisted field absent. An erased
+        // structural-contract argument may carry that field, so its pattern
+        // still needs a runtime presence test.
         for line in &matrix.lines {
             if let Cell::Struct { fields, .. } = &line.cells[0] {
                 for (name, _) in fields {
                     if !named.iter().any(|(known, _, _)| known == name) {
-                        named.push((name.clone(), Presence::Absent, Arc::new(Ty::default())));
+                        let presence = match row.rest {
+                            Rest::Closed => Presence::Absent,
+                            _ => Presence::Undecided,
+                        };
+                        named.push((name.clone(), presence, Arc::new(Ty::default())));
                     }
                 }
             }
@@ -4794,6 +5123,14 @@ impl Lower<'_> {
         // presence nor the value is worth reading.
         if matrix.untested() {
             return self.tree(matrix.dropped(), tree, body);
+        }
+        if self.structural_patterns {
+            if matrix.absent().lines.is_empty() {
+                return self.field(col, matrix.present(), tree, body);
+            }
+            if matrix.present().lines.is_empty() {
+                return self.tree(matrix.absent(), tree, body);
+            }
         }
         match col.presence {
             Presence::Present => self.field(col, matrix.present(), tree, body),
@@ -4971,6 +5308,9 @@ impl Lower<'_> {
             .kept(|line| matches!(line.cells[0], Cell::Wild(_)))
             .dropped();
         let none = matrix.dropped();
+        if self.structural_patterns && some.lines.is_empty() {
+            return self.tree(none, tree, body);
+        }
         let none = self.child(tree.span, |low, inner| low.tree(none, tree, inner));
         let some = self.child(tree.span, |low, inner| low.tree(some, tree, inner));
         self.emit(
@@ -5049,6 +5389,7 @@ mod tests {
             "let f = fn s => match s with | { x } => 1n | _ => 2n end",
             |program, _| {
                 let definition = &mut program.terms.values_mut().next().unwrap().value;
+                ordinary_fixture(definition);
                 let ir::TermKind::Fn { body, .. } = &mut definition.kind else {
                     panic!("function fixture")
                 };
@@ -5064,6 +5405,15 @@ mod tests {
         );
         assert!(!projects_any_field(&output), "{output:#?}");
         assert!(yields_constant(&output, 2), "{output:#?}");
+    }
+
+    /// These recovery tests exercise ordinary-arrow facts, after intentionally
+    /// corrupting the checked program. Structural contracts deliberately keep
+    /// dynamic tests beyond the fallback's narrower row, so remove that layer.
+    fn ordinary_fixture(definition: &mut Term) {
+        while let Ty::Contract { fallback, .. } = &*definition.ty {
+            definition.ty = fallback.clone();
+        }
     }
 
     /// Every instruction of every function and global, nested blocks included.
@@ -5286,6 +5636,7 @@ mod tests {
             "let f = fn s => match s with | { x, y } => y | { x } => x end",
             |program, inferred| {
                 let symbol = *program.terms.keys().next().expect("the source defines f");
+                ordinary_fixture(&mut program.terms.get_mut(&symbol).unwrap().value);
                 inferred
                     .semantics_mut()
                     .promises
@@ -5384,7 +5735,9 @@ mod tests {
             .iter()
             .filter(|function| function.name.starts_with("go#"))
             .collect();
-        assert_eq!(adapters.len(), 2, "{:#?}", output.functions);
+        // Container-aware known-call fitting adds the outer argument adapter;
+        // the two recursive states must still remain distinct beneath it.
+        assert_eq!(adapters.len(), 3, "{:#?}", output.functions);
         assert!(adapters.iter().any(|function| {
             function
                 .body
@@ -5398,7 +5751,7 @@ mod tests {
     /// Repeating the same recovery identity closes the guarded cycle immediately;
     /// changing it reaches one distinct state before the stable suffix coalesces.
     #[test]
-    fn recursive_adapter_coalescing_preserves_recovered_presence_correlation() {
+    fn recursive_adapter_coalescing_stays_bounded_across_recovered_presence_ids() {
         let adapters = |first_id| {
             let output = lowered_after_check(
                 "type X 'a 'b = 'a\n\
@@ -5481,8 +5834,12 @@ mod tests {
                 .count()
         };
 
-        assert_eq!(adapters(2), 1);
-        assert_eq!(adapters(1), 2);
+        // The known-call path now includes the outer container adapter and
+        // adapts the callback held inside it. Recovery identities remain
+        // finite inputs to that traversal rather than growing a new adapter
+        // layer per recursive visit.
+        assert_eq!(adapters(2), 3);
+        assert_eq!(adapters(1), 3);
     }
 
     #[test]

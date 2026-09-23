@@ -1737,10 +1737,23 @@ fn recursive_arrow_fitting_reuses_one_guarded_adapter() {
          let poly : Runs (..'r) = fn n => poly\n\
          let takes : Runs (!Log) -> Nat + !Log = fn f => 1n\n\
          let go = fn w => handle takes poly with | !Log.write n => {} end";
-    let adapter = section(source, "fn go#3");
+    let whole = listing(source);
+    // The source and target profiles may need a finite adapter prefix before
+    // their recursive states repeat. Exactly one adapter closes over itself
+    // once that state is reached; its effect bundle must still be packed.
+    let recursive: Vec<_> = whole
+        .split("\n\n")
+        .filter_map(|section| {
+            let name = section.strip_prefix("fn go#")?.split('(').next()?;
+            let closure = format!("closure go#{name},");
+            section.contains(&closure).then_some((section, closure))
+        })
+        .collect();
+    assert_eq!(recursive.len(), 1, "{whole}");
+    let (adapter, closure) = &recursive[0];
     assert!(adapter.contains("struct { Log:"), "{adapter}");
     assert!(adapter.contains("call %"), "{adapter}");
-    assert_eq!(adapter.matches("closure go#3").count(), 1, "{adapter}");
+    assert_eq!(adapter.matches(closure).count(), 1, "{adapter}");
 }
 
 #[test]
@@ -1800,20 +1813,20 @@ fn an_adapter_forwards_the_bundle_it_was_handed() {
         listing(source)
     );
     assert_eq!(
-        section(source, "fn fwd#3"),
-        r#"fn fwd#3(%27: fn, %28: struct, %29: fn; %56: cont) entry b0 [f8, MaySuspend]:
-  b0(%27: fn, %28: struct, %29: fn, %56: cont):
+        section(source, "fn fwd#2"),
+        r#"fn fwd#2(%27: fn, %28: struct, %29: fn; %55: cont) entry b0 [f7, MaySuspend]:
+  b0(%27: fn, %28: struct, %29: fn, %55: cont):
     %30: struct = project %28, "Log"
-    %38: fn = closure fwd#2, [%29]
-    call %27, %30, %28, %38 -> %56"#
+    %38: fn = closure fwd#3, [%29]
+    call %27, %30, %28, %38 -> %55"#
     );
     assert_eq!(
-        section(source, "fn fwd#2"),
-        r#"fn fwd#2(%31: fn, %32: struct, %33: struct, %34: nat; %55: cont) entry b0 [f7, MaySuspend]:
-  b0(%31: fn, %32: struct, %33: struct, %34: nat, %55: cont):
+        section(source, "fn fwd#3"),
+        r#"fn fwd#3(%31: fn, %32: struct, %33: struct, %34: nat; %56: cont) entry b0 [f8, MaySuspend]:
+  b0(%31: fn, %32: struct, %33: struct, %34: nat, %56: cont):
     %35: struct = struct { Log: %32 }
     %36: struct = merge %33, %35
-    call %31, %36, %34 -> %55"#
+    call %31, %36, %34 -> %56"#
     );
 }
 

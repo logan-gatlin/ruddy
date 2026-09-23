@@ -42,10 +42,14 @@
 //! and nothing may make the dependency run back.
 
 pub const TAIL_RECURSION_CODE: &str = "tail-recursion-opportunity";
+mod contract_patterns;
 mod presentation;
+use contract_patterns::{Bindings as ContractBindings, PatternNames, Projection};
 pub use presentation::TypePresentation;
 pub const TAIL_RECURSION_MESSAGE: &str = "This function can be rewritten as tail recursion. Accumulate the numeric operation before each recursive call instead of retaining work after it.";
 pub const TAIL_RECURSION_ACTION: &str = "Convert to tail recursion";
+
+use std::fmt::Write as _;
 
 use std::{
     collections::{HashMap, HashSet},
@@ -269,13 +273,14 @@ pub fn type_prec(kind: &parse::TypeKind) -> Prec {
         // The body runs as far right as it can, so a hidden type needs
         // parentheses anywhere anything may follow it — as an arrow's input,
         // as an argument, as a case's payload.
-        TypeKind::Hidden { .. } => Prec::Lambda,
+        TypeKind::Hidden { .. } | TypeKind::Structural { .. } => Prec::Lambda,
         TypeKind::Arrow { .. } => Prec::Arrow,
         // A row of effects binds as a sum does: it is written with the same
         // labels and the same tail, and needs the same brackets around it.
         TypeKind::Sum { .. } | TypeKind::Effects(_) => Prec::Sum,
         TypeKind::Apply { .. } | TypeKind::Mut(..) => Prec::Apply,
-        TypeKind::Struct { .. }
+        TypeKind::Match(_)
+        | TypeKind::Struct { .. }
         | TypeKind::Tuple(_)
         | TypeKind::Array(_)
         | TypeKind::Ident { .. }
@@ -626,7 +631,7 @@ fn bare_identifier(name: &str) -> bool {
 }
 
 /// Write one decoded Ruddy string with the escapes accepted by the lexer.
-pub fn write_string(f: &mut fmt::Formatter<'_>, value: &str) -> fmt::Result {
+pub fn write_string(f: &mut impl fmt::Write, value: &str) -> fmt::Result {
     f.write_str("\"")?;
     for c in value.chars() {
         match c {
@@ -642,7 +647,7 @@ pub fn write_string(f: &mut fmt::Formatter<'_>, value: &str) -> fmt::Result {
 }
 
 /// Write a field label in its shortest unambiguous source spelling.
-pub fn write_field_label(f: &mut fmt::Formatter<'_>, name: &str) -> fmt::Result {
+pub fn write_field_label(f: &mut impl fmt::Write, name: &str) -> fmt::Result {
     let canonical_numeric = name
         .parse::<u64>()
         .is_ok_and(|value| value.to_string() == name);
@@ -654,7 +659,7 @@ pub fn write_field_label(f: &mut fmt::Formatter<'_>, name: &str) -> fmt::Result 
 }
 
 /// Write a union tag, including its sigil, in canonical source spelling.
-pub fn write_tag_label(f: &mut fmt::Formatter<'_>, name: &str) -> fmt::Result {
+pub fn write_tag_label(f: &mut impl fmt::Write, name: &str) -> fmt::Result {
     f.write_str("#")?;
     if bare_tag(name) {
         f.write_str(name)
@@ -1406,6 +1411,8 @@ impl ir::ErrorKind {
             ir::ErrorKind::ParameterApplied { .. } => "applied-parameter",
             ir::ErrorKind::DuplicateParameter { .. } => "duplicate-parameter",
             ir::ErrorKind::GrowingRecursion => "growing-recursion",
+            ir::ErrorKind::UnsupportedMatchDiscriminator => "unsupported-match-discriminator",
+            ir::ErrorKind::ImportedTypeLimit { .. } => "imported-type-limit",
             ir::ErrorKind::DuplicateCase { .. } => "duplicate-case",
             // The shape is not part of these codes, only of their wording: a
             // reporter that treats a struct's row differently from a sum's is
@@ -1740,6 +1747,16 @@ impl ir::Error {
                     .label("declared again here")
                     .related(source.span(*previous), FIRST_DECLARATION)
             }
+            E::UnsupportedMatchDiscriminator => Diagnostic::new(
+                code,
+                "this match type arm has no structural discriminator",
+                span,
+            ).help("use a record shape or a single tag to choose an arm, or put this arm last"),
+            E::ImportedTypeLimit { name } => Diagnostic::new(
+                code,
+                format!("the argument type of imported effect alias `{name}` is too large to expand"),
+                span,
+            ).help("name shared parts in ordinary type declarations before exporting this effect alias"),
             E::GrowingRecursion => {
                 Diagnostic::new(code, "recursive type arguments grow without bound", span)
                     .label("each trip around this recursion builds a larger type")
@@ -2292,7 +2309,7 @@ impl Grouped for Ty {
         match unpackaged(self) {
             // The body runs as far right as it can, exactly as the written
             // form's does.
-            Ty::Hidden { .. } => Prec::Lambda,
+            Ty::Hidden { .. } | Ty::Contract { .. } => Prec::Lambda,
             Ty::Arrow(..) => Prec::Arrow,
             Ty::Sum(_) => Prec::Sum,
             Ty::Mut(..) | Ty::Mirror(_) | Ty::TypeInfo(_) => Prec::Apply,
@@ -2335,6 +2352,23 @@ enum SemanticJob<'a> {
     Effect(&'a str, &'a RowField),
     Mark(&'a Presence),
     Text(&'static str),
+    Owned(String),
+    ContractExpr(
+        &'a crate::contracts::Expr,
+        &'a crate::contracts::Contract,
+        std::sync::Arc<ContractBindings>,
+        bool,
+    ),
+    ContractScope(
+        &'a crate::contracts::Expr,
+        &'a crate::contracts::Contract,
+        std::sync::Arc<ContractBindings>,
+    ),
+    ContractPattern(
+        &'a crate::contracts::Pattern,
+        Projection,
+        std::sync::Arc<PatternNames>,
+    ),
 }
 
 fn format_semantic(f: &mut fmt::Formatter<'_>, root: SemanticRoot<'_>) -> fmt::Result {
@@ -2346,7 +2380,40 @@ fn format_semantic_named(
     root: SemanticRoot<'_>,
     names: Option<&[String]>,
 ) -> fmt::Result {
-    format_semantic_replacing(f, root, names, &HashMap::new(), &HashMap::new())
+    format_semantic_budgeted(f, root, names, &HashMap::new(), &HashMap::new(), true)
+}
+
+const TYPE_DISPLAY_LIMIT: usize = 256 * 1024;
+const TYPE_DISPLAY_TRUNCATED: &str =
+    "… [type display truncated; use the complete type presentation]";
+
+struct TypeWriter<'a> {
+    output: &'a mut dyn fmt::Write,
+    remaining: usize,
+    truncated: bool,
+}
+
+impl TypeWriter<'_> {
+    fn truncate(&mut self) -> fmt::Result {
+        if !self.truncated {
+            self.truncated = true;
+            self.output.write_str(TYPE_DISPLAY_TRUNCATED)?;
+        }
+        Ok(())
+    }
+}
+
+impl fmt::Write for TypeWriter<'_> {
+    fn write_str(&mut self, text: &str) -> fmt::Result {
+        if self.truncated {
+            return Ok(());
+        }
+        if text.len() > self.remaining {
+            return self.truncate();
+        }
+        self.remaining -= text.len();
+        self.output.write_str(text)
+    }
 }
 
 fn format_semantic_replacing(
@@ -2356,6 +2423,32 @@ fn format_semantic_replacing(
     replacements: &HashMap<usize, String>,
     bounds: &HashMap<u32, u32>,
 ) -> fmt::Result {
+    format_semantic_budgeted(f, root, names, replacements, bounds, false)
+}
+
+fn format_semantic_budgeted(
+    f: &mut impl fmt::Write,
+    root: SemanticRoot<'_>,
+    names: Option<&[String]>,
+    replacements: &HashMap<usize, String>,
+    bounds: &HashMap<u32, u32>,
+    budgeted: bool,
+) -> fmt::Result {
+    let mut writer = TypeWriter {
+        output: f,
+        remaining: if budgeted {
+            TYPE_DISPLAY_LIMIT
+        } else {
+            usize::MAX
+        },
+        truncated: false,
+    };
+    let f = &mut writer;
+    let mut remaining_jobs = if budgeted {
+        TYPE_DISPLAY_LIMIT
+    } else {
+        usize::MAX
+    };
     let first = match root {
         SemanticRoot::Ty(ty) => SemanticJob::Ty(ty, false),
         SemanticRoot::Row(row) => SemanticJob::Row(row),
@@ -2364,8 +2457,26 @@ fn format_semantic_replacing(
     };
     let mut work = vec![first];
     while let Some(part) = work.pop() {
+        if f.truncated {
+            break;
+        }
+        if remaining_jobs == 0 {
+            f.truncate()?;
+            break;
+        }
+        remaining_jobs -= 1;
         match part {
             SemanticJob::Text(text) => f.write_str(text)?,
+            SemanticJob::Owned(text) => f.write_str(&text)?,
+            SemanticJob::ContractPattern(pattern, projection, names) => {
+                write_contract_pattern(f, &mut work, pattern, &projection, &names)?
+            }
+            SemanticJob::ContractExpr(expr, contract, bindings, inline) => {
+                write_contract_expr(f, &mut work, expr, contract, &bindings, inline)?
+            }
+            SemanticJob::ContractScope(expr, contract, bindings) => {
+                write_contract_scope(f, &mut work, expr, contract, &bindings)?
+            }
             SemanticJob::Ty(ty, grouped) => {
                 if let Some(text) = replacements.get(&(ty as *const Ty as usize)) {
                     // Applications are safe in all type positions with grouping.
@@ -2381,6 +2492,63 @@ fn format_semantic_replacing(
                     work.push(SemanticJob::Text(")"));
                 }
                 match ty {
+                    Ty::Contract { contract, .. } => {
+                        if contract.effect_sink.is_none()
+                            && contract.annotation_cases().is_some()
+                            && let crate::contracts::Expr::Match { arms, .. } = &*contract.body
+                        {
+                            f.write_str("match")?;
+                            work.push(SemanticJob::Text(" end"));
+                            for arm in arms.iter().rev() {
+                                let crate::contracts::Expr::Apply { function, .. } = &*arm.body
+                                else {
+                                    unreachable!()
+                                };
+                                let crate::contracts::Expr::Capture(index) = &**function else {
+                                    unreachable!()
+                                };
+                                let Ty::Arrow(from, to, _) = &*contract.captures[*index] else {
+                                    unreachable!()
+                                };
+                                work.push(SemanticJob::Ty(to, to.prec() <= Prec::Arrow));
+                                work.push(SemanticJob::Text(" => "));
+                                let grouped = matches!(&**from, Ty::Sum(row) if row.labels.len() != 1 || !matches!(row.rest, Rest::Closed));
+                                work.push(SemanticJob::Ty(from, grouped));
+                                work.push(SemanticJob::Text(" | "));
+                            }
+                            continue;
+                        }
+                        f.write_str("fn")?;
+                        if let Some(sink) = &contract.effect_sink
+                            && let Ty::Arrow(_, _, effects) = &**sink
+                        {
+                            work.push(SemanticJob::Effects(effects));
+                            work.push(SemanticJob::Text(" + "));
+                        }
+                        if let Some(scopes) = ContractBindings::match_function(contract)
+                            && let crate::contracts::Expr::Match { scrutinee, arms } =
+                                &*contract.body
+                        {
+                            for (arm, (bindings, names)) in arms.iter().zip(scopes).rev() {
+                                contract_arm_jobs(
+                                    &mut work, contract, scrutinee, arm, bindings, names,
+                                );
+                            }
+                        } else {
+                            for index in contract.arguments.len()..contract.parameters {
+                                if f.truncated {
+                                    break;
+                                }
+                                write!(f, " 'input{index}")?;
+                            }
+                            f.write_str(" => ")?;
+                            work.push(SemanticJob::ContractScope(
+                                &contract.body,
+                                contract,
+                                Default::default(),
+                            ));
+                        }
+                    }
                     Ty::Package(body) => work.push(SemanticJob::Ty(body, false)),
                     Ty::Hidden { name, body, .. } => {
                         write!(f, "hide '{name} => ")?;
@@ -2429,10 +2597,7 @@ fn format_semantic_replacing(
                             work.push(SemanticJob::Effects(effects));
                             work.push(SemanticJob::Text(" + "));
                         }
-                        work.push(SemanticJob::Ty(
-                            to,
-                            shown && matches!(unpackaged(to), Ty::Arrow(..) | Ty::Hidden { .. }),
-                        ));
+                        work.push(SemanticJob::Ty(to, shown && to.prec() <= Prec::Arrow));
                         work.push(SemanticJob::Text(" -> "));
                         work.push(SemanticJob::Ty(from, from.prec() < Prec::Sum));
                     }
@@ -2643,6 +2808,442 @@ fn format_semantic_replacing(
     Ok(())
 }
 
+/// Print the structural part of a written type using the same renderer as an
+/// inferred contract. Captures retain their source-level names and syntax.
+pub fn structural_type_text(
+    parameters: usize,
+    body: &std::sync::Arc<crate::contracts::Expr>,
+    captures: &[String],
+) -> String {
+    structural_type_text_with_arguments(parameters, body, captures, &[])
+}
+
+/// The imported form can retain arguments supplied before an interface was
+/// published. Source annotations start with no supplied arguments.
+pub fn structural_type_text_with_arguments(
+    parameters: usize,
+    body: &std::sync::Arc<crate::contracts::Expr>,
+    captures: &[String],
+    arguments: &[String],
+) -> String {
+    use std::sync::Arc;
+    let mut operands: Vec<_> = captures
+        .iter()
+        .chain(arguments)
+        .map(|_| Arc::new(Ty::Undecided))
+        .collect();
+    let replacements: HashMap<_, _> = operands
+        .iter()
+        .zip(captures.iter().chain(arguments))
+        .map(|(ty, source)| (Arc::as_ptr(ty) as usize, source.clone()))
+        .collect();
+    let arguments = operands.split_off(captures.len());
+    let ty = Ty::Contract {
+        fallback: Arc::new(Ty::Undecided),
+        contract: Arc::new(crate::contracts::Contract {
+            parameters,
+            body: body.clone(),
+            captures: operands.into(),
+            arguments: arguments.into(),
+            effect_sink: None,
+        }),
+    };
+    struct Written<'a>(&'a Ty, &'a HashMap<usize, String>);
+    impl fmt::Display for Written<'_> {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            format_semantic_replacing(f, SemanticRoot::Ty(self.0), None, self.1, &HashMap::new())
+        }
+    }
+    Written(&ty, &replacements).to_string()
+}
+
+/// A scope stops at branch bodies: factoring a projection outside the branch
+/// which proves it safe would change the contract's requirements.
+fn write_contract_scope<'a>(
+    f: &mut impl fmt::Write,
+    work: &mut Vec<SemanticJob<'a>>,
+    root: &'a crate::contracts::Expr,
+    contract: &'a crate::contracts::Contract,
+    inherited: &std::sync::Arc<ContractBindings>,
+) -> fmt::Result {
+    use crate::contracts::Expr;
+    use SemanticJob::{ContractExpr as E, Owned, Text};
+    let mut counts = HashMap::<usize, usize>::new();
+    let mut seen = HashSet::new();
+    let mut postorder = Vec::new();
+    let mut pending = vec![(root, false)];
+    while let Some((expr, finish)) = pending.pop() {
+        let key = expr as *const Expr as usize;
+        if finish {
+            postorder.push(expr);
+            continue;
+        }
+        *counts.entry(key).or_default() += 1;
+        if inherited.contains(expr) || !seen.insert(key) {
+            continue;
+        }
+        pending.push((expr, true));
+        match expr {
+            Expr::Match { scrutinee, .. } => pending.push((scrutinee, false)),
+            _ => {
+                let mut children = Vec::new();
+                expr.children(&mut children);
+                pending.extend(children.into_iter().rev().map(|child| (&**child, false)));
+            }
+        }
+    }
+    let mut bindings = (**inherited).clone();
+    let mut definitions = Vec::new();
+    // Captures of the same finite callable contract can share one definition.
+    // Its fallback is representation metadata, absent from this source form.
+    let mut capture_groups: Vec<(&std::sync::Arc<Ty>, Vec<usize>)> = Vec::new();
+    for expr in &postorder {
+        let Expr::Capture(index) = expr else {
+            continue;
+        };
+        let Some(ty) = contract.captures.get(*index) else {
+            continue;
+        };
+        if !matches!(&**ty, Ty::Contract { .. }) {
+            continue;
+        }
+        let key = *expr as *const Expr as usize;
+        if let Some((_, keys)) = capture_groups
+            .iter_mut()
+            .find(|(other, _)| same_printed_contract(ty, other))
+        {
+            keys.push(key);
+        } else {
+            capture_groups.push((ty, vec![key]));
+        }
+    }
+    for expr in postorder {
+        let key = expr as *const Expr as usize;
+        if bindings.contains(expr) {
+            continue;
+        }
+        let aliases = capture_groups
+            .iter()
+            .find_map(|(_, keys)| (keys.len() > 1 && keys.contains(&key)).then_some(keys));
+        let repeated = counts[&key] > 1
+            && match expr {
+                Expr::Input(_) => false,
+                Expr::Capture(index) => matches!(
+                    contract.captures.get(*index).map(|ty| &**ty),
+                    Some(Ty::Contract { .. })
+                ),
+                _ => true,
+            };
+        if repeated || aliases.is_some() {
+            let index = bindings
+                .nodes
+                .values()
+                .copied()
+                .max()
+                .map_or(0, |index| index + 1);
+            bindings.nodes.insert(key, index);
+            if let Some(aliases) = aliases {
+                for alias in aliases {
+                    bindings.nodes.insert(*alias, index);
+                }
+            }
+            definitions.push((expr, index));
+        }
+    }
+    let bindings = std::sync::Arc::new(bindings);
+    if definitions.is_empty() {
+        work.push(E(root, contract, bindings, false));
+        return Ok(());
+    }
+    f.write_str("do")?;
+    work.push(Text(" end"));
+    contract_sequence_jobs(work, root, contract, &bindings);
+    for (expr, index) in definitions.into_iter().rev() {
+        work.push(Text(";"));
+        work.push(E(expr, contract, bindings.clone(), true));
+        work.push(Owned(format!(" let 'node{index} = ")));
+    }
+    Ok(())
+}
+
+/// Keep a sequence in one `do` block, including the forced evaluations that
+/// remain necessary even when its expression has a shared name.
+fn contract_sequence_jobs<'a>(
+    work: &mut Vec<SemanticJob<'a>>,
+    root: &'a crate::contracts::Expr,
+    contract: &'a crate::contracts::Contract,
+    bindings: &std::sync::Arc<ContractBindings>,
+) {
+    use crate::contracts::Expr;
+    use SemanticJob::{ContractExpr as E, Text};
+    let mut values = Vec::new();
+    let mut result = root;
+    while let Expr::Then { value, body } = result {
+        values.push(&**value);
+        result = body;
+        if bindings.contains(result) {
+            break;
+        }
+    }
+    work.push(E(result, contract, bindings.clone(), false));
+    work.push(Text(" return "));
+    for value in values.into_iter().rev() {
+        work.push(Text(";"));
+        work.push(E(value, contract, bindings.clone(), false));
+        work.push(Text(" _ = "));
+    }
+}
+
+fn same_printed_contract(left: &std::sync::Arc<Ty>, right: &std::sync::Arc<Ty>) -> bool {
+    let mut pending = vec![(left, right)];
+    let mut seen = HashSet::new();
+    while let Some((left, right)) = pending.pop() {
+        if !seen.insert((std::sync::Arc::as_ptr(left), std::sync::Arc::as_ptr(right))) {
+            continue;
+        }
+        match (&**left, &**right) {
+            (Ty::Contract { contract: a, .. }, Ty::Contract { contract: b, .. }) => {
+                if a.parameters != b.parameters
+                    || a.captures.len() != b.captures.len()
+                    || a.arguments.len() != b.arguments.len()
+                    || a.effect_sink.is_some() != b.effect_sink.is_some()
+                    || !crate::contracts::Expr::same_structure(&a.body, &b.body)
+                {
+                    return false;
+                }
+                pending.extend(a.type_operands().zip(b.type_operands()));
+            }
+            _ if crate::types::same_finite_syntax(left, right) => {}
+            _ => return false,
+        }
+    }
+    true
+}
+
+fn contract_arm_jobs<'a>(
+    work: &mut Vec<SemanticJob<'a>>,
+    contract: &'a crate::contracts::Contract,
+    scrutinee: &crate::contracts::Expr,
+    arm: &'a crate::contracts::Arm,
+    bindings: ContractBindings,
+    names: PatternNames,
+) {
+    use SemanticJob::{ContractPattern, ContractScope, Text};
+    work.push(ContractScope(
+        &arm.body,
+        contract,
+        std::sync::Arc::new(bindings),
+    ));
+    work.push(Text(" => "));
+    work.push(ContractPattern(
+        &arm.pattern,
+        Projection::of(scrutinee),
+        std::sync::Arc::new(names),
+    ));
+    work.push(Text(" | "));
+}
+
+fn write_contract_expr<'a>(
+    f: &mut impl fmt::Write,
+    work: &mut Vec<SemanticJob<'a>>,
+    expr: &'a crate::contracts::Expr,
+    contract: &'a crate::contracts::Contract,
+    bindings: &std::sync::Arc<ContractBindings>,
+    inline: bool,
+) -> fmt::Result {
+    use crate::contracts::Expr;
+    use SemanticJob::{ContractExpr as E, Owned, Text};
+    if let Some(name) = bindings.pattern_name(expr) {
+        return f.write_str(name);
+    }
+    if !inline && let Some(index) = bindings.nodes.get(&(expr as *const _ as usize)) {
+        return write!(f, "'node{index}");
+    }
+    match expr {
+        Expr::Input(index) if *index >= contract.arguments.len() => write!(f, "'input{index}"),
+        Expr::Input(index) | Expr::Capture(index) => {
+            let ty = match expr {
+                Expr::Input(_) => contract.arguments.get(*index),
+                _ => contract.captures.get(*index),
+            };
+            f.write_str("capture (")?;
+            work.push(Text(")"));
+            match ty {
+                Some(ty) => work.push(SemanticJob::Ty(ty, false)),
+                None => work.push(Text("_")),
+            }
+            Ok(())
+        }
+        Expr::Field { base, label: name } | Expr::Payload { base, label: name } => {
+            let shape = if matches!(expr, Expr::Payload { .. }) {
+                Shape::Sum
+            } else {
+                Shape::Struct
+            };
+            f.write_str("(")?;
+            work.push(Owned(format!(").{}", label(shape, name))));
+            work.push(E(base, contract, bindings.clone(), false));
+            Ok(())
+        }
+        Expr::Record { fields, spread } => {
+            if fields.is_empty() && spread.is_none() {
+                return f.write_str("()");
+            }
+            if spread.is_none()
+                && let Some(order) = tuple_field_order(fields.iter().map(|(name, _)| name.as_str()))
+            {
+                f.write_str("(")?;
+                work.push(Text(if fields.len() == 1 { ",)" } else { ")" }));
+                for (index, at) in order.into_iter().enumerate().rev() {
+                    work.push(E(&fields[at].1, contract, bindings.clone(), false));
+                    if index > 0 {
+                        work.push(Text(", "));
+                    }
+                }
+                return Ok(());
+            }
+            f.write_str("{ ")?;
+            work.push(Text(" }"));
+            if let Some(spread) = spread {
+                work.push(E(spread, contract, bindings.clone(), false));
+                work.push(Text(".."));
+                if !fields.is_empty() {
+                    work.push(Text(", "));
+                }
+            }
+            for (index, (name, value)) in fields.iter().enumerate().rev() {
+                work.push(E(value, contract, bindings.clone(), false));
+                work.push(Owned(format!("{}: ", label(Shape::Struct, name))));
+                if index > 0 {
+                    work.push(Text(", "));
+                }
+            }
+            Ok(())
+        }
+        Expr::Tag {
+            label: name,
+            payload,
+        } => {
+            write!(f, "{}", label(Shape::Sum, name))?;
+            if !matches!(&**payload, Expr::Record { fields, spread: None } if fields.is_empty()) {
+                f.write_str(" (")?;
+                work.push(Text(")"));
+                work.push(E(payload, contract, bindings.clone(), false));
+            }
+            Ok(())
+        }
+        Expr::Apply { function, argument } => {
+            f.write_str("(")?;
+            work.push(Text(")"));
+            work.push(E(argument, contract, bindings.clone(), false));
+            work.push(Text(") ("));
+            work.push(E(function, contract, bindings.clone(), false));
+            Ok(())
+        }
+        Expr::Match { scrutinee, arms } => {
+            f.write_str("match ")?;
+            work.push(Text(" end"));
+            for arm in arms.iter().rev() {
+                let (local, names) = bindings.arm(scrutinee, &arm.pattern, &arm.body);
+                contract_arm_jobs(work, contract, scrutinee, arm, local, names);
+            }
+            work.push(Text(" with"));
+            work.push(E(scrutinee, contract, bindings.clone(), false));
+            Ok(())
+        }
+        Expr::Then { .. } => {
+            f.write_str("do")?;
+            work.push(Text(" end"));
+            contract_sequence_jobs(work, expr, contract, bindings);
+            Ok(())
+        }
+    }
+}
+
+fn write_contract_pattern<'a>(
+    f: &mut impl fmt::Write,
+    work: &mut Vec<SemanticJob<'a>>,
+    pattern: &'a crate::contracts::Pattern,
+    projection: &Projection,
+    names: &std::sync::Arc<PatternNames>,
+) -> fmt::Result {
+    use crate::contracts::Pattern;
+    use SemanticJob::{ContractPattern as P, Owned, Text};
+    match pattern {
+        Pattern::Any => f.write_str(names.get(projection).map_or("_", String::as_str)),
+        Pattern::Tag {
+            label: name,
+            payload,
+        } => {
+            write!(f, "{}", label(Shape::Sum, name))?;
+            if !matches!(&**payload, Pattern::Record { fields, open: false } if fields.is_empty()) {
+                f.write_str(" (")?;
+                work.push(Text(")"));
+                work.push(P(
+                    payload,
+                    if names.is_empty() {
+                        projection.clone()
+                    } else {
+                        projection.payload(name)
+                    },
+                    names.clone(),
+                ));
+            }
+            Ok(())
+        }
+        Pattern::Record { fields, open } => {
+            if fields.is_empty() && !open {
+                return f.write_str("()");
+            }
+            if !open
+                && let Some(order) = tuple_field_order(fields.iter().map(|(name, _)| name.as_str()))
+            {
+                f.write_str("(")?;
+                work.push(Text(if fields.len() == 1 { ",)" } else { ")" }));
+                for (index, at) in order.into_iter().enumerate().rev() {
+                    work.push(P(
+                        &fields[at].1,
+                        if names.is_empty() {
+                            projection.clone()
+                        } else {
+                            projection.field(&fields[at].0)
+                        },
+                        names.clone(),
+                    ));
+                    if index > 0 {
+                        work.push(Text(", "));
+                    }
+                }
+                return Ok(());
+            }
+            f.write_str("{ ")?;
+            work.push(Text(" }"));
+            if *open {
+                work.push(Text(".."));
+                if !fields.is_empty() {
+                    work.push(Text(", "));
+                }
+            }
+            for (index, (name, pattern)) in fields.iter().enumerate().rev() {
+                work.push(P(
+                    pattern,
+                    if names.is_empty() {
+                        projection.clone()
+                    } else {
+                        projection.field(name)
+                    },
+                    names.clone(),
+                ));
+                work.push(Owned(format!("{}: ", label(Shape::Struct, name))));
+                if index > 0 {
+                    work.push(Text(", "));
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
 /// Flatten a semantic row with the same outer-wins rule as inference. A name
 /// is claimed before its presence is inspected, so an outer absent entry masks
 /// an inner present one rather than merely disappearing beside it.
@@ -2685,7 +3286,7 @@ fn unit_type(ty: &Ty) -> bool {
 }
 
 fn write_semantic_mark(
-    f: &mut fmt::Formatter<'_>,
+    f: &mut impl fmt::Write,
     presence: &Presence,
     parenthesized: bool,
     names: Option<&[String]>,
@@ -2873,6 +3474,7 @@ fn scheme_names(scheme: &Scheme) -> Vec<String> {
     let mut candidates: HashMap<u32, String> = HashMap::new();
     let mut path: Vec<String> = Vec::new();
     let mut work = vec![Work::Root(scheme.body())];
+    let mut seen_types = HashSet::new();
     while let Some(job) = work.pop() {
         match job {
             Work::Push(segment) => path.push(segment),
@@ -2915,38 +3517,47 @@ fn scheme_names(scheme: &Scheme) -> Vec<String> {
                     schedule(&mut work, input, Work::Ty(argument));
                 }
             }
-            Work::Ty(ty) => match unpackaged(ty) {
-                Ty::Arrow(from, to, effects) => {
-                    schedule(&mut work, "output".to_string(), Work::Ty(to));
-                    if effect_row_shown(effects) {
-                        schedule(
-                            &mut work,
-                            "effects".to_string(),
-                            Work::Row(effects, Shape::Effect),
-                        );
+            Work::Ty(ty) => {
+                let ty = unpackaged(ty);
+                if !seen_types.insert(ty as *const Ty) {
+                    continue;
+                }
+                match ty {
+                    Ty::Contract { contract, .. } => {
+                        work.extend(contract.type_operands().map(|ty| Work::Ty(ty)));
                     }
-                    schedule(&mut work, "input".to_string(), Work::Ty(from));
-                }
-                Ty::Hidden { body, .. }
-                | Ty::Array(body)
-                | Ty::Mirror(body)
-                | Ty::TypeInfo(body)
-                | Ty::Package(body) => work.push(Work::Ty(body)),
-                Ty::Mut(region, element) => {
-                    schedule(&mut work, "value".to_string(), Work::Ty(element));
-                    schedule(&mut work, "region".to_string(), Work::Ty(region));
-                }
-                Ty::Struct(row) => work.push(Work::Row(row, Shape::Struct)),
-                Ty::Sum(row) => work.push(Work::Row(row, Shape::Sum)),
-                Ty::Presence(presence) => work.push(Work::Presence(presence)),
-                Ty::Named { name, args, .. } => {
-                    let base = path_segment(name);
-                    for (at, argument) in args.iter().enumerate().rev() {
-                        schedule(&mut work, format!("{base}_{at}"), Work::Ty(argument));
+                    Ty::Arrow(from, to, effects) => {
+                        schedule(&mut work, "output".to_string(), Work::Ty(to));
+                        if effect_row_shown(effects) {
+                            schedule(
+                                &mut work,
+                                "effects".to_string(),
+                                Work::Row(effects, Shape::Effect),
+                            );
+                        }
+                        schedule(&mut work, "input".to_string(), Work::Ty(from));
                     }
+                    Ty::Hidden { body, .. }
+                    | Ty::Array(body)
+                    | Ty::Mirror(body)
+                    | Ty::TypeInfo(body)
+                    | Ty::Package(body) => work.push(Work::Ty(body)),
+                    Ty::Mut(region, element) => {
+                        schedule(&mut work, "value".to_string(), Work::Ty(element));
+                        schedule(&mut work, "region".to_string(), Work::Ty(region));
+                    }
+                    Ty::Struct(row) => work.push(Work::Row(row, Shape::Struct)),
+                    Ty::Sum(row) => work.push(Work::Row(row, Shape::Sum)),
+                    Ty::Presence(presence) => work.push(Work::Presence(presence)),
+                    Ty::Named { name, args, .. } => {
+                        let base = path_segment(name);
+                        for (at, argument) in args.iter().enumerate().rev() {
+                            schedule(&mut work, format!("{base}_{at}"), Work::Ty(argument));
+                        }
+                    }
+                    _ => {}
                 }
-                _ => {}
-            },
+            }
             Work::Row(row, shape) => {
                 let (fields, rest) = flattened_row(row);
                 if let Rest::More(more) = rest {
@@ -3435,24 +4046,35 @@ fn presentation_lines(formula: &Formula, names: &[String]) -> Vec<String> {
 /// A scheme requiring nothing prints no `where`. A single-use unconstrained
 /// presence prints as `?`; shared occurrences retain their common name.
 /// Declaration-level abbreviations belong to [`TypePresentation`], not here:
-/// this Display must remain usable inside an annotation.
+/// ordinary output is usable inside an annotation. Oversized diagnostic output
+/// is explicitly truncated; [`TypePresentation`] preserves the complete type
+/// with helper declarations for shared captured callables.
 impl fmt::Display for Scheme {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut writer = TypeWriter {
+            output: f,
+            remaining: TYPE_DISPLAY_LIMIT,
+            truncated: false,
+        };
         let names = scheme_names(self);
         let plan = presentation::PresencePlan::new(self);
-        format_semantic_replacing(
-            f,
+        format_semantic_budgeted(
+            &mut writer,
             SemanticRoot::Ty(self.body()),
             Some(&names),
             &HashMap::new(),
             &plan.bounds,
+            true,
         )?;
-        format_scheme_constraints(f, &plan.formula, &names)
+        if writer.truncated {
+            return Ok(());
+        }
+        format_scheme_constraints(&mut writer, &plan.formula, &names)
     }
 }
 
 fn format_scheme_constraints(
-    f: &mut fmt::Formatter<'_>,
+    f: &mut impl fmt::Write,
     formula: &Formula,
     names: &[String],
 ) -> fmt::Result {
@@ -3628,6 +4250,7 @@ impl ConstraintKind {
             ConstraintKind::Project { .. } => "project",
             ConstraintKind::Spread { .. } => "spread",
             ConstraintKind::Equal { .. } => "equal",
+            ConstraintKind::Apply { .. } => "apply",
             ConstraintKind::Let { .. } => "let",
             ConstraintKind::Instance { .. } => "instance",
             ConstraintKind::Match { .. } => "match",
@@ -3681,6 +4304,12 @@ impl fmt::Display for ConstraintKind {
                 ..
             } => write!(f, "..{operand} ~ {demand} -> {result}"),
             ConstraintKind::Equal { expected, actual } => write!(f, "{expected} ~ {actual}"),
+            ConstraintKind::Apply {
+                callee,
+                argument,
+                result,
+                ..
+            } => write!(f, "{callee} ({argument}) -> {result}"),
             // A header rather than a line, because a `let` carries two lists of
             // constraints and a list is not a line: what it says of itself is
             // what the name was bound to while its value was walked, and the
@@ -4186,6 +4815,12 @@ impl inference::Error {
             source.span(self.at),
         );
         match &self.kind {
+            E::StructuralContract { .. } => {
+                diagnostic = diagnostic
+                    .label("this structural contract cannot describe the call")
+                    .help("check that the arguments satisfy every reachable contract case")
+                    .help("or give helper functions ordinary arrow annotations to bound structural inference");
+            }
             E::RuntimeTypeInformation { .. } => {
                 diagnostic = diagnostic.label("this operation needs runtime information that is not available here").help("supply a concrete supported type, or retain unknown foreign data as ForeignValue");
             }
@@ -4570,6 +5205,7 @@ impl inference::ErrorKind {
         match self {
             inference::ErrorKind::NotAStruct { .. } => "not-a-struct",
             inference::ErrorKind::Mismatch { .. } => "type-mismatch",
+            inference::ErrorKind::StructuralContract { .. } => "structural-contract",
             inference::ErrorKind::EffectArgument { .. } => "effect-argument-mismatch",
             inference::ErrorKind::Recursive => "recursive-type",
             // A missing case and a missing field are one complaint, so they
@@ -4613,6 +5249,7 @@ impl fmt::Display for inference::ErrorKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             inference::ErrorKind::RuntimeTypeInformation { message } => f.write_str(message),
+            inference::ErrorKind::StructuralContract { message } => f.write_str(message),
             inference::ErrorKind::NotAStruct { base, demand } => {
                 let asked = match demand {
                     inference::StructDemand::Projection => "read",

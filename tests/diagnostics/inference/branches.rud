@@ -1,1 +1,1 @@
-let bad = fn value => match value with | #A _ => 1n | #B _ => {} end
+let bad: _ -> _ = fn value => match value with | #A _ => 1n | #B _ => {} end

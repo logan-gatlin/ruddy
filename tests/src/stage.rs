@@ -334,7 +334,7 @@ fn the_presence_tab_renders_the_store_and_the_clauses() {
     // the definition ends up publishing.
     let nodes = tab(
         "presence",
-        "let p = fn a => match a with | {x} => {} | {y} => {} end",
+        "let p: _ -> _ = fn a => match a with | {x} => {} | {y} => {} end",
     );
     let labels: Vec<&str> = nodes.iter().map(|node| node.label.as_str()).collect();
     assert_eq!(
@@ -365,7 +365,7 @@ fn the_presence_tab_renders_the_store_and_the_clauses() {
     // marked as the error it owns, and it is the only one that is.
     let nodes = tab(
         "presence",
-        "let p = fn a => match a with | {x} => {} | {y} => {} end\nlet bad = p {}",
+        "let p: _ -> _ = fn a => match a with | {x} => {} | {y} => {} end\nlet bad = p {}",
     );
     let flipped: Vec<&str> = nodes
         .iter()
@@ -400,7 +400,7 @@ fn the_presence_tab_renders_the_store_and_the_clauses() {
     // in turn for the one thing only the first of them did.
     let nodes = tab(
         "presence",
-        "let p = fn a => match a with | {x} => {} | {y} => {} end\n\
+        "let p: _ -> _ = fn a => match a with | {x} => {} | {y} => {} end\n\
          let bad = fn b => do let _ = p {} return match b with | {x} => {} | {y} => {} end end",
     );
     let unsatisfiable: Vec<&str> = nodes
@@ -470,7 +470,7 @@ fn the_presence_tab_renders_the_store_and_the_clauses() {
 
 #[test]
 fn branch_refinement_is_coherent_across_the_debugger_tabs() {
-    let source = "let swap = fn v => match v with \
+    let source = "let swap: _ -> _ = fn v => match v with \
                   | {a} => { b: a } | {b} => { a: b } end";
 
     let presence = tab("presence", source);
@@ -575,7 +575,7 @@ fn branch_refinement_is_coherent_across_the_debugger_tabs() {
 fn the_presence_tab_counts_what_it_rendered() {
     let stage = stage(
         "presence",
-        "let p = fn a => match a with | {x} => {} | {y} => {} end",
+        "let p: _ -> _ = fn a => match a with | {x} => {} | {y} => {} end",
     );
     assert_eq!(stage.summary, "1 constraint");
     assert!(stage.micros.is_some());

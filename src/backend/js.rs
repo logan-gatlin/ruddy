@@ -115,6 +115,7 @@ pub fn generate_for_platform(artifact: &Artifact, platform: Platform) -> Result<
         prepared = Some(linked);
     }
     let mut exports = HashMap::new();
+    let mut native = HashMap::new();
     let root = prepared.as_ref().unwrap_or(artifact);
     if let Some(host) = super::host::compile(root, &[], platform)? {
         let mut library = root.clone();
@@ -123,10 +124,16 @@ pub fn generate_for_platform(artifact: &Artifact, platform: Platform) -> Result<
             crate::link::link(&[library, host.artifact]).expect("host adapter links to its root");
         linked.header = artifact.header().clone();
         exports = host.exports;
+        native = host.native;
         prepared = Some(linked);
     }
-    Generator::new(prepared.as_ref().unwrap_or(artifact), &exports, platform)?
-        .generate_with_entry(entry.as_deref())
+    Generator::new(
+        prepared.as_ref().unwrap_or(artifact),
+        &exports,
+        &native,
+        platform,
+    )?
+    .generate_with_entry(entry.as_deref())
 }
 
 /// Validate only the root's public host interface; dependencies retain effects.
@@ -175,6 +182,7 @@ impl<'a> Generator<'a> {
     fn new(
         artifact: &'a Artifact,
         host_exports: &HashMap<String, String>,
+        native: &HashMap<String, super::host::NativeTemplate>,
         platform: Platform,
     ) -> Result<Self, Error> {
         if !artifact.header().dependencies.is_empty() {
@@ -241,12 +249,14 @@ impl<'a> Generator<'a> {
                 &mut exports,
                 &path,
                 host_exports.get(&value.name).unwrap_or(&value.name),
-                super::host::native_descriptor(&value.scheme.body, &declarations).map_err(
-                    |message| Error::ExportType {
-                        name: value.name.clone(),
-                        message,
-                    },
-                )?,
+                match native.get(&value.name) {
+                    Some(proven) => proven.clone(),
+                    None => super::host::native_descriptor(&value.scheme.body, &declarations)
+                        .map_err(|message| Error::ExportType {
+                            name: value.name.clone(),
+                            message,
+                        })?,
+                },
                 artifact
                     .lir()
                     .globals
@@ -1148,8 +1158,8 @@ const $arrayPop = $a => $a.size === 0
   ? $sum("None", undefined)
   : $sum("Some", $record([["0", $arrayNth($a, $a.size - 1)], ["1", $take($a, $a.size - 1)]]));
 const $namespace = $entries => Object.freeze($record($entries));
-const $own = ($o, $k) => Object.prototype.hasOwnProperty.call($o, $k);
-const $hasRest = ($o, $known) => Reflect.ownKeys($o).some($k => typeof $k !== "string" || !$known.includes($k));
+const $own = ($o, $k) => $o !== undefined && Object.prototype.hasOwnProperty.call($o, $k);
+const $hasRest = ($o, $known) => $o !== undefined && Reflect.ownKeys($o).some($k => typeof $k !== "string" || !$known.includes($k));
 const $same = Object.is;
 const $unreachable = () => { throw new Error("unreachable Ruddy LIR branch"); };
 "#;

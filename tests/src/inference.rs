@@ -723,19 +723,25 @@ fn a_struct_spread_of_an_open_value_keeps_its_rest_and_replaces_by_name() {
          let copy = fn c => { ..c }\n\
          let added = set_a { b: \"s\" }\n\
          let replaced = set_a { a: \"s\", b: true }\n\
-         let kept = fn c => (set_a c).b\n",
+         let kept = fn c => (set_a c).b\n\
+         let kept_text = kept {b: \"s\"}\nlet kept_flag = kept {a: (), b: true}",
     );
     assert_eq!(
         scheme(&mint, &output, "set_a"),
-        "{ a?: 'a, ..'b } -> { a: Nat, ..'b }"
+        "fn 'input0 => { a: capture (Nat), ..'input0 }"
     );
-    assert_eq!(scheme(&mint, &output, "copy"), "{ ..'a } -> { ..'a }");
-    assert_eq!(scheme(&mint, &output, "added"), "{ a: Nat, b: String }");
+    assert_eq!(
+        scheme(&mint, &output, "copy"),
+        "fn 'input0 => { ..'input0 }"
+    );
+    assert_eq!(scheme(&mint, &output, "added"), "{ b: String, a: Nat }");
     assert_eq!(scheme(&mint, &output, "replaced"), "{ a: Nat, b: Bool }");
     assert_eq!(
         scheme(&mint, &output, "kept"),
-        "{ a?: 'a, b: 'b, ..'c } -> 'b"
+        "fn 'input0 => ((capture (fn 'input0 => { a: capture (Nat), ..'input0 })) ('input0)).b"
     );
+    assert_eq!(scheme(&mint, &output, "kept_text"), "String");
+    assert_eq!(scheme(&mint, &output, "kept_flag"), "Bool");
     // The demand is one constraint of its own, shown as the value against
     // what the literal asks of it and then what the literal is.
     let emitted = constraints(&mint, &output, "set_a");
@@ -1452,7 +1458,8 @@ fn no_subterm_keeps_a_solver_variable() {
 
 #[test]
 fn quantifiers_are_named_in_first_occurrence_order() {
-    let (mint, _, output) = inferred("let apply = fn f x => f x");
+    let (mint, _, output) =
+        inferred("let apply: ('z -> 'y + ..'e) -> 'z -> 'y + ..'e = fn f x => f x");
     // The effect row `apply` links its two arrows through is quantified with
     // everything else, in the same alphabet; the row on its own outer arrow
     // occurs once and is closed. See R22 and R23.
@@ -1461,7 +1468,9 @@ fn quantifiers_are_named_in_first_occurrence_order() {
         "('a -> 'b + ..'c) -> 'a -> 'b + ..'c"
     );
 
-    let (mint, _, output) = inferred("let compose = fn f g x => f (g x)");
+    let (mint, _, output) = inferred(
+        "let compose: ('y -> 'z + ..'e) -> ('x -> 'y + ..'e) -> 'x -> 'z + ..'e = fn f g x => f (g x)",
+    );
     assert_eq!(
         scheme(&mint, &output, "compose"),
         "('a -> 'b + ..'c) -> ('d -> 'a + ..'c) -> 'd -> 'b + ..'c"
@@ -6197,15 +6206,22 @@ fn a_shared_rest_lacks_the_absent_label() {
     );
 }
 
-/// A match with no default closes the row: the listed cases are the whole
-/// sum, and the annotation's own spelling unfolds to exactly that.
+/// A match with no default closes the sum, and all returned payloads share
+/// the ordinary result type established by the `None` branch.
 #[test]
 fn a_match_without_a_default_closes_the_sum() {
     let (mint, _, output) = inferred(
         "type Option 'T = #Some 'T | #None\n\
-         let get = fn opt => match opt with | #Some x => x | #None => 0n end",
+         let get = fn opt => match opt with | #Some x => x | #None => 0n end\n\
+         let number = get (#Some 7n)\n\
+         let none = get #None",
     );
-    assert_eq!(scheme(&mint, &output, "get"), "#Some? Nat | #None? -> Nat");
+    assert_eq!(
+        scheme(&mint, &output, "get"),
+        "fn | #Some ('a) => 'a | #None => capture (Nat)"
+    );
+    assert_eq!(scheme(&mint, &output, "number"), "Nat");
+    assert_eq!(scheme(&mint, &output, "none"), "Nat");
 }
 
 /// With a default the row stays open — the rest a fresh tail lacking the
@@ -6217,18 +6233,24 @@ fn a_default_keeps_the_sum_open_and_is_typed_minus_the_handled_cases() {
         "let fallback = fn r => 0n\n\
          let first = fn v => match v with | #Some x => x | rest => fallback rest end",
     );
-    // The scrutinee allows `Some` and whatever else; the binder's sum has
-    // `Some` absent — not part of what the type says, so it prints as the
-    // bare rest — over the same tail.
-    assert_eq!(scheme(&mint, &output, "first"), "#Some Nat | ..'a -> Nat");
-    let (mint, _, output) =
-        inferred("let rest_of = fn v => match v with | #Some x => x | rest => rest end");
-    // Binding the result to both the payload and the leftover sum ties them
-    // together: what `Some` carries is the sum without `Some`.
+    // The default is called only for the unmatched part of the input.
+    assert_eq!(
+        scheme(&mint, &output, "first"),
+        "fn | #Some ('a) => 'a | 'a => (capture (| ..'a -> Nat)) ('a)"
+    );
+    let (mint, _, output) = inferred(
+        "let rest_of = fn v => match v with | #Some x => x | rest => rest end\n\
+         let payload = rest_of (#Some (#Other true))\n\
+         let rest: #Other Bool = rest_of (#Other true)",
+    );
+    // The handled payload and the unchanged default share a compatible sum type.
     assert_eq!(
         scheme(&mint, &output, "rest_of"),
-        "#Some (| ..'a) | ..'a -> | ..'a"
+        "fn | #Some ('a) => 'a | 'a => 'a"
     );
+    // The unannotated nested tag retains the open tail every tag literal has.
+    assert_eq!(scheme(&mint, &output, "payload"), "#Other Bool | ..'a");
+    assert_eq!(scheme(&mint, &output, "rest"), "#Other Bool");
 }
 
 /// R7's nuance: a tag only partially handled — a refutable payload — is not
@@ -6245,16 +6267,21 @@ fn a_partially_handled_case_stays_present_for_the_catch_all() {
     // payload is not `X` reaches it.
     assert_eq!(
         scheme(&mint, &output, "f"),
-        "#A (#X 'a | ..'b) | ..'c -> Nat"
+        "fn | #A (#X (_)) => capture (Nat) | 'a => (capture (#A (#X 'a | ..'b) | ..'c -> Nat)) ('a)"
     );
-    let (mint, _, output) =
-        inferred("let g = fn e => match e with | #A #X x => #Nothing | r => r end");
+    let (mint, _, output) = inferred(
+        "let g = fn e => match e with | #A #X x => #Nothing | r => r end\n\
+         let rest: #A (#Y) = g (#A #Y)\n\
+         let handled: #Nothing = g (#A (#X \"text\"))",
+    );
     // Handing the binder back out shows the same nuance from the result side:
     // the sum the match evaluates to still allows `A`.
     assert_eq!(
         scheme(&mint, &output, "g"),
-        "#A (#X 'a | ..'b) | #Nothing | ..'c -> #Nothing | #A (#X 'a | ..'b) | ..'c"
+        "fn | #A (#X (_)) => #Nothing | 'a => 'a"
     );
+    assert_eq!(scheme(&mint, &output, "rest"), "#A (#Y)");
+    assert_eq!(scheme(&mint, &output, "handled"), "#Nothing");
 }
 
 /// What a case carries flows to the arm's binder, nesting included, and a
@@ -6266,18 +6293,33 @@ fn payloads_flow_to_binders_and_a_bare_tag_means_unit() {
          | #Cons { head: #Some x, tail: t } => x \
          | #Cons { head: #None, tail: t } => 0n \
          | #Nil => 0n \
-         end",
+         end\n\
+         let payload = pick (#Cons {head: #Some 7n, tail: ()})\n\
+         let none = pick (#Cons {head: #None, tail: true})",
     );
     assert_eq!(
         scheme(&mint, &output, "pick"),
-        "#Cons? { head: #Some Nat | #None, tail: 'a } | #Nil? -> Nat"
+        "fn | #Cons ({ head: #Some ('a), tail: _ }) => 'a | #Cons ({ head: #None, tail: _ }) => capture (Nat) | #Nil => capture (Nat)"
     );
-    // The bare `#None` and `#Nil` both carry unit: supplying a
-    // payload to one is the ordinary mismatch.
-    let (_, _, output) = infer_src(
+    assert_eq!(scheme(&mint, &output, "payload"), "Nat");
+    assert_eq!(scheme(&mint, &output, "none"), "Nat");
+    // A bare tag arm demands unit. Another record payload reaches the
+    // default; sibling patterns retain the record constructor family.
+    let (mint, _, output) = inferred(
         "let f = fn v => match v with | #None => 0n | r => 1n end\n\
-         let bad = f (#None 5n)",
+         let fallback = f (#None {extra: 5n})",
     );
+    assert_eq!(scheme(&mint, &output, "fallback"), "Nat");
+    let (_, _, output) = infer_src(
+        "let f = fn v => match v with | #None => 0n | _ => 1n end\nlet bad = f (#None 5n)",
+    );
+    assert_eq!(output.errors().len(), 1, "{:#?}", output.errors());
+    assert!(matches!(
+        output.errors()[0].kind,
+        ErrorKind::Mismatch { .. }
+    ));
+    let (_, _, output) =
+        infer_src("let f = fn v => match v with | #None => 0n end\nlet bad = f (#None 5n)");
     assert_eq!(output.errors().len(), 1, "{:#?}", output.errors());
     assert!(matches!(
         output.errors()[0].kind,
@@ -6299,27 +6341,29 @@ fn a_natural_match_is_about_numbers() {
     assert_eq!(scheme(&mint, &output, "same"), "Nat -> Nat");
 }
 
-/// The column-union program — the shape that broke revision 1 — types clean:
-/// `a` closes over its one tag, `b` over the two the two arms list between
-/// them, and `c` is unconstrained, because positions type as the union of
-/// what the whole match tests there, never per-arm.
+/// Each structural arm retains its exact record and tag requirements; `c`
+/// remains unconstrained in either arm.
 #[test]
 fn columns_type_as_unions_across_arms() {
     let (mint, _, output) = inferred(
         "let f = fn e => match e with \
-         | { a: #A, b: #X, c: x } => 1n | { a: #A, b: #Y, c: y } => 2n end",
+         | { a: #A, b: #X, c: x } => 1n | { a: #A, b: #Y, c: y } => 2n end\n\
+         let x = f {a: #A, b: #X, c: \"text\"}\n\
+         let y = f {a: #A, b: #Y, c: true}",
     );
     assert_eq!(
         scheme(&mint, &output, "f"),
-        "{ a: #A, b: #X | #Y, c: 'a } -> Nat"
+        "fn | { a: #A, b: #X, c: _ } => capture (Nat) | { a: #A, b: #Y, c: _ } => capture (Nat)"
     );
+    assert_eq!(scheme(&mint, &output, "x"), "Nat");
+    assert_eq!(scheme(&mint, &output, "y"), "Nat");
 }
 
 /// `()` as a pattern demands unit of its position, in a match as on a `let`.
 #[test]
 fn a_unit_pattern_demands_unit() {
     let (mint, _, output) = inferred("let f = fn v => match v with | () => 1n end");
-    assert_eq!(scheme(&mint, &output, "f"), "() -> Nat");
+    assert_eq!(scheme(&mint, &output, "f"), "fn | () => capture (Nat)");
 }
 
 /// The empty match eliminates the empty sum: the scrutinee is `|`, and the
@@ -6330,39 +6374,32 @@ fn an_empty_match_eliminates_the_empty_sum() {
     assert_eq!(scheme(&mint, &output, "absurd"), "| -> 'a");
 }
 
-/// Every arm's body — the default's included — unifies with the match's own
-/// type, so bodies that cannot agree are the mismatch, reported at the body.
+/// All structural arms, including the default, share an ordinary result
+/// family. Keeping the structural relationship must not admit scalar unions.
 #[test]
-fn arm_bodies_unify_with_the_match() {
+fn structural_arm_bodies_share_their_ordinary_result_type() {
     let (mint, _, output) = inferred("let sole = fn v => match v with | w => w end");
-    assert_eq!(scheme(&mint, &output, "sole"), "'a -> 'a");
+    assert_eq!(scheme(&mint, &output, "sole"), "fn | 'a => 'a");
 
     let (_, _, output) = infer_src("let f = fn v => match v with | #A x => 0n | #B y => {} end");
-    assert_eq!(output.errors().len(), 1, "{:#?}", output.errors());
-    assert!(matches!(
-        output.errors()[0].kind,
-        ErrorKind::Mismatch { .. }
-    ));
+    assert!(!output.errors().is_empty());
 }
 
-/// A case the arms do not list is refused at the use site that supplies it —
-/// the ordinary mismatch against the closed sum, not a rule of the match's
-/// own.
+/// A structural contract reports an uncovered case at the supplied argument.
 #[test]
 fn supplying_an_unhandled_case_is_a_use_site_mismatch() {
-    let (_, _, output) = infer_src(
-        "let f = fn opt => match opt with | #Some x => x end\n\
-         let bad = f #None",
-    );
+    let source = "let f = fn opt => match opt with | #Some x => x end\n\
+         let bad = f #None";
+    let (_, lowered, output) = infer_src(source);
     assert_eq!(output.errors().len(), 1, "{:#?}", output.errors());
-    match &output.errors()[0].kind {
-        ErrorKind::ExtraField { shape, base, field } => {
-            assert_eq!(*shape, Shape::Sum);
-            assert_eq!(base.to_string(), "#Some? 'a");
-            assert_eq!(field, "None");
-        }
-        other => panic!("expected an extra case, got {other:?}"),
-    }
+    assert!(
+        matches!(&output.errors()[0].kind, ErrorKind::StructuralContract { message }
+        if message.contains("does not cover its input"))
+    );
+    assert_eq!(
+        lowered.source.span(output.errors()[0].at).start,
+        source.rfind("#None").unwrap()
+    );
 }
 
 /// Every written body appears exactly once in the IR — there is no
@@ -6419,8 +6456,9 @@ fn a_catch_all_keeps_struct_payload_rows_open() {
     );
     assert_eq!(
         scheme(&mint, &output, "f"),
-        "#P (#A { x?: #X | ..'a, ..'b } | ..'c) | ..'d -> Nat"
+        "fn | #P (#A ({ x: #X })) => capture (Nat) | #P (#A (_)) => capture (Nat) | _ => capture (Nat)"
     );
+    assert_eq!(scheme(&mint, &output, "user"), "Nat");
 }
 
 /// Overlapping struct arms — the same tag at one field, a binder at the
@@ -6585,7 +6623,10 @@ fn a_wildcard_struct_leaf_still_demands_its_field() {
     assert_eq!(scheme(&mint, &output, "use_y"), "{ x: 'a, y: 'b } -> 'b");
 
     let (mint, _, output) = inferred("let use_y = fn p => match p with | {x: _, y} => y end");
-    assert_eq!(scheme(&mint, &output, "use_y"), "{ x: 'a, y: 'b } -> 'b");
+    assert_eq!(
+        scheme(&mint, &output, "use_y"),
+        "fn | { x: _, y: 'a } => 'a"
+    );
 }
 
 /// R8: in a match, `_` types exactly as a named, unused catch-all does — the
@@ -6601,9 +6642,9 @@ fn a_wildcard_arm_types_as_a_named_catch_all() {
     let wild = scheme(&mint, &output, "get");
     let (mint, _, output) = inferred(with_name);
     assert_eq!(wild, scheme(&mint, &output, "get"));
-    // The root row stays open past the listed case, so `get` takes any
-    // `Option Nat` — and more.
-    assert_eq!(wild, "#Some Nat | ..'a -> Nat");
+    // The default accepts the unmatched input and fixes the returned payload
+    // to the same ordinary result type.
+    assert_eq!(wild, "fn | #Some ('a) => 'a | _ => capture (Nat)");
 
     let (mint, _, output) = inferred(
         "type Option 'T = #Some 'T | #None\n\
@@ -6615,21 +6656,25 @@ fn a_wildcard_arm_types_as_a_named_catch_all() {
     // payload to the scrutinee.
     let (mint, _, output) =
         inferred("let has = fn opt => match opt with | #Some _ => 1n | #None => 0n end");
-    assert_eq!(scheme(&mint, &output, "has"), "#Some? 'a | #None? -> Nat");
+    assert_eq!(
+        scheme(&mint, &output, "has"),
+        "fn | #Some (_) => capture (Nat) | #None => capture (Nat)"
+    );
 }
 
-/// The motivating program of the exactness spec: exact arms over every
-/// presence combination of two fields. The column rule gives each field a
-/// fresh presence variable — `{}` mentions neither — and closes the row, so
-/// unification infers two optional fields and generalization prints them as
-/// the `when`s they stayed.
+/// Exact arms over every subset of two fields state their coverage directly.
 #[test]
-fn the_motivating_program_infers_optional_fields() {
+fn the_motivating_program_keeps_every_optional_field_combination() {
     let (mint, _, output) = inferred(
         "let p = fn a => match a with \
-         | {a, b} => () | {a} => {} | {b} => {} | {} => {} end",
+         | {a, b} => () | {a} => {} | {b} => {} | {} => {} end\n\
+         let all = (p {a: true, b: 1n}, p {a: \"text\"}, p {b: ()}, p ())",
     );
-    assert_eq!(scheme(&mint, &output, "p"), "{ a?: 'a, b?: 'b } -> ()");
+    assert_eq!(
+        scheme(&mint, &output, "p"),
+        "fn | { a: _, b: _ } => () | { a: _ } => () | { b: _ } => () | () => ()"
+    );
+    assert_eq!(scheme(&mint, &output, "all"), "((), (), (), ())");
 }
 
 /// R5's closed half: a single exact arm mentions every field in every entry,
@@ -6638,17 +6683,20 @@ fn the_motivating_program_infers_optional_fields() {
 #[test]
 fn an_exact_column_closes_the_row() {
     let (mint, _, output) = inferred("let f = fn v => match v with | {a, b} => a end");
-    assert_eq!(scheme(&mint, &output, "f"), "{ a: 'a, b: 'b } -> 'a");
+    assert_eq!(scheme(&mint, &output, "f"), "fn | { a: 'a, b: _ } => 'a");
 
-    let (_, _, output) = infer_src(
-        "let f = fn v => match v with | {a, b} => a end\n\
-         let bad = f { a: 1n, b: 2n, c: 3n }",
-    );
+    let source = "let f = fn v => match v with | {a, b} => a end\n\
+         let bad = f { a: 1n, b: 2n, c: 3n }";
+    let (_, lowered, output) = infer_src(source);
     assert_eq!(output.errors().len(), 1, "{:#?}", output.errors());
     assert!(matches!(
         output.errors()[0].kind,
-        ErrorKind::ExtraField { .. }
+        ErrorKind::StructuralContract { .. }
     ));
+    assert_eq!(
+        lowered.source.span(output.errors()[0].at).start,
+        source.rfind("{ a:").unwrap()
+    );
 }
 
 /// R5's open half: a `..` entry — or a binder or wildcard anywhere 'in the
@@ -6659,24 +6707,33 @@ fn a_rest_or_binder_entry_opens_the_row() {
         "let f = fn v => match v with | {a, ..} => a end\n\
          let ok = f { a: 1n, b: 2n }",
     );
-    assert_eq!(scheme(&mint, &output, "f"), "{ a: 'a, ..'b } -> 'a");
+    assert_eq!(scheme(&mint, &output, "f"), "fn | { a: 'a, .. } => 'a");
     assert_eq!(scheme(&mint, &output, "ok"), "Nat");
 
     let (mint, _, output) = inferred(
         "let g = fn v => match v with | {a} => a | w => 0n end\n\
          let ok = g { a: 1n, b: 2n }",
     );
-    // The binder opens the row and un-pins the presence: `a` may be there.
-    assert_eq!(scheme(&mint, &output, "g"), "{ a?: Nat, ..'a } -> Nat");
+    // The exact first arm rejects the extra field, so the default runs.
+    assert_eq!(
+        scheme(&mint, &output, "g"),
+        "fn | { a: 'a } => 'a | _ => capture (Nat)"
+    );
+    assert_eq!(scheme(&mint, &output, "ok"), "Nat");
 }
 
-/// The spec's open example: `x` is presence-variable — `{}` does not mention
-/// it — the row stays open, and `x`'s type unifies with `Nat` through the
-/// second arm's `0`.
+/// The open arm and empty arm still share one ordinary result type. Calling
+/// the former at String therefore conflicts with the latter's Nat result.
 #[test]
-fn the_open_example_types_through_both_arms() {
-    let (mint, _, output) = inferred("let f = fn v => match v with | {x, ..} => x | {} => 0n end");
-    assert_eq!(scheme(&mint, &output, "f"), "{ x?: Nat, ..'a } -> Nat");
+fn the_open_example_cannot_choose_its_ordinary_result_type() {
+    let (_, _, output) = infer_src(
+        "let f = fn v => match v with | {x, ..} => x | {} => 0n end\nlet text = f {x: \"text\", y: true}\nlet empty = f ()",
+    );
+    assert_eq!(output.errors().len(), 1, "{:#?}", output.errors());
+    assert!(matches!(
+        output.errors()[0].kind,
+        ErrorKind::Mismatch { .. }
+    ));
 }
 
 /// R2 on a `let`, the breaking change: an exact pattern demands exactly its
@@ -6710,10 +6767,13 @@ fn an_exact_let_pattern_is_exact() {
 #[test]
 fn unit_and_empty_braces_demand_the_same() {
     let (mint, _, output) = inferred("let f = fn v => match v with | {} => 1n end");
-    assert_eq!(scheme(&mint, &output, "f"), "() -> Nat");
+    assert_eq!(scheme(&mint, &output, "f"), "fn | () => capture (Nat)");
 
     let (mint, _, output) = inferred("let g = fn v => match v with | {a} => a | () => 0n end");
-    assert_eq!(scheme(&mint, &output, "g"), "{ a?: Nat } -> Nat");
+    assert_eq!(
+        scheme(&mint, &output, "g"),
+        "fn | { a: 'a } => 'a | () => capture (Nat)"
+    );
 
     let (_, _, output) = infer_src("let {} = 5n");
     assert_eq!(output.errors().len(), 1, "{:#?}", output.errors());
@@ -6743,22 +6803,21 @@ fn a_mixed_match_is_one_ordinary_mismatch() {
     ));
 }
 
-/// R4's last sentence: field types still unify across the arms that mention
-/// the field, presence variables or not — one field, one type.
+/// Fields retain their ordinary payload type across exact shape branches.
 #[test]
-fn field_types_unify_across_arms() {
-    let (mint, _, output) =
-        inferred("let f = fn v => match v with | {a} => a | {a, b} => b | {} => 2n end");
-    // `a` is typed by arm one's use as the result, `b` by arm two's, and the
-    // result `Nat` reaches both through the bodies.
-    // The arms' coverage bounds `b` by `a`: an `a`, or no `b` — exactly the
-    // three subsets the three arms name.
+fn field_types_are_compatible_across_structural_arms() {
+    let (mint, _, output) = inferred(
+        "let f = fn v => match v with | {a} => a | {a, b} => b | {} => 2n end\n\
+         let first = f {a: 1n}\nlet second = f {a: 2n, b: 3n}\nlet empty = f ()",
+    );
     assert_eq!(
         scheme(&mint, &output, "f"),
-        "{ a when 'input_0_a: Nat, b when <= 'input_0_a: Nat } -> Nat"
+        "fn | { a: 'a } => 'a | { a: _, b: 'a } => 'a | () => capture (Nat)"
     );
+    for name in ["first", "second", "empty"] {
+        assert_eq!(scheme(&mint, &output, name), "Nat");
+    }
 
-    // Disagreeing across arms is the mismatch it sounds like.
     let (_, _, output) = infer_src(
         "let wants : Nat -> Nat = fn n => n\n\
          let f = fn v => match v with | {a} => wants a | {a, b} => wants (a {}) end",
@@ -6794,7 +6853,10 @@ fn a_case_tested_by_numbers_stays_present_for_the_catch_all() {
 #[test]
 fn an_empty_struct_payload_covers_its_case() {
     let (mint, _, output) = inferred("let f = fn e => match e with | #A {} => 1n | r => 2n end");
-    assert_eq!(scheme(&mint, &output, "f"), "#A | ..'a -> Nat");
+    assert_eq!(
+        scheme(&mint, &output, "f"),
+        "fn | #A => capture (Nat) | _ => capture (Nat)"
+    );
 }
 
 /// The store as a program's batches read once inference is done: their origin
@@ -6809,33 +6871,53 @@ fn store(output: &inference::Output) -> Vec<String> {
         .collect()
 }
 
-/// R7's three inferences, which are the whole motivation: exact arms that name
-/// different fields say exactly one of them is there, exact arms that name all
-/// and none say the two agree, and open arms say at least one is.
-///
-/// None of the three is an unconstrained type. `{x when a, y when b} -> {}` on
-/// its own admits `{}`, which no arm of the first program accepts; the `where`
-/// clause is what makes the printed type the type the definition has.
+/// Exact alternatives, both-or-neither, and open alternatives retain their
+/// distinct coverage in the inferred program and enforce it at each call.
 #[test]
 fn the_motivating_programs_infer_their_constraints() {
     let (mint, _, output) = inferred("let p = fn a => match a with | {x} => {} | {y} => {} end");
     assert_eq!(
         scheme(&mint, &output, "p"),
-        "{ x when 'input_0_x: 'a, y when 'input_0_y: 'b } -> () where 'input_0_x != 'input_0_y"
+        "fn | { x: _ } => () | { y: _ } => ()"
     );
 
     let (mint, _, output) = inferred("let q = fn v => match v with | {x, y} => {} | {} => {} end");
     assert_eq!(
         scheme(&mint, &output, "q"),
-        "{ x when 'input_0_x: 'a, y when 'input_0_y: 'b } -> () where 'input_0_x = 'input_0_y"
+        "fn | { x: _, y: _ } => () | () => ()"
     );
 
     let (mint, _, output) =
         inferred("let r = fn v => match v with | {x, ..} => {} | {y, ..} => {} end");
     assert_eq!(
         scheme(&mint, &output, "r"),
-        "{ x when 'input_0_x: 'a, y when 'input_0_y: 'b, ..'c } -> () where 'input_0_x or 'input_0_y"
+        "fn | { x: _, .. } => () | { y: _, .. } => ()"
     );
+    for (body, allowed, rejected) in [
+        (
+            "match v with | {x} => () | {y} => () end",
+            "{x: true}",
+            "()",
+        ),
+        (
+            "match v with | {x, y} => () | () => () end",
+            "()",
+            "{x: true}",
+        ),
+        (
+            "match v with | {x, ..} => () | {y, ..} => () end",
+            "{x: true, y: 1n}",
+            "()",
+        ),
+    ] {
+        inferred(&format!("let f = fn v => {body}\nlet ok: () = f {allowed}"));
+        let (_, _, output) = infer_src(&format!("let f = fn v => {body}\nlet bad = f {rejected}"));
+        assert_eq!(output.errors().len(), 1, "{:#?}", output.errors());
+        assert!(matches!(
+            output.errors()[0].kind,
+            ErrorKind::StructuralContract { .. }
+        ));
+    }
 }
 
 #[test]
@@ -6851,11 +6933,14 @@ fn a_presence_match_refines_annotated_and_inferred_results() {
 
     let (mint, _, output) = inferred(
         "let swap = fn v => match v with \
-         | {a} => { b: a } | {b} => { a: b } end",
+         | {a} => { b: a } | {b} => { a: b } end\n\
+         let left = swap {a: true}\nlet right = swap {b: \"text\"}",
     );
+    assert_eq!(scheme(&mint, &output, "left"), "{ b: Bool }");
+    assert_eq!(scheme(&mint, &output, "right"), "{ a: String }");
     assert_eq!(
         scheme(&mint, &output, "swap"),
-        "{ a when 'input_0_a: 'a, b when 'input_0_b: 'b } -> { b when 'input_0_a: 'a, a when 'input_0_b: 'b } where 'input_0_a != 'input_0_b"
+        "fn | { a: 'a } => { b: 'a } | { b: 'a } => { a: 'a }"
     );
 }
 
@@ -6890,16 +6975,21 @@ fn a_presence_arm_refines_scrutinee_uses_and_exact_absence() {
         "let only_a : { a: Nat } -> Nat = fn r => r.a\n\
          let only_b : { b: Nat } -> Nat = fn r => r.b\n\
          let direct = fn v => match v with | {a} => v.a | {b} => v.b end\n\
-         let whole = fn v => match v with | {a} => only_a v | {b} => only_b v end",
+         let whole = fn v => match v with | {a} => only_a v | {b} => only_b v end\n\
+         let direct_text = direct {a: \"text\"}\nlet direct_flag = direct {b: true}\n\
+         let whole_nat = whole {b: 1n}",
     );
     assert_eq!(
         scheme(&mint, &output, "direct"),
-        "{ a when 'input_0_a: 'a, b when 'input_0_b: 'a } -> 'a where 'input_0_a != 'input_0_b"
+        "fn | { a: 'a } => 'a | { b: 'a } => 'a"
     );
     assert_eq!(
         scheme(&mint, &output, "whole"),
-        "{ a when 'input_0_a: Nat, b when 'input_0_b: Nat } -> Nat where 'input_0_a != 'input_0_b"
+        "match | { a: Nat } => Nat | { b: Nat } => Nat end"
     );
+    assert_eq!(scheme(&mint, &output, "direct_text"), "String");
+    assert_eq!(scheme(&mint, &output, "direct_flag"), "Bool");
+    assert_eq!(scheme(&mint, &output, "whole_nat"), "Nat");
 }
 
 #[test]
@@ -7033,23 +7123,17 @@ fn overlap_uses_exclusion_and_arm_assumptions_do_not_leak() {
 }
 
 #[test]
-fn refinement_stays_presence_only_and_mixed_matches_stay_flat() {
-    let (_, _, output) = infer_src("let bad = fn v => match v with | {x} => 1n | {y} => {} end");
-    assert!(
-        output
-            .errors()
-            .iter()
-            .any(|error| matches!(error.kind, ErrorKind::Mismatch { .. }))
-    );
-
-    let (_, _, output) =
-        infer_src("let bad = fn v => match v with | {x} => { out: 1n } | {y} => { out: {} } end");
-    assert!(
-        output
-            .errors()
-            .iter()
-            .any(|error| matches!(error.kind, ErrorKind::Mismatch { .. }))
-    );
+fn structural_matches_reject_incompatible_results_and_mixed_matches_stay_flat() {
+    for body in [
+        "match v with | {x} => 1n | {y} => {} end",
+        "match v with | {x} => { out: 1n } | {y} => { out: {} } end",
+    ] {
+        let (_, _, output) = infer_src(&format!("let choose = fn v => {body}"));
+        assert!(
+            !output.errors().is_empty(),
+            "incompatible branch results must fail at the definition"
+        );
+    }
 
     let (_, _, output) =
         inferred("let mixed = fn v => match v with | {x: 0n} => 1n | rest => 2n end");
@@ -7128,17 +7212,28 @@ fn structural_result_families_cover_arrows_sums_names_and_absence() {
          let named = fn v => match v with | {x} => one | {y} => two end\n\
          let same_named = fn v => match v with | {x} => one | {y} => three end\n\
          let mixed_named = fn v => match v with\n\
-         | {x} => one | {y} => { value: { b: 4n } } end",
+         | {x} => one | {y} => { value: { b: 4n } } end\n\
+         let first: Box {a: Nat} = named {x: ()}\n\
+         let second: Crate {b: Nat} = named {y: ()}\n\
+         let same: Box {b: Nat} = same_named {y: ()}\n\
+         let mixed: {value: {b: Nat}} = mixed_named {y: ()}",
     );
     assert_eq!(
         scheme(&mint, &output, "named"),
-        "{ x when 'input_0_x: 'a, y when 'input_0_y: 'b } -> { value: { a when 'input_0_x: Nat, b when 'input_0_y: Nat } } where 'input_0_x != 'input_0_y"
+        "fn | { x: _ } => capture (Box { a: Nat }) | { y: _ } => capture (Crate { b: Nat })"
     );
     for name in ["same_named", "mixed_named"] {
         let printed = scheme(&mint, &output, name);
-        assert!(printed.contains("a when"), "{name}: {printed}");
-        assert!(printed.contains("b when"), "{name}: {printed}");
+        assert!(
+            printed.contains("| { x: _ } => capture (Box { a: Nat })"),
+            "{name}: {printed}"
+        );
+        assert!(printed.contains("| { y: _ } =>"), "{name}: {printed}");
     }
+    assert_eq!(scheme(&mint, &output, "first"), "Box { a: Nat }");
+    assert_eq!(scheme(&mint, &output, "second"), "Crate { b: Nat }");
+    assert_eq!(scheme(&mint, &output, "same"), "Box { b: Nat }");
+    assert_eq!(scheme(&mint, &output, "mixed"), "{ value: { b: Nat } }");
 
     let (mint, _, output) = inferred(
         "type A 'a = { value: 'a }\n\
@@ -7148,8 +7243,8 @@ fn structural_result_families_cover_arrows_sums_names_and_absence() {
          let finite = fn v => match v with | {x} => aa | {y} => bb end",
     );
     let finite = scheme(&mint, &output, "finite");
-    assert!(finite.contains("a when"), "{finite}");
-    assert!(finite.contains("b when"), "{finite}");
+    assert!(finite.contains("capture (A (A { a: Nat }))"), "{finite}");
+    assert!(finite.contains("capture (B (B { b: Nat }))"), "{finite}");
 
     inferred(
         "type LoopA = { next: LoopA }\n\
@@ -7529,8 +7624,8 @@ fn an_inferred_local_keeps_the_requirement_of_its_arm() {
 
 #[test]
 fn local_instance_requirements_keep_their_reserved_source_slot() {
-    let src = "let p = fn a => match a with | {x} => {} | {y} => {} end\n\
-               let f = do let g = fn a => match a with | {x} => {} | {y} => {} end\n\
+    let src = "let p : { x when 'a: Nat, y when 'b: Nat } -> {} where 'a != 'b = fn a => match a with | {x} => {} | {y} => {} end\n\
+               let f = do let g : { x when 'a: Nat, y when 'b: Nat } -> {} where 'a != 'b = fn a => match a with | {x} => {} | {y} => {} end\n\
                let _ = g {} return p {} end";
     let (_, out, output) = infer_src(src);
     let map = &out.source;
@@ -7549,12 +7644,12 @@ fn local_instance_requirements_keep_their_reserved_source_slot() {
         output.semantics().store()
     );
     assert_eq!(map.span(output.errors()[0].at).start, first_empty);
-    // Generation reserved ids 1 and 2 of `f`'s group for the two use-site
-    // slots, after the local match's coverage. Solving instantiates `g`
+    // Generation reserved ids 2 and 3 of `f`'s group for the two use-site
+    // slots, after the local annotation and match coverage. Solving instantiates `g`
     // through a temporary batch allocated after those slots; replacement must
-    // retain 1 rather than publishing that temporary id. `p`'s own coverage
-    // batch is numbered by its group, which is why it is a 0 as well.
-    assert_eq!(flipped.id.index(), 1, "{:#?}", output.semantics().store());
+    // retain 2 rather than publishing that temporary id. Each declaration's
+    // annotation and coverage batches are numbered within its own group.
+    assert_eq!(flipped.id.index(), 2, "{:#?}", output.semantics().store());
     let (_, out, _) = infer_src(src);
     let name = |scope: Symbol| {
         out.program
@@ -7570,7 +7665,7 @@ fn local_instance_requirements_keep_their_reserved_source_slot() {
             .iter()
             .map(|batch| (name(batch.id.scope()), batch.id.index()))
             .collect::<Vec<_>>(),
-        vec![(0, 0), (1, 0), (1, 1), (1, 2)]
+        vec![(0, 0), (0, 1), (1, 0), (1, 1), (1, 2), (1, 3)]
     );
 }
 
@@ -7627,7 +7722,7 @@ fn a_guarded_batch_can_own_the_single_store_flip() {
 
 #[test]
 fn a_prior_store_flip_does_not_turn_later_arms_into_a_cascade() {
-    let src = "let one = fn a => match a with | {x} => {} | {y} => {} end\n\
+    let src = "let one : { x when 'a: Nat, y when 'b: Nat } -> {} where 'a != 'b = fn a => match a with | {x} => {} | {y} => {} end\n\
                let f = fn v => do let _ = one {}\n\
                return match v with | {x} => 1n | {y} => 2n end end";
     let (_, _, output) = infer_src(src);
@@ -7659,7 +7754,7 @@ fn a_nested_column_contributes_to_the_enclosing_disjunct() {
         inferred("let n = fn v => match v with | {x: {a}} => {} | {y} => {} end");
     assert_eq!(
         scheme(&mint, &output, "n"),
-        "{ x when 'input_0_x: { a: 'a }, y when 'input_0_y: 'b } -> () where 'input_0_x != 'input_0_y"
+        "fn | { x: { a: _ } } => () | { y: _ } => ()"
     );
     assert_eq!(store(&output).len(), 1, "{:#?}", output.semantics().store());
 }
@@ -7677,17 +7772,21 @@ fn a_shared_presence_prints_one_name() {
     );
 }
 
-/// Fold-back, R8: a presence the store has already decided is no variable at
-/// all. The `let` pattern forces `x` present, `a != b` then forces `y` absent,
-/// and both are settled in the type — no variables and no clause survive.
+/// A demand before a match remains part of the published program, even if
+/// the later match has another arm that would accept the input by itself.
 #[test]
-fn an_entailed_presence_folds_back_at_generalization() {
-    let (mint, _, output) = infer_src(
-        "let h = fn v =>\n\
+fn a_destructuring_requirement_survives_structural_generalization() {
+    let source = "let h = fn v =>\n\
          \x20 do let {x, ..} = v\n\
-         \x20 return match v with | {x} => {} | {y} => {} end end",
+         \x20 return match v with | {x} => {} | {y} => {} end end";
+    let (mint, _, output) = inferred(&format!("{source}\nlet ok = h {{x: true}}"));
+    assert_eq!(
+        scheme(&mint, &output, "h"),
+        "fn 'input0 => do _ = 'input0; _ = ('input0).x; return match 'input0 with | { x: _ } => () | { y: _ } => () end end"
     );
-    assert_eq!(scheme(&mint, &output, "h"), "{ x: 'a } -> ()");
+    assert_eq!(scheme(&mint, &output, "ok"), "()");
+    let (_, _, output) = infer_src(&format!("{source}\nlet bad = h {{y: true}}"));
+    assert!(!output.errors().is_empty());
 }
 
 /// A use of a constrained scheme conjoins its formula with fresh variables, so
@@ -7695,7 +7794,7 @@ fn an_entailed_presence_folds_back_at_generalization() {
 /// argument, which is the value the reader can change.
 #[test]
 fn a_use_site_that_cannot_satisfy_the_scheme_is_refused() {
-    let src = "let p = fn a => match a with | {x} => {} | {y} => {} end\nlet bad = p {}";
+    let src = "let p : { x when 'a: Nat, y when 'b: Nat } -> {} where 'a != 'b = fn a => match a with | {x} => {} | {y} => {} end\nlet bad = p {}";
     let (_, out, output) = infer_src(src);
     let map = &out.source;
     assert!(out.errors.is_empty(), "{:#?}", out.errors);
@@ -7765,7 +7864,7 @@ fn a_required_mixed_nested_combination_uses_neutral_vocabulary() {
 #[test]
 fn each_use_is_constrained_on_its_own() {
     let (_, _, output) = inferred(
-        "let p = fn a => match a with | {x} => {} | {y} => {} end\n\
+        "let p : { x when 'a: Nat, y when 'b: Nat } -> {} where 'a != 'b = fn a => match a with | {x} => {} | {y} => {} end\n\
          let one = p {x: 1n}\n\
          let two = p {y: 2n}",
     );
@@ -7954,7 +8053,7 @@ fn a_flipped_store_silences_a_nested_clause() {
             .map(|(symbol, scheme)| (mint.name(*symbol).to_string(), scheme.to_string()))
             .collect()
     };
-    let src = "let p = fn a => match a with | {x} => {} | {y} => {} end\n\
+    let src = "let p : { x when 'a: Nat, y when 'b: Nat } -> {} where 'a != 'b = fn a => match a with | {x} => {} | {y} => {} end\n\
                let j = fn n => do let _ = p {} return k n end\n\
                let k = fn n => do let g : { x when 'a: Nat } -> {} where 'a = fn v => {} return j n end";
     let (mint, _, output) = infer_src(src);
@@ -7967,7 +8066,7 @@ fn a_flipped_store_silences_a_nested_clause() {
         [("g".to_string(), "{ x?: Nat } -> ()".to_string())]
     );
 
-    let src = "let p = fn a => match a with | {x} => {} | {y} => {} end\n\
+    let src = "let p : { x when 'a: Nat, y when 'b: Nat } -> {} where 'a != 'b = fn a => match a with | {x} => {} | {y} => {} end\n\
                let bad = p {}\n\
                let k = do let g : { x when 'a: Nat } -> {} where 'a = fn v => {} return g end";
     let (mint, _, output) = infer_src(src);
@@ -7998,13 +8097,29 @@ fn a_non_qualifying_column_constrains_nothing() {
         output.semantics().store()
     );
 
-    // And so does a column mixing exact and `..`-open entries, whose covered
-    // set is not one disjunction over one universe.
-    let (_, _, output) = infer_src("let m = fn v => match v with | {x} => {} | {y, ..} => {} end");
+    // A finite contract retains a mixed exact/open column. Its generation
+    // premises are true; application checks actual shape coverage directly.
+    let (_, _, output) = inferred(
+        "let m = fn v => match v with | {x} => {} | {y, ..} => {} end\nlet exact = m {x: 1n}\nlet open = m {y: 2n, z: true}",
+    );
     assert!(
-        store(&output).is_empty(),
+        output
+            .semantics()
+            .store()
+            .batches
+            .iter()
+            .all(|batch| batch.formula.is_true()),
         "{:#?}",
         output.semantics().store()
+    );
+    let (_, _, output) = infer_src(
+        "let m = fn v => match v with | {x} => {} | {y, ..} => {} end\nlet missing = m {z: 1n}",
+    );
+    assert!(
+        output
+            .errors()
+            .iter()
+            .any(|error| matches!(error.kind, ErrorKind::StructuralContract { .. }))
     );
 }
 
@@ -8042,7 +8157,7 @@ fn an_ordinary_program_requires_nothing() {
 #[test]
 fn the_first_flipping_batch_owns_the_error() {
     let (mint, _, output) = infer_src(
-        "let p = fn a => match a with | {x} => {} | {y} => {} end\n\
+        "let p : { x when 'a: Nat, y when 'b: Nat } -> {} where 'a != 'b = fn a => match a with | {x} => {} | {y} => {} end\n\
          let bad = do let _ = p {} return p {} end",
     );
     assert_eq!(output.errors().len(), 1, "{:#?}", output.errors());
@@ -8061,7 +8176,7 @@ fn the_first_flipping_batch_owns_the_error() {
     assert_eq!(scheme(&mint, &output, "bad"), "()");
 
     let (_, _, output) = infer_src(
-        "let p = fn a => match a with | {x} => {} | {y} => {} end\n\
+        "let p : { x when 'a: Nat, y when 'b: Nat } -> {} where 'a != 'b = fn a => match a with | {x} => {} | {y} => {} end\n\
          let bad = p {}\n\
          let worse = p {}",
     );
@@ -8239,7 +8354,7 @@ fn a_use_site_reads_labels_through_the_whole_type() {
 /// application already aimed at its own argument stays where it belongs.
 #[test]
 fn a_use_site_is_aimed_at_the_argument_it_constrains() {
-    let src = "let p = fn a => match a with | {x} => {} | {y} => {} end\n\
+    let src = "let p : { x when 'a: Nat, y when 'b: Nat } -> {} where 'a != 'b = fn a => match a with | {x} => {} | {y} => {} end\n\
                let k = fn a => fn b => 1n\n\
                let use = k (p { x: 1n }) 2n";
     let (_, out, output) = inferred(src);
@@ -8263,7 +8378,7 @@ fn a_use_site_is_aimed_at_the_argument_it_constrains() {
 #[test]
 fn an_annotation_after_the_flip_is_not_checked() {
     let (mint, _, output) = infer_src(
-        "let p = fn a => match a with | {x} => {} | {y} => {} end\n\
+        "let p : { x when 'a: Nat, y when 'b: Nat } -> {} where 'a != 'b = fn a => match a with | {x} => {} | {y} => {} end\n\
          let after : { x when 'a: Nat, y when 'b: Nat } -> {} where 'a or 'b = fn v =>\n\
          \x20 do let _ = p {} return match v with | {x} => {} | {y} => {} end end",
     );
@@ -8283,7 +8398,7 @@ fn an_annotation_after_the_flip_is_not_checked() {
     );
 
     let (_, _, output) = infer_src(
-        "let p = fn a => match a with | {x} => {} | {y} => {} end\n\
+        "let p : { x when 'a: Nat, y when 'b: Nat } -> {} where 'a != 'b = fn a => match a with | {x} => {} | {y} => {} end\n\
          let bad = p {}\n\
          let after : { x when 'a: Nat, y when 'b: Nat } -> {} where 'a or 'b = fn v =>\n\
          \x20 match v with | {x} => {} | {y} => {} end",
@@ -8298,22 +8413,29 @@ fn an_annotation_after_the_flip_is_not_checked() {
     );
 }
 
-/// A component of the store is what a scheme requires, and it grows through the
-/// variables its batches share: two matches over one argument are one component,
-/// and the clause the definition publishes is what both of them say.
+/// Both matches must cover the same supplied argument, so publishing the
+/// structural body retains the combined requirement of their two patterns.
 #[test]
 fn a_scheme_requires_the_whole_component_it_reaches() {
     let (mint, _, output) = inferred(
         "let f = fn v => { a: match v with | {x, ..} => 1n | {y, ..} => 2n end,\n\
-         \x20               b: match v with | {y, ..} => 1n | {z, ..} => 2n end }",
+         \x20               b: match v with | {y, ..} => 1n | {z, ..} => 2n end }\n\
+         let y = f {y: true}\nlet xz = f {x: 1n, z: ()}",
     );
     // Both matches constrain `v`, and the scheme carries what the two of them
     // require together rather than either alone.
     assert_eq!(
         scheme(&mint, &output, "f"),
-        "{ x when 'input_0_x: 'a, y when 'input_0_y: 'b, z when 'input_0_z: 'c, ..'d } -> { a: Nat, b: Nat } \
-         where 'input_0_x and 'input_0_z or 'input_0_y"
+        "fn 'input0 => { a: match 'input0 with | { x: _, .. } => capture (Nat) | { y: _, .. } => capture (Nat) end, b: match 'input0 with | { y: _, .. } => capture (Nat) | { z: _, .. } => capture (Nat) end }"
     );
+    assert_eq!(scheme(&mint, &output, "y"), "{ a: Nat, b: Nat }");
+    assert_eq!(scheme(&mint, &output, "xz"), "{ a: Nat, b: Nat }");
+    for value in ["{x: 1n}", "{z: ()}", "()"] {
+        let (_, _, output) = infer_src(&format!(
+            "let f = fn v => {{ a: match v with | {{x, ..}} => 1n | {{y, ..}} => 2n end, b: match v with | {{y, ..}} => 1n | {{z, ..}} => 2n end }}\nlet bad = f {value}"
+        ));
+        assert!(!output.errors().is_empty(), "accepted {value}");
+    }
 }
 
 /// Every complaint one source made, as the codes a reporter keys on.
@@ -8330,11 +8452,8 @@ fn infer_codes(src: &str) -> Vec<&'static str> {
 const EFFECTS: &str = "effect Log = { write: Nat -> () }\n\
                        effect IO = { print: Nat -> () }\n";
 
-/// R23's closing rule, over the four schemes the spec names. An effect row
-/// variable the solver learned nothing about sits on one arrow and no other, so
-/// it is the empty row rather than a `..'b` the caller gets to choose; one that
-/// genuinely links two arrows occurs twice and is quantified with everything
-/// else, in the same alphabet.
+/// A pure identity closes its effect row. Structural higher-order programs
+/// defer each callback's effect demand until application.
 #[test]
 fn an_effect_variable_that_links_nothing_is_closed() {
     let (mint, _, output) = inferred(
@@ -8345,11 +8464,11 @@ fn an_effect_variable_that_links_nothing_is_closed() {
     assert_eq!(scheme(&mint, &output, "id"), "'a -> 'a");
     assert_eq!(
         scheme(&mint, &output, "apply"),
-        "('a -> 'b + ..'c) -> 'a -> 'b + ..'c"
+        "fn 'input0 'input1 => ('input0) ('input1)"
     );
     assert_eq!(
         scheme(&mint, &output, "compose"),
-        "('a -> 'b + ..'c) -> ('d -> 'a + ..'c) -> 'd -> 'b + ..'c"
+        "fn 'input0 'input1 'input2 => ('input0) (('input1) ('input2))"
     );
 
     let (mint, _, output) = inferred(&format!(
@@ -9036,7 +9155,7 @@ fn a_nested_let_leaves_an_outer_binders_effects_alone() {
     let (mint, _, output) = inferred("let a = fn p => do let q = fn z => p z return q end");
     assert_eq!(
         scheme(&mint, &output, "a"),
-        "('a -> 'b + ..'c) -> 'a -> 'b + ..'c"
+        "('a -> 'b + ..'c) -> fn 'input0 => (capture ('a -> 'b + ..'c)) ('input0)"
     );
     let locals: Vec<String> = output
         .semantics()
@@ -9044,7 +9163,10 @@ fn a_nested_let_leaves_an_outer_binders_effects_alone() {
         .values()
         .map(|scheme| scheme.to_string())
         .collect();
-    assert_eq!(locals, ["'a -> 'b + ..'c"]);
+    assert_eq!(
+        locals,
+        ["fn 'input0 => (capture ('a -> 'b + ..'c)) ('input0)"]
+    );
 }
 
 /// A `raise` lowering already refused still has a type: its value is walked
@@ -11168,10 +11290,11 @@ fn equality_constraints_preserve_expected_then_actual_side_ordering() {
 #[test]
 fn sat_and_effect_defaults_are_first_class_binding_reasons() {
     let (_, _, output) = infer_src(
-        "let pure = fn x => x\n\
+        "extern require: { x when 'a: Nat, y when 'b: Nat } -> () where 'a != 'b = \"host.require\"\n\
+         let pure = fn x => x\n\
          let folded = fn v =>\n\
          \x20 do let {x, ..} = v\n\
-         \x20 return match v with | {x} => {} | {y} => {} end end",
+         \x20 return require v end",
     );
     assert!(output.diagnostics().reasons().iter().any(|reason| matches!(
         reason.origin,
@@ -11563,6 +11686,9 @@ fn sat_choices(name: &str, terms: usize, attribute: &str) -> String {
     )
 }
 
+const TWO_PRESENCE_CHOICES: &str =
+    "extern require: { x when 'a: Nat, y when 'b: Nat } -> () where 'a != 'b = \"host.require\"";
+
 const EXTEND4_CHANNELS: &str = "let extend4 = fn
     | () => (#None, #None, #None, #None)
     | (a,) => (a, #None, #None, #None)
@@ -11686,10 +11812,12 @@ fn sat_term_limit_defaults_to_256_and_can_be_raised() {
 
 #[test]
 fn sat_term_override_is_local_and_applies_to_nested_bindings() {
-    let body = "fn value => match value with | {x} => {} | {y} => {} end";
-    inferred(&format!("@max_sat_terms 2n\nlet fits = {body}"));
+    let body = "fn value => require value";
+    inferred(&format!(
+        "{TWO_PRESENCE_CHOICES}\n@max_sat_terms 2n\nlet fits = {body}"
+    ));
     let (_, _, output) = infer_src(&format!(
-        "@max_sat_terms 1n\nlet small = do let nested = {body} return nested end\nlet normal = {body}"
+        "{TWO_PRESENCE_CHOICES}\n@max_sat_terms 1n\nlet small = do let nested = {body} return nested end\nlet normal = {body}"
     ));
     assert_eq!(output.errors().len(), 1, "{:?}", output.errors());
     assert!(matches!(
@@ -11740,12 +11868,14 @@ fn sat_term_limits_are_separate_within_a_recursive_group() {
 
 #[test]
 fn sat_term_override_reaches_discarded_and_destructured_initializers() {
-    let body = "fn value => match value with | {x} => {} | {y} => {} end";
+    let body = "fn value => require value";
     for binding in [
         format!("let _ = {body}"),
         format!("let {{f}} = {{f: {body}}}"),
     ] {
-        let (_, _, output) = infer_src(&format!("@max_sat_terms 1n\n{binding}"));
+        let (_, _, output) = infer_src(&format!(
+            "{TWO_PRESENCE_CHOICES}\n@max_sat_terms 1n\n{binding}"
+        ));
         assert!(
             output
                 .errors()
@@ -11754,15 +11884,18 @@ fn sat_term_override_reaches_discarded_and_destructured_initializers() {
             "{:?}",
             output.errors()
         );
-        inferred(&format!("@max_sat_terms 2n\n{binding}"));
+        inferred(&format!(
+            "{TWO_PRESENCE_CHOICES}\n@max_sat_terms 2n\n{binding}"
+        ));
     }
 }
 
 #[test]
 fn sat_term_override_edits_invalidate_cached_inference() {
-    let source =
-        "@max_sat_terms 1n\nlet choose = fn value => match value with | {x} => {} | {y} => {} end";
-    let parsed = parse::parse(lex(source, FileID::GENERATED).tokens);
+    let source = format!(
+        "{TWO_PRESENCE_CHOICES}\n@max_sat_terms 1n\nlet choose = fn value => require value"
+    );
+    let parsed = parse::parse(lex(&source, FileID::GENERATED).tokens);
     let mut mint = dummy_mint();
     let mut lowered = ir::build(&mut mint, parsed.stmts);
     let mut session = inference::Session::default();
@@ -12039,6 +12172,7 @@ fn a_package_will_not_hide_a_cell_region() {
         "let keep = fn _ => do\n  let cell = mut 0n\n  let held: Held = { value: { inner: cell } }\n  return held\nend",
         "let keep = fn _ => do\n  let cell = mut 0n\n  let held: Held = { value: [cell] }\n  return held\nend",
         "let keep = fn _ => do\n  let cell = mut 0n\n  let held: Bare = cell\n  return held\nend",
+        "let choose = fn value selector => match selector with | #Keep => value | _ => value end\nlet keep = fn _ => do\n  let cell = mut 0n\n  let held: Bare = choose cell\n  return held\nend",
     ] {
         let (_, _, inferred) = infer_src(&format!("{prelude}{body}"));
         let error = inferred

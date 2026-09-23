@@ -7,6 +7,7 @@
 pub mod construction;
 pub mod conventions;
 pub mod interface;
+mod structural;
 
 use std::{
     collections::{BTreeSet, HashMap, HashSet},
@@ -230,6 +231,14 @@ impl Analysis {
         for declaration in semantics.typed().values() {
             let mut work = vec![(&declaration.value, BTreeSet::new(), BTreeSet::new())];
             while let Some((term, available, available_construction)) = work.pop() {
+                if self
+                    .callables
+                    .unresolved_structural_results
+                    .contains(&term.at)
+                {
+                    report(term.at, "cannot determine the hidden type arguments of this structural result's callable values".into());
+                    continue;
+                }
                 let flow = self.callables.occurrences[&term.at];
                 let condition = &construction[flow.evaluation as usize].condition;
                 let scoped = condition
@@ -490,6 +499,10 @@ pub fn parameters(ty: &Arc<Ty>) -> BTreeSet<u32> {
                 work.extend([from.clone(), to.clone()]);
                 row_parameters(row, &mut work, &mut parameters);
             }
+            Ty::Contract { fallback, contract } => {
+                work.push(fallback.clone());
+                work.extend(contract.type_operands().cloned());
+            }
             Ty::Array(inner)
             | Ty::TypeInfo(inner)
             | Ty::Mirror(inner)
@@ -533,21 +546,40 @@ pub fn instantiate(
 ) -> HashMap<u32, Arc<Ty>> {
     let mut result = HashMap::new();
     let mut work = vec![(declared.clone(), used.clone())];
-    let mut visited = Vec::new();
+    let mut visited: HashMap<(usize, usize), (Arc<Ty>, Arc<Ty>)> = HashMap::new();
     let mut aliases_seen = HashSet::new();
     while let Some((declared, used)) = work.pop() {
         if let Some(slot) = evidence_slot(&declared) {
             result.entry(slot).or_insert(used);
             continue;
         }
+        // The finite type DAG is already shared. Comparing every new pair
+        // structurally against every prior pair expands long contract capture
+        // chains repeatedly; pointer pairs suffice here. Alias unfolding has
+        // its own coinductive guard below, and owners prevent address reuse.
+        let key = (Arc::as_ptr(&declared) as usize, Arc::as_ptr(&used) as usize);
         if visited
-            .iter()
-            .any(|(a, b)| same_finite_syntax(a, &declared) && same_finite_syntax(b, &used))
+            .insert(key, (declared.clone(), used.clone()))
+            .is_some()
         {
             continue;
         }
-        visited.push((declared.clone(), used.clone()));
         match (&*declared, &*used) {
+            (
+                Ty::Contract {
+                    fallback: declared,
+                    contract: a,
+                },
+                Ty::Contract {
+                    fallback: used,
+                    contract: b,
+                },
+            ) => {
+                work.push((declared.clone(), used.clone()));
+                work.extend(a.type_operands().cloned().zip(b.type_operands().cloned()));
+            }
+            (Ty::Contract { fallback, .. }, _) => work.push((fallback.clone(), used)),
+            (_, Ty::Contract { fallback, .. }) => work.push((declared, fallback.clone())),
             (
                 Ty::Named {
                     symbol: a,

@@ -1,5 +1,7 @@
 //! Pass two: solving. See [`Solve`].
 
+mod contracts;
+
 use std::{
     collections::{HashMap, HashSet, hash_map::DefaultHasher},
     hash::{Hash, Hasher},
@@ -295,6 +297,11 @@ enum SolveWork {
         assumption: Option<(Symbol, Symbol)>,
         depth: u32,
     },
+    FinishContract {
+        expected: Arc<Ty>,
+        actual: Arc<Ty>,
+        depth: u32,
+    },
 }
 
 /// Pass two: the solver, which sees constraints and never terms.
@@ -567,7 +574,28 @@ impl Solve<'_> {
                             );
                         }
                     }
+                    // A closure written in a refined match arm may use that
+                    // arm's facts while its body is checked, but the effects
+                    // on the resulting arrow describe a later invocation.
+                    // Settle the body's effects under the construction-time
+                    // premise, then publish that arrow row outside the premise
+                    // rather than making the closure's own effects conditional
+                    // on a match which has already finished.
+                    let enclosing_guard = self.guard.take();
+                    if let Some(guard) = &enclosing_guard {
+                        let arrow = Arc::new(Ty::Arrow(
+                            Arc::new(Ty::unit()),
+                            Arc::new(Ty::unit()),
+                            remaining.clone(),
+                        ));
+                        if let Ty::Arrow(_, _, effects) =
+                            &*self.table.specialize_under(&arrow, guard)
+                        {
+                            remaining = effects.clone();
+                        }
+                    }
                     self.relate_effects(span, &remaining, external, true, false);
+                    self.guard = enclosing_guard;
                 }
                 ConstraintKind::Project {
                     base,
@@ -582,6 +610,35 @@ impl Solve<'_> {
                     operand_span,
                 } => self.spread(span, *operand_span, operand, demand, result),
                 ConstraintKind::Equal { expected, actual } => self.unify(span, expected, actual),
+                ConstraintKind::Apply {
+                    callee,
+                    argument,
+                    parameter,
+                    argument_at,
+                    result,
+                    effects,
+                    allow_deferred,
+                } => {
+                    let function = self.table.resolve(callee);
+                    let function = self.table.unfolded(self.aliases, &function);
+                    if matches!(&*function, Ty::Contract { .. }) {
+                        self.apply_contract(
+                            *argument_at,
+                            callee,
+                            argument,
+                            result,
+                            effects,
+                            *allow_deferred,
+                        );
+                    } else {
+                        let demand = Arc::new(Ty::Arrow(
+                            parameter.clone(),
+                            result.clone(),
+                            effects.clone(),
+                        ));
+                        self.unify(span, &demand, callee);
+                    }
+                }
                 ConstraintKind::Open {
                     hidden,
                     binder,
@@ -929,7 +986,24 @@ impl Solve<'_> {
         result: &Arc<Ty>,
     ) {
         let base = self.table.resolve(base);
+        let base = self.normalize_contract(field_span, &base);
         let exposed = super::unfold(self.aliases, &base);
+
+        if let Ty::Contract { fallback, contract } = &*exposed
+            && contract.remaining_parameters() == 0
+        {
+            if matches!(&*self.table.resolve(fallback), Ty::Undecided) {
+                let mut error = Error::new(field_span, ErrorKind::StructuralContract {
+                    message: "the structural result is still symbolic and does not establish this field".into(),
+                });
+                error.id = self.table.error_id();
+                self.errors.push(error);
+                self.unify(field_span, result, &Arc::new(Ty::Undecided));
+                return;
+            }
+            self.project(field_span, base_span, fallback, field, result);
+            return;
+        }
         match &*exposed {
             Ty::Nat
             | Ty::Int
@@ -1311,6 +1385,7 @@ impl Solve<'_> {
                                 continue;
                             }
                             match &*ty {
+                                Ty::Contract { .. } => values.push(tagged(60, [])),
                                 Ty::Nat => values.push(tagged(0, [])),
                                 Ty::Int => values.push(tagged(1, [])),
                                 Ty::Fixed(kind) => values.push(tagged(30, [*kind as u64])),
@@ -2195,6 +2270,30 @@ impl Solve<'_> {
         self.table.level = level;
         let error_start = self.errors.len();
         self.run(value);
+        if let Err(limit) = crate::contracts::check_type_graph(
+            bound,
+            |ty| self.table.resolve(ty),
+            |row| self.table.canon(row),
+        ) {
+            let mut error = Error::new(
+                binding_span,
+                ErrorKind::StructuralContract {
+                    message: limit.to_string(),
+                },
+            );
+            error.id = self.table.error_id();
+            self.errors.push(error);
+            self.table.level = level - 1;
+            let recovery = Scheme::new(0, Arc::new(Ty::Undecided));
+            self.locals.insert(symbol, recovery.clone());
+            self.schemes.insert(
+                symbol,
+                ExplainedScheme::local(recovery, SchemeProvenance::default()),
+            );
+            self.run(body);
+            self.schemes.remove(&symbol);
+            return;
+        }
         // R23's closing rule, said about a nested binding on the same terms: a
         // `let` in the middle of a body is generalized exactly as one at the
         // top of a file is.
@@ -2362,6 +2461,32 @@ impl Solve<'_> {
         // structural data directly instead of rechecking that invariant.
         type Arguments = (Arc<[Arc<Ty>]>, Arc<[Arc<Ty>]>);
         let mut assumption_arguments: HashMap<usize, Arguments> = HashMap::new();
+        // Contract conformance can ask ordinary capture/arrow obligations
+        // through another solver invocation. Those obligations remain below
+        // the alias guards already open in the caller; rebuilding only a local
+        // index would forget the repeating pair and recurse on the host stack.
+        // This invocation removes only the assumptions it opens itself.
+        for (at, (left, right)) in self.assumed.iter().enumerate() {
+            if let (
+                Ty::Named {
+                    symbol: left,
+                    args: left_args,
+                    ..
+                },
+                Ty::Named {
+                    symbol: right,
+                    args: right_args,
+                    ..
+                },
+            ) = (&**left, &**right)
+            {
+                assumption_index
+                    .entry((*left, *right))
+                    .or_default()
+                    .push(at);
+                assumption_arguments.insert(at, (left_args.clone(), right_args.clone()));
+            }
+        }
         let mut work = vec![SolveWork::Ty(lhs, rhs, original_depth)];
         while let Some(part) = work.pop() {
             crate::cancellation::checkpoint();
@@ -2373,6 +2498,26 @@ impl Solve<'_> {
                 SolveWork::Ty(lhs, rhs, depth) => {
                     self.depth = depth;
                     let (lhs, rhs) = (self.table.resolve(&lhs), self.table.resolve(&rhs));
+                    // A summary is published only after its value body checks.
+                    // Recovery keeps the ordinary checked shape, whose failed
+                    // variables have already been made undecided.
+                    let failed = self
+                        .errors
+                        .iter()
+                        .any(|error| error.at.definition == span.definition);
+                    let recovered = |ty: Arc<Ty>| {
+                        if failed
+                            && let Ty::Contract { fallback, contract } = &*ty
+                            && contract.remaining_parameters() > 0
+                        {
+                            fallback.clone()
+                        } else {
+                            ty
+                        }
+                    };
+                    let (lhs, rhs) = (recovered(lhs), recovered(rhs));
+                    let lhs = self.normalize_contract(span, &lhs);
+                    let rhs = self.normalize_contract(span, &rhs);
                     // A synthesized constructor was selected from one arm at
                     // this exact structural position. The rule consumes only
                     // that contributor, so a sibling's source cannot leak into
@@ -2452,6 +2597,52 @@ impl Solve<'_> {
                         | (Ty::Rigid { .. }, _)
                         | (_, Ty::Rigid { .. }) => {
                             self.types(span, goal, &lhs, &rhs);
+                        }
+                        (Ty::Contract { fallback, contract }, _)
+                            if contract.remaining_parameters() == 0
+                                && !matches!(&*self.table.resolve(fallback), Ty::Undecided) =>
+                        {
+                            work.push(SolveWork::Ty(fallback.clone(), rhs.clone(), depth + 1));
+                        }
+                        (_, Ty::Contract { fallback, contract })
+                            if contract.remaining_parameters() == 0
+                                && !matches!(&*self.table.resolve(fallback), Ty::Undecided) =>
+                        {
+                            work.push(SolveWork::Ty(lhs.clone(), fallback.clone(), depth + 1));
+                        }
+                        (Ty::Contract { .. }, _) | (_, Ty::Contract { .. })
+                            if !matches!(&*lhs, Ty::Named { .. })
+                                && !matches!(&*rhs, Ty::Named { .. }) =>
+                        {
+                            // Named annotations must first expose their
+                            // ordinary arrow or structural body through the
+                            // guarded alias rule below.
+                            let equations = match (&*lhs, &*rhs) {
+                                (
+                                    Ty::Contract { contract: left, .. },
+                                    Ty::Contract {
+                                        contract: right, ..
+                                    },
+                                ) => contracts::structural_equations(left, right),
+                                _ => None,
+                            };
+                            if let Some(equations) = equations {
+                                work.push(SolveWork::FinishContract {
+                                    expected: lhs.clone(),
+                                    actual: rhs.clone(),
+                                    depth,
+                                });
+                                work.extend(
+                                    equations
+                                        .into_iter()
+                                        .rev()
+                                        .map(|(left, right)| SolveWork::Ty(left, right, depth + 1)),
+                                );
+                            } else if let Some((expected, actual)) =
+                                self.compare_contract(span, &lhs, &rhs)
+                            {
+                                work.push(SolveWork::Ty(expected, actual, depth + 1));
+                            }
                         }
                         (
                             Ty::Named { symbol, args, .. },
@@ -2783,6 +2974,14 @@ impl Solve<'_> {
                         self.mismatch(span, goal, &lhs, &rhs);
                     }
                 }
+                SolveWork::FinishContract {
+                    expected,
+                    actual,
+                    depth,
+                } => {
+                    self.depth = depth;
+                    self.compare_contract_effects(span, &expected, &actual);
+                }
                 SolveWork::FinishUnfold { assumption, depth } => {
                     self.depth = depth;
                     if let Some(key) = assumption {
@@ -2851,6 +3050,10 @@ impl Solve<'_> {
                             work.push(Work::Row(effects.clone()));
                             work.push(Work::Ty(to.clone()));
                             work.push(Work::Ty(from.clone()));
+                        }
+                        Ty::Contract { fallback, contract } => {
+                            work.push(Work::Ty(fallback.clone()));
+                            work.extend(contract.type_operands().cloned().map(Work::Ty));
                         }
                         Ty::Package(body) | Ty::Hidden { body, .. } => {
                             work.push(Work::Ty(body.clone()))
@@ -3503,7 +3706,7 @@ impl Solve<'_> {
             // slot means nothing, and constraining it would reject rows that
             // agree.
             _ => {
-                self.presences(span, &p1, &p2);
+                self.row_presences(span, shape, &p1, &p2);
                 (!matches!(self.table.presence_of(&p1), Presence::Absent))
                     .then(|| (want.ty.clone(), have.ty.clone()))
             }
@@ -3519,6 +3722,25 @@ impl Solve<'_> {
     /// pair that is already the same thing — said as `Same` rather than as
     /// [`Rule::Presence`] because that rule is worded about the label whose
     /// presence it is deciding, and here there is no row in sight to have one.
+    fn row_presences(&mut self, span: Anchor, shape: Shape, lhs: &Presence, rhs: &Presence) {
+        let sealed = |presence: &Presence| {
+            shape != Shape::Effect
+                && matches!(presence, Presence::Var(var)
+                    if self.table.abstract_existentials.contains(var)
+                        && self.table.var_meta[*var as usize].subject
+                            == super::Subject::MatchResult)
+        };
+        let flexible = |presence: &Presence| {
+            matches!(presence, Presence::Var(var)
+                if !self.table.abstract_existentials.contains(var))
+        };
+        if (sealed(lhs) && !flexible(rhs)) || (sealed(rhs) && !flexible(lhs)) {
+            self.guarded_presence(span, lhs, rhs);
+        } else {
+            self.presences(span, lhs, rhs);
+        }
+    }
+
     fn presences(&mut self, span: Anchor, lhs: &Presence, rhs: &Presence) {
         if self.guard.is_some() {
             self.guarded_presence(span, lhs, rhs);
@@ -3595,10 +3817,7 @@ impl Solve<'_> {
     /// Record presence equality under the active arm premise without binding
     /// either presence globally.
     fn guarded_presence(&mut self, span: Anchor, lhs: &Presence, rhs: &Presence) {
-        let premise = self
-            .guard
-            .clone()
-            .expect("guarded presence equality has an active premise");
+        let premise = self.guard.clone().unwrap_or(Formula::True);
         let lhs = self.table.presence_of(lhs);
         let rhs = self.table.presence_of(rhs);
         let obligation = match (&lhs, &rhs) {
@@ -3669,7 +3888,9 @@ impl Solve<'_> {
                 obligation: obligation.clone(),
             },
         );
-        self.record_obligation(span, premise, obligation, formula);
+        if self.active_refinement.is_some() {
+            self.record_obligation(span, premise, obligation, formula);
+        }
     }
 
     /// Push the labels only one side names into what the other side allows
@@ -3798,8 +4019,10 @@ impl Solve<'_> {
                     let abandoned = [Assigned::Ty(field.ty.clone())];
                     self.fail(span, Rule::Presence { shape }, goal, error, &abandoned);
                 }
-                (_, Side::Expected) => self.presences(span, &Presence::Absent, &presence),
-                (_, Side::Actual) => self.presences(span, &presence, &Presence::Absent),
+                (_, Side::Expected) => {
+                    self.row_presences(span, shape, &Presence::Absent, &presence)
+                }
+                (_, Side::Actual) => self.row_presences(span, shape, &presence, &Presence::Absent),
             }
         }
         // And whatever would have continued past them allows nothing more
@@ -3964,6 +4187,7 @@ impl Solve<'_> {
                 rest: Rest,
             },
             Arrow,
+            Contract(Arc<crate::contracts::Contract>),
             Struct,
             Sum,
             Named {
@@ -3987,6 +4211,11 @@ impl Solve<'_> {
                             work.push(Work::Row(effects.clone()));
                             work.push(Work::Type(to.clone()));
                             work.push(Work::Type(from.clone()));
+                        }
+                        Ty::Contract { fallback, contract } => {
+                            work.push(Work::Contract(contract.clone()));
+                            work.extend(contract.type_operands().rev().cloned().map(Work::Type));
+                            work.push(Work::Type(fallback.clone()));
                         }
                         Ty::Struct(row) => {
                             work.push(Work::Struct);
@@ -4082,6 +4311,18 @@ impl Solve<'_> {
                     let to = types.pop().expect("guarded arrow result");
                     let from = types.pop().expect("guarded arrow parameter");
                     types.push(Arc::new(Ty::Arrow(from, to, effects)));
+                }
+                Work::Contract(contract) => {
+                    let count = contract.type_operands().count();
+                    let split = types.len() - count - 1;
+                    let mut children = types.drain(split..).collect::<Vec<_>>().into_iter();
+                    let fallback = children.next().expect("guarded contract fallback");
+                    let contract =
+                        contract.map_types(|_| children.next().expect("guarded contract operand"));
+                    types.push(Arc::new(Ty::Contract {
+                        fallback,
+                        contract: Arc::new(contract),
+                    }));
                 }
                 Work::Struct => {
                     let row = rows.pop().expect("guarded struct row");
@@ -4291,6 +4532,10 @@ impl Solve<'_> {
                         work.push(Work::Row(Arc::new(effects.clone())));
                         work.push(Work::Type(to.clone()));
                         work.push(Work::Type(from.clone()));
+                    }
+                    Ty::Contract { fallback, contract } => {
+                        work.push(Work::Type(fallback.clone()));
+                        work.extend(contract.type_operands().cloned().map(Work::Type));
                     }
                     Ty::Package(body) | Ty::Hidden { body, .. } => {
                         work.push(Work::Type(body.clone()))
@@ -4556,15 +4801,13 @@ fn row_ty(row: &Row) -> Arc<Ty> {
 /// rather than quietly dropping it.
 fn region_in(table: &super::Table, ty: &Arc<Ty>) -> Option<Arc<Ty>> {
     let mut work = vec![table.resolve(ty)];
-    let mut seen = 0usize;
+    let mut seen = HashSet::new();
+    let mut retained = Vec::new();
     while let Some(ty) = work.pop() {
-        seen += 1;
-        // A regular recursive type is finite through its aliases, and this
-        // walk is over a resolved witness, so a bound keeps a pathological
-        // one from running away.
-        if seen > 4096 {
-            return None;
+        if !seen.insert(Arc::as_ptr(&ty)) {
+            continue;
         }
+        retained.push(ty.clone());
         match &*ty {
             Ty::Mut(..) => return Some(ty.clone()),
             Ty::Array(inner) | Ty::Package(inner) | Ty::Mirror(inner) | Ty::TypeInfo(inner) => {
@@ -4574,6 +4817,10 @@ fn region_in(table: &super::Table, ty: &Arc<Ty>) -> Option<Arc<Ty>> {
             Ty::Arrow(from, to, _) => {
                 work.push(table.resolve(from));
                 work.push(table.resolve(to));
+            }
+            Ty::Contract { fallback, contract } => {
+                work.push(table.resolve(fallback));
+                work.extend(contract.type_operands().map(|ty| table.resolve(ty)));
             }
             Ty::Struct(row) | Ty::Sum(row) => {
                 for field in row.labels.values() {

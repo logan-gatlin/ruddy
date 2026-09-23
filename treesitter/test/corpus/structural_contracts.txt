@@ -1,0 +1,523 @@
+==================
+Residual structural types keep effect rows and shared expressions
+==================
+
+let f: fn => capture (Nat) + | = f
+let g: fn 'x => 'x + !IO = g
+let h: fn 'x => do let 'pair = {left: 'x, right: 'x}; return {a: 'pair, b: 'pair} end = h
+
+---
+
+(source_file
+  (let_definition
+    (identifier)
+    (annotation
+      (structural_contract_type
+        (structural_capture
+          (identifier))
+        (effect_row)))
+    (identifier))
+  (let_definition
+    (identifier)
+    (annotation
+      (structural_contract_type
+        (type_variable)
+        (type_variable)
+        (effect_row
+          (effect_case
+            (effect_label)))))
+    (identifier))
+  (let_definition
+    (identifier)
+    (annotation
+      (structural_contract_type
+        (type_variable)
+        (structural_then
+          (type_variable)
+          (structural_record
+            (structural_field
+              (identifier)
+              (type_variable))
+            (structural_field
+              (identifier)
+              (type_variable)))
+          (structural_record
+            (structural_field
+              (identifier)
+              (type_variable))
+            (structural_field
+              (identifier)
+              (type_variable))))))
+    (identifier)))
+
+==================
+Match types preserve tag, record, and tuple relationships
+==================
+
+let get: match
+| #Red => { r: 'a, ..'rest } -> 'a
+| #Green => { g: 'b, ..'rest } -> 'b
+end = get
+type Pad = match
+| () => (#None, #None)
+| ('a,) => ('a, #None)
+| ('a, 'b) => ('a, 'b)
+end
+
+---
+
+(source_file
+  (let_definition
+    (identifier)
+    (annotation
+      (match_type
+        (match_type_arm
+          (sum_type
+            (sum_case
+              (tag)))
+          (function_type
+            (struct_type
+              (struct_type_field
+                (identifier)
+                (type_variable))
+              (rest
+                (type_variable)))
+            (type_variable)))
+        (match_type_arm
+          (sum_type
+            (sum_case
+              (tag)))
+          (function_type
+            (struct_type
+              (struct_type_field
+                (identifier)
+                (type_variable))
+              (rest
+                (type_variable)))
+            (type_variable)))))
+    (identifier))
+  (type_definition
+    (identifier)
+    (annotation
+      (match_type
+        (match_type_arm
+          (unit)
+          (tuple_type
+            (sum_type
+              (sum_case
+                (tag)))
+            (sum_type
+              (sum_case
+                (tag)))))
+        (match_type_arm
+          (tuple_type
+            (type_variable))
+          (tuple_type
+            (type_variable)
+            (sum_type
+              (sum_case
+                (tag)))))
+        (match_type_arm
+          (tuple_type
+            (type_variable)
+            (type_variable))
+          (tuple_type
+            (type_variable)
+            (type_variable)))))))
+
+==================
+Sum results stop before the following match type arm
+==================
+
+let f: match
+| #A => #B | #C
+| #D => #E
+end = f
+let g: match
+| (#A | #B) => #C
+| (#D | #E) => #F
+end = g
+
+---
+
+(source_file
+  (let_definition
+    (identifier)
+    (annotation
+      (match_type
+        (match_type_arm
+          (sum_type
+            (sum_case
+              (tag)))
+          (sum_type
+            (sum_case
+              (tag))
+            (sum_case
+              (tag))))
+        (match_type_arm
+          (sum_type
+            (sum_case
+              (tag)))
+          (sum_type
+            (sum_case
+              (tag))))))
+    (identifier))
+  (let_definition
+    (identifier)
+    (annotation
+      (match_type
+        (match_type_arm
+          (parenthesized_type
+            (sum_type
+              (sum_case
+                (tag))
+              (sum_case
+                (tag))))
+          (sum_type
+            (sum_case
+              (tag))))
+        (match_type_arm
+          (parenthesized_type
+            (sum_type
+              (sum_case
+                (tag))
+              (sum_case
+                (tag))))
+          (sum_type
+            (sum_case
+              (tag))))))
+    (identifier)))
+
+==================
+Match types nest in results and callback inputs
+==================
+
+let f: match
+| #A => match | #B => #C | #D => #E end
+| #F => #G
+end = f
+let apply: (match | #A => #B | #C => #D end) -> Nat = apply
+
+---
+
+(source_file
+  (let_definition
+    (identifier)
+    (annotation
+      (match_type
+        (match_type_arm
+          (sum_type
+            (sum_case
+              (tag)))
+          (match_type
+            (match_type_arm
+              (sum_type
+                (sum_case
+                  (tag)))
+              (sum_type
+                (sum_case
+                  (tag))))
+            (match_type_arm
+              (sum_type
+                (sum_case
+                  (tag)))
+              (sum_type
+                (sum_case
+                  (tag))))))
+        (match_type_arm
+          (sum_type
+            (sum_case
+              (tag)))
+          (sum_type
+            (sum_case
+              (tag))))))
+    (identifier))
+  (let_definition
+    (identifier)
+    (annotation
+      (function_type
+        (parenthesized_type
+          (match_type
+            (match_type_arm
+              (sum_type
+                (sum_case
+                  (tag)))
+              (sum_type
+                (sum_case
+                  (tag))))
+            (match_type_arm
+              (sum_type
+                (sum_case
+                  (tag)))
+              (sum_type
+                (sum_case
+                  (tag))))))
+        (identifier)))
+    (identifier)))
+
+==================
+Structural function contracts describe fields, captures, and matched payloads
+==================
+
+let get: fn 'image => ('image).r = get
+let over: fn 'function 'value => ('function) ('value) = over
+let wrap: fn 'value => #Some ('value) = wrap
+let choose: fn 'value => match 'value with
+| #Some 'payload => 'payload
+| #None => capture (Nat)
+end = choose
+let preserve: fn 'value => do _ = (capture (Nat -> Nat)) ('value); return 'value end = preserve
+
+---
+
+(source_file
+  (let_definition
+    (identifier)
+    (annotation
+      (structural_contract_type
+        (type_variable)
+        (structural_projection
+          (parenthesized_structural_expression
+            (type_variable))
+          (identifier))))
+    (identifier))
+  (let_definition
+    (identifier)
+    (annotation
+      (structural_contract_type
+        (type_variable)
+        (type_variable)
+        (structural_application
+          (parenthesized_structural_expression
+            (type_variable))
+          (parenthesized_structural_expression
+            (type_variable)))))
+    (identifier))
+  (let_definition
+    (identifier)
+    (annotation
+      (structural_contract_type
+        (type_variable)
+        (structural_tag
+          (tag)
+          (parenthesized_structural_expression
+            (type_variable)))))
+    (identifier))
+  (let_definition
+    (identifier)
+    (annotation
+      (structural_contract_type
+        (type_variable)
+        (structural_match
+          (type_variable)
+          (structural_match_arm
+            (structural_tag_pattern
+              (tag)
+              (type_variable))
+            (type_variable))
+          (structural_match_arm
+            (structural_tag_pattern
+              (tag))
+            (structural_capture
+              (identifier))))))
+    (identifier))
+  (let_definition
+    (identifier)
+    (annotation
+      (structural_contract_type
+        (type_variable)
+        (structural_then
+          (structural_application
+            (parenthesized_structural_expression
+              (structural_capture
+                (function_type
+                  (identifier)
+                  (identifier))))
+            (parenthesized_structural_expression
+              (type_variable)))
+          (type_variable))))
+    (identifier)))
+
+==================
+Structural match function types bind tuple positions without an end
+==================
+
+let extend2: fn
+| () => (#None, #None)
+| ('a,) => ('a, #None)
+| ('a, 'b) => ('a, 'b)
+= fn
+| () => (#None, #None)
+| (a,) => (a, #None)
+| (a, b) => (a, b)
+
+---
+
+(source_file
+  (let_definition
+    (identifier)
+    (annotation
+      (structural_contract_type
+        (structural_match_arm
+          (unit)
+          (structural_tuple
+            (structural_tag
+              (tag))
+            (structural_tag
+              (tag))))
+        (structural_match_arm
+          (structural_tuple_pattern
+            (type_variable))
+          (structural_tuple
+            (type_variable)
+            (structural_tag
+              (tag))))
+        (structural_match_arm
+          (structural_tuple_pattern
+            (type_variable)
+            (type_variable))
+          (structural_tuple
+            (type_variable)
+            (type_variable)))))
+    (match_function
+      (match_arm
+        (unit)
+        (tuple_expression
+          (tag_expression
+            (tag))
+          (tag_expression
+            (tag))))
+      (match_arm
+        (tuple_pattern
+          (identifier))
+        (tuple_expression
+          (identifier)
+          (tag_expression
+            (tag))))
+      (match_arm
+        (tuple_pattern
+          (identifier)
+          (identifier))
+        (tuple_expression
+          (identifier)
+          (identifier))))))
+
+==================
+Structural match function types keep nested matches and captures scoped
+==================
+
+let f: fn
+| #Some 'value => match 'value with
+  | { item: 'item } => 'item
+  end
+| #None => capture (fn | ('a,) => 'a)
+= f
+
+---
+
+(source_file
+  (let_definition
+    (identifier)
+    (annotation
+      (structural_contract_type
+        (structural_match_arm
+          (structural_tag_pattern
+            (tag)
+            (type_variable))
+          (structural_match
+            (type_variable)
+            (structural_match_arm
+              (structural_record_pattern
+                (structural_field_pattern
+                  (identifier)
+                  (type_variable)))
+              (type_variable))))
+        (structural_match_arm
+          (structural_tag_pattern
+            (tag))
+          (structural_capture
+            (structural_contract_type
+              (structural_match_arm
+                (structural_tuple_pattern
+                  (type_variable))
+                (type_variable)))))))
+    (identifier)))
+
+==================
+Structural match function types retain effect suffixes
+==================
+
+let identity: fn | 'a => 'a + | = identity
+let apply: fn | ('function, 'argument) => 'function 'argument + !IO = apply
+
+---
+
+(source_file
+  (let_definition
+    (identifier)
+    (annotation
+      (structural_contract_type
+        (structural_match_arm
+          (type_variable)
+          (type_variable))
+        (effect_row)))
+    (identifier))
+  (let_definition
+    (identifier)
+    (annotation
+      (structural_contract_type
+        (structural_match_arm
+          (structural_tuple_pattern
+            (type_variable)
+            (type_variable))
+          (structural_application
+            (type_variable)
+            (type_variable)))
+        (effect_row
+          (effect_case
+            (effect_label)))))
+    (identifier)))
+
+==================
+Structural match function types occur in aliases callbacks and externs
+==================
+
+type Unwrap = fn | #Some 'a => 'a
+let consume: (fn | ('a,) => 'a) -> Nat = consume
+extern unwrap: fn | { value: 'a, .. } => 'a = "value => value.value"
+
+---
+
+(source_file
+  (type_definition
+    (identifier)
+    (annotation
+      (structural_contract_type
+        (structural_match_arm
+          (structural_tag_pattern
+            (tag)
+            (type_variable))
+          (type_variable)))))
+  (let_definition
+    (identifier)
+    (annotation
+      (function_type
+        (parenthesized_type
+          (structural_contract_type
+            (structural_match_arm
+              (structural_tuple_pattern
+                (type_variable))
+              (type_variable))))
+        (identifier)))
+    (identifier))
+  (extern_definition
+    (identifier)
+    (extern_annotation
+      (structural_contract_type
+        (structural_match_arm
+          (structural_record_pattern
+            (structural_field_pattern
+              (identifier)
+              (type_variable)))
+          (type_variable))))
+    (string)))

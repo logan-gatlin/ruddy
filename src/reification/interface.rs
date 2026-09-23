@@ -12,6 +12,10 @@ pub struct Interface {
     pub nodes: Vec<Node>,
     pub ports: Vec<BTreeSet<u32>>,
     pub construction: BTreeMap<u32, super::construction::Demand>,
+    /// Callable conventions captured by a partially applied structural
+    /// function, in the same order as its semantic contract arguments.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub structural_arguments: BTreeMap<u32, Vec<u32>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -52,6 +56,7 @@ impl Interface {
             nodes: Vec::new(),
             ports: Vec::new(),
             construction: BTreeMap::new(),
+            structural_arguments: BTreeMap::new(),
         };
         let mut nodes = HashMap::new();
         let mut ports = HashMap::new();
@@ -185,6 +190,13 @@ impl Interface {
                 }
             };
             output.nodes[target as usize] = copied;
+            if let Some(arguments) = graph.structural_arguments.get(&source) {
+                let arguments = arguments
+                    .iter()
+                    .map(|argument| node(graph, &mut output, &mut nodes, &mut pending, *argument))
+                    .collect();
+                output.structural_arguments.insert(target, arguments);
+            }
         }
         output.normalize();
         output
@@ -272,6 +284,14 @@ impl Interface {
         }
         let mut visited = HashSet::new();
         let mut pending = vec![self.root];
+        for (function, arguments) in &self.structural_arguments {
+            if !matches!(self.nodes.get(*function as usize), Some(Node::Arrow { .. })) {
+                return Err("invalid structural callable argument owner".into());
+            }
+            if arguments.len() > crate::contracts::MAX_NODES {
+                return Err("structural callable argument count exceeds its bound".into());
+            }
+        }
         let mut bound_ports = HashSet::new();
         while let Some(id) = pending.pop() {
             if id as usize >= self.nodes.len() {
@@ -279,6 +299,9 @@ impl Interface {
             }
             if !visited.insert(id) {
                 continue;
+            }
+            if let Some(arguments) = self.structural_arguments.get(&id) {
+                pending.extend(arguments.iter().copied());
             }
             match &self.nodes[id as usize] {
                 Node::Value | Node::Lazy | Node::Sealed => {}
@@ -414,6 +437,15 @@ impl Interface {
                 }
             };
             graph.shapes[nodes[id] as usize] = shape;
+        }
+        for (function, arguments) in &self.structural_arguments {
+            graph.structural_arguments.insert(
+                nodes[*function as usize],
+                arguments
+                    .iter()
+                    .map(|argument| nodes[*argument as usize])
+                    .collect(),
+            );
         }
         nodes[self.root as usize]
     }

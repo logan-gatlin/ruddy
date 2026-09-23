@@ -8,9 +8,12 @@ use crate::artifact::{Artifact, DeclaredType, Presence, Rest, Row, Type};
 
 use super::js::{Error, Platform};
 
+mod contracts;
+
 pub(super) struct Adapters {
     pub artifact: Artifact,
     pub exports: HashMap<String, String>,
+    pub native: HashMap<String, NativeTemplate>,
 }
 
 /// Which way a value crosses the JavaScript boundary.
@@ -46,6 +49,41 @@ impl NativeTemplate {
             },
             parameters,
         ))
+    }
+
+    fn has_optional_input(&self) -> bool {
+        use crate::reification::Node;
+        let mut pending = vec![(0u32, false)];
+        let mut seen = std::collections::HashSet::new();
+        while let Some((index, incoming)) = pending.pop() {
+            if !seen.insert((index, incoming)) {
+                continue;
+            }
+            match &self.descriptor.nodes[index as usize] {
+                Node::Arrow([argument, result, _]) => {
+                    pending.push((*argument, true));
+                    pending.push((*result, incoming));
+                }
+                Node::Struct(fields) => {
+                    if incoming
+                        && self
+                            .optional_fields
+                            .get(&index)
+                            .is_some_and(|fields| !fields.is_empty())
+                    {
+                        return true;
+                    }
+                    pending.extend(fields.iter().map(|(_, child)| (*child, incoming)));
+                }
+                Node::Sum(fields) => {
+                    pending.extend(fields.iter().map(|(_, child)| (*child, incoming)))
+                }
+                Node::Alias(inner) | Node::Array(inner) => pending.push((*inner, incoming)),
+                // The host cannot construct reflected or hidden payloads.
+                _ => {}
+            }
+        }
+        false
     }
 
     pub fn validate(&self, parameters: usize) -> Result<(), &'static str> {
@@ -111,15 +149,30 @@ pub(super) fn native_descriptor(
         },
         String::from("value"),
         false,
+        false,
     )];
     let mut aliases = HashMap::new();
+    let mut views = HashMap::new();
     let projections = forwarding(declarations);
-    while let Some((id, view, path, incoming)) = work.pop() {
+    while let Some((id, view, path, incoming, exact)) = work.pop() {
         let view = resolved(view);
+        let view_key = (
+            view.ty as *const Type,
+            Arc::as_ptr(&view.args),
+            incoming,
+            exact,
+        );
+        if let Some((prior, _)) = views.get(&view_key) {
+            nodes[id] = Runtime::Alias(*prior);
+            continue;
+        }
+        // Retain argument environments as well as their addresses. Shared
+        // portable nodes must not expand once per incoming edge.
+        views.insert(view_key, (id as u32, view.args.clone()));
         let mut child = |view, position: String, incoming| {
             let index = nodes.len();
             nodes.push(Runtime::ForeignValue);
-            work.push((index, view, position, incoming));
+            work.push((index, view, position, incoming, exact));
             index as u32
         };
         nodes[id] = match view.ty {
@@ -130,6 +183,13 @@ pub(super) fn native_descriptor(
             Type::String => Runtime::String,
             Type::Bool => Runtime::Bool,
             Type::ForeignValue => Runtime::ForeignValue,
+            // The host needs a concrete calling layout. The generated adapter
+            // is subsequently compiled against the original semantic contract,
+            // so this witness cannot authorize an unchecked call. Reflection
+            // identities below Mirror/TypeInfo must never use this erasure.
+            Type::Contract { fallback, .. } if !exact => {
+                Runtime::Alias(child(view.child(fallback), path, incoming))
+            }
             Type::Package(inner) => Runtime::Alias(child(view.child(inner), path, incoming)),
             // A hidden type crosses the boundary as a sealed package: the
             // host holds it and hands it back, and cannot make one.
@@ -142,7 +202,7 @@ pub(super) fn native_descriptor(
                         || effects
                             .labels
                             .iter()
-                            .any(|(_, presence, _)| **presence != Presence::Absent))
+                            .any(|(_, presence, _)| *presence != Presence::Absent))
                 {
                     return Err(format!(
                         "{path} has an effectful callback contract that cannot be supplied by a native JavaScript caller"
@@ -161,13 +221,19 @@ pub(super) fn native_descriptor(
                 incoming,
             )),
             Type::Mirror(inner) => {
-                Runtime::Mirror(child(view.child(inner), format!("{path} mirror"), incoming))
+                let index = child(view.child(inner), format!("{path} mirror"), incoming);
+                work.last_mut().expect("mirror child").4 = true;
+                Runtime::Mirror(index)
             }
-            Type::TypeInfo(inner) => Runtime::TypeInfo(child(
-                view.child(inner),
-                format!("{path} type information"),
-                incoming,
-            )),
+            Type::TypeInfo(inner) => {
+                let index = child(
+                    view.child(inner),
+                    format!("{path} type information"),
+                    incoming,
+                );
+                work.last_mut().expect("type information child").4 = true;
+                Runtime::TypeInfo(index)
+            }
             Type::Named { name, args } => {
                 let declaration = declarations
                     .get(name.as_str())
@@ -176,6 +242,7 @@ pub(super) fn native_descriptor(
                 let state = (
                     name.clone(),
                     incoming,
+                    exact,
                     arguments
                         .iter()
                         .map(|arg| key(arg.clone(), declarations, &projections))
@@ -205,7 +272,7 @@ pub(super) fn native_descriptor(
                 let mut fields: Vec<_> = fields
                     .labels
                     .into_iter()
-                    .filter(|(_, presence, _)| **presence != Presence::Absent)
+                    .filter(|(_, presence, _)| *presence != Presence::Absent)
                     .map(|(name, presence, ty)| {
                         if matches!(view.ty, Type::Struct(_))
                             && !matches!(presence, Presence::Present | Presence::Absent)
@@ -290,11 +357,17 @@ struct Graph {
 
 /// Resolve alias parameters without expanding recursive structural aliases.
 fn resolved(mut view: View<'_>) -> View<'_> {
-    while let Type::Bound(index) = view.ty {
-        let Some(arg) = view.args.get(*index as usize) else {
-            break;
-        };
-        view = arg.clone();
+    loop {
+        view.ty = view.ty.unshared();
+        match view.ty {
+            Type::Bound(index) => {
+                let Some(arg) = view.args.get(*index as usize) else {
+                    break;
+                };
+                view = arg.clone();
+            }
+            _ => break,
+        }
     }
     view
 }
@@ -312,6 +385,7 @@ fn forwarding<'a>(declarations: &HashMap<&'a str, &'a DeclaredType>) -> HashMap<
             }
             let mut ty = &declaration.scheme.body;
             loop {
+                ty = ty.unshared();
                 match ty {
                     Type::Bound(index) => {
                         projections.insert(name, *index as usize);
@@ -337,8 +411,29 @@ fn forwarding<'a>(declarations: &HashMap<&'a str, &'a DeclaredType>) -> HashMap<
 }
 
 struct Fields<'a> {
-    labels: Vec<(&'a str, &'a Presence, View<'a>)>,
+    labels: Vec<(&'a str, Presence, View<'a>)>,
     rest: &'a Rest,
+}
+
+fn field_presence(presence: &Presence, view: &View<'_>) -> Presence {
+    let mut presence = presence.clone();
+    let mut arguments = view.args.clone();
+    let mut seen = std::collections::HashSet::new();
+    while let Presence::Bound(index) = presence {
+        let Some(argument) = arguments.get(index as usize) else {
+            break;
+        };
+        let argument = resolved(argument.clone());
+        if !seen.insert((argument.ty as *const Type, Arc::as_ptr(&argument.args))) {
+            break;
+        }
+        let Type::Presence(actual) = argument.ty else {
+            break;
+        };
+        presence = actual.clone();
+        arguments = argument.args;
+    }
+    presence
 }
 
 /// Splice row arguments just as unfolding a source alias does. A row parameter
@@ -350,11 +445,13 @@ fn fields<'a>(
 ) -> Fields<'a> {
     let mut labels = Vec::new();
     loop {
-        labels.extend(
-            row.labels
-                .iter()
-                .map(|(name, field)| (name.as_str(), &field.presence, view.child(&field.ty))),
-        );
+        labels.extend(row.labels.iter().map(|(name, field)| {
+            (
+                name.as_str(),
+                field_presence(&field.presence, &view),
+                view.child(&field.ty),
+            )
+        }));
         match &row.rest {
             Rest::More(more) => row = more,
             Rest::Bound(index) if (*index as usize) < view.args.len() => {
@@ -402,6 +499,8 @@ fn key(
     }
     let mut work = vec![Work::Type(view)];
     let mut out = String::new();
+    let mut nodes = HashMap::new();
+    let mut environments = Vec::new();
     while let Some(item) = work.pop() {
         let view = match item {
             Work::Text(text) => {
@@ -410,7 +509,38 @@ fn key(
             }
             Work::Type(view) => resolved(view),
         };
+        if let Type::Contract { fallback, .. } = view.ty {
+            work.push(Work::Type(view.child(fallback)));
+            continue;
+        }
+        if let Type::Named { name, args } = view.ty
+            && let Some(&index) = projections.get(name.as_str())
+        {
+            work.push(Work::Type(view.child(&args[index])));
+            continue;
+        }
+        let state = (view.ty as *const Type, Arc::as_ptr(&view.args));
+        if let Some(id) = nodes.get(&state) {
+            out.push_str(&format!("ref:{id};"));
+            continue;
+        }
+        let id = nodes.len();
+        nodes.insert(state, id);
+        environments.push(view.args.clone());
+        out.push_str(&format!("node:{id}:"));
         match view.ty {
+            Type::Hidden { binder, body, .. } => {
+                out.push_str(&format!("H{binder}("));
+                work.push(Work::Text(")".into()));
+                work.push(Work::Type(view.child(body)));
+            }
+            Type::Mut(region, inner) => {
+                out.push_str("mut(");
+                work.push(Work::Text(")".into()));
+                work.push(Work::Type(view.child(inner)));
+                work.push(Work::Type(view.child(region)));
+            }
+            Type::Contract { fallback, .. } => work.push(Work::Type(view.child(fallback))),
             Type::Named { name, args } => {
                 if let Some(&index) = projections.get(name.as_str()) {
                     work.push(Work::Type(view.child(&args[index])));
@@ -482,17 +612,25 @@ impl Graph {
             },
         )];
         let mut aliases = HashMap::new();
+        let mut views: HashMap<_, (usize, Arc<Vec<View<'_>>>)> = HashMap::new();
         let projections = forwarding(declarations);
         while let Some((id, mut view)) = work.pop() {
             loop {
+                view = resolved(view);
                 match view.ty {
-                    Type::Package(inner) => view = view.child(inner),
-                    Type::Bound(index) if (*index as usize) < view.args.len() => {
-                        view = view.args[*index as usize].clone()
-                    }
+                    Type::Package(inner)
+                    | Type::Contract {
+                        fallback: inner, ..
+                    } => view = view.child(inner),
                     _ => break,
                 }
             }
+            let view_key = (view.ty as *const Type, Arc::as_ptr(&view.args));
+            if let Some((prior, _)) = views.get(&view_key) {
+                nodes[id] = nodes[*prior].clone();
+                continue;
+            }
+            views.insert(view_key, (id, view.args.clone()));
             let mut child = |view| {
                 let id = nodes.len();
                 nodes.push(Plan::Value);
@@ -545,7 +683,7 @@ impl Graph {
                                     .map_or(*label, |(name, _)| name);
                                 // Named operations use `!IO.write`; unnamed ones use
                                 // `!Exit code`. Require either delimiter after the name.
-                                **presence != Presence::Absent
+                                *presence != Presence::Absent
                                     && [format!("| !{name}."), format!("| !{name} ")]
                                         .iter()
                                         .any(|prefix| line.trim_start().starts_with(prefix))
@@ -561,7 +699,7 @@ impl Graph {
                             || fields.labels.iter().any(|(label, presence, _)| {
                                 let name = crate::types::EffectId::parse_row_key(label)
                                     .map_or(*label, |(name, _)| name);
-                                **presence != Presence::Absent && name == "Immediate"
+                                *presence != Presence::Absent && name == "Immediate"
                             }) {
                             " + !Immediate"
                         } else {
@@ -570,7 +708,7 @@ impl Graph {
                         effectful: fields
                             .labels
                             .iter()
-                            .any(|(_, presence, _)| **presence != Presence::Absent)
+                            .any(|(_, presence, _)| *presence != Presence::Absent)
                             || !matches!(fields.rest, Rest::Closed),
                         result: child(view.child(result)),
                     }
@@ -584,9 +722,9 @@ impl Graph {
                     let fields: Vec<_> = fields
                         .labels
                         .into_iter()
-                        .filter(|(_, presence, _)| **presence != Presence::Absent)
+                        .filter(|(_, presence, _)| *presence != Presence::Absent)
                         .map(|(name, presence, ty)| {
-                            (name.to_string(), *presence == Presence::Present, child(ty))
+                            (name.to_string(), presence == Presence::Present, child(ty))
                         })
                         .collect();
                     if matches!(view.ty, Type::Struct(_)) {
@@ -934,41 +1072,275 @@ pub(super) fn compile(
         raw_types.insert(name, (local, arguments));
         interface.header.types.push(raw);
     }
+    let mut checks = HashMap::new();
+    let mut candidates_by_value = HashMap::new();
+    let mut witnesses = None;
+    for (index, value) in root.header().values.iter().enumerate() {
+        if !contracts::needed(&value.scheme.body, &declarations) {
+            continue;
+        }
+        if witnesses.is_none() {
+            let new = contracts::Witnesses::new(&prefix, &namespace, &declarations);
+            interface
+                .header
+                .types
+                .extend(new.declarations().iter().cloned());
+            witnesses = Some(new);
+        }
+        let local = format!("{namespace}WitnessValue_{index}");
+        let witness = witnesses.as_ref().unwrap().value(
+            format!("{prefix}{local}"),
+            &value.scheme,
+            &declarations,
+        );
+        let arguments = witness
+            .params
+            .iter()
+            .enumerate()
+            .map(|(parameter, kind)| {
+                match kind.sense {
+                    // Type holes may specialize to the concrete caller domain the
+                    // structural program admits. Presence choices stay universal:
+                    // native optional fields accept both absence and presence.
+                    crate::artifact::Sense::Presence => format!(" 'host_{index}_{parameter}"),
+                    crate::artifact::Sense::Effects => " (..)".into(),
+                    crate::artifact::Sense::Row => " {}".into(),
+                    _ => " _".into(),
+                }
+            })
+            .collect::<String>();
+        let clause = witness
+            .params
+            .iter()
+            .position(|param| param.sense == crate::artifact::Sense::Presence)
+            .map_or_else(String::new, |parameter| {
+                format!(" where 'host_{index}_{parameter} = 'host_{index}_{parameter}")
+            });
+        interface.header.types.push(witness);
+        let Some(name) = value.name.strip_prefix(&prefix) else {
+            return Err(Error::UnresolvedPublicValue(value.name.clone()));
+        };
+        let arity = contracts::arity(&value.scheme.body, &declarations);
+        let params = (0..arity)
+            .map(|at| format!("host_arg_{index}_{at}"))
+            .collect::<Vec<_>>();
+        let expression = if params.is_empty() {
+            format!("program::{name}")
+        } else {
+            let params = params.join(" ");
+            format!("fn {params} => program::{name} {params}")
+        };
+        checks.insert(
+            index,
+            format!("let checked_{index}: program::{local}{arguments}{clause} = {expression}\n"),
+        );
+    }
+    let inferred = if checks.is_empty() {
+        None
+    } else {
+        let mut sources: Vec<_> = checks.iter().collect();
+        sources.sort_by_key(|(index, _)| **index);
+        let source = sources
+            .iter()
+            .map(|(_, source)| source.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        Some(
+            crate::entry::compile_adapter(&interface, dependencies, &source).map_err(|errors| {
+                for (index, source) in &sources {
+                    if let Err(errors) =
+                        crate::entry::compile_adapter(&interface, dependencies, source)
+                    {
+                        return Error::Export {
+                            name: root.header().values[**index].name.clone(),
+                            message: errors.join("; "),
+                        };
+                    }
+                }
+                Error::Export {
+                    name: root.header().identity.name.clone(),
+                    message: errors.join("; "),
+                }
+            })?,
+        )
+    };
+    // A second, direct annotation check establishes permissions for the
+    // concrete native shape. Eta inference above only proposes its type holes.
+    if let Some(inferred) = &inferred {
+        let inferred_declarations: HashMap<_, _> = declarations
+            .iter()
+            .map(|(name, declaration)| (*name, *declaration))
+            .chain(
+                interface
+                    .header
+                    .types
+                    .iter()
+                    .map(|ty| (ty.name.as_str(), ty)),
+            )
+            .collect();
+        let mut candidates = Vec::new();
+        for (&index, source) in &mut checks {
+            let value = &root.header().values[index];
+            let scheme = &inferred
+                .header()
+                .values
+                .iter()
+                .find(|value| value.name.ends_with(&format!("::checked_{index}")))
+                .expect("inferred native candidate")
+                .scheme;
+            let local = format!("{namespace}Candidate_{index}");
+            let candidate =
+                contracts::candidate(format!("{prefix}{local}"), scheme, &inferred_declarations);
+            let arguments = candidate
+                .params
+                .iter()
+                .enumerate()
+                .map(|(parameter, kind)| match kind.sense {
+                    crate::artifact::Sense::Presence => format!(" 'native_{index}_{parameter}"),
+                    crate::artifact::Sense::Effects => " (..)".into(),
+                    crate::artifact::Sense::Row => " {}".into(),
+                    _ => " _".into(),
+                })
+                .collect::<String>();
+            let name = value.name.strip_prefix(&prefix).expect("root export");
+            let clause = candidate
+                .params
+                .iter()
+                .position(|parameter| parameter.sense == crate::artifact::Sense::Presence)
+                .map_or_else(String::new, |parameter| {
+                    format!(" where 'native_{index}_{parameter} = 'native_{index}_{parameter}")
+                });
+            *source = format!(
+                "let checked_{index}: program::{local}{arguments}{clause} = program::{name}\n"
+            );
+            candidates_by_value.insert(index, candidate.clone());
+            candidates.push(candidate);
+        }
+        interface.header.types.extend(candidates);
+    }
+    let checked = if checks.is_empty() {
+        None
+    } else {
+        let mut sources: Vec<_> = checks.iter().collect();
+        sources.sort_by_key(|(index, _)| **index);
+        let source = sources
+            .iter()
+            .map(|(_, source)| source.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        Some(
+            crate::entry::compile_adapter(&interface, dependencies, &source).map_err(|errors| {
+                for (index, source) in &sources {
+                    if let Err(errors) =
+                        crate::entry::compile_adapter(&interface, dependencies, source)
+                    {
+                        return Error::Export {
+                            name: root.header().values[**index].name.clone(),
+                            message: errors.join("; "),
+                        };
+                    }
+                }
+                Error::Export {
+                    name: root.header().identity.name.clone(),
+                    message: errors.join("; "),
+                }
+            })?,
+        )
+    };
+    if let Some(checked) = &checked {
+        for (&index, candidate) in &candidates_by_value {
+            let scheme = &checked
+                .header()
+                .values
+                .iter()
+                .find(|value| value.name.ends_with(&format!("::checked_{index}")))
+                .expect("proved native value")
+                .scheme;
+            if !contracts::universal(scheme, candidate) {
+                return Err(Error::Export {
+                    name: root.header().values[index].name.clone(),
+                    message: "the structural contract requires stronger presence conditions than native callers can guarantee".into(),
+                });
+            }
+        }
+    }
+    let mut declarations = declarations;
+    for declaration in &interface.header.types {
+        declarations.insert(declaration.name.as_str(), declaration);
+        if let Some(local) = declaration.name.strip_prefix(&prefix) {
+            raw_types
+                .entry(declaration.name.as_str())
+                .or_insert_with(|| {
+                    let arguments = declaration
+                        .params
+                        .iter()
+                        .map(|param| match param.sense {
+                            crate::artifact::Sense::Effects => " (..)",
+                            crate::artifact::Sense::Row => " { .. }",
+                            _ => " _",
+                        })
+                        .collect::<String>();
+                    (local.to_owned(), arguments)
+                });
+        }
+    }
     let mut definitions = Vec::new();
+    let mut native = HashMap::new();
     for (index, value) in root.header().values.iter().enumerate() {
         if !value.scheme.representations.is_empty() {
             return Err(Error::ExportType { name: value.name.clone(), message: "this value requires runtime type information from its caller; export a concrete instantiation or a ForeignValue wrapper".into() });
         }
-        native_descriptor(&value.scheme.body, &declarations).map_err(|message| {
-            Error::ExportType {
+        let structural = checks.contains_key(&index);
+        let body = if structural {
+            &checked
+                .as_ref()
+                .unwrap()
+                .header()
+                .values
+                .iter()
+                .find(|value| value.name.ends_with(&format!("::checked_{index}")))
+                .expect("checked native value")
+                .scheme
+                .body
+        } else {
+            &value.scheme.body
+        };
+        let descriptor =
+            native_descriptor(body, &declarations).map_err(|message| Error::ExportType {
                 name: value.name.clone(),
                 message,
-            }
-        })?;
-        let graph =
-            Graph::build(&value.scheme.body, &declarations, platform).map_err(|message| {
-                Error::Export {
-                    name: value.name.clone(),
-                    message,
-                }
             })?;
-        if !graph.needed[0] {
+        if structural {
+            if descriptor.has_optional_input() {
+                return Err(Error::Export {
+                    name: value.name.clone(),
+                    message: "structural native exports require concrete record inputs; provide an ordinary annotation with required fields".into(),
+                });
+            }
+            native.insert(value.name.clone(), descriptor);
+        }
+        let graph =
+            Graph::build(body, &declarations, platform).map_err(|message| Error::Export {
+                name: value.name.clone(),
+                message,
+            })?;
+        if !graph.needed[0] && !structural {
             continue;
         }
         let Some(name) = value.name.strip_prefix(&prefix) else {
             return Err(Error::UnresolvedPublicValue(value.name.clone()));
         };
         let helper_prefix = format!("Host_{index}_");
-        let mut source = graph.definitions(&helper_prefix, &raw_types);
+        let mut source = checks.get(&index).cloned().unwrap_or_default();
+        source.push_str(&graph.definitions(&helper_prefix, &raw_types));
+        let original = if structural {
+            format!("checked_{index}")
+        } else {
+            format!("program::{name}")
+        };
         source.push_str(&format!(
             "let host_{index} = {}\n",
-            graph.expression(
-                0,
-                &format!("program::{name}"),
-                &helper_prefix,
-                &mut 0,
-                false
-            )
+            graph.expression(0, &original, &helper_prefix, &mut 0, false)
         ));
         definitions.push((value.name.clone(), format!("host_{index}"), source));
     }
@@ -1024,5 +1396,40 @@ pub(super) fn compile(
     Ok(Some(Adapters {
         artifact: adapter,
         exports,
+        native,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shared_native_layouts_remain_finite() {
+        let mut ty = Type::Nat;
+        for _ in 0..64 {
+            let shared = Arc::new(ty);
+            ty = Type::Struct(Row {
+                labels: ["left", "right"]
+                    .into_iter()
+                    .map(|name| {
+                        (
+                            name.into(),
+                            crate::artifact::RowField {
+                                presence: Presence::Present,
+                                ty: Type::Shared(shared.clone()),
+                            },
+                        )
+                    })
+                    .collect(),
+                rest: Rest::Closed,
+            });
+        }
+        let declarations = HashMap::new();
+        let native = native_descriptor(&ty, &declarations).unwrap();
+        assert!(native.descriptor.nodes.len() < 256);
+        let graph = Graph::build(&ty, &declarations, Platform::Node).unwrap();
+        assert!(graph.nodes.len() < 256);
+        assert!(!graph.needed[0]);
+    }
 }

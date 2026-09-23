@@ -231,6 +231,10 @@ fn ownership_metadata(scheme: &Scheme) -> (u32, Vec<u32>) {
     while let Some(part) = parts.pop() {
         match part {
             Part::Ty(ty) => match ty {
+                Ty::Contract { fallback, contract } => {
+                    parts.push(Part::Ty(fallback));
+                    parts.extend(contract.type_operands().map(|ty| Part::Ty(ty)));
+                }
                 Ty::Package(body) => {
                     packages += 1;
                     parts.push(Part::Ty(body));
@@ -484,6 +488,10 @@ fn relevant_parameters(aliases: &IndexMap<Symbol, Scheme>) -> HashMap<Symbol, Ha
         while let Some(next) = work.pop() {
             match next {
                 Work::Ty(ty) => match ty {
+                    Ty::Contract { fallback, contract } => {
+                        work.push(Work::Ty(fallback));
+                        work.extend(contract.type_operands().map(|ty| Work::Ty(ty)));
+                    }
                     Ty::Bound(index) => {
                         out.insert(*index as usize);
                     }
@@ -569,6 +577,10 @@ fn names_in(ty: &Ty, relevant: &HashMap<Symbol, HashSet<usize>>, out: &mut Vec<S
     while let Some(next) = work.pop() {
         match next {
             Work::Ty(ty) => match ty {
+                Ty::Contract { fallback, contract } => {
+                    work.push(Work::Ty(fallback));
+                    work.extend(contract.type_operands().map(|ty| Work::Ty(ty)));
+                }
                 Ty::Named { symbol, args, .. } => {
                     out.push(*symbol);
                     if let Some(selected) = relevant.get(symbol) {

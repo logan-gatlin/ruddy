@@ -298,6 +298,22 @@ fn written_names(root: &ir::Type, out: &mut HashSet<Symbol>) {
     let mut work = vec![root];
     while let Some(ty) = work.pop() {
         match &ty.anchored {
+            T::Match(arms) => {
+                for (input, output) in arms {
+                    work.push(input);
+                    work.push(output);
+                }
+            }
+            T::Structural {
+                captures,
+                arguments,
+                effect_sink,
+                ..
+            } => {
+                work.extend(captures);
+                work.extend(arguments);
+                work.extend(effect_sink.iter().map(|sink| sink.as_ref()));
+            }
             T::Ident(symbol) => {
                 out.insert(*symbol);
             }
@@ -719,6 +735,11 @@ fn publish_evidence(result: &mut GroupResult, signatures: Arc<Signatures>) {
                 };
             }
         }
+        // Routes name semantic positions, not the producer's allocation
+        // sharing. A repeated DAG node may occur at several such positions.
+        // Give each retained route its own bridge while bounding diagnostic
+        // detail independently of the complete semantic type graph.
+        explained.provenance.nodes = evidence_routes(&explained.provenance.nodes);
         let mut next = u32::MAX;
         let mut bridge = |roots: &mut Vec<ReasonId>, omitted: &mut usize, sort| {
             let id = ReasonId {
@@ -770,25 +791,69 @@ fn evidence_order(provenance: &SchemeProvenance) -> Vec<usize> {
     while let Some(index) = work.pop() {
         ordered.push(index);
         let node = &provenance.nodes[index];
-        if let ProvenanceShape::Row(labels) = &node.shape {
-            let mut offset = 0;
-            let mut fields: Vec<_> = labels
-                .iter()
-                .map(|(name, payload)| {
-                    let start = offset;
-                    offset += 1 + usize::from(*payload);
-                    (name, &node.children[start..offset])
-                })
-                .collect();
-            fields.sort_unstable_by_key(|(name, _)| *name);
-            for (_, children) in fields.into_iter().rev() {
-                work.extend(children.iter().rev());
-            }
-        } else {
-            work.extend(node.children.iter().rev());
-        }
+        work.extend(evidence_children(node).into_iter().rev());
     }
     ordered
+}
+
+fn evidence_children(node: &ProvenanceNode) -> Vec<usize> {
+    if node.children.is_empty() {
+        return Vec::new();
+    }
+    if let ProvenanceShape::Row(labels) = &node.shape {
+        let mut offset = 0;
+        let mut fields: Vec<_> = labels
+            .iter()
+            .map(|(name, payload)| {
+                let start = offset;
+                offset += 1 + usize::from(*payload);
+                (name, &node.children[start..offset])
+            })
+            .collect();
+        fields.sort_unstable_by_key(|(name, _)| *name);
+        fields
+            .into_iter()
+            .flat_map(|(_, children)| children.iter().copied())
+            .collect()
+    } else {
+        node.children.clone()
+    }
+}
+
+/// Reify a bounded prefix of semantic evidence paths. Incidental DAG sharing
+/// can change after a body edit without changing the exported type, so it must
+/// not change the route addresses retained by cached consumers. Cut subtrees
+/// remain explicit omitted evidence; this never changes a type or obligation.
+fn evidence_routes(source: &[ProvenanceNode]) -> Vec<ProvenanceNode> {
+    const MAX_NODES: usize = 4096;
+    let Some(root) = source.first() else {
+        return Vec::new();
+    };
+    let mut nodes = vec![root.clone()];
+    let mut work = vec![(0usize, 0usize)];
+    while let Some((from, to)) = work.pop() {
+        let original = &source[from];
+        nodes[to].children.clear();
+        if original.children.is_empty() {
+            continue;
+        }
+        if nodes.len().saturating_add(original.children.len()) > MAX_NODES {
+            nodes[to].omitted = nodes[to].omitted.saturating_add(1);
+            continue;
+        }
+        let first = nodes.len();
+        for child in &original.children {
+            let index = nodes.len();
+            nodes.push(source[*child].clone());
+            nodes[to].children.push(index);
+        }
+        // Visit fields in canonical order, while retaining their original
+        // child-edge order for replay over the opened semantic type.
+        for child in evidence_children(&nodes[to]).into_iter().rev() {
+            work.push((original.children[child - first], child));
+        }
+    }
+    nodes
 }
 
 fn quantified_rows(root: &Ty) -> HashSet<u32> {
@@ -957,5 +1022,50 @@ impl Fingerprint {
                 T::Error => self.word(21),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod evidence_tests {
+    use super::*;
+
+    fn node(children: Vec<usize>) -> ProvenanceNode {
+        ProvenanceNode {
+            shape: ProvenanceShape::Ty(if children.is_empty() {
+                ProvenanceTy::Leaf
+            } else {
+                ProvenanceTy::Named(children.len())
+            }),
+            roots: Vec::new(),
+            omitted: 0,
+            children,
+        }
+    }
+
+    #[test]
+    fn published_routes_do_not_depend_on_allocation_sharing() {
+        let shared = vec![node(vec![1, 1]), node(Vec::new())];
+        let separate = vec![node(vec![1, 2]), node(Vec::new()), node(Vec::new())];
+        assert_eq!(
+            format!("{:?}", evidence_routes(&shared)),
+            format!("{:?}", evidence_routes(&separate)),
+        );
+    }
+
+    #[test]
+    fn repeated_diagnostic_paths_have_an_explicit_omission_boundary() {
+        let mut source = Vec::new();
+        for index in 0..100 {
+            source.push(node(vec![index + 1, index + 1]));
+        }
+        source.push(node(Vec::new()));
+        let routes = evidence_routes(&source);
+        assert!(routes.len() <= 4096);
+        assert!(routes.iter().any(|node| node.omitted != 0));
+        let provenance = SchemeProvenance {
+            nodes: routes,
+            quantified: Vec::new(),
+        };
+        assert_eq!(evidence_order(&provenance).len(), provenance.nodes.len());
     }
 }

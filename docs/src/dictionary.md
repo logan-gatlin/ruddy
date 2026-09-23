@@ -88,8 +88,30 @@ Code that computes a value.
 
 ## Type annotation
 An explicit type written for a value.
+An annotation can use an ordinary type or a structural contract.
 
 [Grammar](grammar.md#values-and-functions), [Type syntax](grammar.md#types)
+
+## Structural contract
+A function type that preserves how input shapes determine output shapes.
+It can be written as `match | Input => Output | ... end`, or as
+`fn 'input => expression` using finite type operations such as field selection,
+record construction, structural matching, and callable type application.
+The compiler checks the promised relationships and can infer them from a function.
+Branches share compatible ordinary result and payload types; conditional fields
+and tagged variants preserve the structural choices.
+Evaluation and interface expansion have finite bounds; exceeding one reports an
+error. Shared operations and captured types remain shared in complete type
+presentations and exported interfaces.
+
+[Grammar](grammar.md#structural-contracts)
+
+## Residual type computation
+A structural contract whose arguments have been supplied but whose result still
+depends on unresolved type information. Its writable form is `fn => expression`,
+with an effect row when the remaining checks require one.
+
+[Grammar](grammar.md#structural-contracts)
 
 ## Tuple
 A struct whose fields are numbered positions starting at zero.
@@ -113,6 +135,8 @@ A description of a value's shape that can bind names to its parts.
 
 ## Type variable
 A name beginning with `'` that stands for a type or another parameter used in a type annotation or definition.
+In a structural contract, `fn` parameters, pattern binders, and local `let`
+bindings name argument types or the results of structural type operations.
 
 [Grammar](grammar.md#types)
 
@@ -139,6 +163,8 @@ Struct and sum rows share a kind; effect rows have a separate kind.
 ## Presence variable
 A type-level boolean describing whether a struct field, sum case, or effect belongs to a type.
 Presence variables and constraints can be inferred from program shape, and one variable can connect entries across structs, sums, and effects.
+Structural contracts provide a branch-based form for relationships that follow
+structural matching and construction, without naming each presence separately.
 
 [Rows and presence inference](book/rows.md#presence-is-inferred-from-program-shape)
 

@@ -536,8 +536,9 @@ impl Grouped for Show<'_, TypeKind> {
             | TypeKind::Mirror(_)
             | TypeKind::TypeInfo(_) => Prec::Apply,
             // The body runs as far right as it can, as the written form's does.
-            TypeKind::Hidden { .. } => Prec::Lambda,
-            TypeKind::Struct { .. }
+            TypeKind::Hidden { .. } | TypeKind::Structural { .. } => Prec::Lambda,
+            TypeKind::Match(_)
+            | TypeKind::Struct { .. }
             | TypeKind::Array(_)
             | TypeKind::Ident(_)
             | TypeKind::Param { .. }
@@ -746,6 +747,61 @@ impl Show<'_, TermKind> {
 impl fmt::Display for Show<'_, TypeKind> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.node {
+            TypeKind::Structural {
+                parameters,
+                body,
+                captures,
+                arguments,
+                effect_sink,
+            } => {
+                f.write_str(&ruddy::ui::structural_type_text_with_arguments(
+                    *parameters,
+                    body,
+                    &captures
+                        .iter()
+                        .map(|ty| self.show(ty).to_string())
+                        .collect::<Vec<_>>(),
+                    &arguments
+                        .iter()
+                        .map(|ty| self.show(ty).to_string())
+                        .collect::<Vec<_>>(),
+                ))?;
+                if let Some(sink) = effect_sink
+                    && let TypeKind::Arrow { effects, .. } = &sink.anchored
+                    && let Some(effects) = self.effect_row(effects)
+                {
+                    write!(f, " + {effects}")?;
+                }
+                Ok(())
+            }
+            TypeKind::Match(arms) => {
+                f.write_str("match")?;
+                for (from, to) in arms {
+                    let grouped = matches!(&from.anchored, TypeKind::Sum { cases, spreads, tail }
+                        if cases.len() != 1 || !spreads.is_empty() || tail.is_some());
+                    f.write_str(" | ")?;
+                    if grouped {
+                        f.write_str("(")?;
+                    }
+                    write!(f, "{}", self.show(from))?;
+                    if grouped {
+                        f.write_str(")")?;
+                    }
+                    // A result can end in an unclosed `fn | ...`, including
+                    // through an arrow or `hide`. Keep the next arm outside it.
+                    let shown = self.show(to);
+                    let grouped = shown.prec() <= Prec::Arrow;
+                    f.write_str(" => ")?;
+                    if grouped {
+                        f.write_str("(")?;
+                    }
+                    write!(f, "{shown}")?;
+                    if grouped {
+                        f.write_str(")")?;
+                    }
+                }
+                f.write_str(" end")
+            }
             TypeKind::Error => f.write_str("<error>"),
             // The hole, as written: `_`, whether the reader left it or the
             // pattern desugar did.

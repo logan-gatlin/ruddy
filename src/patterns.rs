@@ -383,69 +383,87 @@ fn check_terms(program: &Program, inferred: &inference::Output, only_inferred: b
 
 /// Every match in one term, outermost first, each checked where it is found.
 fn walk(check: &Check, term: &Term, out: &mut Output) {
-    walk_under(check, term, &Formula::True, out);
+    walk_under(check, term, &Formula::True, &[], out);
 }
 
-fn walk_under(check: &Check, term: &Term, assumed: &Formula, out: &mut Output) {
+fn walk_under(check: &Check, term: &Term, assumed: &Formula, inputs: &[Symbol], out: &mut Output) {
     match &term.kind {
         TermKind::Match { scrutinee, arms } => {
-            check.matched(term.at, scrutinee, arms, assumed, out);
-            walk_under(check, scrutinee, assumed, out);
+            let structural =
+                !inputs.is_empty() && crate::contracts::references_any(scrutinee, inputs);
+            check.matched(term.at, scrutinee, arms, assumed, structural, out);
+            walk_under(check, scrutinee, assumed, inputs, out);
             let guards = check.arm_assumptions(term.at, scrutinee);
-            for (at, (_, body)) in arms.iter().enumerate() {
+            for (at, (pattern, body)) in arms.iter().enumerate() {
                 let inside = guards.as_ref().map_or_else(
                     || assumed.clone(),
                     |guards| assumed.clone().and(guards[at].clone()),
                 );
-                walk_under(check, body, &inside, out);
+                let mut arm_inputs = inputs.to_vec();
+                if structural {
+                    pattern_inputs(pattern, &mut arm_inputs);
+                }
+                walk_under(check, body, &inside, &arm_inputs, out);
             }
         }
-        TermKind::Unary { value, .. } => walk_under(check, value, assumed, out),
+        TermKind::Unary { value, .. } => walk_under(check, value, assumed, inputs, out),
         TermKind::Binary { left, right, .. } => {
-            walk_under(check, left, assumed, out);
-            walk_under(check, right, assumed, out);
+            walk_under(check, left, assumed, inputs, out);
+            walk_under(check, right, assumed, inputs, out);
         }
         TermKind::Apply { func, arg } => {
-            walk_under(check, func, assumed, out);
-            walk_under(check, arg, assumed, out);
+            walk_under(check, func, assumed, inputs, out);
+            walk_under(check, arg, assumed, inputs, out);
         }
-        TermKind::Fn { body, .. } => walk_under(check, body, assumed, out),
-        TermKind::Let { value, body, .. } => {
-            walk_under(check, value, assumed, out);
-            walk_under(check, body, assumed, out);
+        TermKind::Fn { arg, body } => {
+            let mut inside = inputs.to_vec();
+            if !inputs.is_empty() || matches!(&*term.ty, Ty::Contract { .. }) {
+                inside.push(arg.anchored);
+            }
+            walk_under(check, body, assumed, &inside, out);
+        }
+        TermKind::Let {
+            name, value, body, ..
+        } => {
+            walk_under(check, value, assumed, inputs, out);
+            let mut inside = inputs.to_vec();
+            if !inputs.is_empty() && crate::contracts::references_any(value, inputs) {
+                inside.push(name.anchored);
+            }
+            walk_under(check, body, assumed, &inside, out);
         }
         TermKind::Struct { fields, spread } => {
             for field in fields.values() {
-                walk_under(check, &field.value, assumed, out);
+                walk_under(check, &field.value, assumed, inputs, out);
             }
             if let Some(spread) = spread {
-                walk_under(check, &spread.value, assumed, out);
+                walk_under(check, &spread.value, assumed, inputs, out);
             }
         }
         TermKind::Array(items) => {
             for item in items {
-                walk_under(check, &item.value, assumed, out);
+                walk_under(check, &item.value, assumed, inputs, out);
             }
         }
         TermKind::Tag { payload, .. } => {
             if let Some(payload) = payload {
-                walk_under(check, payload, assumed, out);
+                walk_under(check, payload, assumed, inputs, out);
             }
         }
-        TermKind::Project { base, .. } => walk_under(check, base, assumed, out),
+        TermKind::Project { base, .. } => walk_under(check, base, assumed, inputs, out),
         // A handler's arms are not value patterns and nothing here changes for
         // them: what they hold is ordinary terms, and a match written inside
         // one is checked exactly as a match written anywhere else is.
         TermKind::Handle { body, handler } => {
-            walk_under(check, body, assumed, out);
+            walk_under(check, body, assumed, inputs, out);
             for arm in &handler.arms {
-                walk_under(check, &arm.body, assumed, out);
+                walk_under(check, &arm.body, assumed, inputs, out);
             }
             if let Some(ret) = &handler.ret {
-                walk_under(check, &ret.body, assumed, out);
+                walk_under(check, &ret.body, assumed, inputs, out);
             }
         }
-        TermKind::Raise(value) => walk_under(check, value, assumed, out),
+        TermKind::Raise(value) => walk_under(check, value, assumed, inputs, out),
         TermKind::Operation { .. }
         | TermKind::Ident(_)
         | TermKind::Natural(_)
@@ -455,6 +473,28 @@ fn walk_under(check: &Check, term: &Term, assumed: &Formula, out: &mut Output) {
         | TermKind::String(_)
         | TermKind::Bool(_)
         | TermKind::Error => {}
+    }
+}
+
+/// Values bound by a structural input pattern retain that dependency in
+/// nested matches. This tracks names only; ordinary closed scrutinees keep
+/// their precise typed reachability checks.
+fn pattern_inputs(pattern: &Pattern, inputs: &mut Vec<Symbol>) {
+    let mut pending = vec![pattern];
+    while let Some(pattern) = pending.pop() {
+        match &pattern.anchored {
+            PatternKind::Bind(name) => inputs.push(name.anchored),
+            PatternKind::Struct { fields, .. } => {
+                pending.extend(fields.values().map(|field| &field.value));
+            }
+            PatternKind::Tag { payload, .. } => pending.extend(payload.as_deref()),
+            PatternKind::Hidden { pattern, .. } => pending.push(pattern),
+            PatternKind::Array { before, after, .. } => {
+                pending.extend(before);
+                pending.extend(after);
+            }
+            _ => {}
+        }
     }
 }
 
@@ -603,6 +643,7 @@ impl Check<'_> {
         scrutinee: &Term,
         arms: &[(Pattern, Term)],
         assumed: &Formula,
+        structural: bool,
         out: &mut Output,
     ) {
         let ty = scrutinee.ty.clone();
@@ -724,6 +765,17 @@ impl Check<'_> {
         // decides the column, whether any assignment the store allows reaches
         // the arm past the ones above it.
         let cols = [Col::Whole(ty.clone())];
+        // A structural contract's fallback records the representation checked
+        // for its body, not every admitted input. In particular, a tag tested
+        // beside a wildcard does not close the wildcard's sum to that tag.
+        // Broaden only reachability's domain; coverage still reads the checked
+        // type and the inference store, and closed source values stay precise.
+        let reachable_ty = if structural && constrained.is_none() {
+            self.structural_reachability(&ty, &cells.iter().collect::<Vec<_>>(), 0)
+        } else {
+            ty.clone()
+        };
+        let reachable_cols = [Col::Whole(reachable_ty)];
         let mut reported = Vec::with_capacity(arms.len());
         for (at, (pattern, _)) in arms.iter().enumerate() {
             let verdict = match misplaced {
@@ -744,7 +796,7 @@ impl Check<'_> {
                                 cells[..at].iter().map(|cell| vec![cell.clone()]).collect();
                             self.useful(
                                 &rows,
-                                &cols,
+                                &reachable_cols,
                                 &[cells[at].clone()],
                                 &Walk::start(Mode::Reachability, assumed.clone()),
                             )
@@ -824,6 +876,58 @@ impl Check<'_> {
             arms: reported,
             coverage,
         });
+    }
+
+    /// Restore wildcard alternatives that the ordinary representation witness
+    /// may have closed while checking one structural branch. Recurse through
+    /// tested paths only, so recursive aliases and untested payloads do not
+    /// expand. A contract already bounds the depth of these source patterns.
+    fn structural_reachability(&self, ty: &Arc<Ty>, cells: &[&Cell], depth: usize) -> Arc<Ty> {
+        if depth > crate::contracts::MAX_DEPTH {
+            return ty.clone();
+        }
+        let shaped = self.shape(ty);
+        let wild = cells.iter().any(|cell| matches!(cell, Cell::Wild));
+        match &*shaped {
+            Ty::Struct(original) | Ty::Sum(original) => {
+                let sum = matches!(&*shaped, Ty::Sum(_));
+                let mut row = flat(original);
+                // The sentinel is local to the reachability matrix: rest
+                // openness carries no SAT variable or published type identity.
+                if wild && matches!(row.rest, Rest::Closed) {
+                    row.rest = Rest::Bound(u32::MAX);
+                }
+                for (name, field) in &mut row.labels {
+                    let mut below = Vec::new();
+                    for cell in cells {
+                        match cell {
+                            Cell::Wild => below.push(*cell),
+                            Cell::Tag {
+                                name: label,
+                                payload,
+                            } if sum && label == name => {
+                                below.push(payload.as_ref());
+                            }
+                            Cell::Struct { fields, exact } if !sum => {
+                                if let Some((_, child)) =
+                                    fields.iter().find(|(label, _)| label == name)
+                                {
+                                    below.push(child);
+                                } else if !exact {
+                                    below.push(&Cell::Wild);
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    if below.iter().any(|cell| !matches!(cell, Cell::Wild)) {
+                        field.ty = self.structural_reachability(&field.ty, &below, depth + 1);
+                    }
+                }
+                Arc::new(if sum { Ty::Sum(row) } else { Ty::Struct(row) })
+            }
+            _ => ty.clone(),
+        }
     }
 
     /// The local ordered arm assumptions translated from inference's solver

@@ -299,6 +299,15 @@ impl Candidate<'_> {
             let mut children = Vec::new();
             match &term.kind {
                 TermKind::Apply { func, arg } => {
+                    // A structural contract can make the call's effects depend
+                    // on its argument. For a literal closure its checked body
+                    // is available, so inspect every possible arm directly.
+                    // A representation witness alone cannot prove purity.
+                    if let TermKind::Fn { body, .. } = &func.kind {
+                        children.extend([body.as_ref(), arg.as_ref()]);
+                        work.extend(children.into_iter().map(|child| (child, scope)));
+                        continue;
+                    }
                     let ty = crate::inference::unfold(
                         self.analysis.inferred.semantics().aliases(),
                         &func.ty,

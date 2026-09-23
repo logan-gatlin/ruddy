@@ -22,6 +22,7 @@ Names are case-sensitive, and letters may be Unicode.
 The name `_` is reserved for ignoring a value or leaving a type unspecified.
 Keywords such as `let`, `fn`, and `end` cannot be identifiers.
 The words `when` and `where` have special meaning in type constraints but can be identifiers elsewhere.
+The word `capture` has special meaning inside a structural contract body.
 
 A line comment starts with `--` and ends at the newline.
 A block comment starts with `(*` and ends with `*)`; block comments can contain nested block comments.
@@ -245,7 +246,8 @@ Parameters can stand for whole types, struct/sum rows, effect rows, regions, or
 presences. Their kinds are inferred from the definition's body and `where`
 constraints. Every free variable must appear in the header; anonymous `..`,
 `when _`, `when <= 'p`, and `_` holes are not allowed in definitions. A `hide` binder still
-introduces its own whole-type variable within its body.
+introduces its own whole-type variable within its body. A structural contract's
+`fn` parameters and pattern binders also have their own local scope.
 
 Presence arguments are `true`, `false`, or a variable:
 
@@ -278,6 +280,8 @@ Parentheses group a type argument that itself contains an application, as in `Op
 | `#Some String \| #None` | A [sum type](dictionary.md#sum-type) with two cases |
 | `\|` | A sum type with no cases |
 | `String -> Nat` | A function type |
+| `match \| #Red => { r: Nat } -> Nat \| #Green => { g: Nat } -> Nat end` | A function contract with an input/result pair for each arm |
+| `fn 'record => 'record.r` | A [structural contract](dictionary.md#structural-contract) that returns the input's `r` field type |
 | `mut 'r String` | A mutable cell type with [region](dictionary.md#region) `'r` |
 | `hide 'a => { mirror: Mirror 'a, value: 'a }` | A [hidden type](dictionary.md#hidden-type) whose variable `'a` stands for one type its producer chose |
 
@@ -302,6 +306,172 @@ let describe: Box -> String = fn box => match box with
 | hide 'item { value, show } => show value
 end
 ```
+
+### Structural contracts
+
+A [structural contract](dictionary.md#structural-contract) describes how a
+function transforms its arguments' types. It retains the relationship between
+an input shape and the corresponding output shape, including through partial
+application and calls to other functions. The compiler can infer these contracts
+from finite structural operations, and the displayed form can be written as an
+annotation.
+
+Native JavaScript exports need a concrete calling shape. The compiler checks
+that shape against the structural contract before generating an adapter.
+Structural exports with optional incoming record fields are currently rejected:
+a native caller can choose each field independently, which may violate a
+relationship between branches. Export a concrete ordinary annotation instead,
+for example `let get_nat: {value: Nat} -> Nat = get`. Ordinary calls within Ruddy
+retain the complete structural contract.
+
+When several captured functions share a contract, a complete type presentation
+can introduce ordinary `type InferredContract ... = ...` declarations before the
+annotation. Keep those declarations when copying the annotation into another
+scope. This preserves sharing across nested function contracts as well as the
+local `let` sharing inside one contract body.
+
+The form `match | Input => Output | ... end` gives input/result pairs. Each arm
+describes one call; its output can be another function type for the remaining
+arguments. The call described by `=>` is pure; an explicit arrow in its output
+can carry its own effect row:
+
+```ruddy
+let get_channel:
+  match
+  | #Red => { r: 'value, ..'red_rest } -> 'value
+  | #Green => { g: 'value, ..'green_rest } -> 'value
+  end = fn channel image => match channel with
+  | #Red => image.r
+  | #Green => image.g
+  end
+```
+
+The red case only needs `r`; the green case only needs `g`. Both branches return
+one common payload type, `'value`. Each call can instantiate that type afresh.
+If a selector admits both tags, the call must satisfy both reachable cases.
+Every written arm is checked against the function's body; an annotation cannot
+add an unsupported branch or result type. Ordinary type variables in these arms
+follow the annotation's usual scope. Row tails can remain independent.
+
+Arms are selected in order by their record fields, tuple positions, and tags.
+Other input constraints are checked after selection: scalar types such as
+`Nat` and `String`, type aliases, and function types are not dispatch tests.
+Use distinct structural shapes to distinguish arms; for example, `#Number Nat`
+and `#Text String` select different tags, while `#Value Nat` and `#Value String`
+do not select different arms.
+
+Every arm starts with `|`. Parenthesize a multi-case sum used as an arm's input:
+`match | (#Red | #Green) => Result end`. In
+`match | #A => #B | #C | #D => #E end`, the first result is `#B | #C` and the
+second input is `#D`.
+
+The form `fn 'input ... => expression` describes the structural relationship
+directly. Parameters name argument types and use apostrophes. For example, the
+same getter's inferred contract can be written with meaningful parameter names:
+
+```ruddy
+let get_channel:
+  fn 'channel 'image => match 'channel with
+  | #Red => 'image.r
+  | #Green => 'image.g
+  end = fn channel image => match channel with
+  | #Red => image.r
+  | #Green => image.g
+  end
+```
+
+Here `'image.r` means the type of the selected field. A matching arm establishes
+which fields or payloads its result may inspect. Pattern variables bind the
+types of the matched parts within that arm. As with value functions, a
+single-argument contract that matches its argument can use `fn | pattern =>
+expression | ...`, without a closing `end`. This is shorthand for
+`fn 'input => match 'input with | pattern => expression | ... end`:
+
+```ruddy
+let extend2:
+  fn
+  | () => (#None, #None)
+  | ('a,) => ('a, #None)
+  | ('a, 'b) => ('a, 'b)
+  = fn
+  | () => (#None, #None)
+  | (a,) => (a, #None)
+  | (a, b) => (a, b)
+```
+
+Each tuple position keeps its own compatible tagged payload type. The padding
+branch contributes nullary `#None` at each position, so `extend2 (#Red,)` is
+valid, while `extend2 (1n,)` would require incompatible tagged and natural-number
+results and is rejected. Pattern binders preserve selected types; they do not
+remove the ordinary constraints shared by the branches.
+
+Patterns are ordered and must cover every possible shape of an actual
+argument. They support `_`, apostrophe binders, tags, tuples, and structs. A
+struct pattern is closed unless it ends in `..`.
+
+The contract body is a finite language of type operations:
+
+| Form | Meaning |
+| --- | --- |
+| `'input`, `'part` | An argument type or a type bound by a pattern or local `let` |
+| `'record.field`, `'tuple.0` | Select a field type |
+| `'variant.#Some` | Select the payload type of an admitted tag |
+| `{ r: 'value, ..'image }` | Replace or add `r` and preserve the other fields |
+| `('a, 'b)`, `#Some 'a` | Construct a tuple or tagged type |
+| `capture (T)` | Include an ordinary type, such as `Nat`, an arrow, or another structural contract |
+| `'operation 'argument` | Apply a callable type, checking its input and retaining its effects |
+| `match 'input with \| pattern => expression ... end` | Select structural arms while retaining their input/output relationship |
+
+These operations inspect and construct types; they do not execute arbitrary
+value expressions. There are no arithmetic operations, mutable cells, effect
+handlers, or recursive value definitions inside a contract body. Calls use the
+callee's type contract. Contract evaluation has finite limits and rejects a
+recursive or excessively large computation.
+
+These limits cover graph size, nesting, and normalization work. An exhausted
+limit is a compilation diagnostic; it does not authorize a call through a less
+precise type. Exported interfaces preserve shared type graphs. Types whose
+presence packages require too many distinct occurrences, and imported effect
+alias arguments that are too large to expand, also produce diagnostics before
+expansion. Editor recovery can show an unknown type for a rejected declaration;
+that recovery view does not make the declaration valid.
+
+Shared expressions can be named once with `do let 'name = expression; ... return
+expression end`. The semicolons are optional. For example, the type
+`fn 'x => do let 'pair = ('x, 'x); return ('pair, 'pair) end` preserves the same
+pair in both positions. An initializer written `_ = expression` retains a
+required check even when its result is unused. A `do` body must have `return`.
+Inferred signatures use these bindings to avoid repeating shared computations.
+Complete presentations preserve all shared definitions. Oversized raw type
+text in diagnostic or debug output is explicitly marked as truncated; copy the
+complete presentation when writing an annotation.
+
+`capture (T)` has ordinary type syntax inside its parentheses. Contract
+parameters are referred to directly in the structural body; `capture ('a)`
+instead refers to an ordinary type variable in the surrounding annotation.
+Parenthesize a contract used inside a larger type, such as
+`(fn 'record => 'record.r) -> Nat`.
+
+Calls inside a contract preserve effects, including the effects of a supplied
+callback. A trailing `+` row retains an explicit effect requirement, as in
+`fn 'operation 'argument => 'operation 'argument + !Clock`. The empty row
+`+ |` requires the described calls to be pure. Ordinary arrows inside
+`capture (...)` keep their usual effect syntax. The shorthand form accepts the
+same suffix after its final arm, for example `fn | 'a => 'a + |`.
+
+A displayed contract with no remaining parameters uses `fn => expression`.
+This is a residual type computation whose arguments have already been supplied;
+it does not describe a zero-argument value function. For example,
+`fn => capture (Nat)` resolves to `Nat`. A residual may retain an effect row
+while waiting for enough type information to finish checking its calls.
+
+Structural branches retain conditional fields and tagged variants, while their
+ordinary result types must agree. For example, branches may return `#Number Nat`
+and `#Text String`, since the tags distinguish the payloads. Branches returning
+bare `Nat` and `String` are incompatible, even if every call could select a
+single branch. Likewise, one field or tag cannot acquire incompatible payload
+types in different branches. General untagged union types such as `Nat or
+String` or `Nat | String` are not supported.
 
 ### Open types and constraints
 

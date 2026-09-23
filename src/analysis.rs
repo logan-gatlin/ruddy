@@ -673,7 +673,20 @@ impl Analysis {
         }
         self.term_at(path, offset).map(|term| Hover {
             span: self.built.source.span(term.at),
-            ty: term.ty.to_string(),
+            ty: crate::ui::TypePresentation::resolved_type(
+                &term.ty,
+                self.inferred
+                    .semantics()
+                    .aliases()
+                    .iter()
+                    .filter(|(alias, _)| {
+                        self.built.program.types.contains_key(*alias)
+                            && self.mint.parent(**alias) == self.mint.parent(term.at.definition)
+                    })
+                    .map(|(alias, scheme)| (self.mint.name(*alias), scheme)),
+            )
+            .map(|presentation| presentation.to_string())
+            .unwrap_or_else(|| term.ty.to_string()),
             runtime_information: None,
         })
     }

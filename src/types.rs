@@ -563,6 +563,12 @@ pub struct Scheme {
 /// constructor is fieldless by construction.
 #[derive(Debug, Clone, Default)]
 pub enum Ty {
+    /// A checked, finite structural computation. The fallback describes the
+    /// callable's erased representation; semantic application uses `contract`.
+    Contract {
+        fallback: Arc<Ty>,
+        contract: Arc<crate::contracts::Contract>,
+    },
     /// A presence argument, kept distinct from a value type.
     Presence(Presence),
     Nat,
@@ -974,6 +980,10 @@ fn take_row_children(row: &mut Row, types: &mut Vec<Arc<Ty>>, rows: &mut Vec<Arc
 
 fn take_ty_children(ty: &mut Ty, types: &mut Vec<Arc<Ty>>, rows: &mut Vec<Arc<Row>>) {
     match ty {
+        Ty::Contract { fallback, contract } => {
+            types.push(std::mem::replace(fallback, Arc::new(Ty::Undecided)));
+            types.extend(contract.type_operands().cloned());
+        }
         Ty::Arrow(from, to, effects) => {
             types.push(std::mem::replace(from, Arc::new(Ty::Undecided)));
             types.push(std::mem::replace(to, Arc::new(Ty::Undecided)));
@@ -1148,6 +1158,31 @@ pub(crate) fn same_finite_syntax_metered(
                     continue;
                 }
                 match (left, right) {
+                    (
+                        Ty::Contract {
+                            fallback: a,
+                            contract: left,
+                        },
+                        Ty::Contract {
+                            fallback: b,
+                            contract: right,
+                        },
+                    ) => {
+                        if left.parameters != right.parameters
+                            || !crate::contracts::Expr::same_structure(&left.body, &right.body)
+                            || left.effect_sink.is_some() != right.effect_sink.is_some()
+                            || left.captures.len() != right.captures.len()
+                            || left.arguments.len() != right.arguments.len()
+                        {
+                            return Some(false);
+                        }
+                        pending.push(Pair::Ty(a, b, env.clone()));
+                        pending.extend(
+                            left.type_operands()
+                                .zip(right.type_operands())
+                                .map(|(a, b)| Pair::Ty(a, b, env.clone())),
+                        );
+                    }
                     (Ty::Fixed(left), Ty::Fixed(right)) if left == right => {}
                     (Ty::Nat, Ty::Nat)
                     | (Ty::Int, Ty::Int)
@@ -1302,6 +1337,7 @@ pub fn open_hidden(body: &Arc<Ty>, binder: u32, replacement: &Arc<Ty>) -> Arc<Ty
         Ty(&'a Arc<Ty>),
         Row(&'a Row),
         Arrow,
+        Contract(Arc<crate::contracts::Contract>),
         Package,
         Hidden(u32, Arc<str>),
         Shadow,
@@ -1329,6 +1365,11 @@ pub fn open_hidden(body: &Arc<Ty>, binder: u32, replacement: &Arc<Ty>) -> Arc<Ty
     while let Some(part) = work.pop() {
         match part {
             Work::Ty(ty) => match &**ty {
+                Ty::Contract { fallback, contract } => {
+                    work.push(Work::Contract(contract.clone()));
+                    work.extend(contract.type_operands().rev().map(Work::Ty));
+                    work.push(Work::Ty(fallback));
+                }
                 Ty::HiddenVar { binder: found, .. } if *found == binder && shadowed == 0 => {
                     types.push(replacement.clone());
                 }
@@ -1404,6 +1445,14 @@ pub fn open_hidden(body: &Arc<Ty>, binder: u32, replacement: &Arc<Ty>) -> Arc<Ty
                 | Ty::Undecided => types.push(ty.clone()),
             },
             Work::Shadow => shadowed += 1,
+            Work::Contract(contract) => {
+                let n = contract.type_operands().count();
+                let mut operands = types.split_off(types.len() - n).into_iter();
+                let fallback = types.pop().expect("contract representation");
+                let contract =
+                    Arc::new(contract.map_types(|_| operands.next().expect("contract operand")));
+                types.push(Arc::new(Ty::Contract { fallback, contract }));
+            }
             Work::Unshadow => shadowed -= 1,
             Work::Row(row) => {
                 let mut nested = 0;
@@ -1779,6 +1828,9 @@ impl Scheme {
 /// package. The walk includes composed row tails because imported and inferred
 /// rows may retain their finite shape in `Rest::More`.
 fn existential_outside_package(body: &Arc<Ty>, existentials: &IndexSet<u32>) -> bool {
+    if existentials.is_empty() {
+        return false;
+    }
     enum Work {
         Ty(Arc<Ty>, bool),
         Row(Row, bool),
@@ -1787,6 +1839,16 @@ fn existential_outside_package(body: &Arc<Ty>, existentials: &IndexSet<u32>) -> 
     while let Some(part) = work.pop() {
         match part {
             Work::Ty(ty, packaged) => match &*ty {
+                Ty::Contract { fallback, contract } => {
+                    work.extend(
+                        contract
+                            .type_operands()
+                            .rev()
+                            .cloned()
+                            .map(|ty| Work::Ty(ty, packaged)),
+                    );
+                    work.push(Work::Ty(fallback.clone(), packaged));
+                }
                 Ty::Package(inner) => work.push(Work::Ty(inner.clone(), true)),
                 Ty::Hidden { body, .. } => work.push(Work::Ty(body.clone(), packaged)),
                 Ty::Array(element) | Ty::Mirror(element) | Ty::TypeInfo(element) => {
@@ -1844,10 +1906,26 @@ fn partition_package_formula(
     }
     let mut slot_owners = HashMap::new();
     let mut package_count = 0u32;
-    let mut work = vec![Work::Ty(body.clone(), None)];
+    let mut work = if existentials.is_empty() {
+        Vec::new()
+    } else {
+        vec![Work::Ty(body.clone(), None)]
+    };
     while let Some(part) = work.pop() {
         match part {
             Work::Ty(ty, owner) => match &*ty {
+                Ty::Contract { fallback, contract } => {
+                    // Match the artifact's preorder: the ordinary witness,
+                    // then captures, supplied arguments, and the effect sink.
+                    work.extend(
+                        contract
+                            .type_operands()
+                            .rev()
+                            .cloned()
+                            .map(|ty| Work::Ty(ty, owner)),
+                    );
+                    work.push(Work::Ty(fallback.clone(), owner));
+                }
                 Ty::Package(inner) => {
                     let here = package_count;
                     package_count += 1;

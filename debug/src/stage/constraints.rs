@@ -123,6 +123,7 @@ fn rows(ids: &mut Ids, cx: &Cx, constraints: &[Constraint]) -> Vec<Node> {
                 ConstraintKind::Project { .. }
                 | ConstraintKind::Spread { .. }
                 | ConstraintKind::Equal { .. }
+                | ConstraintKind::Apply { .. }
                 | ConstraintKind::Open { .. }
                 | ConstraintKind::Instance { .. }
                 | ConstraintKind::Performs { .. }
@@ -154,6 +155,7 @@ fn counted(constraints: &[Constraint]) -> usize {
             ConstraintKind::Project { .. }
             | ConstraintKind::Spread { .. }
             | ConstraintKind::Equal { .. }
+            | ConstraintKind::Apply { .. }
             | ConstraintKind::Open { .. }
             | ConstraintKind::Instance { .. }
             | ConstraintKind::Performs { .. }

@@ -71,7 +71,10 @@
 //! that one mistake is reported once rather than echoed by every consumer.
 
 mod constrain;
+mod contract_annotations;
+mod contracts;
 mod defaults;
+mod export;
 pub mod sat;
 mod solve;
 
@@ -1327,6 +1330,21 @@ pub enum ConstraintKind {
     /// `actual` is what the term turned out to be, which is the order a
     /// mismatch is worded in.
     Equal { expected: Arc<Ty>, actual: Arc<Ty> },
+    /// Calling a first-class contract or an as-yet unknown function. The
+    /// callee is resolved by solving before its structural computation runs.
+    Apply {
+        callee: Arc<Ty>,
+        argument: Arc<Ty>,
+        /// The ordinary call demand, allocated at the call's lexical level.
+        parameter: Arc<Ty>,
+        argument_at: Anchor,
+        result: Arc<Ty>,
+        effects: Row,
+        /// The enclosing function retains this invocation in its published
+        /// summary. Without one, unresolved argument requirements may not be
+        /// erased by checking only a representation fallback.
+        allow_deferred: bool,
+    },
     /// A name bound for the length of a body, and generalized before the body
     /// is looked at.
     ///
@@ -2602,6 +2620,10 @@ pub enum StructDemand {
 
 #[derive(Debug, Clone)]
 pub enum ErrorKind {
+    /// A finite structural contract cannot safely describe this operation.
+    StructuralContract {
+        message: String,
+    },
     /// Projection exceeded this definition's configured product-term budget.
     SatTermLimit {
         max_terms: usize,
@@ -3014,6 +3036,7 @@ struct SchemeProvenance {
 #[derive(Debug, Clone)]
 struct QuantifiedProvenance {
     sort: VarSort,
+    subject: Subject,
     roots: Vec<ReasonId>,
     omitted: usize,
 }
@@ -3036,6 +3059,7 @@ enum ProvenanceShape {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProvenanceTy {
     Leaf,
+    Contract(usize),
     Array,
     Mut,
     Arrow,
@@ -3264,6 +3288,11 @@ struct Fingerprint {
 
 #[derive(Default)]
 struct Table {
+    /// Errors found while reconstructing the ordinary part of a written contract.
+    contract_annotation_errors: Vec<Error>,
+    active_contract_annotations: HashSet<usize>,
+    contract_annotation_templates:
+        HashMap<contract_annotations::Key, contract_annotations::Template>,
     /// Projection budgets and failures belong to definitions, including their
     /// nested bindings. A recursive group shares a table but not a budget.
     sat_term_limits: HashMap<Symbol, usize>,
@@ -4208,7 +4237,7 @@ fn describe_type(ty: &Arc<Ty>) -> TypeDescription {
         Ty::Bool => TypeDescription::Bool,
         Ty::Presence(_) => TypeDescription::Undecided,
         Ty::ForeignValue => TypeDescription::ForeignValue,
-        Ty::Arrow(..) => TypeDescription::Function,
+        Ty::Arrow(..) | Ty::Contract { .. } => TypeDescription::Function,
         Ty::Struct(..) => TypeDescription::Struct,
         Ty::Sum(..) => TypeDescription::TaggedValue,
         Ty::Array(..) => TypeDescription::Array,
@@ -4317,6 +4346,7 @@ impl MismatchFingerprints {
                         continue;
                     }
                     match &*ty {
+                        Ty::Contract { .. } => values.push(tagged(60, [])),
                         Ty::Nat => values.push(tagged(0, [])),
                         Ty::Int => values.push(tagged(1, [])),
                         Ty::Fixed(kind) => values.push(tagged(30, [*kind as u64])),
@@ -6226,6 +6256,78 @@ impl Fingerprint {
         writeln!(self.text, "{value:?}").expect("writing to a buffer");
     }
 
+    /// Encode each structural DAG node once. Debug-formatting a shared
+    /// expression would expand it back into a potentially exponential tree.
+    fn contract_expression(&mut self, root: &Arc<crate::contracts::Expr>) {
+        use crate::contracts::Expr;
+        let mut pending = vec![root];
+        let mut seen = HashMap::new();
+        while let Some(expr) = pending.pop() {
+            let key = Arc::as_ptr(expr);
+            if let Some(index) = seen.get(&key) {
+                self.word(0xff);
+                self.word(*index);
+                continue;
+            }
+            let index = seen.len() as u64;
+            seen.insert(key, index);
+            match &**expr {
+                Expr::Input(index) => {
+                    self.word(0);
+                    self.word(*index as u64);
+                }
+                Expr::Capture(index) => {
+                    self.word(1);
+                    self.word(*index as u64);
+                }
+                Expr::Field { base, label } => {
+                    self.word(2);
+                    self.debug(label);
+                    pending.push(base);
+                }
+                Expr::Payload { base, label } => {
+                    self.word(3);
+                    self.debug(label);
+                    pending.push(base);
+                }
+                Expr::Record { fields, spread } => {
+                    self.word(4);
+                    self.word(fields.len() as u64);
+                    self.word(u64::from(spread.is_some()));
+                    for (label, _) in fields.iter() {
+                        self.debug(label);
+                    }
+                    pending.extend(spread.iter());
+                    pending.extend(fields.iter().rev().map(|(_, value)| value));
+                }
+                Expr::Tag { label, payload } => {
+                    self.word(5);
+                    self.debug(label);
+                    pending.push(payload);
+                }
+                Expr::Apply { function, argument } => {
+                    self.word(6);
+                    pending.push(argument);
+                    pending.push(function);
+                }
+                Expr::Match { scrutinee, arms } => {
+                    self.word(7);
+                    self.word(arms.len() as u64);
+                    for arm in arms.iter() {
+                        self.debug(&arm.pattern);
+                    }
+                    pending.extend(arms.iter().rev().map(|arm| &arm.body));
+                    pending.push(scrutinee);
+                }
+                Expr::Then { value, body } => {
+                    self.word(8);
+                    pending.push(body);
+                    pending.push(value);
+                }
+            }
+        }
+    }
+
     fn scheme(&mut self, scheme: &Scheme) {
         self.word(scheme.count() as u64);
         self.word(scheme.presences() as u64);
@@ -6243,10 +6345,28 @@ impl Fingerprint {
     /// imported type may be as deep as an artifact cares to make it.
     fn ty(&mut self, ty: &Arc<Ty>) {
         let mut work: Vec<&Ty> = vec![ty];
+        let mut seen = HashMap::new();
         let mut rows: Vec<&Row> = Vec::new();
         loop {
             if let Some(ty) = work.pop() {
+                let key = ty as *const Ty;
+                if let Some(index) = seen.get(&key) {
+                    self.word(0x4f);
+                    self.word(*index);
+                    continue;
+                }
+                seen.insert(key, seen.len() as u64);
                 match ty {
+                    Ty::Contract { fallback, contract } => {
+                        self.word(0x40);
+                        self.word(contract.parameters as u64);
+                        self.contract_expression(&contract.body);
+                        self.word(contract.captures.len() as u64);
+                        self.word(contract.arguments.len() as u64);
+                        self.word(u64::from(contract.effect_sink.is_some()));
+                        work.extend(contract.type_operands().map(|ty| &**ty));
+                        work.push(fallback);
+                    }
                     Ty::Nat => self.word(0x01),
                     Ty::Int => self.word(0x02),
                     Ty::Fixed(kind) => {
@@ -6575,6 +6695,15 @@ fn declarations(mint: &Mint, program: &Program) -> (Arc<Signatures>, GroupResult
                 },
             ));
         }
+    }
+
+    Arc::make_mut(&mut table.signatures).aliases = aliases.clone();
+    for (symbol, declaration) in &program.types {
+        contract_annotations::validate_declaration(
+            &mut table,
+            declaration.value.at,
+            aliases[symbol].body(),
+        );
     }
 
     let variances = semantic_variances(&aliases);
@@ -6953,6 +7082,18 @@ fn declarations(mint: &Mint, program: &Program) -> (Arc<Signatures>, GroupResult
             }
         }
     }
+    // An extern's anonymous holes belong to this declaration scope. Coverage
+    // above has now made every decision available without an initializer;
+    // close the remainder before another group's independent table opens it.
+    // In particular, captured structural rows must never carry declaration-
+    // local variable numbers into a caller's unrelated variable arena.
+    for (symbol, scheme) in &mut externs {
+        *scheme = table.published(scheme);
+        env.insert(
+            *symbol,
+            Binding::Poly(ExplainedScheme::imported(scheme.clone())),
+        );
+    }
     // The groups are read out before anything is solved: solving mutates the
     // definitions they name, and which definitions have to be typed together is
     // a fact about the lowered program that nothing here changes.
@@ -7136,6 +7277,7 @@ fn infer_group(
             table: &mut table,
             mint,
             env: &mut env,
+            group_members: members,
             aliases: &signatures.aliases,
             out: Vec::new(),
             annotated: Vec::new(),
@@ -7275,6 +7417,38 @@ fn infer_group(
         // complaint written into the middle of it would move everybody
         // else's.
         let told = errors.len();
+        if let Err(limit) = crate::contracts::check_type_graph(
+            &member.ty,
+            |ty| table.resolve(ty),
+            |row| table.canon(row),
+        ) {
+            errors.push(Error {
+                id: table.error_id(),
+                cause: ErrorCause::Direct,
+                at: decl.name_at,
+                kind: ErrorKind::StructuralContract {
+                    message: limit.to_string(),
+                },
+                explanation: None,
+            });
+            // This definition is rejected, so dependent groups receive error
+            // recovery rather than another independently instantiated copy of
+            // its oversized captures. Never substitute an ordinary arrow as
+            // evidence that its structural requirements were established.
+            let recovery = Arc::new(Ty::Undecided);
+            decl.value.ty = recovery.clone();
+            let scheme = Scheme::new(0, recovery);
+            for local in published[at]..published[at + 1] {
+                *locals.get_index_mut(local).expect("member local").1 = scheme.clone();
+            }
+            let explained = ExplainedScheme::local(scheme.clone(), SchemeProvenance::default());
+            env.insert(symbol, Binding::Poly(explained.clone()));
+            published_schemes.insert(symbol, explained);
+            schemes.insert(symbol, scheme);
+            promises.insert(symbol, Formula::True);
+            constraints.insert(symbol, member.generated);
+            continue;
+        }
         // A variable stands for whatever *this* annotation's
         // caller picks, so it means nothing in anybody else's type. A
         // scheme that would quantify one it did not declare is refused at
@@ -7363,10 +7537,12 @@ fn infer_group(
         // the empty row rather than a `..'b` the caller gets to choose.
         table.close_handler_presences(&member.ty, 0);
         table.close_effects(&member.ty, 0);
+
         // Fold-back, next of everything generalization does: a presence
         // the store has already decided is no variable at all, so it is
         // settled here rather than quantified and printed as one.
         table.fold_back(&member.ty);
+
         // What the scheme requires of what is left. An annotated definition
         // publishes its *annotation's* clause rather than what its body
         // worked out — the annotation is the contract, and R10 has already
@@ -7379,7 +7555,18 @@ fn infer_group(
             Some(_) if table.unsat => Formula::True,
             _ => table.required(&member.ty),
         };
-        let (scheme, mut subst) = table.generalize(&member.ty, 0, required);
+        let publication = if from != to || told != errors.len() {
+            match &*table.resolve(&member.ty) {
+                Ty::Contract { fallback, .. } => {
+                    decl.value.ty = fallback.clone();
+                    fallback.clone()
+                }
+                _ => member.ty.clone(),
+            }
+        } else {
+            member.ty.clone()
+        };
+        let (scheme, mut subst) = table.generalize(&publication, 0, required);
         // With the substitution in hand, resolve every type the walk wrote
         // into the body, so a term's type and its definition's scheme spell
         // the same variable the same way.
@@ -7634,6 +7821,7 @@ fn assemble(
         semantics: Arc::new(semantics),
         diagnostics: Arc::new(diagnostics),
     };
+    export::check(program, &mut output);
     if output.errors().is_empty() {
         let mut requirements = crate::reification::Analysis::infer(program, output.semantics());
         if defaults::instantiate(Arc::make_mut(&mut output.semantics), &requirements) {
@@ -7824,7 +8012,27 @@ impl Table {
     /// value that needs no table: the store with every variable followed to
     /// what it was decided to be, the refinements likewise, and the arenas
     /// the explanations read.
-    fn finish(self, parts: GroupParts) -> GroupResult {
+    fn finish(self, mut parts: GroupParts) -> GroupResult {
+        let oversized: HashSet<_> = parts
+            .errors
+            .iter()
+            .filter_map(|error| match &error.kind {
+                ErrorKind::StructuralContract { message }
+                    if message.contains("semantic type graph budget") =>
+                {
+                    Some(error.at.definition)
+                }
+                _ => None,
+            })
+            .collect();
+        parts.errors.retain(|error| {
+            !oversized.contains(&error.at.definition)
+                || !matches!(&error.kind, ErrorKind::StructuralContract { message }
+                    if message.contains("normalization exceeds its finite work budget"))
+        });
+        parts
+            .errors
+            .extend(self.contract_annotation_errors.iter().cloned());
         let store = self.settled();
         let refinements = parts
             .refinements
@@ -7926,6 +8134,13 @@ impl Table {
                 operand, result, ..
             } => vec![operand, result],
             ConstraintKind::Equal { expected, actual } => vec![expected, actual],
+            ConstraintKind::Apply {
+                callee,
+                argument,
+                parameter,
+                result,
+                ..
+            } => vec![callee, argument, parameter, result],
             ConstraintKind::Let { bound, .. } => vec![bound],
             ConstraintKind::Instance { ty, .. } => vec![ty],
             ConstraintKind::Match {
@@ -8021,6 +8236,7 @@ impl Table {
     /// one: a fresh variable reaches the rest of the solve only by being bound
     /// into something, and every binding made since is being undone here too.
     fn restore(&mut self, known: Known) {
+        self.contract_annotation_templates.clear();
         self.handler_presences = known.handler_presences;
         self.handler_absences = known.handler_absences;
         self.vars = known.vars;
@@ -8451,11 +8667,35 @@ impl Table {
 
         let mut same = true;
         let mut work = vec![Work::Ty(a.clone(), b.clone())];
+        let mut seen = HashSet::new();
         while let Some(part) = work.pop() {
             match part {
                 Work::Ty(a, b) => {
                     let (a, b) = (self.resolve(&a), self.resolve(&b));
+                    if !seen.insert((Arc::as_ptr(&a), Arc::as_ptr(&b))) {
+                        continue;
+                    }
                     match (&*a, &*b) {
+                        (
+                            Ty::Contract { contract: left, .. },
+                            Ty::Contract {
+                                contract: right, ..
+                            },
+                        ) => {
+                            if left.parameters != right.parameters
+                                || left.captures.len() != right.captures.len()
+                                || left.arguments.len() != right.arguments.len()
+                                || left.effect_sink.is_some() != right.effect_sink.is_some()
+                                || !crate::contracts::Expr::same_structure(&left.body, &right.body)
+                            {
+                                return false;
+                            }
+                            work.extend(
+                                left.type_operands()
+                                    .zip(right.type_operands())
+                                    .map(|(a, b)| Work::Ty(a.clone(), b.clone())),
+                            );
+                        }
                         (Ty::Fixed(left), Ty::Fixed(right)) if left == right => {}
                         (Ty::Nat, Ty::Nat)
                         | (Ty::Int, Ty::Int)
@@ -8643,6 +8883,15 @@ impl Table {
                         visited_tys.push(ty.clone());
                         match &*ty {
                             Ty::Presence(p) => work.push((Part::Presence(p.clone()), trace, route)),
+                            Ty::Contract { fallback, contract } => {
+                                work.push((Part::Ty(fallback.clone()), trace, route));
+                                work.extend(
+                                    contract
+                                        .type_operands()
+                                        .cloned()
+                                        .map(|ty| (Part::Ty(ty), trace, route)),
+                                );
+                            }
                             Ty::Package(body) | Ty::Hidden { body, .. } => {
                                 work.push((Part::Ty(body.clone()), trace, route))
                             }
@@ -8892,12 +9141,20 @@ impl Table {
             Row(Row),
         }
         let mut work = vec![Work::Ty(ty.clone())];
+        let mut seen = HashSet::new();
         while let Some(part) = work.pop() {
             match part {
                 Work::Ty(ty) => {
                     let ty = self.resolve(&ty);
+                    if !seen.insert(Arc::as_ptr(&ty)) {
+                        continue;
+                    }
                     match &*ty {
                         Ty::Var(var) => found.push(*var),
+                        Ty::Contract { fallback, contract } => {
+                            work.push(Work::Ty(fallback.clone()));
+                            work.extend(contract.type_operands().cloned().map(Work::Ty));
+                        }
                         Ty::Package(body) | Ty::Hidden { body, .. } => {
                             work.push(Work::Ty(body.clone()))
                         }
@@ -9003,15 +9260,23 @@ impl Table {
         }
 
         let mut work = vec![Work::Ty(ty.clone())];
+        let mut seen = HashSet::new();
         while let Some(part) = work.pop() {
             match part {
                 Work::Ty(ty) => {
                     let ty = self.resolve(&ty);
+                    if !seen.insert(Arc::as_ptr(&ty)) {
+                        continue;
+                    }
                     match &*ty {
                         Ty::Arrow(from, to, effects) => {
                             work.push(Work::Row(effects.clone(), Shape::Effect));
                             work.push(Work::Ty(to.clone()));
                             work.push(Work::Ty(from.clone()));
+                        }
+                        Ty::Contract { fallback, contract } => {
+                            work.push(Work::Ty(fallback.clone()));
+                            work.extend(contract.type_operands().cloned().map(Work::Ty));
                         }
                         Ty::Package(body) | Ty::Hidden { body, .. } => {
                             work.push(Work::Ty(body.clone()))
@@ -9692,6 +9957,31 @@ impl Table {
         }
     }
 
+    /// Substitute the presence literals established only while `condition`
+    /// holds, without binding their shared inference variables globally.
+    ///
+    /// Structural normalization uses this after selecting one finite case.
+    /// The same captured result may occur in another case, so folding these
+    /// facts into the table would incorrectly specialize every use of it.
+    fn specialize_under(&self, ty: &Arc<Ty>, condition: &Formula) -> Arc<Ty> {
+        if !self.store_satisfiable() {
+            return self.resolve(ty);
+        }
+        let premise = self.known().and(self.resolved(condition));
+        let mut found = IndexSet::new();
+        self.presences_in(ty, &mut found);
+        let mut renames = HashMap::new();
+        for var in found {
+            let literal = Formula::Atom(Atom::Var(var));
+            if sat::entails(&premise, &literal) {
+                renames.insert(var, Presence::Present);
+            } else if sat::entails(&premise, &literal.not()) {
+                renames.insert(var, Presence::Absent);
+            }
+        }
+        substitute_presence_vars(&self.resolve(ty), &renames)
+    }
+
     /// Every presence variable a type still mentions, in the order it mentions
     /// them — which is the order the printed alphabet follows.
     ///
@@ -9705,15 +9995,22 @@ impl Table {
             Presence(Presence),
         }
         let mut work = vec![Work::Ty(ty.clone())];
+        let mut seen = HashSet::new();
         while let Some(part) = work.pop() {
             match part {
                 Work::Ty(ty) => {
                     let ty = self.resolve(&ty);
+                    if !seen.insert(Arc::as_ptr(&ty)) {
+                        continue;
+                    }
                     match &*ty {
                         Ty::Arrow(from, to, effects) => {
                             work.push(Work::Row(effects.clone()));
                             work.push(Work::Ty(to.clone()));
                             work.push(Work::Ty(from.clone()));
+                        }
+                        Ty::Contract { contract, .. } => {
+                            work.extend(contract.type_operands().cloned().map(Work::Ty));
                         }
                         Ty::Package(body) | Ty::Hidden { body, .. } => {
                             work.push(Work::Ty(body.clone()))
@@ -9800,6 +10097,10 @@ impl Table {
                     Ty::Presence(Presence::Bound(index)) if scheme.is_existential(*index) => {
                         root_slots.insert(*index);
                     }
+                    Ty::Contract { fallback, contract } => {
+                        work.extend(contract.type_operands().rev().cloned().map(Work::Ty));
+                        work.push(Work::Ty(fallback.clone()));
+                    }
                     Ty::Package(_) => {} // a nested owner
                     Ty::Hidden { body, .. } => work.push(Work::Ty(body.clone())),
                     Ty::Array(element) | Ty::Mirror(element) | Ty::TypeInfo(element) => {
@@ -9868,7 +10169,15 @@ impl Table {
             root_node = *body;
         }
         let mut work = vec![(Opened::Ty(root.clone()), root_node)];
+        let mut visited_types = HashSet::new();
+        let mut retained_types = Vec::new();
         while let Some((opened, at)) = work.pop() {
+            if let Opened::Ty(ty) = &opened {
+                if !visited_types.insert((Arc::as_ptr(ty), at)) {
+                    continue;
+                }
+                retained_types.push(ty.clone());
+            }
             let Some(node) = provenance.nodes.get(at) else {
                 continue;
             };
@@ -9905,6 +10214,9 @@ impl Table {
             match opened {
                 Opened::Ty(ty) => {
                     let shape = match &*ty {
+                        Ty::Contract { contract, .. } => {
+                            ProvenanceTy::Contract(contract.type_operands().count())
+                        }
                         Ty::Arrow(..) => ProvenanceTy::Arrow,
                         Ty::Package(..) => ProvenanceTy::Package,
                         Ty::Hidden { .. } => ProvenanceTy::Hidden,
@@ -9922,6 +10234,11 @@ impl Table {
                     }
                     attach(self, &ty);
                     let children: Vec<Opened> = match &*ty {
+                        Ty::Contract { fallback, contract } => std::iter::once(fallback)
+                            .chain(contract.type_operands())
+                            .cloned()
+                            .map(Opened::Ty)
+                            .collect(),
                         Ty::Arrow(from, to, effects) => vec![
                             Opened::Ty(from.clone()),
                             Opened::Ty(to.clone()),
@@ -10033,6 +10350,10 @@ impl Table {
                 }
                 Work::Region(_) => {}
                 Work::Ty(ty) => match ty {
+                    Ty::Contract { fallback, contract } => {
+                        work.push(Work::Ty(fallback));
+                        work.extend(contract.type_operands().map(|ty| Work::Ty(ty)));
+                    }
                     Ty::Mut(region, element) => {
                         work.push(Work::Region(region));
                         work.push(Work::Ty(element));
@@ -10123,7 +10444,12 @@ impl Table {
                             let fresh = Presence::Var(
                                 self.mint_from_budgeted(
                                     VarSort::Presence,
-                                    Subject::Instance,
+                                    explained
+                                        .provenance
+                                        .quantified
+                                        .get(at as usize)
+                                        .filter(|slot| slot.subject == Subject::MatchResult)
+                                        .map_or(Subject::Instance, |slot| slot.subject),
                                     explained
                                         .provenance
                                         .quantified
@@ -10215,6 +10541,16 @@ impl Table {
         while let Some(part) = work.pop() {
             match part {
                 Work::Ty(ty, root) => match &*ty {
+                    Ty::Contract { fallback, contract } => {
+                        work.extend(
+                            contract
+                                .type_operands()
+                                .rev()
+                                .cloned()
+                                .map(|ty| Work::Ty(ty, false)),
+                        );
+                        work.push(Work::Ty(fallback.clone(), false));
+                    }
                     Ty::Package(body) => {
                         let key: Vec<_> =
                             collect_owned_existentials(body, &self.abstract_existentials)
@@ -10415,6 +10751,10 @@ impl Table {
                 Work::Ty(ty) => {
                     let ty = self.resolve(&ty);
                     match &*ty {
+                        Ty::Contract { fallback, contract } => {
+                            work.push(Work::Ty(fallback.clone()));
+                            work.extend(contract.type_operands().cloned().map(Work::Ty));
+                        }
                         Ty::Package(body) | Ty::Hidden { body, .. } => {
                             work.push(Work::Ty(body.clone()))
                         }
@@ -10673,11 +11013,21 @@ impl Table {
             Row(Row),
         }
         let mut work = vec![Work::Ty(ty.clone())];
+        let mut seen = HashSet::new();
+        let mut retained = Vec::new();
         while let Some(part) = work.pop() {
             match part {
                 Work::Ty(ty) => {
                     let ty = self.resolve(&ty);
+                    if !seen.insert(Arc::as_ptr(&ty)) {
+                        continue;
+                    }
+                    retained.push(ty.clone());
                     match &*ty {
+                        Ty::Contract { fallback, contract } => {
+                            work.push(Work::Ty(fallback.clone()));
+                            work.extend(contract.type_operands().cloned().map(Work::Ty));
+                        }
                         Ty::Package(body) | Ty::Hidden { body, .. } => {
                             work.push(Work::Ty(body.clone()))
                         }
@@ -10869,6 +11219,11 @@ impl Table {
         while let Some(ty) = work.pop() {
             let ty = self.resolve(&ty);
             let row = match &*ty {
+                Ty::Contract { fallback, contract } => {
+                    work.push(fallback.clone());
+                    work.extend(contract.type_operands().cloned());
+                    None
+                }
                 Ty::Arrow(from, to, row) => {
                     self.presences_in(from, &mut inputs);
                     work.push(to.clone());
@@ -11015,11 +11370,27 @@ impl Table {
             Row(Row, bool),
         }
         let mut work = vec![Work::Ty(ty.clone())];
+        // Closing distinguishes exactly one occurrence from two or more.
+        // Two visits per shared node preserve that distinction without
+        // enumerating all paths through captured representation DAGs.
+        let mut visited: HashMap<*const Ty, (Arc<Ty>, u8)> = HashMap::new();
         while let Some(part) = work.pop() {
             match part {
                 Work::Ty(ty) => {
                     let ty = self.resolve(&ty);
+                    let visits = &mut visited
+                        .entry(Arc::as_ptr(&ty))
+                        .or_insert_with(|| (ty.clone(), 0))
+                        .1;
+                    if *visits == 2 {
+                        continue;
+                    }
+                    *visits += 1;
                     match &*ty {
+                        Ty::Contract { fallback, contract } => {
+                            work.push(Work::Ty(fallback.clone()));
+                            work.extend(contract.type_operands().cloned().map(Work::Ty));
+                        }
                         Ty::Package(body) | Ty::Hidden { body, .. } => {
                             work.push(Work::Ty(body.clone()))
                         }
@@ -11047,7 +11418,8 @@ impl Table {
                 Work::Row(row, effects) => {
                     let row = self.canon(&row);
                     if effects && let Rest::Var(var) = row.rest {
-                        *found.entry(var).or_default() += 1;
+                        let count = found.entry(var).or_default();
+                        *count = (*count + 1).min(2);
                     }
                     work.extend(
                         row.labels
@@ -11121,6 +11493,7 @@ impl Table {
         let mut quantified = (0..count)
             .map(|_| QuantifiedProvenance {
                 sort: VarSort::Type,
+                subject: Subject::Instance,
                 roots: Vec::new(),
                 omitted: 0,
             })
@@ -11128,12 +11501,14 @@ impl Table {
         for (var, at) in &subst.types {
             if let Some(slot) = quantified.get_mut(*at as usize) {
                 slot.sort = self.var_meta[*var as usize].sort;
+                slot.subject = self.var_meta[*var as usize].subject;
                 slot.roots.push(self.var_meta[*var as usize].minted_by);
             }
         }
         for (var, at) in &subst.presences {
             if let Some(slot) = quantified.get_mut(*at as usize) {
                 slot.sort = VarSort::Presence;
+                slot.subject = self.var_meta[*var as usize].subject;
                 slot.roots.push(self.var_meta[*var as usize].minted_by);
             }
         }
@@ -11143,11 +11518,24 @@ impl Table {
             }
         }
         let mut nodes = Vec::<ProvenanceNode>::new();
+        let mut source_nodes: HashMap<*const Ty, (Arc<Ty>, usize)> = HashMap::new();
         let mut work = vec![Work::Ty(ty.clone(), None)];
         while let Some(item) = work.pop() {
             let parent = match &item {
                 Work::Ty(_, p) | Work::Row(_, p) | Work::Presence(_, p) => *p,
             };
+            let source_type = match &item {
+                Work::Ty(ty, _) => Some(ty.clone()),
+                _ => None,
+            };
+            if let Some(ty) = &source_type
+                && let Some((_, prior)) = source_nodes.get(&Arc::as_ptr(ty))
+            {
+                if let Some(parent) = parent {
+                    nodes[parent].children.push(*prior);
+                }
+                continue;
+            }
             let (shape, mut roots, children): (ProvenanceShape, Vec<ReasonId>, Vec<Work>) =
                 match item {
                     Work::Ty(mut ty, _) => {
@@ -11177,6 +11565,14 @@ impl Table {
                             }
                         }
                         let (tag, children) = match &*ty {
+                            Ty::Contract { fallback, contract } => (
+                                ProvenanceTy::Contract(contract.type_operands().count()),
+                                std::iter::once(fallback)
+                                    .chain(contract.type_operands())
+                                    .cloned()
+                                    .map(|ty| Work::Ty(ty, None))
+                                    .collect(),
+                            ),
                             Ty::Arrow(from, to, effects) => (
                                 ProvenanceTy::Arrow,
                                 vec![
@@ -11283,6 +11679,9 @@ impl Table {
                 omitted: 0,
                 children: Vec::new(),
             });
+            if let Some(ty) = source_type {
+                source_nodes.insert(Arc::as_ptr(&ty), (ty, id));
+            }
             if let Some(parent) = parent {
                 nodes[parent].children.push(id);
             }
@@ -11308,11 +11707,34 @@ impl Table {
         }
         let before = nodes;
         let mut exact = Vec::<ProvenanceNode>::new();
+        type PublishedIdentity = (*const Ty, Option<usize>);
+        let mut published_nodes: HashMap<PublishedIdentity, (Arc<Ty>, usize)> = HashMap::new();
         let mut work = vec![Published::Ty(published.clone(), None, Some(0))];
         while let Some(item) = work.pop() {
+            let published_type = match &item {
+                Published::Ty(ty, parent, old) => {
+                    let key = (Arc::as_ptr(ty), *old);
+                    if let Some((_, prior)) = published_nodes.get(&key) {
+                        if let Some(parent) = parent {
+                            exact[*parent].children.push(*prior);
+                        }
+                        continue;
+                    }
+                    Some((key, ty.clone()))
+                }
+                _ => None,
+            };
             let (shape, parent, old, children): (_, _, _, Vec<Published>) = match item {
                 Published::Ty(ty, parent, old) => {
                     let (tag, child_types): (ProvenanceTy, Vec<Published>) = match &*ty {
+                        Ty::Contract { fallback, contract } => (
+                            ProvenanceTy::Contract(contract.type_operands().count()),
+                            std::iter::once(fallback)
+                                .chain(contract.type_operands())
+                                .cloned()
+                                .map(|ty| Published::Ty(ty, None, None))
+                                .collect(),
+                        ),
                         Ty::Arrow(from, to, effects) => (
                             ProvenanceTy::Arrow,
                             vec![
@@ -11442,6 +11864,9 @@ impl Table {
                 omitted,
                 children: Vec::new(),
             });
+            if let Some((key, ty)) = published_type {
+                published_nodes.insert(key, (ty, id));
+            }
             if let Some(parent) = parent {
                 exact[parent].children.push(id);
             }
@@ -11715,11 +12140,19 @@ impl Table {
         }
 
         let mut work = vec![Work::Ty(ty.clone())];
+        let mut seen = HashSet::new();
         while let Some(part) = work.pop() {
             match part {
                 Work::Ty(ty) => {
                     let ty = self.resolve(&ty);
+                    if !seen.insert(Arc::as_ptr(&ty)) {
+                        continue;
+                    }
                     match &*ty {
+                        Ty::Contract { fallback, contract } => {
+                            work.push(Work::Ty(fallback.clone()));
+                            work.extend(contract.type_operands().cloned().map(Work::Ty));
+                        }
                         Ty::Package(body) | Ty::Hidden { body, .. } => {
                             work.push(Work::Ty(body.clone()))
                         }
@@ -11819,7 +12252,9 @@ impl Table {
     fn zonk(&self, ty: &Arc<Ty>, subst: &Subst) -> Arc<Ty> {
         enum Work {
             Ty(Arc<Ty>),
+            Cache(Arc<Ty>),
             Arrow,
+            Contract(Arc<crate::contracts::Contract>),
             Package,
             Hidden(u32, Arc<str>),
             Array,
@@ -11841,12 +12276,18 @@ impl Table {
         }
 
         let mut work = vec![Work::Ty(ty.clone())];
-        let mut types = Vec::new();
+        let mut types: Vec<Arc<Ty>> = Vec::new();
+        let mut cache: HashMap<*const Ty, (Arc<Ty>, Arc<Ty>)> = HashMap::new();
         let mut rows = Vec::new();
         while let Some(part) = work.pop() {
             match part {
                 Work::Ty(ty) => {
                     let ty = self.resolve(&ty);
+                    if let Some((_, cached)) = cache.get(&Arc::as_ptr(&ty)) {
+                        types.push(cached.clone());
+                        continue;
+                    }
+                    work.push(Work::Cache(ty.clone()));
                     match &*ty {
                         Ty::Presence(p) => {
                             let p = match self.presence_of(p) {
@@ -11877,6 +12318,11 @@ impl Table {
                         Ty::Hidden { binder, name, body } => {
                             work.push(Work::Hidden(*binder, name.clone()));
                             work.push(Work::Ty(body.clone()));
+                        }
+                        Ty::Contract { fallback, contract } => {
+                            work.push(Work::Contract(contract.clone()));
+                            work.extend(contract.type_operands().rev().cloned().map(Work::Ty));
+                            work.push(Work::Ty(fallback.clone()));
                         }
                         Ty::Arrow(from, to, effects) => {
                             work.push(Work::Arrow);
@@ -11924,6 +12370,10 @@ impl Table {
                         other => types.push(Arc::new(other.clone())),
                     }
                 }
+                Work::Cache(original) => {
+                    let value = types.last().expect("transformed type").clone();
+                    cache.insert(Arc::as_ptr(&original), (original, value));
+                }
                 Work::Row(row) => {
                     let row = self.canon(&row);
                     let rest = match &row.rest {
@@ -11958,6 +12408,15 @@ impl Table {
                                 .then(|| Work::Ty(field.ty.clone()))
                         },
                     ));
+                }
+                Work::Contract(contract) => {
+                    let n = contract.type_operands().count();
+                    let mut operands = types.split_off(types.len() - n).into_iter();
+                    let fallback = types.pop().expect("contract representation");
+                    let contract = Arc::new(
+                        contract.map_types(|_| operands.next().expect("contract operand")),
+                    );
+                    types.push(Arc::new(Ty::Contract { fallback, contract }));
                 }
                 Work::Arrow => {
                     let effects = rows.pop().expect("zonked effects row");
@@ -12133,6 +12592,9 @@ impl Table {
     /// it spells `a`.
     fn zonk_error(&self, kind: &ErrorKind, subst: &mut Subst) -> ErrorKind {
         match kind {
+            ErrorKind::StructuralContract { message } => ErrorKind::StructuralContract {
+                message: message.clone(),
+            },
             ErrorKind::RuntimeTypeInformation { message } => ErrorKind::RuntimeTypeInformation {
                 message: message.clone(),
             },
@@ -12352,6 +12814,10 @@ fn collect_owned_existentials(body: &Arc<Ty>, abstract_: &HashSet<TyVar>) -> Ind
                 Ty::Presence(Presence::Var(var)) if abstract_.contains(var) => {
                     found.insert(*var);
                 }
+                Ty::Contract { fallback, contract } => {
+                    work.extend(contract.type_operands().rev().cloned().map(Work::Ty));
+                    work.push(Work::Ty(fallback.clone()));
+                }
                 Ty::Package(_) => {} // belongs to the nested package
                 Ty::Hidden { body, .. } => work.push(Work::Ty(body.clone())),
                 Ty::Array(element) | Ty::Mirror(element) | Ty::TypeInfo(element) => {
@@ -12395,6 +12861,7 @@ fn substitute_presence_vars(root: &Arc<Ty>, renames: &HashMap<TyVar, Presence>) 
         Ty(Arc<Ty>),
         Row(Row),
         Arrow,
+        Contract(Arc<crate::contracts::Contract>),
         Package,
         Hidden(u32, Arc<str>),
         Array,
@@ -12412,6 +12879,11 @@ fn substitute_presence_vars(root: &Arc<Ty>, renames: &HashMap<TyVar, Presence>) 
     while let Some(part) = work.pop() {
         match part {
             Work::Ty(ty) => match &*ty {
+                Ty::Contract { fallback, contract } => {
+                    work.push(Work::Contract(contract.clone()));
+                    work.extend(contract.type_operands().rev().cloned().map(Work::Ty));
+                    work.push(Work::Ty(fallback.clone()));
+                }
                 Ty::Arrow(from, to, effects) => {
                     work.push(Work::Arrow);
                     work.push(Work::Row(effects.clone()));
@@ -12485,6 +12957,25 @@ fn substitute_presence_vars(root: &Arc<Ty>, renames: &HashMap<TyVar, Presence>) 
                         .filter(|field| !matches!(field.presence, Presence::Absent))
                         .map(|field| Work::Ty(field.ty.clone())),
                 );
+            }
+            Work::Contract(contract) => {
+                let effect_sink = contract
+                    .effect_sink
+                    .as_ref()
+                    .map(|_| types.pop().expect("renamed contract effect sink"));
+                let arguments = types.split_off(types.len() - contract.arguments.len());
+                let captures = types.split_off(types.len() - contract.captures.len());
+                let fallback = types.pop().expect("renamed contract fallback");
+                types.push(Arc::new(Ty::Contract {
+                    fallback,
+                    contract: Arc::new(crate::contracts::Contract {
+                        parameters: contract.parameters,
+                        body: contract.body.clone(),
+                        captures: captures.into(),
+                        arguments: arguments.into(),
+                        effect_sink,
+                    }),
+                }));
             }
             Work::Arrow => {
                 let effects = rows.pop().unwrap();
@@ -12595,6 +13086,13 @@ fn semantic_variances(aliases: &IndexMap<Symbol, Scheme>) -> HashMap<(Symbol, u3
                                 *out.entry((*owner, *index)).or_default() |=
                                     if positive { 1 } else { 2 };
                             }
+                            Ty::Contract { contract, .. } => {
+                                // Captures may be both inspected and returned by the contract.
+                                for ty in contract.type_operands() {
+                                    work.push(Work::Ty(ty.clone(), positive));
+                                    work.push(Work::Ty(ty.clone(), !positive));
+                                }
+                            }
                             Ty::Arrow(from, to, effects) => {
                                 work.push(Work::Row(effects.clone(), positive));
                                 work.push(Work::Ty(to.clone(), positive));
@@ -12670,6 +13168,11 @@ fn package_positive_presences(
     already: &IndexSet<u32>,
     variances: &HashMap<(Symbol, u32), u8>,
 ) -> (Arc<Ty>, IndexSet<u32>) {
+    // A contract's type operands are all invariant (the scan below visits
+    // both polarities), so none of its presences can be positive-only.
+    if presences == 0 || matches!(&**body, Ty::Contract { .. }) {
+        return (body.clone(), IndexSet::new());
+    }
     #[derive(Default)]
     struct Uses {
         positive: u32,
@@ -12706,6 +13209,12 @@ fn package_positive_presences(
                             use_.owners.insert(owner);
                         } else {
                             use_.negative += 1;
+                        }
+                    }
+                    Ty::Contract { contract, .. } => {
+                        for ty in contract.type_operands() {
+                            work.push(Scan::Ty(ty.clone(), positive, owner));
+                            work.push(Scan::Ty(ty.clone(), !positive, owner));
                         }
                     }
                     Ty::Arrow(from, to, effects) => {
@@ -13024,6 +13533,7 @@ fn shift(ty: &Arc<Ty>, by: u32) -> Arc<Ty> {
         Ty(Arc<Ty>),
         Row(Row),
         Arrow,
+        Contract(Arc<crate::contracts::Contract>),
         Package,
         Hidden(u32, Arc<str>),
         Array,
@@ -13042,6 +13552,11 @@ fn shift(ty: &Arc<Ty>, by: u32) -> Arc<Ty> {
         match part {
             Work::Ty(ty) => match &*ty {
                 Ty::Bound(at) => types.push(Arc::new(Ty::Bound(at + by))),
+                Ty::Contract { fallback, contract } => {
+                    work.push(Work::Contract(contract.clone()));
+                    work.extend(contract.type_operands().rev().cloned().map(Work::Ty));
+                    work.push(Work::Ty(fallback.clone()));
+                }
                 Ty::Arrow(from, to, effects) => {
                     work.push(Work::Arrow);
                     work.push(Work::Row(effects.clone()));
@@ -13104,6 +13619,14 @@ fn shift(ty: &Arc<Ty>, by: u32) -> Arc<Ty> {
                         .filter(|field| !matches!(field.presence, Presence::Absent))
                         .map(|field| Work::Ty(field.ty.clone())),
                 );
+            }
+            Work::Contract(contract) => {
+                let n = contract.type_operands().count();
+                let mut operands = types.split_off(types.len() - n).into_iter();
+                let fallback = types.pop().expect("contract representation");
+                let contract =
+                    Arc::new(contract.map_types(|_| operands.next().expect("contract operand")));
+                types.push(Arc::new(Ty::Contract { fallback, contract }));
             }
             Work::Arrow => {
                 let effects = rows.pop().expect("shifted effects");
@@ -13229,6 +13752,9 @@ fn lower_type(mint: &Mint, table: &mut Table, ty: &Type) -> Arc<Ty> {
 struct Tails {
     types: HashMap<String, Ty>,
     rows: HashMap<String, Rest>,
+    /// Implicit type, row and presence slots reconstructed from structural
+    /// annotation programs. Each use opens its own ordinary payload decisions.
+    representation_variables: Vec<TyVar>,
     /// The `hide` binders enclosing the position being lowered, innermost
     /// last: a scoped name inside one is that binder's own variable, and one
     /// outside every binder is the type an arm's `hide` pattern opened.
@@ -13417,8 +13943,8 @@ struct Lowered {
     /// are ordinary solver variables, which is the whole of the difference
     /// between what the annotation promises and what it leaves to inference.
     ty: Arc<Ty>,
-    /// [`Lowered::ty`] with its rigids quantified and nothing else — what a
-    /// recursive use of the name is a copy of.
+    /// [`Lowered::ty`] with its declared variables and implicit structural
+    /// representation slots quantified — what a recursive use copies.
     ///
     /// Quantifying the rigids is what makes polymorphic recursion over a
     /// declared variable typable: each mention gets its own fresh copy of `r`,
@@ -13583,9 +14109,21 @@ fn lower_annotation(mint: &Mint, table: &mut Table, annotation: &Annotation) -> 
         let index = presence_subst.len() as u32;
         presence_subst.entry(*var).or_insert(index);
     }
+    for var in &tails.representation_variables {
+        if table.var_meta[*var as usize].sort == VarSort::Presence {
+            let index = presence_subst.len() as u32;
+            presence_subst.entry(*var).or_insert(index);
+        }
+    }
     let presences = presence_subst.len() as u32;
     let subst = Subst {
-        types: HashMap::new(),
+        types: tails
+            .representation_variables
+            .iter()
+            .filter(|var| table.var_meta[**var as usize].sort != VarSort::Presence)
+            .enumerate()
+            .map(|(index, var)| (*var, presences + at.len() as u32 + index as u32))
+            .collect(),
         presences: presence_subst,
         rigids: at
             .iter()
@@ -13606,7 +14144,7 @@ fn lower_annotation(mint: &Mint, table: &mut Table, annotation: &Annotation) -> 
             .collect(),
     };
     let scheme = Scheme::existential(
-        presences + at.len() as u32,
+        subst.next(),
         presences,
         existential_slots,
         table.zonk(&ty, &subst),
@@ -13710,6 +14248,9 @@ fn declaration_requirements(root: &Arc<Ty>, aliases: &IndexMap<Symbol, Scheme>) 
                         }
                         work.extend(args.iter().map(|arg| Part::Ty(arg)));
                     }
+                    Ty::Contract { contract, .. } => {
+                        work.extend(contract.type_operands().map(|ty| Part::Ty(ty)))
+                    }
                     Ty::Arrow(from, to, row) => {
                         work.extend([Part::Ty(from), Part::Ty(to), Part::Row(row)]);
                     }
@@ -13751,6 +14292,61 @@ fn lower_scoped(
     boundaries: Option<&HashSet<Anchor>>,
 ) -> Arc<Ty> {
     let lowered = match &ty.anchored {
+        TypeKind::Match(arms) => {
+            let input = Arc::new(crate::contracts::Expr::Input(0));
+            let mut captures = Vec::with_capacity(arms.len());
+            let mut cases = Vec::with_capacity(arms.len());
+            for (from, to) in arms {
+                let from = lower_scoped(mint, table, tails, from, boundaries);
+                let to = lower_scoped(mint, table, tails, to, boundaries);
+                let pattern = crate::contracts::annotation_pattern(&from);
+                let capture = captures.len();
+                captures.push(Arc::new(Ty::Arrow(from, to, Row::closed())));
+                cases.push(crate::contracts::Arm {
+                    pattern,
+                    body: Arc::new(crate::contracts::Expr::Apply {
+                        function: Arc::new(crate::contracts::Expr::Capture(capture)),
+                        argument: input.clone(),
+                    }),
+                });
+            }
+            let contract = Arc::new(crate::contracts::Contract {
+                parameters: 1,
+                body: Arc::new(crate::contracts::Expr::Match {
+                    scrutinee: input,
+                    arms: cases.into(),
+                }),
+                captures: captures.into(),
+                arguments: Arc::from([]),
+                effect_sink: None,
+            });
+            contract_annotations::lower(mint, table, tails, ty.at, contract, boundaries.is_some())
+        }
+        TypeKind::Structural {
+            parameters,
+            body,
+            captures,
+            arguments,
+            effect_sink,
+        } => {
+            let captures = captures
+                .iter()
+                .map(|capture| lower_scoped(mint, table, tails, capture, boundaries))
+                .collect();
+            let contract = Arc::new(crate::contracts::Contract {
+                parameters: *parameters,
+                body: body.clone(),
+                captures,
+                arguments: arguments
+                    .iter()
+                    .map(|argument| lower_scoped(mint, table, tails, argument, boundaries))
+                    .collect(),
+                effect_sink: effect_sink
+                    .as_ref()
+                    .map(|sink| lower_scoped(mint, table, tails, sink, boundaries)),
+            });
+            contract_annotations::lower(mint, table, tails, ty.at, contract, boundaries.is_some())
+        }
         TypeKind::PresenceHole(id) => Ty::Presence(
             tails
                 .anonymous
@@ -14393,8 +14989,10 @@ fn substitute_type_with(
 ) -> Arc<Ty> {
     enum Work<'a> {
         Ty(&'a Ty),
+        Cache(&'a Ty),
         Row(&'a Row),
         Arrow,
+        Contract(Arc<crate::contracts::Contract>),
         Package,
         Hidden(u32, Arc<str>),
         Array,
@@ -14412,68 +15010,87 @@ fn substitute_type_with(
     }
 
     let mut work = vec![Work::Ty(root)];
-    let mut types = Vec::new();
+    let mut types: Vec<Arc<Ty>> = Vec::new();
+    let mut cache: HashMap<*const Ty, Arc<Ty>> = HashMap::new();
     let mut rows = Vec::new();
     while let Some(part) = work.pop() {
         match part {
-            Work::Ty(ty) => match ty {
-                Ty::Bound(index) => types.push(bound_ty(*index)),
-                Ty::Arrow(from, to, effects) => {
-                    work.push(Work::Arrow);
-                    work.push(Work::Row(effects));
-                    work.push(Work::Ty(to));
-                    work.push(Work::Ty(from));
+            Work::Ty(ty) => {
+                if let Some(cached) = cache.get(&(ty as *const Ty)) {
+                    types.push(cached.clone());
+                    continue;
                 }
-                Ty::Presence(presence) => {
-                    let presence = match presence {
-                        Presence::Bound(index) => bound_presence(*index),
-                        other => other.clone(),
-                    };
-                    types.push(Arc::new(Ty::Presence(presence)));
+                work.push(Work::Cache(ty));
+                match ty {
+                    Ty::Bound(index) => types.push(bound_ty(*index)),
+                    Ty::Contract { fallback, contract } => {
+                        work.push(Work::Contract(contract.clone()));
+                        work.extend(contract.type_operands().rev().map(|ty| Work::Ty(ty)));
+                        work.push(Work::Ty(fallback));
+                    }
+                    Ty::Arrow(from, to, effects) => {
+                        work.push(Work::Arrow);
+                        work.push(Work::Row(effects));
+                        work.push(Work::Ty(to));
+                        work.push(Work::Ty(from));
+                    }
+                    Ty::Presence(presence) => {
+                        let presence = match presence {
+                            Presence::Bound(index) => bound_presence(*index),
+                            other => other.clone(),
+                        };
+                        types.push(Arc::new(Ty::Presence(presence)));
+                    }
+                    Ty::Package(body) => {
+                        work.push(Work::Package);
+                        work.push(Work::Ty(body));
+                    }
+                    Ty::Hidden { binder, name, body } => {
+                        work.push(Work::Hidden(*binder, name.clone()));
+                        work.push(Work::Ty(body));
+                    }
+                    Ty::Array(element) => {
+                        work.push(Work::Array);
+                        work.push(Work::Ty(element));
+                    }
+                    Ty::Mirror(element) => {
+                        work.push(Work::Mirror);
+                        work.push(Work::Ty(element));
+                    }
+                    Ty::TypeInfo(element) => {
+                        work.push(Work::TypeInfo);
+                        work.push(Work::Ty(element));
+                    }
+                    Ty::Mut(region, element) => {
+                        work.push(Work::Mut);
+                        work.push(Work::Ty(element));
+                        work.push(Work::Ty(region));
+                    }
+                    Ty::Struct(row) => {
+                        work.push(Work::Struct);
+                        work.push(Work::Row(row));
+                    }
+                    Ty::Sum(row) => {
+                        work.push(Work::Sum);
+                        work.push(Work::Row(row));
+                    }
+                    Ty::Named { symbol, name, args } => {
+                        work.push(Work::Named {
+                            symbol: *symbol,
+                            name: name.clone(),
+                            args: args.len(),
+                        });
+                        work.extend(args.iter().rev().map(|arg| Work::Ty(arg)));
+                    }
+                    other => types.push(Arc::new(other.clone())),
                 }
-                Ty::Package(body) => {
-                    work.push(Work::Package);
-                    work.push(Work::Ty(body));
-                }
-                Ty::Hidden { binder, name, body } => {
-                    work.push(Work::Hidden(*binder, name.clone()));
-                    work.push(Work::Ty(body));
-                }
-                Ty::Array(element) => {
-                    work.push(Work::Array);
-                    work.push(Work::Ty(element));
-                }
-                Ty::Mirror(element) => {
-                    work.push(Work::Mirror);
-                    work.push(Work::Ty(element));
-                }
-                Ty::TypeInfo(element) => {
-                    work.push(Work::TypeInfo);
-                    work.push(Work::Ty(element));
-                }
-                Ty::Mut(region, element) => {
-                    work.push(Work::Mut);
-                    work.push(Work::Ty(element));
-                    work.push(Work::Ty(region));
-                }
-                Ty::Struct(row) => {
-                    work.push(Work::Struct);
-                    work.push(Work::Row(row));
-                }
-                Ty::Sum(row) => {
-                    work.push(Work::Sum);
-                    work.push(Work::Row(row));
-                }
-                Ty::Named { symbol, name, args } => {
-                    work.push(Work::Named {
-                        symbol: *symbol,
-                        name: name.clone(),
-                        args: args.len(),
-                    });
-                    work.extend(args.iter().rev().map(|arg| Work::Ty(arg)));
-                }
-                other => types.push(Arc::new(other.clone())),
-            },
+            }
+            Work::Cache(original) => {
+                cache.insert(
+                    original as *const Ty,
+                    types.last().expect("substituted type").clone(),
+                );
+            }
             Work::Row(row) => {
                 work.push(Work::BuiltRow(row));
                 if let Rest::More(more) = &row.rest {
@@ -14487,6 +15104,14 @@ fn substitute_type_with(
                     };
                     (!matches!(presence, Presence::Absent)).then_some(Work::Ty(&field.ty))
                 }));
+            }
+            Work::Contract(contract) => {
+                let n = contract.type_operands().count();
+                let mut operands = types.split_off(types.len() - n).into_iter();
+                let fallback = types.pop().expect("contract representation");
+                let contract =
+                    Arc::new(contract.map_types(|_| operands.next().expect("contract operand")));
+                types.push(Arc::new(Ty::Contract { fallback, contract }));
             }
             Work::Arrow => {
                 let effects = rows.pop().expect("row substitution postorder");
@@ -16139,6 +16764,7 @@ mod identity_tests {
                 nodes: Vec::new(),
                 quantified: vec![QuantifiedProvenance {
                     sort: VarSort::Row,
+                    subject: Subject::Instance,
                     roots: Vec::new(),
                     omitted: 0,
                 }],

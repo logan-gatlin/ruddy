@@ -99,6 +99,15 @@ impl Condition {
         self.0.insert(term);
     }
     pub fn and(&self, other: &Self) -> Self {
+        if self.is_false() || other.is_false() {
+            return Self::no();
+        }
+        if self.is_true() {
+            return other.clone();
+        }
+        if other.is_true() || self == other {
+            return self.clone();
+        }
         let mut result = Self::no();
         for left in &self.0 {
             for right in &other.0 {
@@ -108,6 +117,15 @@ impl Condition {
         result
     }
     pub fn or(&self, other: &Self) -> Self {
+        if self.is_true() || other.is_true() {
+            return Self::yes();
+        }
+        if self.is_false() {
+            return other.clone();
+        }
+        if other.is_false() || self == other {
+            return self.clone();
+        }
         let mut result = self.clone();
         for term in &other.0 {
             result.insert(term.clone());
@@ -115,6 +133,9 @@ impl Condition {
         result
     }
     pub fn substitute(&self, facts: &BTreeMap<u32, Facts>) -> Self {
+        if self.is_true() || self.is_false() {
+            return self.clone();
+        }
         let mut result = Self::no();
         for term in &self.0 {
             let mut substituted = Self::yes();
@@ -138,6 +159,9 @@ impl Condition {
         result
     }
     pub fn retain(&self, parameters: &BTreeSet<u32>) -> Self {
+        if self.is_true() || self.is_false() {
+            return self.clone();
+        }
         let mut result = Self::no();
         for term in &self.0 {
             result.insert(
@@ -510,12 +534,17 @@ impl super::conventions::Graph {
             })
             .collect();
         let super::conventions::DependencyIndex {
-            dependents,
-            group_members,
+            mut dependents,
             group_targets,
             group_of,
-            dependent_groups,
+            ..
         } = self.dependency_index();
+        // Port targets become dependencies only when this instance actually
+        // reads that port. Its source is already a permanent dependency, so a
+        // newly discovered source port installs its target edges before use.
+        // Waking every member of a shared instantiation for every target
+        // change makes long forwarding chains needlessly quadratic per round.
+        let mut observed = vec![HashSet::new(); self.needs.len()];
         let mut queue: VecDeque<_> = (0..self.needs.len()).collect();
         let mut queued = vec![true; self.needs.len()];
         while let Some(id) = queue.pop_front() {
@@ -552,6 +581,9 @@ impl super::conventions::Graph {
                     } else {
                         for target in targets {
                             if target != id as u32 {
+                                if observed[id].insert(target) {
+                                    dependents[target as usize].push(id);
+                                }
                                 added.include(&values[target as usize]);
                             }
                         }
@@ -562,10 +594,7 @@ impl super::conventions::Graph {
             combined.include(&added);
             if combined != values[id] {
                 values[id] = combined;
-                let members = dependent_groups[id]
-                    .iter()
-                    .flat_map(|group| group_members[*group].iter());
-                for target in dependents[id].iter().chain(members) {
+                for target in &dependents[id] {
                     if !queued[*target] {
                         queued[*target] = true;
                         queue.push_back(*target);
