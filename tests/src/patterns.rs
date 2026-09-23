@@ -1234,7 +1234,7 @@ fn the_store_decides_reachability_for_a_converted_column() {
 /// its own that nothing flipped, and is checked as usual.
 #[test]
 fn a_match_after_the_flip_stands_aside() {
-    let src = "let p = fn a => match a with | {x} => {} | {y} => {} end\n\
+    let src = "let p: {x when 'x: (), y when 'y: ()} -> () where 'x != 'y = fn a => match a with | {x} => {} | {y} => {} end\n\
                let bad = fn v => do let _ = p {} return match v with | {u, w} => 1n | {} => 2n end end";
     let (_, inferred, checks) = checked(src);
     assert_eq!(inferred.errors().len(), 1, "{:#?}", inferred.errors());
@@ -1245,7 +1245,7 @@ fn a_match_after_the_flip_stands_aside() {
     assert!(matches!(last.coverage, Coverage::Skipped));
     assert_eq!(verdicts(last), [Verdict::Skipped; 2]);
 
-    let src = "let p = fn a => match a with | {x} => {} | {y} => {} end\n\
+    let src = "let p: {x when 'x: (), y when 'y: ()} -> () where 'x != 'y = fn a => match a with | {x} => {} | {y} => {} end\n\
                let bad = p {}\n\
                let q = fn v => match v with | {u, w} => 1n | {} => 2n end";
     let (_, inferred, checks) = checked(src);
@@ -1256,7 +1256,7 @@ fn a_match_after_the_flip_stands_aside() {
     assert_eq!(verdicts(last), [Verdict::Reachable; 2]);
 
     let src = "let early : Nat -> Nat = fn n => match n with | 0n => 0n | x => x end\n\
-               let p = fn a => match a with | {x} => {} | {y} => {} end\n\
+               let p: {x when 'x: (), y when 'y: ()} -> () where 'x != 'y = fn a => match a with | {x} => {} | {y} => {} end\n\
                let bad = fn n => do let _ = p {} return match n with | 0n => 1n end end";
     let (_, inferred, checks) = checked(src);
     assert_eq!(inferred.errors().len(), 1);
@@ -1265,7 +1265,7 @@ fn a_match_after_the_flip_stands_aside() {
     assert!(matches!(last.coverage, Coverage::Skipped));
     assert_eq!(verdicts(last), [Verdict::Skipped]);
 
-    let src = "let p = fn a => match a with | {x} => {} | {y} => {} end\n\
+    let src = "let p: {x when 'x: (), y when 'y: ()} -> () where 'x != 'y = fn a => match a with | {x} => {} | {y} => {} end\n\
                let f = do let _ = p {} return match 0n with | 0n => 1n end end";
     let (_, inferred, checks) = checked(src);
     assert_eq!(inferred.errors().len(), 1);
@@ -1636,4 +1636,31 @@ fn tuple_rest_patterns_match_open_structs() {
     ));
     let (_, inferred, _) = checked("let (a, b, ..) = (1n,)");
     assert!(!inferred.errors().is_empty());
+}
+
+#[test]
+fn structural_input_wildcards_keep_other_tags_reachable() {
+    let (_, checks) = clean(
+        "let choose = fn first second => match (first, second) with
+         | (#None, _) => 1n | (_, #None) => 2n | (_, _) => 3n end
+         let first = choose #None #Red
+         let second = choose #Red #None
+         let other = choose #Red #Green",
+    );
+    assert_eq!(verdicts(sole_report(&checks)), [Verdict::Reachable; 3]);
+
+    let (_, _, checks) = checked(
+        "let choose = fn first second => match (first, second) with
+         | (#None, _) => 1n | (#None, _) => 2n | (_, _) => 3n end",
+    );
+    assert_eq!(checks.errors.len(), 1, "{checks:#?}");
+    assert!(matches!(checks.errors[0].kind, ErrorKind::UnreachableArm));
+
+    // Merely being inside a summarized function does not erase the known
+    // domain of a closed source value unrelated to its parameters.
+    let (_, _, checks) = checked(
+        "let closed: #None = #None\nlet choose = fn input => match closed with | #None => input | _ => input end",
+    );
+    assert_eq!(checks.errors.len(), 1, "{checks:#?}");
+    assert!(matches!(checks.errors[0].kind, ErrorKind::UnreachableArm));
 }

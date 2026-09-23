@@ -1,6 +1,6 @@
 //! Pass one: generation. See [`Constrain`].
 
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use indexmap::IndexMap;
 
@@ -17,6 +17,8 @@ use super::{
     Table, effective_conditions, lower_annotation, same_field_set,
 };
 
+mod structural;
+
 /// Pass one: the walk that says what has to hold, and solves nothing.
 pub struct Constrain<'a> {
     pub table: &'a mut Table,
@@ -30,6 +32,8 @@ pub struct Constrain<'a> {
     /// this walk binds goes in the group's own layer; what earlier groups
     /// published is read through the shared one. See [`Env`].
     pub env: &'a mut Env,
+    /// Names in this recursive group, including annotated recursive members.
+    pub group_members: &'a [Symbol],
     /// What the declared types stand for, for the two arms that have to see a
     /// shape rather than a name: applying something annotated `Endo`, and
     /// checking a term against an annotation of `list`.
@@ -180,6 +184,65 @@ struct Columns<'a> {
 /// — a field it did not mention — says nothing about it, and the enclosing
 /// disjunct is where its own literals already are.
 type Cover = Option<IndexMap<usize, Formula>>;
+
+/// Mark the finite constraint lists owned by a structural function's body.
+fn mark_structural_calls(constraints: &mut [Constraint]) {
+    let mut pending: Vec<_> = constraints.iter_mut().collect();
+    while let Some(constraint) = pending.pop() {
+        match &mut constraint.kind {
+            ConstraintKind::Apply { allow_deferred, .. } => *allow_deferred = true,
+            ConstraintKind::Match { arms, .. } => {
+                for arm in arms {
+                    pending.extend(arm.constraints.iter_mut());
+                }
+            }
+            ConstraintKind::Let { value, body, .. } => {
+                pending.extend(value.iter_mut());
+                pending.extend(body.iter_mut());
+            }
+            ConstraintKind::Scoped {
+                opens, constraints, ..
+            } => {
+                pending.extend(opens.iter_mut());
+                pending.extend(constraints.iter_mut());
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Semantic promises of local bindings, including compiler-generated exact
+/// tuple demands. Synthesis must preserve these checks in the contract body.
+fn contract_annotations(constraints: &[Constraint]) -> HashMap<Symbol, Arc<Ty>> {
+    let mut annotations = HashMap::new();
+    let mut pending: Vec<_> = constraints.iter().collect();
+    while let Some(constraint) = pending.pop() {
+        match &constraint.kind {
+            ConstraintKind::Let {
+                symbol,
+                bound,
+                value,
+                body,
+                ..
+            } => {
+                annotations.insert(*symbol, bound.clone());
+                pending.extend(value.iter());
+                pending.extend(body.iter());
+            }
+            ConstraintKind::Match { arms, .. } => {
+                pending.extend(arms.iter().flat_map(|arm| arm.constraints.iter()));
+            }
+            ConstraintKind::Scoped {
+                opens, constraints, ..
+            } => {
+                pending.extend(opens.iter());
+                pending.extend(constraints.iter());
+            }
+            _ => {}
+        }
+    }
+    annotations
+}
 
 /// The covered set of one qualifying column: one disjunct per arm that reaches
 /// it, as R6 defines them.
@@ -362,6 +425,10 @@ impl Constrain<'_> {
 
     /// Infer a type for `term` and write it into `term.ty`.
     pub(super) fn infer_term(&mut self, term: &mut Term) {
+        self.infer_term_with_contract(term, false);
+    }
+
+    fn infer_term_with_contract(&mut self, term: &mut Term, force_contract: bool) {
         crate::cancellation::checkpoint();
         // A block and a match are walked by methods of their own, because
         // checking reaches into them: the block's result and every arm's body
@@ -565,28 +632,32 @@ impl Constrain<'_> {
                     // written into, since [`Solve::fail`] cannot tell which
                     // half of a demand the failure was about.
                     _ => {
-                        let param = self.table.fresh_type_for(Subject::Parameter);
+                        let parameter = self.table.fresh_type_for(Subject::Parameter);
                         let result = self.table.fresh_type_for(Subject::Context);
                         let does = Row::of(self.table.fresh_row_for(Subject::PerformedEffects));
-                        let wanted = Arc::new(Ty::plain(Ty::Arrow(
-                            param.clone(),
-                            result.clone(),
-                            does.clone(),
-                        )));
-                        self.checks(
+                        self.emit(
                             func.at,
-                            &applied,
-                            &wanted,
                             ConstraintOrigin::ApplicationCallee,
-                            Subject::CallShape,
-                            None,
-                            Subject::Callee,
+                            ConstraintSubjects::pair_at(
+                                Subject::CallShape,
+                                None,
+                                Subject::Callee,
+                                Some(func.at),
+                            ),
+                            ConstraintKind::Apply {
+                                callee: applied.clone(),
+                                argument: arg.ty.clone(),
+                                parameter: parameter.clone(),
+                                argument_at: arg.at,
+                                result: result.clone(),
+                                effects: does.clone(),
+                                allow_deferred: false,
+                            },
                         );
-                        let actual = arg.ty.clone();
                         self.checks(
                             arg.at,
-                            &actual,
-                            &param,
+                            &arg.ty,
+                            &parameter,
                             ConstraintOrigin::ApplicationArgument,
                             Subject::Parameter,
                             Some(func.at),
@@ -637,6 +708,8 @@ impl Constrain<'_> {
                 // on the other having run.
                 let outer_mutations = std::mem::take(&mut self.mutations);
                 let held = self.answer.take();
+                let generated_from = self.out.len();
+                let candidate = self.can_summarize(arg.anchored, body);
                 self.infer_term(body);
                 self.answer = held;
                 let mutations = std::mem::replace(&mut self.mutations, outer_mutations);
@@ -657,7 +730,81 @@ impl Constrain<'_> {
                     },
                 );
                 self.table.level -= 1;
-                Arc::new(Ty::Arrow(param, body.ty.clone(), external))
+                let checked = Arc::new(Ty::Arrow(param, body.ty.clone(), external));
+                // The ordinary walk above always validates the written body.
+                // A finite structural summary augments that checked result;
+                // it never replaces validation of an uncalled function.
+                let annotations = contract_annotations(&self.out[generated_from..]);
+                let capture_env = &*self.env;
+                let contract = (candidate
+                    && (force_contract
+                        || crate::contracts::source_benefits(body, |ty| self.table.resolve(ty))))
+                .then(|| {
+                    crate::contracts::synthesize_lambda_with_annotations(
+                        arg.anchored,
+                        body,
+                        &annotations,
+                        &mut || self.table.fresh_type_for(Subject::Term),
+                        &|symbol| match capture_env.get(symbol) {
+                            // The finite graph captures types, not a
+                            // separate scheme's where clause, including
+                            // one on a written structural contract.
+                            // Keep those calls on ordinary inference.
+                            Some(Binding::Poly(known)) => known.scheme.formula().is_true(),
+                            // An enclosing local has not been generalized
+                            // yet; its future clause is equally unknown.
+                            // Locals bound inside this summary are inlined
+                            // by Builder and never reach this predicate.
+                            Some(Binding::Local) => false,
+                            _ => true,
+                        },
+                    )
+                })
+                .flatten()
+                .filter(|contract| force_contract || crate::contracts::benefits(contract))
+                .filter(|contract| {
+                    !contract.captures.iter().any(|capture| {
+                        let Ty::Var(variable) = &**capture else {
+                            return false;
+                        };
+                        self.table
+                            .var_meta
+                            .get(*variable as usize)
+                            .is_some_and(|metadata| {
+                                matches!(
+                                    metadata.subject,
+                                    Subject::TopLevelBinding | Subject::LocalBinding
+                                )
+                            })
+                    })
+                });
+                match contract {
+                    Some(contract) => {
+                        mark_structural_calls(&mut self.out[generated_from..]);
+                        if contract.parameters == 1
+                            && let crate::contracts::Expr::Apply { function, argument } =
+                                &*contract.body
+                            && let crate::contracts::Expr::Capture(index) = &**function
+                            && matches!(&**argument, crate::contracts::Expr::Input(0))
+                            && let Some(captured) = contract.captures.get(*index)
+                            && let Ty::Contract {
+                                contract: forwarded,
+                                ..
+                            } = &*self.table.unfolded(self.aliases, captured)
+                            && forwarded.remaining_parameters() == 1
+                        {
+                            return term.ty = Arc::new(Ty::Contract {
+                                fallback: checked,
+                                contract: forwarded.clone(),
+                            });
+                        }
+                        Arc::new(Ty::Contract {
+                            fallback: checked,
+                            contract: Arc::new(contract),
+                        })
+                    }
+                    None => checked,
+                }
             }
             // An operation is an ordinary value of its declared signature, with
             // the effect's own label as the row of its outermost arrow, closed.
@@ -1987,7 +2134,13 @@ impl Constrain<'_> {
                 term.ty = expected.clone();
             }
             _ => {
-                self.infer_term(term);
+                if matches!(term.kind, TermKind::Fn { .. })
+                    && matches!(&*shape, Ty::Contract { .. })
+                {
+                    self.infer_term_with_contract(term, true);
+                } else {
+                    self.infer_term(term);
+                }
                 let actual = term.ty.clone();
                 self.checks(
                     term.at,

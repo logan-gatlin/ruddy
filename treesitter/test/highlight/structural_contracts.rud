@@ -1,0 +1,13 @@
+let unwrap: fn
+--          ^^ @keyword
+| { value: 'a, .. } => capture (Nat)
+--  ^^^^^ @property
+--         ^^ @variable.parameter
+--                     ^^^^^^^ @keyword
+--                              ^^^ @type.builtin
+= fn { value, .. } => value
+
+let identity: fn | 'a => 'a + |
+--                ^^ @variable.parameter
+--                      ^^ @variable.parameter
+= fn a => a

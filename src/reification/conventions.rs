@@ -89,6 +89,7 @@ pub struct Requirement {
 pub struct Graph {
     pub shapes: Vec<Shape>,
     pub needs: Vec<Needs>,
+    pub(super) structural_arguments: IndexMap<ShapeId, Vec<ShapeId>>,
     /// Recursive definitions allocate their ports before any forward use can
     /// instantiate them. Ordinary definitions reveal components on demand.
     eager: bool,
@@ -96,24 +97,19 @@ pub struct Graph {
 
 pub(super) struct DependencyIndex {
     pub dependents: Vec<Vec<usize>>,
-    pub group_members: Vec<Vec<usize>>,
     pub group_targets: Vec<HashMap<NeedId, Vec<NeedId>>>,
     pub group_of: Vec<Option<usize>>,
-    pub dependent_groups: Vec<Vec<usize>>,
 }
 
 impl Graph {
     pub(super) fn dependency_index(&self) -> DependencyIndex {
         let mut dependents = vec![Vec::new(); self.needs.len()];
-        // The needs of one instantiation share one ports map. They depend on
-        // its targets as a group, and look a port's targets up by the port's
-        // root, so that neither the dependencies nor the lookups are the
-        // size of the instantiation per need.
+        // The needs of one instantiation share one ports map and one index
+        // by source-port root. Solvers subscribe to target changes as each
+        // source port is discovered, avoiding whole-group wakeups.
         let mut groups: HashMap<usize, usize> = HashMap::new();
-        let mut group_members: Vec<Vec<usize>> = Vec::new();
         let mut group_targets: Vec<HashMap<NeedId, Vec<NeedId>>> = Vec::new();
         let mut group_of: Vec<Option<usize>> = vec![None; self.needs.len()];
-        let mut dependent_groups: Vec<Vec<usize>> = vec![Vec::new(); self.needs.len()];
         for (id, needs) in self.needs.iter().enumerate() {
             for edge in &needs.edges {
                 dependents[edge.source as usize].push(id);
@@ -125,29 +121,24 @@ impl Graph {
                 dependents[instance.source as usize].push(id);
                 let key = Arc::as_ptr(&instance.ports) as usize;
                 let group = *groups.entry(key).or_insert_with(|| {
-                    let group = group_members.len();
-                    group_members.push(Vec::new());
+                    let group = group_targets.len();
                     let mut targets: HashMap<NeedId, Vec<NeedId>> = HashMap::new();
                     for (source, target) in instance.ports.iter() {
                         targets
                             .entry(self.need_root(*source))
                             .or_default()
                             .push(*target);
-                        dependent_groups[*target as usize].push(group);
                     }
                     group_targets.push(targets);
                     group
                 });
-                group_members[group].push(id);
                 group_of[id] = Some(group);
             }
         }
         DependencyIndex {
             dependents,
-            group_members,
             group_targets,
             group_of,
-            dependent_groups,
         }
     }
 
@@ -184,7 +175,7 @@ impl Graph {
         native: bool,
         shallow: bool,
     ) -> ShapeId {
-        let (mut root, graph) = crate::ir::representation_graph(ty, aliases);
+        let (mut root, graph) = crate::ir::layout_graph(ty, aliases);
         while graph[root].0 == "package" {
             root = graph[root].1[0].1;
         }
@@ -628,12 +619,12 @@ impl Graph {
             })
             .collect();
         let DependencyIndex {
-            dependents,
-            group_members,
+            mut dependents,
             group_targets,
             group_of,
-            dependent_groups,
+            ..
         } = self.dependency_index();
+        let mut observed = vec![HashSet::new(); self.needs.len()];
         let mut pending: std::collections::VecDeque<_> = (0..self.needs.len()).collect();
         let mut queued = vec![true; self.needs.len()];
         while let Some(id) = pending.pop_front() {
@@ -687,6 +678,9 @@ impl Graph {
                         );
                     } else {
                         for target in targets {
+                            if observed[id].insert(target) {
+                                dependents[target as usize].push(id);
+                            }
                             for supplied in values[target as usize]
                                 .iter()
                                 .filter(|need| parameters.contains(&need.parameter))
@@ -711,10 +705,7 @@ impl Graph {
             let old = values[id].len();
             values[id].extend(added);
             if values[id].len() != old {
-                let members = dependent_groups[id]
-                    .iter()
-                    .flat_map(|group| group_members[*group].iter());
-                for target in dependents[id].iter().chain(members) {
+                for target in &dependents[id] {
                     if !queued[*target] {
                         queued[*target] = true;
                         pending.push_back(*target);
@@ -846,6 +837,13 @@ impl Graph {
                         },
                     };
                     self.shapes[target as usize] = copied;
+                    if let Some(arguments) = self.structural_arguments.get(&source).cloned() {
+                        let arguments = arguments
+                            .into_iter()
+                            .map(|argument| shape(self, argument, since.0, &mut shapes, &mut work))
+                            .collect();
+                        self.structural_arguments.insert(target, arguments);
+                    }
                 }
                 Work::Need(source, target) => {
                     let original = self.needs[source as usize].clone();
@@ -936,6 +934,16 @@ pub struct Plan {
     pub graph: Graph,
     pub bindings: IndexMap<Symbol, Binding>,
     pub occurrences: IndexMap<Anchor, Flow>,
+    /// Pattern desugaring can give a projection and its identifier base the
+    /// same source anchor. Keep the base's container convention separately.
+    pub identifier_occurrences: IndexMap<(Anchor, Symbol), Flow>,
+    /// Applications whose finite structural summary identifies the exact
+    /// callable convention of the returned value.
+    pub structural_results: BTreeSet<Anchor>,
+    /// The instantiated invocation convention after actual callback supply.
+    /// Optional template slots that it never observes need no descriptor.
+    pub structural_invocations: BTreeMap<Anchor, ShapeId>,
+    pub unresolved_structural_results: BTreeSet<Anchor>,
     /// The binders a `hide` pattern gave an authentic mirror of the type it
     /// opened, by the slot that mirror is evidence for. Bound explicitly, by
     /// the pattern itself: the arm's body has this evidence from the moment
@@ -1234,7 +1242,10 @@ impl Planner<'_> {
                 }
             }
             TermKind::Fn { arg, body } => {
-                let arrow = inference::unfold(self.aliases, &term.ty);
+                let mut arrow = inference::unfold(self.aliases, &term.ty);
+                while let Ty::Contract { fallback, .. } = &*arrow {
+                    arrow = inference::unfold(self.aliases, fallback);
+                }
                 let from = match &*arrow {
                     Ty::Arrow(from, _, _) => from.clone(),
                     _ => Arc::new(Ty::Undecided),
@@ -1267,9 +1278,41 @@ impl Planner<'_> {
                 Flow { value, evaluation }
             }
             TermKind::Apply { func, arg } => {
+                let function_type = &func.ty;
+                let argument_type = &arg.ty;
                 let func = self.term(func);
                 let arg = self.term(arg);
-                match self.plan.graph.exposed(func.value).clone() {
+                // Structural contracts do not equate the checked layout with
+                // the semantic argument. Specialize the interface first, then
+                // supply the actual callback. Reversing these operations loses
+                // component descriptors or asks for constructing an entire
+                // function when only its result needs construction evidence.
+                let mut callable = func.value;
+                let mut runtime = inference::unfold(self.aliases, function_type);
+                if matches!(&*runtime, Ty::Contract { .. }) {
+                    while let Ty::Contract { fallback, .. } = &*runtime {
+                        runtime = inference::unfold(self.aliases, fallback);
+                    }
+                    if let Ty::Arrow(from, to, _) = &*runtime {
+                        let mut substitution =
+                            super::instantiate(from, argument_type, self.aliases);
+                        for (parameter, ty) in super::instantiate(to, &term.ty, self.aliases) {
+                            substitution.entry(parameter).or_insert(ty);
+                        }
+                        substitution.retain(|parameter, ty| {
+                            !matches!(&**ty, Ty::Bound(index) if parameter == index)
+                        });
+                        if !substitution.is_empty() {
+                            callable = self.plan.graph.instantiate(
+                                callable,
+                                (0, 0),
+                                &substitution,
+                                self.aliases,
+                            );
+                        }
+                    }
+                }
+                let mut flow = match self.plan.graph.exposed(callable).clone() {
                     Shape::Arrow {
                         argument,
                         result,
@@ -1282,6 +1325,12 @@ impl Planner<'_> {
                             self.empty()
                         };
                         self.plan.graph.supply(argument, arg.value);
+                        if matches!(
+                            &*inference::unfold(self.aliases, function_type),
+                            Ty::Contract { .. }
+                        ) {
+                            self.plan.structural_invocations.insert(term.at, callable);
+                        }
                         Flow {
                             value: result,
                             evaluation: self.plan.graph.union([
@@ -1296,7 +1345,43 @@ impl Planner<'_> {
                         value: self.plan.graph.skeleton(&term.ty, self.aliases),
                         evaluation: self.plan.graph.union([func.evaluation, arg.evaluation]),
                     },
+                };
+                let closed_structural_result = matches!(
+                    &*inference::unfold(self.aliases, function_type),
+                    Ty::Contract { contract, .. }
+                        if contract.arguments.len() + 1 == contract.parameters
+                ) && super::parameters(&term.ty).is_empty();
+                if closed_structural_result {
+                    // Concrete outputs have no hidden descriptor parameters
+                    // to recover. Replaying every captured predecessor here
+                    // would multiply demand graphs along forwarding chains.
+                    // Keep the semantic result type authoritative for effects
+                    // and member representations even without profile replay.
+                    flow.value = self.plan.graph.skeleton(&term.ty, self.aliases);
+                    self.plan.structural_results.insert(term.at);
+                } else if let Some(value) = super::structural::apply(
+                    &mut self.plan.graph,
+                    self.aliases,
+                    function_type,
+                    func.value,
+                    argument_type,
+                    arg.value,
+                    flow.value,
+                ) {
+                    flow.value = value;
+                    self.plan.structural_results.insert(term.at);
+                } else if matches!(
+                    &*inference::unfold(self.aliases, function_type),
+                    Ty::Contract { .. }
+                ) && super::structural::missing_profile(
+                    &self.plan.graph,
+                    self.aliases,
+                    &term.ty,
+                    flow.value,
+                ) {
+                    self.plan.unresolved_structural_results.insert(term.at);
                 }
+                flow
             }
             TermKind::Let {
                 name, value, body, ..
@@ -1533,6 +1618,11 @@ impl Planner<'_> {
             flow
         };
         self.plan.graph.reveal(flow.value, &term.ty, self.aliases);
+        if let TermKind::Ident(symbol) = term.kind {
+            self.plan
+                .identifier_occurrences
+                .insert((term.at, symbol), flow);
+        }
         self.plan.occurrences.insert(term.at, flow);
         flow
     }

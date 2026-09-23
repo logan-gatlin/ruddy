@@ -48,6 +48,610 @@ fn built(source: &str) -> Artifact {
 }
 
 #[test]
+fn finite_structural_contracts_round_trip_without_expanding_shared_expressions() {
+    use ruddy::contracts::Expr;
+
+    let mut data =
+        built("let duplicate = fn value => { left: value, right: value }").to_unchecked();
+    let scheme = &mut data
+        .header
+        .values
+        .iter_mut()
+        .find(|value| value.name.ends_with("::duplicate"))
+        .unwrap()
+        .scheme;
+    let shared = Arc::new(Expr::Input(0));
+    scheme.body = Type::Contract {
+        fallback: Box::new(scheme.body.clone()),
+        contract: artifact::Contract {
+            parameters: 1,
+            body: Arc::new(Expr::Record {
+                fields: vec![("left".into(), shared.clone()), ("right".into(), shared)].into(),
+                spread: None,
+            }),
+            captures: Vec::new(),
+            arguments: Vec::new(),
+            effect_sink: Some(Box::new(Type::Arrow(
+                Box::new(Type::Nat),
+                Box::new(Type::Nat),
+                Row {
+                    labels: Vec::new(),
+                    rest: Rest::Closed,
+                },
+            ))),
+        },
+    };
+    let original = data.validate().expect("finite contract validates");
+    let restored = Artifact::try_parse(&assert_round_trip(&original))
+        .unwrap()
+        .validate()
+        .unwrap();
+    let Type::Contract { contract, .. } = &restored
+        .header()
+        .values
+        .iter()
+        .find(|value| value.name.ends_with("::duplicate"))
+        .unwrap()
+        .scheme
+        .body
+    else {
+        panic!("the exported contract survives serialization");
+    };
+    let Expr::Record { fields, .. } = contract.body.as_ref() else {
+        panic!("the contract retains record construction");
+    };
+    assert!(
+        Arc::ptr_eq(&fields[0].1, &fields[1].1),
+        "wire references preserve shared input nodes"
+    );
+}
+
+#[test]
+fn structural_contracts_preserve_existential_package_owners() {
+    use ruddy::contracts::{Contract, Expr};
+    let row = Arc::new(types::Ty::Struct(types::Row {
+        labels: [(
+            "value".into(),
+            types::RowField {
+                presence: types::Presence::Bound(0),
+                ty: Arc::new(types::Ty::Nat),
+            },
+        )]
+        .into(),
+        rest: types::Rest::Closed,
+    }));
+    let packaged = Arc::new(types::Ty::Package(row.clone()));
+    for (fallback, captures, arguments, wraps_contract) in [
+        (
+            Arc::new(types::Ty::pure(
+                Arc::new(types::Ty::unit()),
+                packaged.clone(),
+            )),
+            vec![Arc::new(types::Ty::Nat)],
+            vec![],
+            false,
+        ),
+        (Arc::new(types::Ty::Nat), vec![row], vec![], true),
+        (
+            Arc::new(types::Ty::Nat),
+            vec![Arc::new(types::Ty::Nat)],
+            vec![packaged],
+            false,
+        ),
+    ] {
+        let body = Arc::new(types::Ty::Contract {
+            fallback,
+            contract: Arc::new(Contract {
+                parameters: 1,
+                body: Arc::new(Expr::Capture(0)),
+                captures: captures.into(),
+                arguments: arguments.into(),
+                effect_sink: None,
+            }),
+        });
+        let scheme = types::Scheme::existential(1, 1, [0].into(), body, types::Formula::bound(0));
+        assert_eq!(
+            matches!(&**scheme.body(), types::Ty::Package(_)),
+            wraps_contract
+        );
+        let mint = Mint::new(Bundle::new("owners", Version::new(0, 1, 0)).unwrap());
+        let mut data = built("let value = 0n").to_unchecked();
+        data.header.values[0].scheme = artifact::export_scheme(&mint, &scheme);
+        assert_round_trip(&data.validate().expect("contract package owners validate"));
+    }
+}
+
+#[test]
+fn structural_contract_type_graphs_preserve_shared_captures_across_artifacts() {
+    use ruddy::contracts::{Contract, Expr};
+    let mint = Mint::new(Bundle::new("graph", Version::new(0, 1, 0)).unwrap());
+    let mut previous = Arc::new(types::Ty::Nat);
+    for _ in 0..128 {
+        let fallback = Arc::new(types::Ty::Arrow(
+            previous.clone(),
+            previous.clone(),
+            types::Row::closed(),
+        ));
+        previous = Arc::new(types::Ty::Contract {
+            fallback,
+            contract: Arc::new(Contract {
+                parameters: 1,
+                body: Arc::new(Expr::Record {
+                    fields: vec![
+                        ("left".into(), Arc::new(Expr::Capture(0))),
+                        ("right".into(), Arc::new(Expr::Capture(1))),
+                    ]
+                    .into(),
+                    spread: None,
+                }),
+                captures: vec![previous.clone(), previous].into(),
+                arguments: Arc::new([]),
+                effect_sink: None,
+            }),
+        });
+    }
+    let scheme = types::Scheme::new(0, previous);
+    let portable = artifact::try_export_scheme(&mint, &scheme).unwrap();
+    let mut data = built("let graph = 0n").to_unchecked();
+    data.header.values[0].scheme = portable;
+    let original = data.validate().expect("shared semantic graph validates");
+    let text = assert_round_trip(&original);
+    assert!(text.len() < 150_000, "{}", text.len());
+    assert!(text.contains("(shared ") && text.contains("(ref "));
+    assert!(format!("{:?}", original.header().values[0].scheme.body).len() < 18_000);
+    let dependency = Artifact::try_parse(&text).unwrap().validate().unwrap();
+    let mut mint = Mint::new(Bundle::new("consumer", Version::new(0, 1, 0)).unwrap());
+    let imported = ir::build_with_dependencies(&mut mint, Vec::new(), &[dependency]);
+    assert!(imported.errors.is_empty(), "{:?}", imported.errors);
+    let body = imported
+        .program
+        .external_schemes
+        .values()
+        .next()
+        .unwrap()
+        .body();
+    let types::Ty::Contract { fallback, contract } = body.as_ref() else {
+        panic!("the imported type preserves its structural contract");
+    };
+    assert!(Arc::ptr_eq(&contract.captures[0], &contract.captures[1]));
+    let types::Ty::Arrow(from, to, _) = fallback.as_ref() else {
+        panic!("the checked fallback survives export");
+    };
+    assert!(Arc::ptr_eq(from, to));
+    assert!(Arc::ptr_eq(from, &contract.captures[0]));
+}
+
+#[test]
+fn structural_contract_type_references_reject_cycles_forward_refs_and_package_sharing() {
+    let original = built("let value = 0n");
+    let text = original.print();
+    for invalid in [
+        "(ty (ref 0))",
+        "(ty (shared 0 (ty (ref 0))))",
+        "(ty (arrow (ty (ref 1)) (ty (shared 1 (ty nat))) (row (labels) closed)))",
+        "(ty (arrow (ty (shared 0 (ty nat))) (ty (shared 0 (ty string))) (row (labels) closed)))",
+        "(ty (shared 0 (ty (package (ty nat)))))",
+    ] {
+        let invalid = text.replacen("(ty nat)", invalid, 1);
+        assert_ne!(invalid, text, "fixture contains the value type");
+        assert!(Artifact::try_parse(&invalid).is_err(), "{invalid}");
+    }
+    assert_eq!(Type::Shared(Arc::new(Type::Nat)), Type::Nat);
+    let mut data = original.to_unchecked();
+    let shared = Arc::new(Type::Struct(Row {
+        labels: vec![(
+            "field".into(),
+            RowField {
+                presence: Presence::Bound(0),
+                ty: Type::Nat,
+            },
+        )],
+        rest: Rest::Closed,
+    }));
+    data.header.values[0].scheme = Scheme {
+        callable: None,
+        representations: Vec::new(),
+        count: 1,
+        presences: 1,
+        existentials: vec![0],
+        formula: Formula::Owned(0, Box::new(Formula::Bound(0))),
+        body: Type::Arrow(
+            Box::new(Type::Package(Box::new(Type::Shared(shared.clone())))),
+            Box::new(Type::Package(Box::new(Type::Shared(shared)))),
+            Row {
+                labels: Vec::new(),
+                rest: Rest::Closed,
+            },
+        ),
+    };
+    assert!(
+        data.validate().is_err(),
+        "sharing cannot merge existential package owners"
+    );
+}
+
+#[test]
+fn structural_contract_type_export_bounds_expanded_package_occurrences() {
+    let mint = Mint::new(Bundle::new("graph", Version::new(0, 1, 0)).unwrap());
+    let mut packaged = Arc::new(types::Ty::Package(Arc::new(types::Ty::Nat)));
+    let mut ordinary = Arc::new(types::Ty::Nat);
+    for _ in 0..24 {
+        packaged = Arc::new(types::Ty::Arrow(
+            packaged.clone(),
+            packaged,
+            types::Row::closed(),
+        ));
+        ordinary = Arc::new(types::Ty::Arrow(
+            ordinary.clone(),
+            ordinary,
+            types::Row::closed(),
+        ));
+    }
+    let error = artifact::try_export_scheme(&mint, &types::Scheme::new(0, packaged)).unwrap_err();
+    assert_eq!(error.limit, 1_000_000);
+    assert!(artifact::try_export_scheme(&mint, &types::Scheme::new(0, ordinary)).is_ok());
+}
+
+#[test]
+fn structural_contract_artifacts_reject_out_of_scope_and_cyclic_references() {
+    use ruddy::contracts::Expr;
+
+    let original = built("let identity = fn value => value");
+    for body in [
+        Expr::Input(1),
+        Expr::Capture(0),
+        Expr::Record {
+            fields: vec![
+                ("same".into(), Arc::new(Expr::Input(0))),
+                ("same".into(), Arc::new(Expr::Input(0))),
+            ]
+            .into(),
+            spread: None,
+        },
+    ] {
+        let mut data = original.to_unchecked();
+        let scheme = &mut data
+            .header
+            .values
+            .iter_mut()
+            .find(|value| value.name.ends_with("::identity"))
+            .unwrap()
+            .scheme;
+        scheme.body = Type::Contract {
+            fallback: Box::new(scheme.body.clone()),
+            contract: artifact::Contract {
+                parameters: 1,
+                body: Arc::new(body),
+                captures: Vec::new(),
+                arguments: Vec::new(),
+                effect_sink: None,
+            },
+        };
+        assert!(
+            data.validate().is_err(),
+            "contract references must remain in their declared spaces"
+        );
+    }
+
+    let mut data = original.to_unchecked();
+    let scheme = &mut data
+        .header
+        .values
+        .iter_mut()
+        .find(|value| value.name.ends_with("::identity"))
+        .unwrap()
+        .scheme;
+    scheme.body = Type::Contract {
+        fallback: Box::new(scheme.body.clone()),
+        contract: artifact::Contract {
+            parameters: 1,
+            body: Arc::new(Expr::Input(0)),
+            captures: Vec::new(),
+            arguments: Vec::new(),
+            effect_sink: None,
+        },
+    };
+    let encoded = data.validate().unwrap().print();
+    let cycle = encoded.replacen(r#"{\"Input\":0}"#, r#"{\"Field\":[0,\"loop\"]}"#, 1);
+    assert_ne!(encoded, cycle, "the wire graph contains its input node");
+    assert!(
+        Artifact::try_parse(&cycle).is_err(),
+        "a node cannot refer to itself"
+    );
+}
+
+#[test]
+fn structural_contract_artifacts_bound_arity_and_preserve_zero_argument_residuals() {
+    let mut data = built("let value = 3n").to_unchecked();
+    let scheme = &mut data
+        .header
+        .values
+        .iter_mut()
+        .find(|value| value.name.ends_with("::value"))
+        .unwrap()
+        .scheme;
+    scheme.body = Type::Contract {
+        fallback: Box::new(Type::Nat),
+        contract: artifact::Contract {
+            parameters: 0,
+            body: Arc::new(ruddy::contracts::Expr::Capture(0)),
+            captures: vec![Type::Nat],
+            arguments: Vec::new(),
+            effect_sink: None,
+        },
+    };
+    let residual = data
+        .validate()
+        .expect("a closed zero-argument residual is valid");
+    assert_round_trip(&residual);
+    let mut changed = residual.to_unchecked();
+    let Type::Contract { contract, .. } = &mut changed
+        .header
+        .values
+        .iter_mut()
+        .find(|value| value.name.ends_with("::value"))
+        .unwrap()
+        .scheme
+        .body
+    else {
+        unreachable!()
+    };
+    contract.parameters = usize::MAX;
+    assert!(
+        changed.validate().is_err(),
+        "arity cannot authorize an unbounded loop"
+    );
+}
+
+#[test]
+fn artifacts_reject_general_union_type_nodes() {
+    let encoded = compact(&built("let value: Nat = 3n").print());
+    let malformed = encoded.replacen(" nat)", " (alternative nat int))", 1);
+    assert_ne!(encoded, malformed, "the wire type includes its scalar body");
+    assert!(
+        Artifact::try_parse(&malformed).is_err(),
+        "whole-type alternatives are not part of the artifact type language"
+    );
+}
+
+#[test]
+fn structural_contracts_reject_incompatible_callable_results_before_lowering() {
+    let source = r#"
+@private extern info_of: 'a -> TypeInfo 'a = "$infoOf"
+@private extern selector: #Red | #Green = "host.selector"
+let read = fn selector image => match selector with
+| #Red => image.r
+| #Green => image.g
+end
+let reflect = fn value => info_of value
+let selected = read selector { r: reflect, g: fn value => value }
+"#;
+    let parsed = parse::parse(token::lex(source, ruddy::tracking::FileID::GENERATED).tokens);
+    assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+    let refused = compile::compile(
+        Mint::new(Bundle::new("tests", Version::new(0, 1, 0)).unwrap()),
+        parsed.stmts,
+        inference::Trace::Off,
+    )
+    .expect_err("incompatible callable result types cannot reach runtime");
+    // Sharing one ordinary function type would require its argument type to
+    // equal TypeInfo of itself: reflect returns TypeInfo a, identity returns a.
+    assert!(
+        refused.errors.iter().any(|error| matches!(
+            error,
+            compile::Error::Inference(inference::Error {
+                kind: inference::ErrorKind::Recursive,
+                ..
+            })
+        )),
+        "{:?}",
+        refused.errors
+    );
+}
+
+#[test]
+fn structural_contract_partial_callback_profiles_survive_artifact_imports() {
+    let dependency = built(
+        r#"
+@private extern info_of: 'a -> TypeInfo 'a = "$infoOf"
+@private let reflect = fn value => info_of value
+@private let select = fn image channel => match channel with
+| #Red => image.r
+| #Green => image.g
+end
+let from_image = select { r: reflect, g: reflect }
+"#,
+    );
+    let dependency = Artifact::try_parse(&assert_round_trip(&dependency))
+        .unwrap()
+        .validate()
+        .unwrap();
+    let source = r#"
+@private let reflected = tests::from_image #Red
+let value = do
+  let info: TypeInfo Nat = reflected 3n
+  return 7n
+end
+"#;
+    let parsed = parse::parse(token::lex(source, ruddy::tracking::FileID::GENERATED).tokens);
+    assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+    let consumer = compile::compile_with_dependencies(
+        Mint::new(Bundle::new("consumer", Version::new(0, 1, 0)).unwrap()),
+        parsed.stmts,
+        &[compile::Dependency {
+            alias: Some("tests"),
+            artifact: compile::DependencyArtifact::Checked(&dependency),
+        }],
+        inference::Trace::Off,
+    )
+    .unwrap_or_else(|partial| panic!("{:?}", partial.errors));
+    let linked = ruddy::link::link(&[dependency, consumer.artifact().clone()]).unwrap();
+    let program =
+        ruddy_interp::Program::load(&linked).expect("imported callback conventions initialize");
+    assert_eq!(
+        ruddy_interp::render::json(&program.export("value").unwrap()),
+        "7"
+    );
+}
+
+#[test]
+fn structural_contract_effect_alias_arguments_retain_exact_imported_identity() {
+    let dependency = built(
+        r#"
+effect Store 'value = () -> 'value
+effect Left = !Store (fn 'x => #Left 'x)
+effect Right = !Store (fn 'x => #Right 'x)
+effect Choice = !Store (match | #Left => #Natural Nat | #Right => #Text String end)
+"#,
+    );
+    let dependency = Artifact::try_parse(&assert_round_trip(&dependency))
+        .unwrap()
+        .validate()
+        .unwrap();
+    let source = r#"
+module Imported =
+  effect Read = (() -> () + tests::!Left) -> ()
+  effect Select = (() -> () + tests::!Choice) -> ()
+end
+module Inline =
+  effect Read = (() -> () + tests::!Store (fn 'x => #Left 'x)) -> ()
+  effect Select = (() -> () + tests::!Store (match | #Left => #Natural Nat | #Right => #Text String end)) -> ()
+end
+module Different =
+  effect Read = (() -> () + tests::!Right) -> ()
+  effect Select = (() -> () + tests::!Store (match | #Left => #Natural Bool | #Right => #Text String end)) -> ()
+end
+"#;
+    let parsed = parse::parse(token::lex(source, ruddy::tracking::FileID::GENERATED).tokens);
+    assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+    let mut mint = Mint::new(Bundle::new("consumer", Version::new(0, 1, 0)).unwrap());
+    let output = ir::build_with_dependencies(&mut mint, parsed.stmts, &[dependency]);
+    assert!(output.errors.is_empty(), "{:?}", output.errors);
+    for name in ["Read", "Select"] {
+        let identities: Vec<_> = output
+            .program
+            .effect_ids
+            .iter()
+            .filter_map(|(symbol, identity)| (mint.name(*symbol) == name).then_some(identity))
+            .collect();
+        assert_eq!(identities.len(), 3);
+        assert_eq!(
+            identities[0], identities[1],
+            "{name}: imported and written contracts agree"
+        );
+        assert_ne!(
+            identities[0], identities[2],
+            "{name}: distinct branch results remain distinct"
+        );
+    }
+}
+
+#[test]
+fn structural_contract_effect_alias_imports_preserve_supplied_arguments_and_effect_sink() {
+    let mut data =
+        built("effect Store 'value = () -> 'value\neffect Alias = !Store Nat").to_unchecked();
+    let alias = data
+        .header
+        .effects
+        .iter_mut()
+        .find(|effect| effect.name.ends_with("::Alias"))
+        .unwrap();
+    let artifact::EffectKind::Alias(row) = &mut alias.kind else {
+        panic!("fixture is an alias")
+    };
+    row.cases[0].args[0] = Type::Contract {
+        fallback: Box::new(Type::Nat),
+        contract: artifact::Contract {
+            parameters: 2,
+            body: Arc::new(ruddy::contracts::Expr::Input(1)),
+            captures: Vec::new(),
+            arguments: vec![Type::String],
+            effect_sink: Some(Box::new(Type::Arrow(
+                Box::new(Type::Nat),
+                Box::new(Type::Nat),
+                Row {
+                    labels: Vec::new(),
+                    rest: Rest::Closed,
+                },
+            ))),
+        },
+    };
+    let dependency = data.validate().unwrap();
+    let source = "effect Copy = (() -> () + tests::!Alias) -> ()";
+    let parsed = parse::parse(token::lex(source, ruddy::tracking::FileID::GENERATED).tokens);
+    let mut mint = Mint::new(Bundle::new("consumer", Version::new(0, 1, 0)).unwrap());
+    let output = ir::build_with_dependencies(&mut mint, parsed.stmts, &[dependency]);
+    assert!(output.errors.is_empty(), "{:?}", output.errors);
+    let inferred = inference::infer(&mint, &output.program, inference::Trace::Off);
+    assert!(inferred.errors().is_empty(), "{:?}", inferred.errors());
+    let copy = inferred
+        .semantics()
+        .operations()
+        .iter()
+        .find(|((symbol, _), _)| mint.name(*symbol) == "Copy")
+        .unwrap()
+        .1;
+    let types::Ty::Arrow(_, _, effects) = copy.0.as_ref() else {
+        panic!("the operation accepts an effectful callback");
+    };
+    let types::Ty::Struct(arguments) = effects.labels.values().next().unwrap().ty.as_ref() else {
+        panic!("the expanded Store effect retains its argument tuple");
+    };
+    let types::Ty::Contract { contract, .. } = arguments.labels["0"].ty.as_ref() else {
+        panic!("partial contract survives alias import")
+    };
+    assert_eq!(contract.parameters, 2);
+    assert_eq!(contract.arguments.len(), 1);
+    assert!(matches!(contract.arguments[0].as_ref(), types::Ty::String));
+    assert!(contract.effect_sink.is_some());
+    assert!(matches!(
+        contract.body.as_ref(),
+        ruddy::contracts::Expr::Input(1)
+    ));
+}
+
+#[test]
+fn structural_contract_effect_alias_arguments_report_expansion_limits_before_import() {
+    let mut data =
+        built("effect Store 'value = () -> 'value\neffect Alias = !Store Nat").to_unchecked();
+    let mut argument = Type::Nat;
+    for _ in 0..24 {
+        let shared = Arc::new(argument);
+        argument = Type::Arrow(
+            Box::new(Type::Shared(shared.clone())),
+            Box::new(Type::Shared(shared)),
+            Row {
+                labels: Vec::new(),
+                rest: Rest::Closed,
+            },
+        );
+    }
+    let alias = data
+        .header
+        .effects
+        .iter_mut()
+        .find(|effect| effect.name.ends_with("::Alias"))
+        .unwrap();
+    let artifact::EffectKind::Alias(row) = &mut alias.kind else {
+        panic!("fixture is an alias")
+    };
+    row.cases[0].args[0] = argument;
+    let dependency = data
+        .validate()
+        .expect("compact portable effect argument validates");
+    let mut mint = Mint::new(Bundle::new("consumer", Version::new(0, 1, 0)).unwrap());
+    let output = ir::build_with_dependencies(&mut mint, Vec::new(), &[dependency]);
+    assert!(
+        output
+            .errors
+            .iter()
+            .any(|error| matches!(error.kind, ir::ErrorKind::ImportedTypeLimit { .. })),
+        "{:?}",
+        output.errors
+    );
+}
+
+#[test]
 fn assembled_artifact_descriptors_require_construction_evidence() {
     let original = built(
         r#"@private extern mirror: () -> Mirror 'a = "$mirror"
@@ -3076,6 +3680,8 @@ fn reification_artifacts_validate_callable_requirement_interfaces() {
 
 #[test]
 fn reification_artifacts_validate_component_descriptor_projections() {
+    // The written universal apply boundary carries the whole-array descriptor;
+    // its callback must project the element descriptor before boxing a value.
     let artifact = built(
         r#"
 type Option 'a = #Some 'a | #None
@@ -3084,7 +3690,7 @@ type Any = hide 'a => { mirror: Mirror 'a, value: 'a }
 @private extern mirror: () -> Mirror 'a = "$mirror"
 @private extern same_pair: (Mirror 'a, Mirror 'b) -> Option { forward: 'a -> 'b, backward: 'b -> 'a } = "$sameMirror"
 let box: 'a -> Any = fn value => { mirror: type_of value, value: value }
-let apply = fn call value => call value
+let apply: ('a -> 'b) -> 'a -> 'b = fn call value => call value
 let element = fn values => match values with | [value, ..] => box value | _ => box () end
 let consume = apply element
 let token = consume [37n]
@@ -3153,6 +3759,7 @@ fn reification_artifacts_reject_changed_published_callable_contracts() {
                         nodes: vec![Node::Value],
                         ports: vec![],
                         construction: Default::default(),
+                        structural_arguments: Default::default(),
                     })
                 }
                 _ => {

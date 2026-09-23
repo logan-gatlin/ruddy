@@ -435,8 +435,27 @@ fn project(
 /// The named exports of a program, as the JavaScript backend produces them
 /// and as the interpreter does, so that one can be held against the other.
 fn both(source: &str, exports: &[&str], integers: Option<u32>) -> (Vec<String>, Vec<String>) {
-    let project = project(source, true, integers, true);
+    both_with_standard(source, exports, integers, true)
+}
+
+fn both_with_standard(
+    source: &str,
+    exports: &[&str],
+    integers: Option<u32>,
+    standard: bool,
+) -> (Vec<String>, Vec<String>) {
+    let project = project(source, standard, integers, true);
     let artifact = ruddy_cli::build_project(project.path()).expect("the consumer builds");
+    // Interpret the same linked artifact that build_project gave the JS backend.
+    let linked = ruddy::artifact::text::try_parse(
+        &fs::read_to_string(&artifact).expect("the built artifact is readable"),
+    )
+    .expect("the built artifact parses");
+    let program = Program::load(&linked).expect("the linked artifact loads");
+    let interpreted = exports
+        .iter()
+        .map(|name| render::json(&program.export(name).expect("an exported value")))
+        .collect();
     let javascript = artifact.with_extension("js");
     let reads = exports
         .iter()
@@ -460,17 +479,141 @@ fn both(source: &str, exports: &[&str], integers: Option<u32>) -> (Vec<String>, 
         serde_json::from_slice(&output.stdout).expect("the probe prints JSON");
     let node = values.iter().map(|value| value.to_string()).collect();
 
-    // Interpret the same linked artifact that build_project gave the JS backend.
-    let linked = ruddy::artifact::text::try_parse(
-        &fs::read_to_string(artifact).expect("the built artifact is readable"),
-    )
-    .expect("the built artifact parses");
-    let program = Program::load(&linked).expect("the linked artifact loads");
-    let interpreted = exports
-        .iter()
-        .map(|name| render::json(&program.export(name).expect("an exported value")))
-        .collect();
     (node, interpreted)
+}
+
+#[test]
+fn structural_contracts_keep_tagged_input_payloads() {
+    let (node, interpreted) = both_with_standard(
+        r#"
+@private let wants: Nat -> Nat = fn value => value
+@private let choose = fn value => match value with
+| #Scalar {a} => wants a
+| #Call {a, b} => wants (a ())
+end
+let scalar = choose (#Scalar {a: 1n})
+let callable = choose (#Call {a: fn _ => 2n, b: ()})
+"#,
+        &["scalar", "callable"],
+        None,
+        false,
+    );
+    assert_eq!(node, ["1", "2"]);
+    assert_eq!(interpreted, node);
+}
+
+#[test]
+fn structural_contracts_keep_exact_rest_tests_before_catchalls() {
+    let (node, interpreted) = both_with_standard(
+        r#"
+@private let record = fn value => match value with | () => 1n | _ => 2n end
+@private let tag = fn value => match value with | #Red => 3n | _ => 4n end
+@private let field_tag = fn value => match value with | #Red {extra} => 5n | #Red => 6n end
+let empty_record = record ()
+let extra_record = record {extra: ()}
+let empty_tag = tag #Red
+let extra_tag = tag (#Red {extra: ()})
+let no_field = field_tag #Red
+let has_field = field_tag (#Red {extra: ()})
+"#,
+        &[
+            "empty_record",
+            "extra_record",
+            "empty_tag",
+            "extra_tag",
+            "no_field",
+            "has_field",
+        ],
+        None,
+        false,
+    );
+    assert_eq!(node, ["1", "2", "3", "4", "6", "5"]);
+    assert_eq!(interpreted, node);
+}
+
+#[test]
+fn structural_contracts_preserve_callbacks_after_invoking_them() {
+    let (node, interpreted) = both_with_standard(
+        r#"
+effect Ask = { ask: () -> Nat }
+@private let callback = fn _ => !Ask.ask ()
+@private let touch = fn action => do _ = action () return action end
+@private let touch_record = fn action => do _ = action () return {run: action} end
+let result = handle (touch callback) () with | !Ask.ask _ => 44n end
+let record = handle (touch_record callback).run () with | !Ask.ask _ => 45n end
+"#,
+        &["result", "record"],
+        None,
+        false,
+    );
+    assert_eq!(node, ["44", "45"]);
+    assert_eq!(interpreted, node);
+}
+
+#[test]
+fn structural_contracts_preserve_effectful_function_payloads() {
+    let (node, interpreted) = both_with_standard(
+        r#"
+effect Ask = { ask: () -> Nat }
+@private let extend4 = fn
+| () => (#None, #None, #None, #None)
+| (a,) => (a, #None, #None, #None)
+| (a, b) => (a, b, #None, #None)
+| (a, b, c) => (a, b, c, #None)
+| (a, b, c, d) => (a, b, c, d)
+@private let get_channel = fn channel image => match channel with
+| #Red => image.r
+| #Green => image.g
+end
+@private let set_channel = fn channel value image => match channel with
+| #Red => { r: value, ..image }
+| #Green => { g: value, ..image }
+end
+@private let callback = fn _ => !Ask.ask ()
+@private let padded_values = extend4 (#Some callback, #Some 9n)
+let number = match padded_values with | (_, #Some value, _, _) => value end
+let padded = match padded_values with
+| (#Some padded_callback, _, _, _) =>
+  handle padded_callback () with | !Ask.ask _ => 41n end
+end
+@private let image = set_channel #Green (#Function callback) { r: #Number 7n, g: #Text "old" }
+let updated = match get_channel #Green image with
+| #Function selected => handle selected () with | !Ask.ask _ => 42n end
+end
+let preserved = match get_channel #Red image with | #Number number => number end
+@private extern info_of: 'a -> TypeInfo 'a = "$infoOf"
+@private let reflect = fn value => info_of value
+let reflected = do
+  return match extend4 (#Some reflect,) with
+  | (#Some padded_reflect, _, _, _) => do
+    let info: TypeInfo Nat = padded_reflect 3n
+    return 5n
+  end
+  end
+end
+@private let choose = fn choice => match choice with
+| #Pure => fn value => value
+| #Effect => fn value => !Ask.ask ()
+end
+let conditional = handle (choose #Effect) 1n with
+| !Ask.ask _ => 43n
+end
+let conditional_pure = (choose #Pure) 8n
+"#,
+        &[
+            "padded",
+            "number",
+            "updated",
+            "preserved",
+            "reflected",
+            "conditional",
+            "conditional_pure",
+        ],
+        None,
+        false,
+    );
+    assert_eq!(node, ["41", "9", "42", "7", "5", "43", "8"]);
+    assert_eq!(interpreted, node);
 }
 
 /// Compile, link, and load a program the interpreter can run.

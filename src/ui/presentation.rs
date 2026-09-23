@@ -12,6 +12,27 @@ pub struct TypePresentation {
 }
 
 impl TypePresentation {
+    /// Present a resolved expression type whose free parameters are visible in
+    /// the type itself. Unresolved solver identities and package ownership need
+    /// their enclosing scheme, so callers retain bounded recovery text there.
+    pub(crate) fn resolved_type<'a>(
+        ty: &std::sync::Arc<Ty>,
+        aliases: impl IntoIterator<Item = (&'a str, &'a Scheme)>,
+    ) -> Option<Self> {
+        let (bounds, _) = contract_parameters(ty, &HashMap::new())?;
+        let count = match bounds.iter().max() {
+            Some(index) => index.checked_add(1)?,
+            None => 0,
+        };
+        // A sparse malformed index must not allocate an unbounded name table
+        // while an editor is recovering an incomplete expression.
+        if count > 65_536 {
+            return None;
+        }
+        let scheme = Scheme::new(count, ty.clone());
+        Some(Self::new(&scheme, aliases))
+    }
+
     /// `aliases` must contain only names accessible in the destination scope.
     /// All supplied names are reserved, including aliases ineligible for reuse.
     /// Reuse is conservative: unconstrained, fully parameterized structural
@@ -22,6 +43,18 @@ impl TypePresentation {
     ) -> Self {
         let aliases: Vec<_> = aliases.into_iter().collect();
         let plan = PresencePlan::new(scheme);
+        // A shared captured callable must be named before it is expanded.
+        // Inline presence bounds cannot move into the helper declarations, so
+        // keep them explicit instead of first rendering an unshared candidate.
+        if !plan.bounds.is_empty()
+            && scan(scheme.body(), 4096).is_none_or(|scan| {
+                scan.types
+                    .iter()
+                    .any(|ty| matches!(ty, Ty::Contract { .. }))
+            })
+        {
+            return Self::with_plan(scheme, &aliases, &PresencePlan::explicit(scheme));
+        }
         let compact = Self::with_plan(scheme, &aliases, &plan);
         if plan.bounds.is_empty() {
             return compact;
@@ -45,12 +78,21 @@ impl TypePresentation {
         let mut definitions = Vec::new();
         let mut reserved: HashSet<String> =
             aliases.iter().map(|(name, _)| name.to_string()).collect();
+        if plan.bounds.is_empty() {
+            share_contracts(
+                scheme,
+                &names,
+                &mut reserved,
+                &mut replacements,
+                &mut definitions,
+            );
+        }
         // Bounded optimization, not bounded display. Large or recovery types
         // always fall back to the complete explicit-stack semantic formatter.
         let Some(all) = scan(scheme.body(), 4096) else {
             return Self {
                 definitions,
-                annotation: scheme.to_string(),
+                annotation: render_scheme(scheme, &names, &replacements, plan),
             };
         };
         for ty in &all.types {
@@ -218,6 +260,194 @@ impl TypePresentation {
     }
 }
 
+/// Captured contracts can share another callable across several nested type
+/// scopes. Expression-local `let` cannot name such a type; ordinary parameterized
+/// type declarations preserve that sharing without extending annotation syntax.
+fn share_contracts(
+    scheme: &Scheme,
+    names: &[String],
+    reserved: &mut HashSet<String>,
+    replacements: &mut HashMap<usize, String>,
+    definitions: &mut Vec<String>,
+) {
+    fn children(ty: &Ty) -> Vec<&Ty> {
+        fn row<'a>(row: &'a Row, out: &mut Vec<&'a Ty>) {
+            let (fields, _) = flattened_row(row);
+            out.extend(fields.into_iter().map(|(_, field)| &*field.ty));
+        }
+        let mut out = Vec::new();
+        match ty {
+            Ty::Contract { contract, .. } => out.extend(contract.type_operands().map(|ty| &**ty)),
+            Ty::Named { args: types, .. } => out.extend(types.iter().map(|ty| &**ty)),
+            Ty::Arrow(from, to, effects) => {
+                out.extend([&**from, &**to]);
+                row(effects, &mut out);
+            }
+            Ty::Struct(fields) | Ty::Sum(fields) => row(fields, &mut out),
+            Ty::Mut(region, inner) => out.extend([&**region, &**inner]),
+            Ty::Array(inner)
+            | Ty::Mirror(inner)
+            | Ty::TypeInfo(inner)
+            | Ty::Package(inner)
+            | Ty::Hidden { body: inner, .. } => out.push(inner),
+            _ => {}
+        }
+        out
+    }
+    let mut seen = HashSet::new();
+    let mut counts = HashMap::<usize, usize>::new();
+    let mut order = Vec::new();
+    let mut work = vec![(scheme.body().as_ref(), false)];
+    while let Some((ty, finish)) = work.pop() {
+        let key = ty as *const Ty as usize;
+        if finish {
+            order.push(ty);
+            continue;
+        }
+        *counts.entry(key).or_default() += 1;
+        if !seen.insert(key) {
+            continue;
+        }
+        if let Ty::Named { name, .. } = ty {
+            reserved.insert(name.to_string());
+        }
+        work.push((ty, true));
+        work.extend(children(ty).into_iter().rev().map(|ty| (ty, false)));
+    }
+    let mut parameters = HashMap::<usize, (Vec<u32>, HashMap<u32, bool>)>::new();
+    for ty in order {
+        let key = ty as *const Ty as usize;
+        if counts[&key] < 2 || !matches!(ty, Ty::Contract { .. }) {
+            continue;
+        }
+        let Some((bounds, rows)) = contract_parameters(ty, &parameters) else {
+            continue;
+        };
+        if bounds.iter().any(|index| {
+            scheme.is_existential(*index) || names.get(*index as usize).is_none_or(String::is_empty)
+        }) {
+            continue;
+        }
+        let mut name = "InferredContract".to_string();
+        let mut suffix = 2;
+        while !reserved.insert(name.clone()) {
+            name = format!("InferredContract{suffix}");
+            suffix += 1;
+        }
+        let params: String = bounds
+            .iter()
+            .map(|index| format!(" {}", names[*index as usize]))
+            .collect();
+        let body = Render {
+            ty,
+            names,
+            replacements,
+            formula: None,
+            bounds: &HashMap::new(),
+        }
+        .to_string();
+        definitions.push(format!("type {name}{params} = {body}"));
+        let args: String = bounds
+            .iter()
+            .map(|index| {
+                let name = &names[*index as usize];
+                match rows.get(index) {
+                    Some(true) => format!(" (..{name})"),
+                    Some(false) => format!(" {{ ..{name} }}"),
+                    None => format!(" {name}"),
+                }
+            })
+            .collect();
+        replacements.insert(key, format!("{name}{args}"));
+        parameters.insert(key, (bounds, rows));
+    }
+}
+
+/// Free parameters of one displayable contract, stopping at aliases already
+/// emitted in postorder. Metadata fallbacks never participate in its spelling.
+fn contract_parameters(
+    ty: &Ty,
+    aliases: &HashMap<usize, (Vec<u32>, HashMap<u32, bool>)>,
+) -> Option<(Vec<u32>, HashMap<u32, bool>)> {
+    enum Job<'a> {
+        Ty(&'a Ty),
+        Row(&'a Row, bool),
+        Rest(&'a Rest, bool),
+        Presence(&'a Presence),
+    }
+    let mut work = vec![Job::Ty(ty)];
+    let mut seen = HashSet::new();
+    let mut bounds = indexmap::IndexSet::new();
+    let mut rows = HashMap::new();
+    while let Some(job) = work.pop() {
+        match job {
+            Job::Ty(ty) => {
+                let key = ty as *const Ty as usize;
+                if !seen.insert(key) {
+                    continue;
+                }
+                if let Some((known, kinds)) = aliases.get(&key) {
+                    bounds.extend(known);
+                    rows.extend(kinds);
+                    continue;
+                }
+                match ty {
+                    Ty::Bound(index) => {
+                        bounds.insert(*index);
+                    }
+                    Ty::Contract { contract, .. } => {
+                        work.extend(contract.type_operands().map(|ty| Job::Ty(ty)))
+                    }
+                    Ty::Named { args: types, .. } => {
+                        work.extend(types.iter().map(|ty| Job::Ty(ty)))
+                    }
+                    Ty::Arrow(from, to, effects) => {
+                        work.push(Job::Row(effects, true));
+                        work.push(Job::Ty(to));
+                        work.push(Job::Ty(from));
+                    }
+                    Ty::Struct(row) | Ty::Sum(row) => work.push(Job::Row(row, false)),
+                    Ty::Mut(region, inner) => {
+                        work.push(Job::Ty(inner));
+                        work.push(Job::Ty(region));
+                    }
+                    Ty::Array(inner) | Ty::Mirror(inner) | Ty::TypeInfo(inner) => {
+                        work.push(Job::Ty(inner))
+                    }
+                    Ty::Presence(presence) => work.push(Job::Presence(presence)),
+                    Ty::Hidden { .. }
+                    | Ty::HiddenVar { .. }
+                    | Ty::Package(_)
+                    | Ty::Var(_)
+                    | Ty::Rigid { .. }
+                    | Ty::Undecided => return None,
+                    _ => {}
+                }
+            }
+            Job::Row(row, effects) => {
+                let (fields, rest) = flattened_row(row);
+                work.push(Job::Rest(rest, effects));
+                for (_, field) in fields {
+                    work.push(Job::Ty(&field.ty));
+                    work.push(Job::Presence(&field.presence));
+                }
+            }
+            Job::Rest(Rest::Bound(index), effects) => {
+                bounds.insert(*index);
+                rows.insert(*index, effects);
+            }
+            Job::Rest(Rest::Closed, _) => {}
+            Job::Rest(Rest::More(row), effects) => work.push(Job::Row(row, effects)),
+            Job::Presence(Presence::Bound(index)) => {
+                bounds.insert(*index);
+            }
+            Job::Presence(Presence::Present | Presence::Absent) => {}
+            Job::Rest(_, _) | Job::Presence(_) => return None,
+        }
+    }
+    Some((bounds.into_iter().collect(), rows))
+}
+
 impl fmt::Display for TypePresentation {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.declaration(""))
@@ -354,6 +584,11 @@ fn scan(ty: &Ty, limit: usize) -> Option<Scan<'_>> {
             Job::Ty(ty) => {
                 out.types.push(ty);
                 match ty {
+                    Ty::Contract { fallback, contract } => {
+                        out.safe = false;
+                        work.push(Job::Ty(fallback));
+                        work.extend(contract.type_operands().map(|ty| Job::Ty(ty)));
+                    }
                     Ty::Bound(index) => out.bounds.push(*index),
                     Ty::Presence(p) => {
                         if let Presence::Bound(index) = p {
@@ -428,7 +663,12 @@ fn scan(ty: &Ty, limit: usize) -> Option<Scan<'_>> {
 }
 
 pub(super) fn anonymous_presences(scheme: &Scheme) -> Vec<u32> {
-    let scan = scan(scheme.body(), usize::MAX).expect("unbounded iterative walk");
+    if scheme.presences() == 0 {
+        return Vec::new();
+    }
+    let Some(scan) = scan(scheme.body(), 4096) else {
+        return Vec::new();
+    };
     let mut counts = HashMap::<u32, usize>::new();
     for index in scan.presences {
         *counts.entry(index).or_default() += 1;

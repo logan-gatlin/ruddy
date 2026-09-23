@@ -139,10 +139,15 @@ impl Validator<'_> {
             Row(&'a Row, Sense),
         }
         let mut work = vec![Work::Ty(root, sense)];
+        let mut seen = std::collections::HashSet::new();
         let mutation = crate::types::mutation_effect().row_key();
         while let Some(part) = work.pop() {
             match part {
                 Work::Ty(ty, sense) => {
+                    let ty = ty.unshared();
+                    if !seen.insert((ty as *const Type, sense.map(|sense| sense as u8))) {
+                        continue;
+                    }
                     if let Type::Bound(index) = ty {
                         self.bound(*index, sense)?;
                         continue;
@@ -151,6 +156,11 @@ impl Validator<'_> {
                         return Err("a region position requires a bound region variable");
                     }
                     match ty {
+                        Type::Contract { fallback, contract } => {
+                            super::contracts::validate(contract)?;
+                            work.push(Work::Ty(fallback, sense));
+                            work.extend(contract.type_operands().map(|ty| Work::Ty(ty, None)));
+                        }
                         Type::Mut(region, element) => {
                             work.push(Work::Ty(region, Some(Sense::Region)));
                             work.push(Work::Ty(element, Some(Sense::Type)));
@@ -201,8 +211,11 @@ impl Validator<'_> {
                             // Imported effect headers may live only in a dependency.
                             // Their tuple is still an argument list: an unknown slot
                             // kind must not turn a region argument into a value type.
-                            if builtin || kinds.is_some() || matches!(&field.ty, Type::Struct(_)) {
-                                let Type::Struct(args) = &field.ty else {
+                            if builtin
+                                || kinds.is_some()
+                                || matches!(field.ty.unshared(), Type::Struct(_))
+                            {
+                                let Type::Struct(args) = field.ty.unshared() else {
                                     return Err("invalid effect argument tuple");
                                 };
                                 if builtin

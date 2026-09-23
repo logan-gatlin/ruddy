@@ -709,6 +709,57 @@ impl fmt::Display for Ast<'_, PatternKind> {
 impl fmt::Display for Ast<'_, TypeKind> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.0 {
+            TypeKind::Structural {
+                parameters,
+                body,
+                captures,
+                effect_sink,
+            } => {
+                f.write_str(&ruddy::ui::structural_type_text(
+                    *parameters,
+                    body,
+                    &captures
+                        .iter()
+                        .map(|ty| Ast(&ty.tracked).to_string())
+                        .collect::<Vec<_>>(),
+                ))?;
+                if let Some(sink) = effect_sink
+                    && let TypeKind::Arrow {
+                        effects: Some(effects),
+                        ..
+                    } = &sink.tracked
+                {
+                    write!(f, " + {}", effect_row(effects))?;
+                }
+                Ok(())
+            }
+            TypeKind::Match(arms) => {
+                f.write_str("match")?;
+                for (from, to) in arms {
+                    let grouped = matches!(&from.tracked, TypeKind::Sum { cases, spreads, tail }
+                        if cases.len() != 1 || !spreads.is_empty() || tail.is_some());
+                    f.write_str(" | ")?;
+                    if grouped {
+                        f.write_str("(")?;
+                    }
+                    write!(f, "{}", Ast(&from.tracked))?;
+                    if grouped {
+                        f.write_str(")")?;
+                    }
+                    // A result can end in an unclosed `fn | ...`, including
+                    // through an arrow or `hide`. Keep the next arm outside it.
+                    let grouped = ruddy::ui::type_prec(&to.tracked) <= Prec::Arrow;
+                    f.write_str(" => ")?;
+                    if grouped {
+                        f.write_str("(")?;
+                    }
+                    write!(f, "{}", Ast(&to.tracked))?;
+                    if grouped {
+                        f.write_str(")")?;
+                    }
+                }
+                f.write_str(" end")
+            }
             TypeKind::Arrow { from, to, effects } => {
                 let row = effects.as_deref().map(effect_row);
                 write_arrow(

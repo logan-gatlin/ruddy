@@ -40,6 +40,10 @@
             "named": true
           },
           {
+            "type": "match_type",
+            "named": true
+          },
+          {
             "type": "mut_type",
             "named": true
           },
@@ -354,6 +358,10 @@
             "named": true
           },
           {
+            "type": "match_type",
+            "named": true
+          },
+          {
             "type": "mut_type",
             "named": true
           },
@@ -371,6 +379,10 @@
           },
           {
             "type": "struct_type",
+            "named": true
+          },
+          {
+            "type": "structural_contract_type",
             "named": true
           },
           {
@@ -454,6 +466,10 @@
             "named": true
           },
           {
+            "type": "match_type",
+            "named": true
+          },
+          {
             "type": "mut_type",
             "named": true
           },
@@ -467,6 +483,10 @@
           },
           {
             "type": "struct_type",
+            "named": true
+          },
+          {
+            "type": "structural_contract_type",
             "named": true
           },
           {
@@ -880,6 +900,10 @@
             "named": true
           },
           {
+            "type": "match_type",
+            "named": true
+          },
+          {
             "type": "mut_type",
             "named": true
           },
@@ -893,6 +917,10 @@
           },
           {
             "type": "struct_type",
+            "named": true
+          },
+          {
+            "type": "structural_contract_type",
             "named": true
           },
           {
@@ -2746,6 +2774,10 @@
             "named": true
           },
           {
+            "type": "match_type",
+            "named": true
+          },
+          {
             "type": "mut_type",
             "named": true
           },
@@ -2832,6 +2864,10 @@
           },
           {
             "type": "identifier",
+            "named": true
+          },
+          {
+            "type": "match_type",
             "named": true
           },
           {
@@ -3353,6 +3389,10 @@
             "named": true
           },
           {
+            "type": "match_type",
+            "named": true
+          },
+          {
             "type": "mut_type",
             "named": true
           },
@@ -3370,6 +3410,10 @@
           },
           {
             "type": "struct_type",
+            "named": true
+          },
+          {
+            "type": "structural_contract_type",
             "named": true
           },
           {
@@ -3487,6 +3531,10 @@
             "named": true
           },
           {
+            "type": "match_type",
+            "named": true
+          },
+          {
             "type": "mut_type",
             "named": true
           },
@@ -3504,6 +3552,10 @@
           },
           {
             "type": "struct_type",
+            "named": true
+          },
+          {
+            "type": "structural_contract_type",
             "named": true
           },
           {
@@ -3569,6 +3621,10 @@
             "named": true
           },
           {
+            "type": "match_type",
+            "named": true
+          },
+          {
             "type": "mut_type",
             "named": true
           },
@@ -3586,6 +3642,10 @@
           },
           {
             "type": "struct_type",
+            "named": true
+          },
+          {
+            "type": "structural_contract_type",
             "named": true
           },
           {
@@ -3821,6 +3881,10 @@
             "named": true
           },
           {
+            "type": "match_type",
+            "named": true
+          },
+          {
             "type": "mut_type",
             "named": true
           },
@@ -3891,6 +3955,10 @@
             "named": true
           },
           {
+            "type": "match_type",
+            "named": true
+          },
+          {
             "type": "mut_type",
             "named": true
           },
@@ -3904,6 +3972,10 @@
           },
           {
             "type": "struct_type",
+            "named": true
+          },
+          {
+            "type": "structural_contract_type",
             "named": true
           },
           {
@@ -4339,6 +4411,10 @@
             "named": true
           },
           {
+            "type": "match_type",
+            "named": true
+          },
+          {
             "type": "mut_type",
             "named": true
           },
@@ -4352,6 +4428,10 @@
           },
           {
             "type": "struct_type",
+            "named": true
+          },
+          {
+            "type": "structural_contract_type",
             "named": true
           },
           {
@@ -5020,6 +5100,10 @@
             "named": true
           },
           {
+            "type": "match_type",
+            "named": true
+          },
+          {
             "type": "mut_type",
             "named": true
           },
@@ -5033,6 +5117,10 @@
           },
           {
             "type": "struct_type",
+            "named": true
+          },
+          {
+            "type": "structural_contract_type",
             "named": true
           },
           {
@@ -5417,6 +5505,183 @@
     }
   },
   {
+    "type": "match_type",
+    "named": true,
+    "fields": {},
+    "children": {
+      "multiple": true,
+      "required": false,
+      "types": [
+        {
+          "type": "match_type_arm",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
+    "type": "match_type_arm",
+    "named": true,
+    "fields": {
+      "from": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "array_type",
+            "named": true
+          },
+          {
+            "type": "boolean",
+            "named": true
+          },
+          {
+            "type": "effect_type",
+            "named": true
+          },
+          {
+            "type": "function_type",
+            "named": true
+          },
+          {
+            "type": "hidden_type",
+            "named": true
+          },
+          {
+            "type": "hole",
+            "named": true
+          },
+          {
+            "type": "identifier",
+            "named": true
+          },
+          {
+            "type": "match_type",
+            "named": true
+          },
+          {
+            "type": "mut_type",
+            "named": true
+          },
+          {
+            "type": "parenthesized_type",
+            "named": true
+          },
+          {
+            "type": "path",
+            "named": true
+          },
+          {
+            "type": "struct_type",
+            "named": true
+          },
+          {
+            "type": "structural_contract_type",
+            "named": true
+          },
+          {
+            "type": "sum_type",
+            "named": true
+          },
+          {
+            "type": "tuple_type",
+            "named": true
+          },
+          {
+            "type": "type_application",
+            "named": true
+          },
+          {
+            "type": "type_variable",
+            "named": true
+          },
+          {
+            "type": "unit",
+            "named": true
+          }
+        ]
+      },
+      "to": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "array_type",
+            "named": true
+          },
+          {
+            "type": "boolean",
+            "named": true
+          },
+          {
+            "type": "effect_type",
+            "named": true
+          },
+          {
+            "type": "function_type",
+            "named": true
+          },
+          {
+            "type": "hidden_type",
+            "named": true
+          },
+          {
+            "type": "hole",
+            "named": true
+          },
+          {
+            "type": "identifier",
+            "named": true
+          },
+          {
+            "type": "match_type",
+            "named": true
+          },
+          {
+            "type": "mut_type",
+            "named": true
+          },
+          {
+            "type": "parenthesized_type",
+            "named": true
+          },
+          {
+            "type": "path",
+            "named": true
+          },
+          {
+            "type": "struct_type",
+            "named": true
+          },
+          {
+            "type": "structural_contract_type",
+            "named": true
+          },
+          {
+            "type": "sum_type",
+            "named": true
+          },
+          {
+            "type": "tuple_type",
+            "named": true
+          },
+          {
+            "type": "type_application",
+            "named": true
+          },
+          {
+            "type": "type_variable",
+            "named": true
+          },
+          {
+            "type": "unit",
+            "named": true
+          }
+        ]
+      }
+    }
+  },
+  {
     "type": "module_definition",
     "named": true,
     "fields": {
@@ -5691,6 +5956,10 @@
             "named": true
           },
           {
+            "type": "match_type",
+            "named": true
+          },
+          {
             "type": "mut_type",
             "named": true
           },
@@ -5738,6 +6007,10 @@
           },
           {
             "type": "identifier",
+            "named": true
+          },
+          {
+            "type": "match_type",
             "named": true
           },
           {
@@ -6142,6 +6415,112 @@
     }
   },
   {
+    "type": "parenthesized_structural_expression",
+    "named": true,
+    "fields": {},
+    "children": {
+      "multiple": false,
+      "required": true,
+      "types": [
+        {
+          "type": "hole",
+          "named": true
+        },
+        {
+          "type": "identifier",
+          "named": true
+        },
+        {
+          "type": "parenthesized_structural_expression",
+          "named": true
+        },
+        {
+          "type": "path",
+          "named": true
+        },
+        {
+          "type": "structural_application",
+          "named": true
+        },
+        {
+          "type": "structural_capture",
+          "named": true
+        },
+        {
+          "type": "structural_match",
+          "named": true
+        },
+        {
+          "type": "structural_projection",
+          "named": true
+        },
+        {
+          "type": "structural_record",
+          "named": true
+        },
+        {
+          "type": "structural_tag",
+          "named": true
+        },
+        {
+          "type": "structural_then",
+          "named": true
+        },
+        {
+          "type": "structural_tuple",
+          "named": true
+        },
+        {
+          "type": "type_variable",
+          "named": true
+        },
+        {
+          "type": "unit",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
+    "type": "parenthesized_structural_pattern",
+    "named": true,
+    "fields": {},
+    "children": {
+      "multiple": false,
+      "required": true,
+      "types": [
+        {
+          "type": "parenthesized_structural_pattern",
+          "named": true
+        },
+        {
+          "type": "structural_record_pattern",
+          "named": true
+        },
+        {
+          "type": "structural_tag_pattern",
+          "named": true
+        },
+        {
+          "type": "structural_tuple_pattern",
+          "named": true
+        },
+        {
+          "type": "type_variable",
+          "named": true
+        },
+        {
+          "type": "unit",
+          "named": true
+        },
+        {
+          "type": "wildcard",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
     "type": "parenthesized_type",
     "named": true,
     "fields": {},
@@ -6178,6 +6557,10 @@
           "named": true
         },
         {
+          "type": "match_type",
+          "named": true
+        },
+        {
           "type": "mut_type",
           "named": true
         },
@@ -6191,6 +6574,10 @@
         },
         {
           "type": "struct_type",
+          "named": true
+        },
+        {
+          "type": "structural_contract_type",
           "named": true
         },
         {
@@ -7280,6 +7667,10 @@
             "named": true
           },
           {
+            "type": "match_type",
+            "named": true
+          },
+          {
             "type": "mut_type",
             "named": true
           },
@@ -7293,6 +7684,10 @@
           },
           {
             "type": "struct_type",
+            "named": true
+          },
+          {
+            "type": "structural_contract_type",
             "named": true
           },
           {
@@ -7334,6 +7729,1094 @@
     }
   },
   {
+    "type": "structural_application",
+    "named": true,
+    "fields": {
+      "argument": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "hole",
+            "named": true
+          },
+          {
+            "type": "identifier",
+            "named": true
+          },
+          {
+            "type": "parenthesized_structural_expression",
+            "named": true
+          },
+          {
+            "type": "path",
+            "named": true
+          },
+          {
+            "type": "structural_capture",
+            "named": true
+          },
+          {
+            "type": "structural_match",
+            "named": true
+          },
+          {
+            "type": "structural_record",
+            "named": true
+          },
+          {
+            "type": "structural_tag",
+            "named": true
+          },
+          {
+            "type": "structural_then",
+            "named": true
+          },
+          {
+            "type": "structural_tuple",
+            "named": true
+          },
+          {
+            "type": "type_variable",
+            "named": true
+          },
+          {
+            "type": "unit",
+            "named": true
+          }
+        ]
+      },
+      "function": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "hole",
+            "named": true
+          },
+          {
+            "type": "identifier",
+            "named": true
+          },
+          {
+            "type": "parenthesized_structural_expression",
+            "named": true
+          },
+          {
+            "type": "path",
+            "named": true
+          },
+          {
+            "type": "structural_application",
+            "named": true
+          },
+          {
+            "type": "structural_capture",
+            "named": true
+          },
+          {
+            "type": "structural_match",
+            "named": true
+          },
+          {
+            "type": "structural_projection",
+            "named": true
+          },
+          {
+            "type": "structural_record",
+            "named": true
+          },
+          {
+            "type": "structural_tag",
+            "named": true
+          },
+          {
+            "type": "structural_then",
+            "named": true
+          },
+          {
+            "type": "structural_tuple",
+            "named": true
+          },
+          {
+            "type": "type_variable",
+            "named": true
+          },
+          {
+            "type": "unit",
+            "named": true
+          }
+        ]
+      }
+    }
+  },
+  {
+    "type": "structural_capture",
+    "named": true,
+    "fields": {
+      "type": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "array_type",
+            "named": true
+          },
+          {
+            "type": "boolean",
+            "named": true
+          },
+          {
+            "type": "effect_type",
+            "named": true
+          },
+          {
+            "type": "function_type",
+            "named": true
+          },
+          {
+            "type": "hidden_type",
+            "named": true
+          },
+          {
+            "type": "hole",
+            "named": true
+          },
+          {
+            "type": "identifier",
+            "named": true
+          },
+          {
+            "type": "match_type",
+            "named": true
+          },
+          {
+            "type": "mut_type",
+            "named": true
+          },
+          {
+            "type": "parenthesized_type",
+            "named": true
+          },
+          {
+            "type": "path",
+            "named": true
+          },
+          {
+            "type": "struct_type",
+            "named": true
+          },
+          {
+            "type": "structural_contract_type",
+            "named": true
+          },
+          {
+            "type": "sum_type",
+            "named": true
+          },
+          {
+            "type": "tuple_type",
+            "named": true
+          },
+          {
+            "type": "type_application",
+            "named": true
+          },
+          {
+            "type": "type_variable",
+            "named": true
+          },
+          {
+            "type": "unit",
+            "named": true
+          }
+        ]
+      }
+    }
+  },
+  {
+    "type": "structural_contract_type",
+    "named": true,
+    "fields": {
+      "body": {
+        "multiple": false,
+        "required": false,
+        "types": [
+          {
+            "type": "hole",
+            "named": true
+          },
+          {
+            "type": "identifier",
+            "named": true
+          },
+          {
+            "type": "parenthesized_structural_expression",
+            "named": true
+          },
+          {
+            "type": "path",
+            "named": true
+          },
+          {
+            "type": "structural_application",
+            "named": true
+          },
+          {
+            "type": "structural_capture",
+            "named": true
+          },
+          {
+            "type": "structural_match",
+            "named": true
+          },
+          {
+            "type": "structural_projection",
+            "named": true
+          },
+          {
+            "type": "structural_record",
+            "named": true
+          },
+          {
+            "type": "structural_tag",
+            "named": true
+          },
+          {
+            "type": "structural_then",
+            "named": true
+          },
+          {
+            "type": "structural_tuple",
+            "named": true
+          },
+          {
+            "type": "type_variable",
+            "named": true
+          },
+          {
+            "type": "unit",
+            "named": true
+          }
+        ]
+      },
+      "effects": {
+        "multiple": false,
+        "required": false,
+        "types": [
+          {
+            "type": "effect_row",
+            "named": true
+          }
+        ]
+      },
+      "parameter": {
+        "multiple": true,
+        "required": false,
+        "types": [
+          {
+            "type": "type_variable",
+            "named": true
+          }
+        ]
+      }
+    },
+    "children": {
+      "multiple": true,
+      "required": false,
+      "types": [
+        {
+          "type": "structural_match_arm",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
+    "type": "structural_field",
+    "named": true,
+    "fields": {
+      "name": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "ERROR",
+            "named": true
+          },
+          {
+            "type": "identifier",
+            "named": true
+          },
+          {
+            "type": "numeric_field",
+            "named": true
+          },
+          {
+            "type": "string",
+            "named": true
+          }
+        ]
+      },
+      "value": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "hole",
+            "named": true
+          },
+          {
+            "type": "identifier",
+            "named": true
+          },
+          {
+            "type": "parenthesized_structural_expression",
+            "named": true
+          },
+          {
+            "type": "path",
+            "named": true
+          },
+          {
+            "type": "structural_application",
+            "named": true
+          },
+          {
+            "type": "structural_capture",
+            "named": true
+          },
+          {
+            "type": "structural_match",
+            "named": true
+          },
+          {
+            "type": "structural_projection",
+            "named": true
+          },
+          {
+            "type": "structural_record",
+            "named": true
+          },
+          {
+            "type": "structural_tag",
+            "named": true
+          },
+          {
+            "type": "structural_then",
+            "named": true
+          },
+          {
+            "type": "structural_tuple",
+            "named": true
+          },
+          {
+            "type": "type_variable",
+            "named": true
+          },
+          {
+            "type": "unit",
+            "named": true
+          }
+        ]
+      }
+    }
+  },
+  {
+    "type": "structural_field_pattern",
+    "named": true,
+    "fields": {
+      "name": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "ERROR",
+            "named": true
+          },
+          {
+            "type": "identifier",
+            "named": true
+          },
+          {
+            "type": "numeric_field",
+            "named": true
+          },
+          {
+            "type": "string",
+            "named": true
+          }
+        ]
+      },
+      "pattern": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "parenthesized_structural_pattern",
+            "named": true
+          },
+          {
+            "type": "structural_record_pattern",
+            "named": true
+          },
+          {
+            "type": "structural_tag_pattern",
+            "named": true
+          },
+          {
+            "type": "structural_tuple_pattern",
+            "named": true
+          },
+          {
+            "type": "type_variable",
+            "named": true
+          },
+          {
+            "type": "unit",
+            "named": true
+          },
+          {
+            "type": "wildcard",
+            "named": true
+          }
+        ]
+      }
+    }
+  },
+  {
+    "type": "structural_match",
+    "named": true,
+    "fields": {},
+    "children": {
+      "multiple": true,
+      "required": true,
+      "types": [
+        {
+          "type": "hole",
+          "named": true
+        },
+        {
+          "type": "identifier",
+          "named": true
+        },
+        {
+          "type": "parenthesized_structural_expression",
+          "named": true
+        },
+        {
+          "type": "path",
+          "named": true
+        },
+        {
+          "type": "structural_application",
+          "named": true
+        },
+        {
+          "type": "structural_capture",
+          "named": true
+        },
+        {
+          "type": "structural_match",
+          "named": true
+        },
+        {
+          "type": "structural_match_arm",
+          "named": true
+        },
+        {
+          "type": "structural_projection",
+          "named": true
+        },
+        {
+          "type": "structural_record",
+          "named": true
+        },
+        {
+          "type": "structural_tag",
+          "named": true
+        },
+        {
+          "type": "structural_then",
+          "named": true
+        },
+        {
+          "type": "structural_tuple",
+          "named": true
+        },
+        {
+          "type": "type_variable",
+          "named": true
+        },
+        {
+          "type": "unit",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
+    "type": "structural_match_arm",
+    "named": true,
+    "fields": {},
+    "children": {
+      "multiple": true,
+      "required": true,
+      "types": [
+        {
+          "type": "hole",
+          "named": true
+        },
+        {
+          "type": "identifier",
+          "named": true
+        },
+        {
+          "type": "parenthesized_structural_expression",
+          "named": true
+        },
+        {
+          "type": "parenthesized_structural_pattern",
+          "named": true
+        },
+        {
+          "type": "path",
+          "named": true
+        },
+        {
+          "type": "structural_application",
+          "named": true
+        },
+        {
+          "type": "structural_capture",
+          "named": true
+        },
+        {
+          "type": "structural_match",
+          "named": true
+        },
+        {
+          "type": "structural_projection",
+          "named": true
+        },
+        {
+          "type": "structural_record",
+          "named": true
+        },
+        {
+          "type": "structural_record_pattern",
+          "named": true
+        },
+        {
+          "type": "structural_tag",
+          "named": true
+        },
+        {
+          "type": "structural_tag_pattern",
+          "named": true
+        },
+        {
+          "type": "structural_then",
+          "named": true
+        },
+        {
+          "type": "structural_tuple",
+          "named": true
+        },
+        {
+          "type": "structural_tuple_pattern",
+          "named": true
+        },
+        {
+          "type": "type_variable",
+          "named": true
+        },
+        {
+          "type": "unit",
+          "named": true
+        },
+        {
+          "type": "wildcard",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
+    "type": "structural_projection",
+    "named": true,
+    "fields": {
+      "base": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "hole",
+            "named": true
+          },
+          {
+            "type": "identifier",
+            "named": true
+          },
+          {
+            "type": "parenthesized_structural_expression",
+            "named": true
+          },
+          {
+            "type": "path",
+            "named": true
+          },
+          {
+            "type": "structural_application",
+            "named": true
+          },
+          {
+            "type": "structural_capture",
+            "named": true
+          },
+          {
+            "type": "structural_match",
+            "named": true
+          },
+          {
+            "type": "structural_projection",
+            "named": true
+          },
+          {
+            "type": "structural_record",
+            "named": true
+          },
+          {
+            "type": "structural_tag",
+            "named": true
+          },
+          {
+            "type": "structural_then",
+            "named": true
+          },
+          {
+            "type": "structural_tuple",
+            "named": true
+          },
+          {
+            "type": "type_variable",
+            "named": true
+          },
+          {
+            "type": "unit",
+            "named": true
+          }
+        ]
+      },
+      "field": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "ERROR",
+            "named": true
+          },
+          {
+            "type": "identifier",
+            "named": true
+          },
+          {
+            "type": "numeric_field",
+            "named": true
+          },
+          {
+            "type": "string",
+            "named": true
+          },
+          {
+            "type": "tag",
+            "named": true
+          }
+        ]
+      }
+    }
+  },
+  {
+    "type": "structural_record",
+    "named": true,
+    "fields": {},
+    "children": {
+      "multiple": true,
+      "required": false,
+      "types": [
+        {
+          "type": "structural_field",
+          "named": true
+        },
+        {
+          "type": "structural_spread",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
+    "type": "structural_record_pattern",
+    "named": true,
+    "fields": {},
+    "children": {
+      "multiple": true,
+      "required": false,
+      "types": [
+        {
+          "type": "structural_field_pattern",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
+    "type": "structural_spread",
+    "named": true,
+    "fields": {},
+    "children": {
+      "multiple": false,
+      "required": true,
+      "types": [
+        {
+          "type": "hole",
+          "named": true
+        },
+        {
+          "type": "identifier",
+          "named": true
+        },
+        {
+          "type": "parenthesized_structural_expression",
+          "named": true
+        },
+        {
+          "type": "path",
+          "named": true
+        },
+        {
+          "type": "structural_application",
+          "named": true
+        },
+        {
+          "type": "structural_capture",
+          "named": true
+        },
+        {
+          "type": "structural_match",
+          "named": true
+        },
+        {
+          "type": "structural_projection",
+          "named": true
+        },
+        {
+          "type": "structural_record",
+          "named": true
+        },
+        {
+          "type": "structural_tag",
+          "named": true
+        },
+        {
+          "type": "structural_then",
+          "named": true
+        },
+        {
+          "type": "structural_tuple",
+          "named": true
+        },
+        {
+          "type": "type_variable",
+          "named": true
+        },
+        {
+          "type": "unit",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
+    "type": "structural_tag",
+    "named": true,
+    "fields": {},
+    "children": {
+      "multiple": true,
+      "required": true,
+      "types": [
+        {
+          "type": "hole",
+          "named": true
+        },
+        {
+          "type": "identifier",
+          "named": true
+        },
+        {
+          "type": "parenthesized_structural_expression",
+          "named": true
+        },
+        {
+          "type": "path",
+          "named": true
+        },
+        {
+          "type": "structural_capture",
+          "named": true
+        },
+        {
+          "type": "structural_match",
+          "named": true
+        },
+        {
+          "type": "structural_record",
+          "named": true
+        },
+        {
+          "type": "structural_tag",
+          "named": true
+        },
+        {
+          "type": "structural_then",
+          "named": true
+        },
+        {
+          "type": "structural_tuple",
+          "named": true
+        },
+        {
+          "type": "tag",
+          "named": true
+        },
+        {
+          "type": "type_variable",
+          "named": true
+        },
+        {
+          "type": "unit",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
+    "type": "structural_tag_pattern",
+    "named": true,
+    "fields": {},
+    "children": {
+      "multiple": true,
+      "required": true,
+      "types": [
+        {
+          "type": "parenthesized_structural_pattern",
+          "named": true
+        },
+        {
+          "type": "structural_record_pattern",
+          "named": true
+        },
+        {
+          "type": "structural_tag_pattern",
+          "named": true
+        },
+        {
+          "type": "structural_tuple_pattern",
+          "named": true
+        },
+        {
+          "type": "tag",
+          "named": true
+        },
+        {
+          "type": "type_variable",
+          "named": true
+        },
+        {
+          "type": "unit",
+          "named": true
+        },
+        {
+          "type": "wildcard",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
+    "type": "structural_then",
+    "named": true,
+    "fields": {},
+    "children": {
+      "multiple": true,
+      "required": true,
+      "types": [
+        {
+          "type": "hole",
+          "named": true
+        },
+        {
+          "type": "identifier",
+          "named": true
+        },
+        {
+          "type": "parenthesized_structural_expression",
+          "named": true
+        },
+        {
+          "type": "path",
+          "named": true
+        },
+        {
+          "type": "structural_application",
+          "named": true
+        },
+        {
+          "type": "structural_capture",
+          "named": true
+        },
+        {
+          "type": "structural_match",
+          "named": true
+        },
+        {
+          "type": "structural_projection",
+          "named": true
+        },
+        {
+          "type": "structural_record",
+          "named": true
+        },
+        {
+          "type": "structural_tag",
+          "named": true
+        },
+        {
+          "type": "structural_then",
+          "named": true
+        },
+        {
+          "type": "structural_tuple",
+          "named": true
+        },
+        {
+          "type": "type_variable",
+          "named": true
+        },
+        {
+          "type": "unit",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
+    "type": "structural_tuple",
+    "named": true,
+    "fields": {},
+    "children": {
+      "multiple": true,
+      "required": true,
+      "types": [
+        {
+          "type": "hole",
+          "named": true
+        },
+        {
+          "type": "identifier",
+          "named": true
+        },
+        {
+          "type": "parenthesized_structural_expression",
+          "named": true
+        },
+        {
+          "type": "path",
+          "named": true
+        },
+        {
+          "type": "structural_application",
+          "named": true
+        },
+        {
+          "type": "structural_capture",
+          "named": true
+        },
+        {
+          "type": "structural_match",
+          "named": true
+        },
+        {
+          "type": "structural_projection",
+          "named": true
+        },
+        {
+          "type": "structural_record",
+          "named": true
+        },
+        {
+          "type": "structural_tag",
+          "named": true
+        },
+        {
+          "type": "structural_then",
+          "named": true
+        },
+        {
+          "type": "structural_tuple",
+          "named": true
+        },
+        {
+          "type": "type_variable",
+          "named": true
+        },
+        {
+          "type": "unit",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
+    "type": "structural_tuple_pattern",
+    "named": true,
+    "fields": {},
+    "children": {
+      "multiple": true,
+      "required": true,
+      "types": [
+        {
+          "type": "parenthesized_structural_pattern",
+          "named": true
+        },
+        {
+          "type": "structural_record_pattern",
+          "named": true
+        },
+        {
+          "type": "structural_tag_pattern",
+          "named": true
+        },
+        {
+          "type": "structural_tuple_pattern",
+          "named": true
+        },
+        {
+          "type": "type_variable",
+          "named": true
+        },
+        {
+          "type": "unit",
+          "named": true
+        },
+        {
+          "type": "wildcard",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
     "type": "sum_case",
     "named": true,
     "fields": {
@@ -7365,6 +8848,10 @@
           },
           {
             "type": "identifier",
+            "named": true
+          },
+          {
+            "type": "match_type",
             "named": true
           },
           {
@@ -7846,6 +9333,10 @@
             "named": true
           },
           {
+            "type": "match_type",
+            "named": true
+          },
+          {
             "type": "mut_type",
             "named": true
           },
@@ -7859,6 +9350,10 @@
           },
           {
             "type": "struct_type",
+            "named": true
+          },
+          {
+            "type": "structural_contract_type",
             "named": true
           },
           {
@@ -7910,6 +9405,10 @@
             "named": true
           },
           {
+            "type": "match_type",
+            "named": true
+          },
+          {
             "type": "mut_type",
             "named": true
           },
@@ -7957,6 +9456,10 @@
           },
           {
             "type": "identifier",
+            "named": true
+          },
+          {
+            "type": "match_type",
             "named": true
           },
           {
@@ -8378,6 +9881,10 @@
   {
     "type": "attribute_key",
     "named": true
+  },
+  {
+    "type": "capture",
+    "named": false
   },
   {
     "type": "do",

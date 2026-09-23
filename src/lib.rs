@@ -2,6 +2,7 @@ pub mod artifact;
 pub mod backend;
 pub mod bundle;
 pub mod compile;
+pub mod contracts;
 pub mod entry;
 pub mod execution;
 pub mod externs;

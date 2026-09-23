@@ -688,14 +688,17 @@ fn both_trees_render_a_where_clause_the_same_way() {
     }
 }
 
-/// The clause a definition ends up with is what its scheme prints, and it
-/// follows the whole type — omitted entirely when the definition requires
-/// nothing, which is what makes an ordinary program read exactly as before.
+/// Structural branches retain their input shapes, while an ordinary written
+/// presence relationship remains a clause after the complete type.
 #[test]
-fn a_scheme_prints_the_clause_it_requires() {
+fn schemes_print_structural_branches_and_explicit_presence_clauses() {
     for (source, expected) in [
         (
             "let p = fn a => match a with | {x} => {} | {y} => {} end",
+            "fn | { x: _ } => () | { y: _ } => ()",
+        ),
+        (
+            "let p: { x when 'x: 'a, y when 'y: 'b } -> () where 'x != 'y = fn _ => ()",
             "{ x when 'input_0_x: 'a, y when 'input_0_y: 'b } -> () where 'input_0_x != 'input_0_y",
         ),
         ("let id = fn x => x", "'a -> 'a"),
@@ -1072,7 +1075,7 @@ fn a_printed_scheme_reads_back_as_source() {
 /// The original wide-channel regression, through inference and the scheme
 /// printer rather than only the propositional presentation helpers.
 #[test]
-fn swizzle_prints_independent_channel_requirements_as_inline_bounds() {
+fn swizzle_prints_a_shared_writable_structural_contract() {
     let source = r#"
 let get_channel = fn channel img => match channel with
 | #Red => img.r | #Green => img.g | #Blue => img.b | #Alpha => img.a end
@@ -1096,10 +1099,21 @@ let swizzle = fn in_channels out_channels img => do
 end
 "#;
     let signature = printed_scheme(source);
-    let (_, constraints) = signature.split_once("\nwhere\n").expect("constraints");
     assert!(
-        signature.starts_with('('),
-        "tuple input must stay a tuple: {signature}"
+        signature.starts_with("fn 'input0 'input1 'input2 =>"),
+        "{signature}"
+    );
+    assert!(!signature.contains("where"), "{signature}");
+    assert!(!signature.contains("when"), "{signature}");
+    assert!(signature.len() < 2500, "{signature}");
+    assert!(signature.contains("do let 'node"), "{signature}");
+    // Each helper's structure appears once: the four pipeline stages reuse
+    // the same finite callable contract rather than expanding it four times.
+    assert_eq!(signature.matches("#Red =>").count(), 2, "{signature}");
+    assert_eq!(
+        signature.matches("| () => (#None").count(),
+        1,
+        "{signature}"
     );
     let compact = presented_scheme(source);
     assert!(compact.to_string().len() <= signature.len(), "{compact}");
@@ -1108,39 +1122,12 @@ end
         &format!("{} =", compact.declaration("let swizzle: ")),
     );
     printed_scheme(&annotated);
-    assert_eq!(signature.matches("when <=").count(), 34, "{signature}");
-    assert_eq!(constraints.lines().count(), 2, "{constraints}");
-    for input in 0..2 {
-        let chain = format!("'input_{input}_2 <= 'input_{input}_1 <= 'input_{input}_0");
-        assert!(
-            constraints
-                .lines()
-                .any(|line| line.trim().trim_end_matches(';') == chain),
-            "{constraints}"
-        );
-    }
-    for (color, field) in [("red", "r"), ("green", "g"), ("blue", "b"), ("alpha", "a")] {
-        let tag = match color {
-            "red" => "Red",
-            "green" => "Green",
-            "blue" => "Blue",
-            _ => "Alpha",
-        };
-        let marker = format!("#{tag} (when <= 'input_2_{field})");
-        assert_eq!(signature.matches(&marker).count(), 8, "{signature}");
-    }
     let annotated = source.replace("let swizzle =", &format!("let swizzle: {signature} ="));
-    // Reading the signature back must type-check and retain its body. The
-    // annotation may give inference a different factoring of the constraints.
-    let roundtrip = printed_scheme(&annotated);
-    assert_eq!(
-        roundtrip.split_once("\nwhere\n").unwrap().0,
-        signature.split_once("\nwhere\n").unwrap().0
-    );
+    assert_eq!(printed_scheme(&annotated), signature);
 }
 
 #[test]
-fn extend4_prints_its_input_prefix_as_an_implication_chain() {
+fn extend4_prints_each_input_shape_with_its_corresponding_result() {
     let source = "let extend4 = fn
         | () => (#None, #None, #None, #None)
         | (a,) => (a, #None, #None, #None)
@@ -1148,29 +1135,26 @@ fn extend4_prints_its_input_prefix_as_an_implication_chain() {
         | (a, b, c) => (a, b, c, #None)
         | (a, b, c, d) => (a, b, c, d)";
     let signature = printed_scheme(source);
+    assert!(signature.starts_with("fn |"), "{signature}");
+    assert_eq!(signature.matches(" => ").count(), 5, "{signature}");
     assert!(
-        signature.starts_with('('),
-        "tuple input must stay a tuple: {signature}"
+        signature.contains("| ('a,) => ('a, #None, #None, #None)"),
+        "{signature}"
     );
+    assert!(
+        signature.contains("| ('a, 'b, 'c, 'd) => ('a, 'b, 'c, 'd)"),
+        "{signature}"
+    );
+    assert!(!signature.contains("where"), "{signature}");
+    assert!(signature.len() < 400, "{signature}");
     let compact = presented_scheme(source);
     let compact_source = source.replace(
         "let extend4 =",
         &format!("{} =", compact.declaration("let extend4: ")),
     );
     printed_scheme(&compact_source);
-    assert!(
-        signature.contains("'input_0_3 <= 'input_0_2 <= 'input_0_1 <= 'input_0_0"),
-        "{signature}"
-    );
-    let constraints = signature.split_once("\nwhere\n").expect("constraints").1;
-    assert_eq!(constraints.lines().count(), 5, "{signature}");
-    assert_eq!(constraints.matches(" = ").count(), 4, "{signature}");
     let annotated = source.replace("let extend4 =", &format!("let extend4: {signature} ="));
-    let roundtrip = printed_scheme(&annotated);
-    assert_eq!(
-        roundtrip.split_once("where").unwrap().0,
-        signature.split_once("where").unwrap().0
-    );
+    assert_eq!(printed_scheme(&annotated), signature);
 }
 
 /// The scheme of the last definition in `source`, as it prints.
@@ -1182,7 +1166,7 @@ fn printed_scheme(source: &str) -> String {
 fn inferred_optional_tuple_elements_keep_tuple_syntax() {
     let source = "let f = fn | () => () | (a,) => ()";
     let signature = printed_scheme(source);
-    assert_eq!(signature, "('a?,) -> ()");
+    assert_eq!(signature, "fn | () => () | (_,) => ()");
     assert_eq!(
         printed_scheme(&format!("let f: {signature} = fn | () => () | (a,) => ()")),
         signature

@@ -4,11 +4,155 @@ use super::*;
 use crate::reification::conventions::{Shape as CallableShape, ShapeId};
 use std::collections::{BTreeMap, HashSet};
 
-type AdapterKey = (String, ShapeId, String, ShapeId, Vec<u32>);
+type AdapterKey = (
+    (String, String),
+    ShapeId,
+    (String, String),
+    ShapeId,
+    Vec<u32>,
+);
 
 struct ReifiedAdapter {
     key: AdapterKey,
     function: FuncId,
+}
+
+/// Descriptor-free containers can still hold callbacks whose effect
+/// evidence uses a different ABI. Compare those layouts before dropping
+/// the producer's type at a join or higher-order boundary.
+fn effect_adaptation(
+    want: &Arc<Ty>,
+    have: &Arc<Ty>,
+    aliases: &IndexMap<Symbol, crate::types::Scheme>,
+) -> bool {
+    // Ordinary finite trees need no alias graph. Direct arrow-row and
+    // identical-allocation cases stay cheap. Semantic syntax equality is
+    // insufficient here because it intentionally ignores effect-row order.
+    //
+    // Unfolding a recursive alias allocates fresh semantic nodes. Pointer
+    // pairs cannot close a cycle when only one side reaches its alias at
+    // a time, and alias arguments can grow without repeating syntax. The
+    // regular layout graph closes both kinds of traversal finitely.
+    //
+    // At an alias boundary use the conservative question: can either
+    // regular layout contain evidence? A positive answer may add an
+    // unnecessary adapter, but cannot skip one through an alias cycle.
+    let alias_evidence = |ty: &Arc<Ty>| {
+        let (root, graph) = crate::ir::layout_graph(ty, aliases);
+        let mut pending = vec![root];
+        let mut seen = HashSet::new();
+        while let Some(at) = pending.pop() {
+            if !seen.insert(at) {
+                continue;
+            }
+            let (label, edges) = &graph[at];
+            match label.as_str() {
+                "growing-runtime-type" => return true,
+                "arrow" => {
+                    for (edge, child) in edges {
+                        if edge != "effects" {
+                            pending.push(*child);
+                            continue;
+                        }
+                        for (edge, child) in &graph[*child].1 {
+                            if edge == "tail" {
+                                if graph[*child].0 != "closed" {
+                                    return true;
+                                }
+                            } else if graph[*child].0 != "effect-case:\\" {
+                                // Mutation has no evidence parameter. Its
+                                // compiler-owned interface distinguishes it
+                                // from an unrelated effect of the same name.
+                                let mutation = graph[*child].1.iter().any(|(edge, identity)| {
+                                    edge == "identity"
+                                        && graph[*identity].0 == "effect:mut"
+                                        && graph[*identity].1.iter().any(|(edge, interface)| {
+                                            edge == "interface"
+                                                && graph[*interface].0 == "<builtin:mut>"
+                                        })
+                                });
+                                if !mutation {
+                                    return true;
+                                }
+                            }
+                        }
+                    }
+                }
+                "fields" | "sum" => {
+                    pending.extend(
+                        edges
+                            .iter()
+                            .filter_map(|(edge, child)| (!edge.ends_with(":\\")).then_some(*child)),
+                    );
+                }
+                "array" | "package" => {
+                    pending.extend(edges.iter().map(|(_, child)| *child));
+                }
+                _ if label.starts_with("hidden:") => {
+                    pending.extend(edges.iter().map(|(_, child)| *child));
+                }
+                _ => {}
+            }
+        }
+        false
+    };
+
+    let mut work = vec![(want.clone(), have.clone())];
+    let mut seen = HashSet::new();
+    while let Some((want, have)) = work.pop() {
+        if Arc::ptr_eq(&want, &have) || !seen.insert((Arc::as_ptr(&want), Arc::as_ptr(&have))) {
+            continue;
+        }
+        // These nodes all belong to the original, retained type DAGs: this
+        // walk never unfolds an alias or creates temporary semantic types.
+        match (&*want, &*have) {
+            (Ty::Named { .. }, _) | (_, Ty::Named { .. }) => {
+                if alias_evidence(&want) || alias_evidence(&have) {
+                    return true;
+                }
+            }
+            (
+                Ty::Package(inner)
+                | Ty::Hidden { body: inner, .. }
+                | Ty::Contract {
+                    fallback: inner, ..
+                },
+                _,
+            ) => {
+                work.push((inner.clone(), have));
+            }
+            (
+                _,
+                Ty::Package(inner)
+                | Ty::Hidden { body: inner, .. }
+                | Ty::Contract {
+                    fallback: inner, ..
+                },
+            ) => {
+                work.push((want, inner.clone()));
+            }
+            (Ty::Arrow(a, b, wanted), Ty::Arrow(c, d, offered)) => {
+                if shape(&flat(wanted)) != shape(&flat(offered)) {
+                    return true;
+                }
+                work.extend([(a.clone(), c.clone()), (b.clone(), d.clone())]);
+            }
+            (Ty::Struct(a), Ty::Struct(b)) | (Ty::Sum(a), Ty::Sum(b)) => {
+                let (a, b) = (flat(a), flat(b));
+                for (name, field) in &a.labels {
+                    if let Some(other) = b.labels.get(name)
+                        && !matches!(field.presence, Presence::Absent)
+                        && !matches!(other.presence, Presence::Absent)
+                    {
+                        work.push((field.ty.clone(), other.ty.clone()));
+                    }
+                }
+            }
+            (Ty::Array(a), Ty::Array(b)) => work.push((a.clone(), b.clone())),
+            _ => {}
+        }
+    }
+    false
 }
 
 impl Lower<'_> {
@@ -20,8 +164,14 @@ impl Lower<'_> {
         have_shape: ShapeId,
         captures: &[u32],
     ) -> Option<AdapterKey> {
-        let want = crate::ir::representation_key(want, self.inference.aliases())?;
-        let have = crate::ir::representation_key(have, self.inference.aliases())?;
+        let want = (
+            crate::ir::representation_key(want, self.inference.aliases())?,
+            crate::ir::layout_key(want, self.inference.aliases())?,
+        );
+        let have = (
+            crate::ir::representation_key(have, self.inference.aliases())?,
+            crate::ir::layout_key(have, self.inference.aliases())?,
+        );
         Some((
             want,
             self.reification.callables.graph.exposed_id(want_shape),
@@ -112,6 +262,10 @@ impl Lower<'_> {
         false
     }
 
+    fn effect_adaptation(&self, want: &Arc<Ty>, have: &Arc<Ty>) -> bool {
+        effect_adaptation(want, have, self.inference.aliases())
+    }
+
     pub(super) fn callable_params(&mut self, id: ShapeId, params: &mut Vec<Param>) {
         for parameter in self.callable_slots(id).keys() {
             let temp = self.fresh(Rep::TypeDescriptor);
@@ -199,7 +353,8 @@ impl Lower<'_> {
                 CallableShape::Lazy | CallableShape::Parameter(_)
             )
         };
-        if unobserved(self, want_shape) || unobserved(self, have_shape) {
+        let effect_adaptation = self.effect_adaptation(want, have);
+        if (unobserved(self, want_shape) || unobserved(self, have_shape)) && !effect_adaptation {
             // Unobserved components are forwarded with the convention supplied
             // by the caller. No code in this function inspects their layout.
             // A generalized definition's bare type parameter is one: the
@@ -215,13 +370,17 @@ impl Lower<'_> {
         }
         if matches!(self.rep(want), Rep::Struct | Rep::Array | Rep::Sum)
             && self.rep(want) == self.rep(have)
-            && (want_shape != have_shape || !same_finite_syntax(want, have))
-            && (self.callable_demands(want_shape) || self.callable_demands(have_shape))
+            && (effect_adaptation || want_shape != have_shape || !same_finite_syntax(want, have))
+            && (effect_adaptation
+                || self.callable_demands(want_shape)
+                || self.callable_demands(have_shape))
         {
             return self
                 .reified_container(want, want_shape, have, have_shape, temp, body, adapters);
         }
-        if (!self.callable_demands(want_shape) && !self.callable_demands(have_shape))
+        if (!effect_adaptation
+            && !self.callable_demands(want_shape)
+            && !self.callable_demands(have_shape))
             || self.rep(want) != Rep::Fn
             || self.rep(have) != Rep::Fn
         {
@@ -236,7 +395,7 @@ impl Lower<'_> {
             self.callable_held[value as usize] = Some(profile);
             return value;
         }
-        if want_shape == have_shape && same_finite_syntax(want, have) {
+        if !effect_adaptation && want_shape == have_shape && same_finite_syntax(want, have) {
             self.hold(temp, want);
             self.callable_held[temp as usize] = Some(want_shape);
             return temp;
@@ -588,12 +747,13 @@ impl Lower<'_> {
                         }
                         let have_profile = self.callable_member(have_shape, &name);
                         let want_profile = self.callable_member(want_shape, &name);
+                        let want_type = self.member_of(want, &name).unwrap_or(field.ty.clone());
                         if !self.callable_demands(have_profile)
                             && !self.callable_demands(want_profile)
+                            && !self.effect_adaptation(&want_type, &field.ty)
                         {
                             continue;
                         }
-                        let want_type = self.member_of(want, &name).unwrap_or(field.ty.clone());
                         let present = self.child(Span::default(), |low, inner| {
                             let member = low.emit(
                                 inner,
@@ -655,12 +815,13 @@ impl Lower<'_> {
                         }
                         let have_profile = self.callable_member(have_shape, &name);
                         let want_profile = self.callable_member(want_shape, &name);
+                        let want_type = self.member_of(want, &name).unwrap_or(field.ty.clone());
                         if !self.callable_demands(have_profile)
                             && !self.callable_demands(want_profile)
+                            && !self.effect_adaptation(&want_type, &field.ty)
                         {
                             continue;
                         }
-                        let want_type = self.member_of(want, &name).unwrap_or(field.ty.clone());
                         let block = self.child(Span::default(), |low, inner| {
                             let member = low.emit(
                                 inner,
@@ -744,5 +905,117 @@ impl Lower<'_> {
         self.contain(result, want);
         self.callable_held[result as usize] = Some(want_shape);
         result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        symbol::{Bundle, Mint, Namespace, Version},
+        types::{EffectId, RowField, Scheme},
+    };
+
+    fn record(name: &str, ty: Arc<Ty>) -> Arc<Ty> {
+        Arc::new(Ty::Struct(Row {
+            labels: [(
+                name.to_owned(),
+                RowField {
+                    presence: Presence::Present,
+                    ty,
+                },
+            )]
+            .into(),
+            rest: Rest::Closed,
+        }))
+    }
+
+    #[test]
+    fn effect_layout_review_closes_offset_recursive_record_aliases() {
+        let mut mint = Mint::new(Bundle::new("layout", Version::new(0, 0, 0)).unwrap());
+        let a = mint.local(None, Namespace::Types, "A");
+        let b = mint.local(None, Namespace::Types, "B");
+        let named = |symbol, name: &str| {
+            Arc::new(Ty::Named {
+                symbol,
+                name: name.into(),
+                args: Arc::from([]),
+            })
+        };
+        let a_ty = named(a, "A");
+        let b_ty = named(b, "B");
+        let aliases = [
+            (
+                a,
+                Scheme::new(0, record("next", record("next", a_ty.clone()))),
+            ),
+            (
+                b,
+                Scheme::new(0, record("next", record("next", b_ty.clone()))),
+            ),
+        ]
+        .into();
+        assert!(!effect_adaptation(&record("next", a_ty), &b_ty, &aliases));
+    }
+
+    #[test]
+    fn effect_layout_review_stops_when_recursive_alias_arguments_grow() {
+        let mut mint = Mint::new(Bundle::new("layout", Version::new(0, 0, 0)).unwrap());
+        let symbol = mint.local(None, Namespace::Types, "Growing");
+        let applied = |argument| {
+            Arc::new(Ty::Named {
+                symbol,
+                name: "Growing".into(),
+                args: [argument].into(),
+            })
+        };
+        let aliases = [(
+            symbol,
+            Scheme::new(
+                1,
+                record("next", applied(Arc::new(Ty::Array(Arc::new(Ty::Bound(0)))))),
+            ),
+        )]
+        .into();
+        let growing = applied(Arc::new(Ty::Nat));
+        assert!(effect_adaptation(
+            &growing,
+            &record("next", growing.clone()),
+            &aliases
+        ));
+    }
+
+    #[test]
+    fn effect_layout_review_checks_callbacks_inside_records_and_aliases() {
+        let unit = Arc::new(Ty::unit());
+        let pure = Arc::new(Ty::pure(unit.clone(), unit.clone()));
+        let effectful = Arc::new(Ty::Arrow(
+            unit.clone(),
+            unit.clone(),
+            Row {
+                labels: [(
+                    EffectId::structural("Log".into(), "0#4:Unit;".into()).row_key(),
+                    RowField {
+                        presence: Presence::Present,
+                        ty: unit,
+                    },
+                )]
+                .into(),
+                rest: Rest::Closed,
+            },
+        ));
+        let have = record("call", pure);
+        let want = record("call", effectful);
+        assert!(effect_adaptation(&want, &have, &IndexMap::new()));
+
+        let mut mint = Mint::new(Bundle::new("layout", Version::new(0, 0, 0)).unwrap());
+        let symbol = mint.local(None, Namespace::Types, "Callback");
+        let named = Arc::new(Ty::Named {
+            symbol,
+            name: "Callback".into(),
+            args: Arc::from([]),
+        });
+        let aliases = [(symbol, Scheme::new(0, want))].into();
+        assert!(effect_adaptation(&named, &have, &aliases));
     }
 }

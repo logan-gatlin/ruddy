@@ -737,6 +737,15 @@ pub type Type = Anchored<TypeKind>;
 
 #[derive(Debug, Clone)]
 pub enum TypeKind {
+    /// A finite collection of correlated argument/result contracts.
+    Match(Vec<(Type, Type)>),
+    Structural {
+        parameters: usize,
+        body: Arc<crate::contracts::Expr>,
+        captures: Vec<Type>,
+        arguments: Vec<Type>,
+        effect_sink: Option<Box<Type>>,
+    },
     /// A presence constant supplied as an argument.
     Presence(bool),
     /// An anonymous presence argument in an annotation.
@@ -913,6 +922,18 @@ fn bounded_presences<'a>(ty: &'a Type) -> Vec<&'a When> {
             }
         };
         match &ty.anchored {
+            TypeKind::Structural {
+                captures,
+                arguments,
+                effect_sink,
+                ..
+            } => work.extend(
+                captures
+                    .iter()
+                    .chain(arguments)
+                    .chain(effect_sink.iter().map(|ty| ty.as_ref())),
+            ),
+            TypeKind::Match(arms) => work.extend(arms.iter().flat_map(|(from, to)| [from, to])),
             TypeKind::Struct {
                 fields, spreads, ..
             } => {
@@ -1171,6 +1192,25 @@ fn presence_polarities(
                 }
                 *visited |= bit;
                 match &ty.anchored {
+                    TypeKind::Structural {
+                        captures,
+                        arguments,
+                        effect_sink,
+                        ..
+                    } => work.extend(
+                        captures
+                            .iter()
+                            .chain(arguments)
+                            .chain(effect_sink.iter().map(|ty| ty.as_ref()))
+                            .map(|ty| Work::Ty(ty, positive, owner)),
+                    ),
+                    TypeKind::Match(arms) => {
+                        for (from, to) in arms.iter().rev() {
+                            let result_owner = if positive { to.at } else { owner };
+                            work.push(Work::Ty(to, positive, result_owner));
+                            work.push(Work::Ty(from, !positive, owner));
+                        }
+                    }
                     TypeKind::Arrow { from, to, effects } => {
                         work.push(Work::Effects(effects, positive, owner));
                         let result_owner = if positive { to.at } else { owner };
@@ -1333,6 +1373,24 @@ fn declaration_variances(
                     }
                 }
                 match &ty.anchored {
+                    TypeKind::Structural {
+                        captures,
+                        arguments,
+                        effect_sink,
+                        ..
+                    } => work.extend(
+                        captures
+                            .iter()
+                            .chain(arguments)
+                            .chain(effect_sink.iter().map(|ty| ty.as_ref()))
+                            .map(|ty| (ty, positive)),
+                    ),
+                    TypeKind::Match(arms) => {
+                        for (from, to) in arms {
+                            work.push((from, !positive));
+                            work.push((to, positive));
+                        }
+                    }
                     TypeKind::Param { index, .. } => {
                         *out.entry((*owner, *index)).or_default() |= bit;
                     }
@@ -1435,6 +1493,13 @@ fn declaration_variances(
                         }
                         *visited |= bit;
                         match ty {
+                            Ty::Contract { fallback, contract } => {
+                                work.push(Semantic::Ty(fallback, positive));
+                                for operand in contract.type_operands() {
+                                    work.push(Semantic::Ty(operand, positive));
+                                    work.push(Semantic::Ty(operand, !positive));
+                                }
+                            }
                             Ty::Presence(Presence::Bound(index))
                                 if (*index as usize) < decl.params.len() =>
                             {
@@ -1694,6 +1759,11 @@ pub enum ErrorKind {
     ExecutableDependency {
         name: String,
     },
+    /// Reconstructing an imported effect alias argument exceeds the finite
+    /// written type budget, even though the portable graph itself is small.
+    ImportedTypeLimit {
+        name: String,
+    },
     /// A reserved array runtime intrinsic has an incompatible signature.
     ArrayInExtern,
     /// A `hide` pattern written where only a `match` arm may open a hidden
@@ -1951,6 +2021,9 @@ pub enum ErrorKind {
     /// the condition and [`Solve::unfold`](crate::inference) for what rests on
     /// it.
     GrowingRecursion,
+    /// A nonfinal case type cannot choose an arm by its scalar, alias, or
+    /// callable identity. Structural dispatch recognizes records and tags.
+    UnsupportedMatchDiscriminator,
     /// One a variable variable used at two sorts in one annotation, as in
     /// `{ x: Nat, ..'r } -> (#A Nat | ..'r)` or
     /// `{ x when 'a: Nat } -> 'a`.
@@ -2733,12 +2806,15 @@ enum Stands {
         index: u32,
         fields: bool,
     },
+    /// Several transparent branches forward different parameter slots. The
+    /// index addresses `Follow::choices`; term forwarding never creates one.
+    Choices(usize),
     Loop,
 }
 
-/// One explicit evaluator step in [`Follow::decl`]. The recursion classifier
-/// follows one chain, but imported forwarding chains can be arbitrarily deep,
-/// so the chain lives here rather than on the native stack.
+/// One explicit evaluator step in [`Follow::decl`]. Contract captures
+/// can branch, and imported forwarding chains can be arbitrarily deep, so the
+/// pending paths live here rather than on the native stack.
 enum FollowWork<'a> {
     Decl(Symbol),
     Written(&'a Type),
@@ -2746,6 +2822,10 @@ enum FollowWork<'a> {
     SelectWritten(&'a [Type]),
     SelectSemantic(&'a [Arc<Ty>]),
     FinishSelect { fields: bool },
+    BeginSelect { fields: bool },
+    SaveChoice,
+    FinishChoices { count: usize, fielded: u32 },
+    ResetFields(u32),
     FinishDecl(Symbol),
 }
 
@@ -2763,18 +2843,16 @@ struct Follow<'a> {
     /// either — so a result reached under an open assumption is still the
     /// right one to keep.
     done: HashMap<Symbol, Stands>,
+    /// Flat parameter alternatives, so repeated forwarding does not copy a
+    /// recursively nested classification tree.
+    choices: Vec<Vec<(u32, bool)>>,
     /// The declarations being followed, outermost first. Meeting one again is
     /// the loop, and everything from it inwards is on that loop.
     open: Vec<Symbol>,
-    /// How many fielded steps had been taken when each open declaration was
-    /// pushed. The walk is one chain — a struct answers without descending, and
-    /// an application descends into exactly one argument — so every step counted
-    /// since a frame was pushed is a step on the path from it, and a loop is
-    /// endless exactly when that count moved.
-    ///
-    /// Counted rather than flagged per frame because the count only ever grows:
-    /// nothing is unwound, so the mark taken at the push is the whole of what a
-    /// frame has to remember.
+    /// How many fielded steps preceded each open declaration. Every step since
+    /// its mark belongs to the current path, so a loop adds endless fields
+    /// exactly when that count moved. Sibling alternative paths restore their
+    /// starting count before being followed.
     marks: Vec<u32>,
     /// How many fielded steps the walk has taken. See [`Follow::marks`].
     fielded: u32,
@@ -3437,7 +3515,7 @@ fn build_captured(
     );
     fixed_spreads.declarations(&mut program);
     b.errors.append(&mut fixed_spreads.errors);
-    // A loop of bare names is the one recursion that cannot be allowed, and it
+    // A loop of transparent names/computations cannot be allowed, and it
     // is what mutual visibility just made writable. See [`ErrorKind::Circular`]
     // for why it means nothing, and [`Solve::unify`](crate::inference) for what
     // it would cost the solver to be handed one.
@@ -4103,13 +4181,14 @@ fn imported_syntax(
     symbols: &mut HashMap<(Namespace, String), Symbol>,
     names: &mut IndexMap<Symbol, artifact::QualifiedName>,
     effect_rows: &ImportedEffectRows,
-) -> Type {
-    imported_syntax_resolved(
+) -> Result<Type, artifact::ExportError> {
+    artifact::check_syntax_import(ty)?;
+    Ok(imported_syntax_resolved(
         ty,
         params,
         &mut |namespace, name| Some(imported_symbol(mint, namespace, name, symbols, names)),
         effect_rows,
-    )
+    ))
 }
 
 /// Flatten composed imported rows with the same outer-label precedence used
@@ -4197,7 +4276,7 @@ fn imported_syntax_resolved(
                     continue;
                 };
                 let mut count = 0;
-                if let artifact::Type::Struct(payload) = &field.ty {
+                if let artifact::Type::Struct(payload) = field.ty.unshared() {
                     let (arguments, _) = imported_row_entries(payload);
                     for (index, arg) in arguments.values().enumerate() {
                         children.push((&arg.ty, effect_rows.argument_is_effects(qualified, index)));
@@ -4243,6 +4322,51 @@ fn imported_syntax_resolved(
             continue;
         }
         let leaf = match ty {
+            artifact::Type::Shared(inner) => {
+                work.push(Work::Read(inner, is_effects));
+                continue;
+            }
+            artifact::Type::Contract { contract, .. } => {
+                if let Some(arms) = contract.annotation_cases() {
+                    queue(
+                        &mut work,
+                        arms.into_iter()
+                            .flat_map(|(from, to)| [(from, false), (to, false)])
+                            .collect(),
+                        |children| {
+                            let mut children = children.into_iter();
+                            let mut arms = Vec::new();
+                            while let Some(from) = children.next() {
+                                arms.push((
+                                    from,
+                                    children.next().expect("paired imported match arm"),
+                                ));
+                            }
+                            TypeKind::Match(arms)
+                        },
+                    );
+                    continue;
+                }
+                let parameters = contract.parameters;
+                let body = contract.body.clone();
+                let capture_count = contract.captures.len();
+                let argument_count = contract.arguments.len();
+                queue(
+                    &mut work,
+                    contract.type_operands().map(|ty| (ty, false)).collect(),
+                    move |children| {
+                        let mut children = children.into_iter();
+                        TypeKind::Structural {
+                            parameters,
+                            body,
+                            captures: children.by_ref().take(capture_count).collect(),
+                            arguments: children.by_ref().take(argument_count).collect(),
+                            effect_sink: children.next().map(Box::new),
+                        }
+                    },
+                );
+                continue;
+            }
             artifact::Type::Nat => TypeKind::Prim(Prim::Nat),
             artifact::Type::Int => TypeKind::Prim(Prim::Int),
             artifact::Type::Fixed(kind) => TypeKind::Prim(Prim::Fixed(*kind)),
@@ -4485,8 +4609,10 @@ fn import_scheme(
 fn clamp_bounds(ty: Arc<Ty>, count: usize, presences: usize) -> Arc<Ty> {
     enum Work<'a> {
         Ty(&'a Ty),
+        Remember(usize),
         Row(&'a crate::types::Row),
         Arrow,
+        Contract(&'a crate::contracts::Contract),
         Package,
         Hidden(u32, Arc<str>),
         Array,
@@ -4507,75 +4633,95 @@ fn clamp_bounds(ty: Arc<Ty>, count: usize, presences: usize) -> Arc<Ty> {
         },
     }
     let mut types = Vec::new();
+    let mut memo = HashMap::<usize, Arc<Ty>>::new();
     let mut rows = Vec::new();
 
     let mut work = vec![Work::Ty(&ty)];
     while let Some(part) = work.pop() {
         match part {
-            Work::Ty(value) => match value {
-                Ty::Nat => types.push(Arc::new(Ty::Nat)),
-                Ty::Int => types.push(Arc::new(Ty::Int)),
-                Ty::Fixed(kind) => types.push(Arc::new(Ty::Fixed(*kind))),
-                Ty::Real => types.push(Arc::new(Ty::Real)),
-                Ty::String => types.push(Arc::new(Ty::String)),
-                Ty::Bool => types.push(Arc::new(Ty::Bool)),
-                Ty::Presence(p) => types.push(Arc::new(Ty::Presence(p.clone()))),
-                Ty::ForeignValue => types.push(Arc::new(Ty::ForeignValue)),
-                Ty::Bound(index) if (*index as usize) < count && (*index as usize) >= presences => {
-                    types.push(Arc::new(Ty::Bound(*index)))
+            Work::Ty(value) => {
+                let key = value as *const Ty as usize;
+                if let Some(value) = memo.get(&key) {
+                    types.push(value.clone());
+                    continue;
                 }
-                Ty::Bound(_) | Ty::Var(_) | Ty::Rigid { .. } | Ty::Undecided => {
-                    types.push(Arc::new(Ty::Undecided))
+                work.push(Work::Remember(key));
+                match value {
+                    Ty::Contract { fallback, contract } => {
+                        work.push(Work::Contract(contract));
+                        let operands: Vec<_> = contract.type_operands().collect();
+                        work.extend(operands.into_iter().rev().map(|ty| Work::Ty(ty)));
+                        work.push(Work::Ty(fallback));
+                    }
+                    Ty::Nat => types.push(Arc::new(Ty::Nat)),
+                    Ty::Int => types.push(Arc::new(Ty::Int)),
+                    Ty::Fixed(kind) => types.push(Arc::new(Ty::Fixed(*kind))),
+                    Ty::Real => types.push(Arc::new(Ty::Real)),
+                    Ty::String => types.push(Arc::new(Ty::String)),
+                    Ty::Bool => types.push(Arc::new(Ty::Bool)),
+                    Ty::Presence(p) => types.push(Arc::new(Ty::Presence(p.clone()))),
+                    Ty::ForeignValue => types.push(Arc::new(Ty::ForeignValue)),
+                    Ty::Bound(index)
+                        if (*index as usize) < count && (*index as usize) >= presences =>
+                    {
+                        types.push(Arc::new(Ty::Bound(*index)))
+                    }
+                    Ty::Bound(_) | Ty::Var(_) | Ty::Rigid { .. } | Ty::Undecided => {
+                        types.push(Arc::new(Ty::Undecided))
+                    }
+                    Ty::HiddenVar { .. } => types.push(Arc::new(value.clone())),
+                    Ty::Arrow(from, to, effects) => {
+                        work.push(Work::Arrow);
+                        work.push(Work::Row(effects));
+                        work.push(Work::Ty(to));
+                        work.push(Work::Ty(from));
+                    }
+                    Ty::Package(body) => {
+                        work.push(Work::Package);
+                        work.push(Work::Ty(body));
+                    }
+                    Ty::Hidden { binder, name, body } => {
+                        work.push(Work::Hidden(*binder, name.clone()));
+                        work.push(Work::Ty(body));
+                    }
+                    Ty::Array(element) => {
+                        work.push(Work::Array);
+                        work.push(Work::Ty(element));
+                    }
+                    Ty::Mirror(element) => {
+                        work.push(Work::Mirror);
+                        work.push(Work::Ty(element));
+                    }
+                    Ty::TypeInfo(element) => {
+                        work.push(Work::TypeInfo);
+                        work.push(Work::Ty(element));
+                    }
+                    Ty::Mut(region, element) => {
+                        work.push(Work::Mut);
+                        work.push(Work::Ty(element));
+                        work.push(Work::Ty(region));
+                    }
+                    Ty::Struct(fields) => {
+                        work.push(Work::Struct);
+                        work.push(Work::Row(fields));
+                    }
+                    Ty::Sum(cases) => {
+                        work.push(Work::Sum);
+                        work.push(Work::Row(cases));
+                    }
+                    Ty::Named { symbol, name, args } => {
+                        work.push(Work::Named {
+                            symbol: *symbol,
+                            name: name.clone(),
+                            args: args.len(),
+                        });
+                        work.extend(args.iter().rev().map(|arg| Work::Ty(arg)));
+                    }
                 }
-                Ty::HiddenVar { .. } => types.push(Arc::new(value.clone())),
-                Ty::Arrow(from, to, effects) => {
-                    work.push(Work::Arrow);
-                    work.push(Work::Row(effects));
-                    work.push(Work::Ty(to));
-                    work.push(Work::Ty(from));
-                }
-                Ty::Package(body) => {
-                    work.push(Work::Package);
-                    work.push(Work::Ty(body));
-                }
-                Ty::Hidden { binder, name, body } => {
-                    work.push(Work::Hidden(*binder, name.clone()));
-                    work.push(Work::Ty(body));
-                }
-                Ty::Array(element) => {
-                    work.push(Work::Array);
-                    work.push(Work::Ty(element));
-                }
-                Ty::Mirror(element) => {
-                    work.push(Work::Mirror);
-                    work.push(Work::Ty(element));
-                }
-                Ty::TypeInfo(element) => {
-                    work.push(Work::TypeInfo);
-                    work.push(Work::Ty(element));
-                }
-                Ty::Mut(region, element) => {
-                    work.push(Work::Mut);
-                    work.push(Work::Ty(element));
-                    work.push(Work::Ty(region));
-                }
-                Ty::Struct(fields) => {
-                    work.push(Work::Struct);
-                    work.push(Work::Row(fields));
-                }
-                Ty::Sum(cases) => {
-                    work.push(Work::Sum);
-                    work.push(Work::Row(cases));
-                }
-                Ty::Named { symbol, name, args } => {
-                    work.push(Work::Named {
-                        symbol: *symbol,
-                        name: name.clone(),
-                        args: args.len(),
-                    });
-                    work.extend(args.iter().rev().map(|arg| Work::Ty(arg)));
-                }
-            },
+            }
+            Work::Remember(key) => {
+                memo.insert(key, types.last().expect("clamped shared type").clone());
+            }
             Work::Row(value) => {
                 let composed = matches!(value.rest, Rest::More(_));
                 let mut labels = Vec::new();
@@ -4607,6 +4753,16 @@ fn clamp_bounds(ty: Arc<Ty>, count: usize, presences: usize) -> Arc<Ty> {
                 });
                 work.extend(labels.into_iter().rev().filter_map(|(_, field)| {
                     (!matches!(field.presence, Presence::Absent)).then_some(Work::Ty(&field.ty))
+                }));
+            }
+            Work::Contract(contract) => {
+                let start = types.len() - contract.type_operands().count();
+                let mut operands = types.split_off(start).into_iter();
+                let fallback = types.pop().expect("contract postorder stays balanced");
+                let contract = contract.map_types(|_| operands.next().expect("contract operand"));
+                types.push(Arc::new(Ty::Contract {
+                    fallback,
+                    contract: Arc::new(contract),
                 }));
             }
             Work::Arrow => {
@@ -4720,7 +4876,14 @@ fn drop_type_iterative(root: Arc<Ty>) {
     while let Some(part) = work.pop() {
         match part {
             Work::Ty(ty) => {
+                if Arc::strong_count(&ty) != 1 {
+                    continue;
+                }
                 match &*ty {
+                    Ty::Contract { fallback, contract } => {
+                        work.push(Work::Ty(fallback.clone()));
+                        work.extend(contract.type_operands().cloned().map(Work::Ty));
+                    }
                     Ty::Arrow(from, to, effects) => {
                         work.push(Work::Ty(from.clone()));
                         work.push(Work::Ty(to.clone()));
@@ -4757,6 +4920,9 @@ fn drop_type_iterative(root: Arc<Ty>) {
                 drop(ty);
             }
             Work::Row(row_) => {
+                if Arc::strong_count(&row_) != 1 {
+                    continue;
+                }
                 row(&row_, &mut work);
                 drop(row_);
             }
@@ -4892,9 +5058,11 @@ fn import_type(
 ) -> Arc<Ty> {
     enum Work<'a> {
         Ty(&'a artifact::Type, bool),
+        Shared(usize, bool),
         Row(&'a artifact::Row, bool),
         Arrow,
         Package,
+        Contract(&'a artifact::Contract),
         Hidden(u32, Arc<str>),
         Array,
         Mirror,
@@ -4911,11 +5079,21 @@ fn import_type(
     }
     let mut types = Vec::new();
     let mut rows = Vec::new();
+    let mut shared = HashMap::<(usize, bool), Arc<Ty>>::new();
 
     let mut work = vec![Work::Ty(value, false)];
     while let Some(part) = work.pop() {
         match part {
             Work::Ty(value, is_effect_row) => match value {
+                artifact::Type::Shared(inner) => {
+                    let key = Arc::as_ptr(inner) as usize;
+                    if let Some(value) = shared.get(&(key, is_effect_row)) {
+                        types.push(value.clone());
+                    } else {
+                        work.push(Work::Shared(key, is_effect_row));
+                        work.push(Work::Ty(inner, is_effect_row));
+                    }
+                }
                 artifact::Type::Nat => types.push(Arc::new(Ty::Nat)),
                 artifact::Type::Int => types.push(Arc::new(Ty::Int)),
                 artifact::Type::Fixed(kind) => types.push(Arc::new(Ty::Fixed(*kind))),
@@ -4935,6 +5113,11 @@ fn import_type(
                     work.push(Work::Row(effects, true));
                     work.push(Work::Ty(to, false));
                     work.push(Work::Ty(from, false));
+                }
+                artifact::Type::Contract { fallback, contract } => {
+                    work.push(Work::Contract(contract));
+                    work.extend(contract.type_operands().rev().map(|ty| Work::Ty(ty, false)));
+                    work.push(Work::Ty(fallback, is_effect_row));
                 }
                 artifact::Type::Package(body) => {
                     work.push(Work::Package);
@@ -4985,6 +5168,12 @@ fn import_type(
                     }));
                 }
             },
+            Work::Shared(key, is_effect_row) => {
+                shared.insert(
+                    (key, is_effect_row),
+                    types.last().expect("shared imported type").clone(),
+                );
+            }
             Work::Row(value, is_effect_row) => {
                 work.push(Work::BuiltRow(value, is_effect_row));
                 if let artifact::Rest::More(more) = &value.rest {
@@ -5000,6 +5189,25 @@ fn import_type(
                 let to = types.pop().expect("type postorder stays balanced");
                 let from = types.pop().expect("type postorder stays balanced");
                 types.push(Arc::new(Ty::Arrow(from, to, effects)));
+            }
+            Work::Contract(contract) => {
+                let effect_sink = contract
+                    .effect_sink
+                    .as_ref()
+                    .map(|_| types.pop().expect("contract effect sink"));
+                let arguments = types.split_off(types.len() - contract.arguments.len());
+                let captures = types.split_off(types.len() - contract.captures.len());
+                let fallback = types.pop().expect("contract postorder stays balanced");
+                types.push(Arc::new(Ty::Contract {
+                    fallback,
+                    contract: Arc::new(crate::contracts::Contract {
+                        parameters: contract.parameters,
+                        body: contract.body.clone(),
+                        captures: captures.into(),
+                        arguments: arguments.into(),
+                        effect_sink,
+                    }),
+                }));
             }
             Work::Package => {
                 let body = types.pop().expect("package postorder stays balanced");
@@ -5521,6 +5729,9 @@ struct RegularType<'a> {
     interned: HashMap<(String, Vec<(String, usize)>), usize>,
     named: HashMap<(Symbol, Vec<usize>, bool), usize>,
     retain_packages: bool,
+    /// Runtime layouts describe the checked value representation; operation
+    /// identity instead retains the complete semantic structural program.
+    erase_contracts: bool,
 }
 
 enum SemanticRoot<'a> {
@@ -5537,6 +5748,24 @@ pub(crate) type RepresentationGraph = Vec<(String, Vec<(String, usize)>)>;
 pub(crate) fn representation_graph(
     ty: &Arc<Ty>,
     aliases: &IndexMap<Symbol, Scheme>,
+) -> (usize, RepresentationGraph) {
+    runtime_graph(ty, aliases, false)
+}
+
+/// Callable layout planning may inspect the checked representation witness.
+/// Exact runtime type identity must retain structural contracts: erasing them
+/// could turn representation equality into an invalid semantic coercion.
+pub(crate) fn layout_graph(
+    ty: &Arc<Ty>,
+    aliases: &IndexMap<Symbol, Scheme>,
+) -> (usize, RepresentationGraph) {
+    runtime_graph(ty, aliases, true)
+}
+
+fn runtime_graph(
+    ty: &Arc<Ty>,
+    aliases: &IndexMap<Symbol, Scheme>,
+    erase_contracts: bool,
 ) -> (usize, RepresentationGraph) {
     let external_types = aliases
         .iter()
@@ -5562,6 +5791,7 @@ pub(crate) fn representation_graph(
         interned: HashMap::new(),
         named: HashMap::new(),
         retain_packages: true,
+        erase_contracts,
     };
     let root = graph.semantic_work(
         SemanticRoot::Type(ty, Vec::new()),
@@ -5593,6 +5823,17 @@ pub(crate) fn representation_key(
     aliases: &IndexMap<Symbol, Scheme>,
 ) -> Option<String> {
     let (root, graph) = representation_graph(ty, aliases);
+    runtime_graph_key(root, graph)
+}
+
+/// A representation witness can vary independently of a structural contract's
+/// semantic identity. Runtime adapter caches must distinguish those layouts.
+pub(crate) fn layout_key(ty: &Arc<Ty>, aliases: &IndexMap<Symbol, Scheme>) -> Option<String> {
+    let (root, graph) = layout_graph(ty, aliases);
+    runtime_graph_key(root, graph)
+}
+
+fn runtime_graph_key(root: usize, graph: RepresentationGraph) -> Option<String> {
     let mut seen = HashSet::new();
     let mut work = vec![root];
     while let Some(at) = work.pop() {
@@ -5766,6 +6007,114 @@ impl RegularType<'_> {
         self.node(format!("effect-case:{presence}"), edges)
     }
 
+    /// Contract identity follows the finite graph itself. Diagnostic text can
+    /// truncate an expanded shared expression and must never be an identity.
+    fn structural_body(&mut self, root: &crate::contracts::Expr) -> usize {
+        use crate::contracts::Expr;
+        let mut pending = vec![(root, false)];
+        let mut ids = HashMap::new();
+        while let Some((expr, finish)) = pending.pop() {
+            let key = expr as *const Expr;
+            if ids.contains_key(&key) {
+                continue;
+            }
+            if !finish {
+                pending.push((expr, true));
+                let mut children = Vec::new();
+                expr.children(&mut children);
+                pending.extend(children.into_iter().rev().map(|child| (&**child, false)));
+                continue;
+            }
+            let child = |expr: &Arc<Expr>| ids[&(&**expr as *const Expr)];
+            let node = match expr {
+                Expr::Input(index) => self.atom(format!("contract-input:{index}")),
+                Expr::Capture(index) => self.atom(format!("contract-capture:{index}")),
+                Expr::Field { base, label } => self.node(
+                    format!("contract-field:{label}"),
+                    vec![("base".into(), child(base))],
+                ),
+                Expr::Payload { base, label } => self.node(
+                    format!("contract-payload:{label}"),
+                    vec![("base".into(), child(base))],
+                ),
+                Expr::Record { fields, spread } => {
+                    let mut edges: Vec<_> = fields
+                        .iter()
+                        .map(|(name, value)| (format!("field:{name}"), child(value)))
+                        .collect();
+                    if let Some(spread) = spread {
+                        edges.push(("spread".into(), child(spread)));
+                    }
+                    self.node("contract-record", edges)
+                }
+                Expr::Tag { label, payload } => self.node(
+                    format!("contract-tag:{label}"),
+                    vec![("payload".into(), child(payload))],
+                ),
+                Expr::Apply { function, argument } => self.node(
+                    "contract-apply",
+                    vec![
+                        ("function".into(), child(function)),
+                        ("argument".into(), child(argument)),
+                    ],
+                ),
+                Expr::Then { value, body } => self.node(
+                    "contract-then",
+                    vec![("value".into(), child(value)), ("body".into(), child(body))],
+                ),
+                Expr::Match { scrutinee, arms } => {
+                    let mut edges = vec![("scrutinee".into(), child(scrutinee))];
+                    for (index, arm) in arms.iter().enumerate() {
+                        edges.push((
+                            format!("pattern:{index}"),
+                            self.structural_pattern(&arm.pattern),
+                        ));
+                        edges.push((format!("body:{index}"), child(&arm.body)));
+                    }
+                    self.node("contract-match", edges)
+                }
+            };
+            ids.insert(key, node);
+        }
+        ids[&(root as *const Expr)]
+    }
+
+    fn structural_pattern(&mut self, root: &crate::contracts::Pattern) -> usize {
+        use crate::contracts::Pattern;
+        let mut pending = vec![(root, false)];
+        let mut ids = HashMap::new();
+        while let Some((pattern, finish)) = pending.pop() {
+            if !finish {
+                pending.push((pattern, true));
+                match pattern {
+                    Pattern::Any => {}
+                    Pattern::Record { fields, .. } => {
+                        pending.extend(fields.iter().rev().map(|(_, pattern)| (pattern, false)))
+                    }
+                    Pattern::Tag { payload, .. } => pending.push((payload, false)),
+                }
+                continue;
+            }
+            let child = |pattern: &Pattern| ids[&(pattern as *const Pattern)];
+            let node = match pattern {
+                Pattern::Any => self.atom("contract-pattern-any"),
+                Pattern::Record { fields, open } => self.node(
+                    format!("contract-pattern-record:{open}"),
+                    fields
+                        .iter()
+                        .map(|(name, pattern)| (name.clone(), child(pattern)))
+                        .collect(),
+                ),
+                Pattern::Tag { label, payload } => self.node(
+                    format!("contract-pattern-tag:{label}"),
+                    vec![("payload".into(), child(payload))],
+                ),
+            };
+            ids.insert(pattern as *const Pattern, node);
+        }
+        ids[&(root as *const Pattern)]
+    }
+
     /// Build source syntax, local named declarations, and effect rows with one
     /// continuation stack. Effect spellings have already been resolved by the
     /// outer dependency work list, so crossing type/effect/type boundaries
@@ -5821,6 +6170,45 @@ impl RegularType<'_> {
                     values.push(self.with_fields(core, fields));
                 }
                 Work::Type(ty, args) => match &ty.anchored {
+                    TypeKind::Structural {
+                        parameters,
+                        body,
+                        captures,
+                        arguments,
+                        effect_sink,
+                    } => {
+                        let operands: Vec<_> = captures
+                            .iter()
+                            .chain(arguments)
+                            .chain(effect_sink.iter().map(|ty| ty.as_ref()))
+                            .collect();
+                        let body = self.structural_body(body);
+                        let labels = std::iter::once("body".into())
+                            .chain((0..captures.len()).map(|at| format!("capture:{at}")))
+                            .chain((0..arguments.len()).map(|at| format!("argument:{at}")))
+                            .chain(effect_sink.iter().map(|_| "effects".into()))
+                            .collect();
+                        work.push(Work::Make(format!("structural:{parameters}"), labels));
+                        work.extend(
+                            operands
+                                .into_iter()
+                                .rev()
+                                .map(|ty| Work::Type(ty, args.clone())),
+                        );
+                        work.push(Work::Canonical(body));
+                    }
+                    TypeKind::Match(arms) => {
+                        work.push(Work::Make(
+                            "match".into(),
+                            (0..arms.len())
+                                .flat_map(|at| [format!("from:{at}"), format!("to:{at}")])
+                                .collect(),
+                        ));
+                        for (from, to) in arms.iter().rev() {
+                            work.push(Work::Type(to, args.clone()));
+                            work.push(Work::Type(from, args.clone()));
+                        }
+                    }
                     TypeKind::Mut(region, element) => {
                         work.push(Work::Make(
                             "mut".into(),
@@ -6125,6 +6513,62 @@ impl RegularType<'_> {
                     values.push(self.node(label, edge_labels.into_iter().zip(children).collect()));
                 }
                 Work::Type(ty, args, supplied_as_effects, instantiation) => match ty {
+                    Ty::Contract { fallback, .. } if self.erase_contracts => {
+                        work.push(Work::Type(
+                            fallback,
+                            args,
+                            supplied_as_effects,
+                            instantiation,
+                        ));
+                    }
+                    Ty::Contract { contract, .. } => {
+                        // The writable case notation and its lowered finite
+                        // program publish the same effect interface.
+                        if contract.annotation_cases().is_some() {
+                            let crate::contracts::Expr::Match { arms, .. } = &*contract.body else {
+                                unreachable!()
+                            };
+                            work.push(Work::Make(
+                                "match".into(),
+                                (0..arms.len())
+                                    .flat_map(|at| [format!("from:{at}"), format!("to:{at}")])
+                                    .collect(),
+                            ));
+                            for arm in arms.iter().rev() {
+                                let crate::contracts::Expr::Apply { function, .. } = &*arm.body
+                                else {
+                                    unreachable!()
+                                };
+                                let crate::contracts::Expr::Capture(index) = &**function else {
+                                    unreachable!()
+                                };
+                                let Ty::Arrow(from, to, _) = &*contract.captures[*index] else {
+                                    unreachable!()
+                                };
+                                work.push(Work::Type(to, args.clone(), false, instantiation));
+                                work.push(Work::Type(from, args.clone(), false, instantiation));
+                            }
+                            continue;
+                        }
+                        let body = self.structural_body(&contract.body);
+                        let labels = std::iter::once("body".into())
+                            .chain((0..contract.captures.len()).map(|at| format!("capture:{at}")))
+                            .chain((0..contract.arguments.len()).map(|at| format!("argument:{at}")))
+                            .chain(contract.effect_sink.iter().map(|_| "effects".into()))
+                            .collect();
+                        work.push(Work::Make(
+                            format!("structural:{}", contract.parameters),
+                            labels,
+                        ));
+                        let operands: Vec<_> = contract.type_operands().collect();
+                        work.extend(
+                            operands
+                                .into_iter()
+                                .rev()
+                                .map(|ty| Work::Type(ty, args.clone(), false, instantiation)),
+                        );
+                        work.push(Work::Canonical(body));
+                    }
                     Ty::Nat => values.push(self.atom("Nat")),
                     Ty::Int => values.push(self.atom("Int")),
                     Ty::Fixed(kind) => values.push(self.atom(kind.name())),
@@ -6337,9 +6781,14 @@ impl RegularType<'_> {
                     let labels = row
                         .labels
                         .iter()
-                        .map(|(name, field)| {
+                        .enumerate()
+                        .map(|(position, (name, field))| {
                             if effects {
-                                "effect".to_string()
+                                if self.erase_contracts {
+                                    format!("effect:{position}")
+                                } else {
+                                    "effect".to_string()
+                                }
                             } else {
                                 let presence = self.semantic_presence(
                                     &field.presence,
@@ -6513,6 +6962,15 @@ impl RegularType<'_> {
                         if claimed.insert(key) {
                             edges.push((label.clone(), *child));
                         }
+                    }
+                }
+            }
+            if kind == "effects" && self.erase_contracts {
+                let mut position = 0usize;
+                for (label, _) in &mut edges {
+                    if label != join {
+                        *label = format!("effect:{position}");
+                        position += 1;
                     }
                 }
             }
@@ -6770,6 +7228,18 @@ fn type_effect_dependencies<'a>(
     let mut dependencies = Vec::new();
     while let Some(ty) = pending.pop() {
         match &ty.anchored {
+            TypeKind::Structural {
+                captures,
+                arguments,
+                effect_sink,
+                ..
+            } => pending.extend(
+                captures
+                    .iter()
+                    .chain(arguments)
+                    .chain(effect_sink.iter().map(|ty| ty.as_ref())),
+            ),
+            TypeKind::Match(arms) => pending.extend(arms.iter().flat_map(|(from, to)| [from, to])),
             TypeKind::Array(element) | TypeKind::Mirror(element) | TypeKind::TypeInfo(element) => {
                 pending.push(element)
             }
@@ -6986,6 +7456,7 @@ impl<'a> EffectCanonicalizer<'a> {
                         interned: HashMap::new(),
                         named: HashMap::new(),
                         retain_packages: false,
+                        erase_contracts: false,
                     };
                     let params = graph.parameters(count);
                     let root = graph.source(
@@ -7146,6 +7617,26 @@ fn rekey_row(row: &mut EffectRow, ids: &IndexMap<Symbol, EffectId>, errors: &mut
 
 fn rekey_type(ty: &mut Type, ids: &IndexMap<Symbol, EffectId>, errors: &mut Vec<Error>) {
     match &mut ty.anchored {
+        TypeKind::Structural {
+            captures,
+            arguments,
+            effect_sink,
+            ..
+        } => {
+            for ty in captures
+                .iter_mut()
+                .chain(arguments)
+                .chain(effect_sink.iter_mut().map(|ty| ty.as_mut()))
+            {
+                rekey_type(ty, ids, errors);
+            }
+        }
+        TypeKind::Match(arms) => {
+            for (from, to) in arms {
+                rekey_type(from, ids, errors);
+                rekey_type(to, ids, errors);
+            }
+        }
         TypeKind::Struct {
             fields, spreads, ..
         } => {
@@ -7464,6 +7955,7 @@ fn looping(
         types,
         external,
         done: HashMap::new(),
+        choices: Vec::new(),
         open: Vec::new(),
         marks: Vec::new(),
         fielded: 0,
@@ -7480,10 +7972,57 @@ fn looping(
 }
 
 impl<'a> Follow<'a> {
+    fn choice_summary(&mut self, choices: impl IntoIterator<Item = Stands>) -> Stands {
+        let mut parameters = Vec::new();
+        for choice in choices {
+            match choice {
+                Stands::Shape => {}
+                Stands::Loop => return Stands::Loop,
+                Stands::Param { index, fields } => parameters.push((index, fields)),
+                Stands::Choices(index) => parameters.extend_from_slice(&self.choices[index]),
+            }
+        }
+        parameters.sort_unstable();
+        parameters.dedup();
+        match parameters.as_slice() {
+            [] => Stands::Shape,
+            &[(index, fields)] => Stands::Param { index, fields },
+            _ => {
+                let index = self.choices.len();
+                self.choices.push(parameters);
+                Stands::Choices(index)
+            }
+        }
+    }
+
+    fn parameters(&self, stands: Stands) -> Vec<(u32, bool)> {
+        match stands {
+            Stands::Param { index, fields } => vec![(index, fields)],
+            Stands::Choices(index) => self.choices[index].clone(),
+            Stands::Shape | Stands::Loop => Vec::new(),
+        }
+    }
+
     /// What one declaration stands for, followed once and remembered.
     fn decl(&mut self, symbol: Symbol) -> Stands {
+        fn branches<'a>(
+            work: &mut Vec<FollowWork<'a>>,
+            branches: Vec<Vec<FollowWork<'a>>>,
+            fielded: u32,
+        ) {
+            work.push(FollowWork::FinishChoices {
+                count: branches.len(),
+                fielded,
+            });
+            for branch in branches.into_iter().rev() {
+                work.push(FollowWork::SaveChoice);
+                work.extend(branch.into_iter().rev());
+                work.push(FollowWork::ResetFields(fielded));
+            }
+        }
         let mut work = vec![FollowWork::Decl(symbol)];
         let mut answer = None;
+        let mut choices = Vec::new();
         while let Some(next) = work.pop() {
             match next {
                 FollowWork::Decl(symbol) => {
@@ -7524,6 +8063,24 @@ impl<'a> Follow<'a> {
                     answer = Some(stands);
                 }
                 FollowWork::Written(ty) => match &ty.anchored {
+                    // Residual computations do not introduce
+                    // a runtime type constructor. Every transparent path must
+                    // reach a shape before it can return to a declaration.
+                    TypeKind::Structural {
+                        captures,
+                        arguments,
+                        effect_sink,
+                        ..
+                    } => branches(
+                        &mut work,
+                        captures
+                            .iter()
+                            .chain(arguments)
+                            .chain(effect_sink.iter().map(|ty| ty.as_ref()))
+                            .map(|ty| vec![FollowWork::Written(ty)])
+                            .collect(),
+                        self.fielded,
+                    ),
                     // A struct whose `..` names a parameter stands for that
                     // parameter, with any fields written in front of it.
                     TypeKind::Struct {
@@ -7549,6 +8106,7 @@ impl<'a> Follow<'a> {
                     | TypeKind::TypeInfo(_)
                     | TypeKind::Sum { .. }
                     | TypeKind::Arrow { .. }
+                    | TypeKind::Match(_)
                     | TypeKind::Effects(_)
                     | TypeKind::Prim(_)
                     | TypeKind::Var(_)
@@ -7571,6 +8129,14 @@ impl<'a> Follow<'a> {
                     }
                 },
                 FollowWork::Semantic(ty) => match &**ty {
+                    Ty::Contract { contract, .. } => branches(
+                        &mut work,
+                        contract
+                            .type_operands()
+                            .map(|ty| vec![FollowWork::Semantic(ty)])
+                            .collect(),
+                        self.fielded,
+                    ),
                     Ty::Package(body) => work.push(FollowWork::Semantic(body)),
                     Ty::Bound(index) => {
                         answer = Some(Stands::Param {
@@ -7640,44 +8206,67 @@ impl<'a> Follow<'a> {
                 },
                 FollowWork::SelectWritten(args) => {
                     let stands = answer.expect("a forwarding head has an answer");
-                    if let Stands::Param { index, fields } = stands {
-                        if fields {
-                            self.fielded += 1;
-                        }
-                        // Written applications have already passed the arity
-                        // check, and imported forwarding slots are clamped to
-                        // their published arity while their interface is read.
-                        let arg = &args[index as usize];
-                        work.push(FollowWork::FinishSelect { fields });
-                        work.push(FollowWork::Written(arg));
+                    let parameters = self.parameters(stands);
+                    if !parameters.is_empty() {
+                        branches(
+                            &mut work,
+                            parameters
+                                .into_iter()
+                                .map(|(index, fields)| {
+                                    vec![
+                                        FollowWork::BeginSelect { fields },
+                                        FollowWork::Written(&args[index as usize]),
+                                        FollowWork::FinishSelect { fields },
+                                    ]
+                                })
+                                .collect(),
+                            self.fielded,
+                        );
                     }
                 }
                 FollowWork::SelectSemantic(args) => {
                     let stands = answer.expect("a forwarding head has an answer");
-                    if let Stands::Param { index, fields } = stands {
-                        if fields {
-                            self.fielded += 1;
-                        }
-                        match args.get(index as usize) {
-                            Some(arg) => {
-                                work.push(FollowWork::FinishSelect { fields });
-                                work.push(FollowWork::Semantic(arg));
-                            }
-                            None => answer = Some(Stands::Shape),
-                        }
+                    let parameters = self.parameters(stands);
+                    if !parameters.is_empty() {
+                        branches(
+                            &mut work,
+                            parameters
+                                .into_iter()
+                                .filter_map(|(index, fields)| {
+                                    args.get(index as usize).map(|arg| {
+                                        vec![
+                                            FollowWork::BeginSelect { fields },
+                                            FollowWork::Semantic(arg),
+                                            FollowWork::FinishSelect { fields },
+                                        ]
+                                    })
+                                })
+                                .collect(),
+                            self.fielded,
+                        );
                     }
                 }
+                FollowWork::BeginSelect { fields } => self.fielded += u32::from(fields),
                 FollowWork::FinishSelect { fields } => {
-                    answer = Some(match answer.expect("a selected argument has an answer") {
-                        Stands::Param {
-                            index,
-                            fields: below,
-                        } => Stands::Param {
-                            index,
-                            fields: fields || below,
-                        },
-                        stands => stands,
-                    });
+                    let stands = answer.expect("a selected argument has an answer");
+                    let parameters = self.parameters(stands);
+                    if !parameters.is_empty() {
+                        answer = Some(self.choice_summary(parameters.into_iter().map(
+                            |(index, below)| Stands::Param {
+                                index,
+                                fields: fields || below,
+                            },
+                        )));
+                    }
+                }
+                FollowWork::SaveChoice => {
+                    choices.push(answer.expect("a transparent branch has an answer"))
+                }
+                FollowWork::ResetFields(fielded) => self.fielded = fielded,
+                FollowWork::FinishChoices { count, fielded } => {
+                    let start = choices.len() - count;
+                    answer = Some(self.choice_summary(choices.drain(start..)));
+                    self.fielded = fielded;
                 }
             }
         }
@@ -9222,6 +9811,26 @@ fn constrain(
     out: &mut impl FnMut(Fact),
 ) {
     match &ty.anchored {
+        TypeKind::Structural {
+            captures,
+            arguments,
+            effect_sink,
+            ..
+        } => {
+            for ty in captures
+                .iter()
+                .chain(arguments)
+                .chain(effect_sink.iter().map(|ty| ty.as_ref()))
+            {
+                constrain(ty, summaries, out);
+            }
+        }
+        TypeKind::Match(arms) => {
+            for (from, to) in arms {
+                constrain(from, summaries, out);
+                constrain(to, summaries, out);
+            }
+        }
         // A name reached as a type is one: this walk only descends through
         // positions a type goes in, so arriving here at all is the statement.
         TypeKind::Param { index, .. } => out(Fact::Says(
@@ -9381,6 +9990,26 @@ fn row_arguments_selected(
         out: &mut Vec<Error>,
     ) {
         match &mut ty.anchored {
+            TypeKind::Structural {
+                captures,
+                arguments,
+                effect_sink,
+                ..
+            } => {
+                for ty in captures
+                    .iter_mut()
+                    .chain(arguments)
+                    .chain(effect_sink.iter_mut().map(|ty| ty.as_mut()))
+                {
+                    walk(ty, kinds, carries, rows, out);
+                }
+            }
+            TypeKind::Match(arms) => {
+                for (from, to) in arms {
+                    walk(from, kinds, carries, rows, out);
+                    walk(to, kinds, carries, rows, out);
+                }
+            }
             TypeKind::Apply { head, args, .. } => {
                 applied(*head, args, kinds, carries, rows, out);
             }
@@ -9740,6 +10369,8 @@ fn row_shaped(
             | TypeKind::Mirror(_)
             | TypeKind::TypeInfo(_)
             | TypeKind::Arrow { .. }
+            | TypeKind::Match(_)
+            | TypeKind::Structural { .. }
             | TypeKind::Prim(_)
             | TypeKind::Var(_)
             | TypeKind::Hidden { .. }
@@ -9941,6 +10572,7 @@ fn row_summaries(
                     | Ty::Presence(_)
                     | Ty::ForeignValue
                     | Ty::Arrow(..)
+                    | Ty::Contract { .. }
                     | Ty::Mut(..)
                     | Ty::Array(_)
                     | Ty::Mirror(_)
@@ -9993,6 +10625,8 @@ fn row_summaries(
                     | TypeKind::TypeInfo(_)
                     | TypeKind::Sum { .. }
                     | TypeKind::Arrow { .. }
+                    | TypeKind::Match(_)
+                    | TypeKind::Structural { .. }
                     | TypeKind::Effects(_)
                     | TypeKind::Prim(_)
                     | TypeKind::Var(_)
@@ -10175,6 +10809,8 @@ fn row_summary(ty: &Type, decls: &HashMap<Symbol, RowSummary>, shape: Sense) -> 
         | TypeKind::TypeInfo(_)
         | TypeKind::Sum { .. }
         | TypeKind::Arrow { .. }
+        | TypeKind::Match(_)
+        | TypeKind::Structural { .. }
         | TypeKind::Effects(_)
         | TypeKind::Prim(_)
         | TypeKind::Var(_)
@@ -10307,6 +10943,26 @@ fn relevance(types: &IndexMap<Symbol, Decl<Type>>) -> HashSet<Slot> {
     /// survive.
     fn occurrences(ty: &Type, under: &mut Vec<Slot>, out: &mut impl FnMut(u32, &[Slot])) {
         match &ty.anchored {
+            TypeKind::Structural {
+                captures,
+                arguments,
+                effect_sink,
+                ..
+            } => {
+                for ty in captures
+                    .iter()
+                    .chain(arguments)
+                    .chain(effect_sink.iter().map(|ty| ty.as_ref()))
+                {
+                    occurrences(ty, under, out);
+                }
+            }
+            TypeKind::Match(arms) => {
+                for (from, to) in arms {
+                    occurrences(from, under, out);
+                    occurrences(to, under, out);
+                }
+            }
             TypeKind::Param { index, .. } => out(*index, under),
             TypeKind::Array(element) | TypeKind::Mirror(element) | TypeKind::TypeInfo(element) => {
                 occurrences(element, under, out)
@@ -10425,6 +11081,26 @@ fn relevance(types: &IndexMap<Symbol, Decl<Type>>) -> HashSet<Slot> {
 /// is a local, and no declaration answers to it.
 fn mentioned(ty: &Type, out: &mut Vec<Symbol>) {
     match &ty.anchored {
+        TypeKind::Structural {
+            captures,
+            arguments,
+            effect_sink,
+            ..
+        } => {
+            for ty in captures
+                .iter()
+                .chain(arguments)
+                .chain(effect_sink.iter().map(|ty| ty.as_ref()))
+            {
+                mentioned(ty, out);
+            }
+        }
+        TypeKind::Match(arms) => {
+            for (from, to) in arms {
+                mentioned(from, out);
+                mentioned(to, out);
+            }
+        }
         TypeKind::Ident(symbol) => out.push(*symbol),
         TypeKind::Array(element) | TypeKind::Mirror(element) | TypeKind::TypeInfo(element) => {
             mentioned(element, out)
@@ -10496,6 +11172,26 @@ fn mentioned(ty: &Type, out: &mut Vec<Symbol>) {
 /// [`ErrorKind::GrowingRecursion`] and [`Solve::unfold`](crate::inference).
 fn grows(ty: &Type, group: &[Symbol], report: &mut impl FnMut(Anchor)) {
     match &ty.anchored {
+        TypeKind::Structural {
+            captures,
+            arguments,
+            effect_sink,
+            ..
+        } => {
+            for ty in captures
+                .iter()
+                .chain(arguments)
+                .chain(effect_sink.iter().map(|ty| ty.as_ref()))
+            {
+                grows(ty, group, report);
+            }
+        }
+        TypeKind::Match(arms) => {
+            for (from, to) in arms {
+                grows(from, group, report);
+                grows(to, group, report);
+            }
+        }
         // A group member written bare hands on nothing — and if it takes
         // something, the arity check has already spoken and this would be a
         // second complaint about one mistake.
@@ -10565,6 +11261,19 @@ fn grows(ty: &Type, group: &[Symbol], report: &mut impl FnMut(Anchor)) {
 /// grows exactly as one with a parameter in a field does.
 fn mentions_a_parameter(ty: &Type) -> bool {
     match &ty.anchored {
+        TypeKind::Structural {
+            captures,
+            arguments,
+            effect_sink,
+            ..
+        } => captures
+            .iter()
+            .chain(arguments)
+            .chain(effect_sink.iter().map(|ty| ty.as_ref()))
+            .any(mentions_a_parameter),
+        TypeKind::Match(arms) => arms
+            .iter()
+            .any(|(from, to)| mentions_a_parameter(from) || mentions_a_parameter(to)),
         TypeKind::Param { .. } => true,
         TypeKind::Array(element) | TypeKind::Mirror(element) | TypeKind::TypeInfo(element) => {
             mentions_a_parameter(element)
@@ -11332,6 +12041,15 @@ impl<'a> Builder<'a> {
                                         &mut program.external_names,
                                         &effect_rows,
                                     )
+                                    .unwrap_or_else(|_| {
+                                        self.error_at(
+                                            Anchor::GENERATED,
+                                            ErrorKind::ImportedTypeLimit {
+                                                name: declaration.name.clone(),
+                                            },
+                                        );
+                                        Anchor::GENERATED.anchor(TypeKind::Error)
+                                    })
                                 })
                                 .collect();
                             cases.push(AliasCase {
@@ -11781,6 +12499,20 @@ impl<'a> Builder<'a> {
         while let Some(node) = pending.pop() {
             let mut tail = None;
             match &node.anchored {
+                TypeKind::Structural {
+                    captures,
+                    arguments,
+                    effect_sink,
+                    ..
+                } => pending.extend(
+                    captures
+                        .iter()
+                        .chain(arguments)
+                        .chain(effect_sink.iter().map(|ty| ty.as_ref())),
+                ),
+                TypeKind::Match(arms) => {
+                    pending.extend(arms.iter().flat_map(|(from, to)| [from, to]))
+                }
                 TypeKind::Param { symbol, index } => {
                     captured.insert(*index, (*symbol, node.at));
                 }
@@ -12198,6 +12930,32 @@ impl<'a> Builder<'a> {
     fn substituted(&mut self, ty: &Type, args: &[Type]) -> Type {
         let span = ty.at;
         let tracked = match &ty.anchored {
+            TypeKind::Structural {
+                parameters,
+                body,
+                captures,
+                arguments,
+                effect_sink,
+            } => TypeKind::Structural {
+                parameters: *parameters,
+                body: body.clone(),
+                captures: captures
+                    .iter()
+                    .map(|ty| self.substituted(ty, args))
+                    .collect(),
+                arguments: arguments
+                    .iter()
+                    .map(|ty| self.substituted(ty, args))
+                    .collect(),
+                effect_sink: effect_sink
+                    .as_ref()
+                    .map(|ty| Box::new(self.substituted(ty, args))),
+            },
+            TypeKind::Match(arms) => TypeKind::Match(
+                arms.iter()
+                    .map(|(from, to)| (self.substituted(from, args), self.substituted(to, args)))
+                    .collect(),
+            ),
             TypeKind::Param { index, .. } => {
                 return args
                     .get(*index as usize)
@@ -13790,6 +14548,40 @@ impl<'a> Builder<'a> {
         let span = ty.span;
         let here = self.anchor(span);
         match ty.tracked {
+            parse::TypeKind::Structural {
+                parameters,
+                body,
+                captures,
+                effect_sink,
+            } => here.anchor(TypeKind::Structural {
+                parameters,
+                body,
+                arguments: Vec::new(),
+                captures: captures.into_iter().map(|ty| self.ty(ty, place)).collect(),
+                effect_sink: effect_sink.map(|ty| Box::new(self.ty(*ty, place))),
+            }),
+            parse::TypeKind::Match(arms) => {
+                let arms: Vec<_> = arms
+                    .into_iter()
+                    .map(|(from, to)| (self.ty(from, place), self.ty(to, place)))
+                    .collect();
+                let mut invalid = false;
+                for (from, _) in arms.iter().take(arms.len().saturating_sub(1)) {
+                    let discriminator = match &from.anchored {
+                        TypeKind::Struct { .. } | TypeKind::Error => true,
+                        TypeKind::Sum { cases, tail, .. } => cases.len() == 1 && tail.is_none(),
+                        _ => false,
+                    };
+                    if !discriminator {
+                        self.error_at(from.at, ErrorKind::UnsupportedMatchDiscriminator);
+                        invalid = true;
+                    }
+                }
+                if invalid {
+                    return here.anchor(TypeKind::Error);
+                }
+                here.anchor(TypeKind::Match(arms))
+            }
             // The variable is bound for the body and nowhere else, with an id
             // of its own: a `'a` under it is this `hide`'s, whatever `'a` may
             // mean around it.
@@ -15193,6 +15985,70 @@ mod tests {
         token,
         tracking::FileID,
     };
+
+    #[test]
+    fn effect_evidence_order_changes_layout_but_not_semantic_identity() {
+        use crate::types::{EffectId, Presence, Rest, Row as SemanticRow, RowField};
+        let a = EffectId::structural("A".into(), "0#4:Unit;".into()).row_key();
+        let b = EffectId::structural("B".into(), "0#4:Unit;".into()).row_key();
+        let callback = |names: [&str; 2]| {
+            Arc::new(Ty::Arrow(
+                Arc::new(Ty::Nat),
+                Arc::new(Ty::Nat),
+                SemanticRow {
+                    labels: names
+                        .into_iter()
+                        .map(|name| {
+                            (
+                                name.to_owned(),
+                                RowField {
+                                    presence: Presence::Present,
+                                    ty: Arc::new(Ty::unit()),
+                                },
+                            )
+                        })
+                        .collect(),
+                    rest: Rest::Closed,
+                },
+            ))
+        };
+        let ab = callback([&a, &b]);
+        let ba = callback([&b, &a]);
+        let aliases = IndexMap::new();
+        assert_eq!(
+            representation_key(&ab, &aliases),
+            representation_key(&ba, &aliases)
+        );
+        assert_ne!(layout_key(&ab, &aliases), layout_key(&ba, &aliases));
+        let split = |ty: &Arc<Ty>, last: &str| {
+            let Ty::Arrow(from, to, effects) = &**ty else {
+                unreachable!()
+            };
+            let mut prefix = effects.clone();
+            let field = prefix.labels.shift_remove(last).unwrap();
+            prefix.rest = Rest::More(Arc::new(SemanticRow {
+                labels: [(last.to_owned(), field)].into(),
+                rest: Rest::Closed,
+            }));
+            Arc::new(Ty::Arrow(from.clone(), to.clone(), prefix))
+        };
+        let split_ab = split(&ab, &b);
+        let split_ba = split(&ba, &a);
+        assert_eq!(
+            representation_key(&ab, &aliases),
+            representation_key(&split_ab, &aliases)
+        );
+        assert_eq!(
+            layout_key(&ab, &aliases),
+            layout_key(&split_ab, &aliases),
+            "splitting a row does not reorder its evidence parameters"
+        );
+        assert_ne!(
+            layout_key(&split_ab, &aliases),
+            layout_key(&split_ba, &aliases),
+            "composed rows retain the order of their evidence parameters"
+        );
+    }
 
     #[test]
     fn extern_target_text_and_literal_span_survive_lowering() {

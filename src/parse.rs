@@ -654,6 +654,8 @@ pub enum PatternKind {
 
 pub type Type = Tracked<TypeKind>;
 
+mod structural;
+
 /// An extern's boundary type. Ordinary Ruddy types are leaves; `fn(...) -> ...`
 /// nodes record the foreign function's call arity independently of the curried
 /// [`Type`] exposed to Ruddy code. Parentheses around a marked function remain
@@ -677,6 +679,15 @@ pub enum ExternTypeKind {
 
 #[derive(Debug, Clone)]
 pub enum TypeKind {
+    /// A structural function contract, with one input/result relationship per arm.
+    Match(Vec<(Type, Type)>),
+    /// A finite structural computation, with ordinary type captures.
+    Structural {
+        parameters: usize,
+        body: std::sync::Arc<crate::contracts::Expr>,
+        captures: Vec<Type>,
+        effect_sink: Option<Box<Type>>,
+    },
     /// A concrete presence supplied to a type parameter.
     Presence(bool),
     Struct {
@@ -1183,6 +1194,8 @@ struct Parser {
     type_before_value: bool,
     /// A trailing `when` is an element marker while reading a tuple type.
     type_before_presence: bool,
+    /// A result inside `match` may end before a pipe introducing the next arm.
+    type_match_result: bool,
     /// The regions recovery has dropped so far; see [`Output::skipped`].
     skipped: Vec<Span>,
     /// How far [`Parser::mismatched_closer`] has folded the token prefix into
@@ -1255,6 +1268,7 @@ impl Parser {
             errors: Vec::new(),
             type_before_value: false,
             type_before_presence: false,
+            type_match_result: false,
             skipped: Vec::new(),
             scan_pos: 0,
             scan_open: Vec::new(),
@@ -2453,7 +2467,12 @@ impl Parser {
                 }),
             ));
         }
-        if self.at(&Kind::Fn) {
+        if self.at(&Kind::Fn)
+            && self
+                .toks
+                .get(self.pos + 1)
+                .is_some_and(|token| matches!(token.tracked, Kind::LeftParen))
+        {
             return self.extern_function_type();
         }
         if self.at_grouped_extern_function() {
@@ -2488,10 +2507,14 @@ impl Parser {
             at += 1;
         }
         opens > 0
-            && matches!(
-                self.toks.get(at).map(|token| &token.tracked),
-                Some(Kind::Fn | Kind::Attribute(_))
-            )
+            && match self.toks.get(at).map(|token| &token.tracked) {
+                Some(Kind::Fn) => matches!(
+                    self.toks.get(at + 1).map(|token| &token.tracked),
+                    Some(Kind::LeftParen)
+                ),
+                Some(Kind::Attribute(_)) => true,
+                _ => false,
+            }
     }
 
     /// `fn(<extern-type>, ...) -> <extern-type> [+ <effects>]`.
@@ -4178,6 +4201,9 @@ impl Parser {
     /// other call returns a `+` to the caller that is about to build the arrow
     /// it belongs to.
     fn arrow(&mut self, outermost: bool) -> Option<Type> {
+        if self.at(&Kind::Fn) {
+            return self.structural_type();
+        }
         // `hide 'a => <type>` binds over everything to its right, the way a
         // lambda's body runs to the end: read here, above the arrow, so the
         // body takes the whole arrow after it and an arrow's result may be
@@ -4511,6 +4537,9 @@ impl Parser {
                 cases.insert(name, SumCase::Written { when, payload });
             }
 
+            if self.type_match_result && self.at_type_match_arm() {
+                break;
+            }
             match self.eat_if(&Kind::Pipe) {
                 Some(pipe) => separator = Some(pipe.span),
                 None => break,
@@ -4589,6 +4618,7 @@ impl Parser {
                     | Kind::LeftBracket
                     | Kind::LeftParen
                     | Kind::Underscore
+                    | Kind::Match
             )
         )
     }
@@ -4608,6 +4638,7 @@ impl Parser {
         };
         let span = tok.span;
         match &tok.tracked {
+            Kind::Match => self.match_type(),
             Kind::Bool(value) => {
                 let value = *value;
                 self.advance();
@@ -4650,6 +4681,71 @@ impl Parser {
             // reported, so `let x : = ()` cannot pass for `let x : () = ()`.
             _ => self.expected(Expected::Type),
         }
+    }
+
+    /// A pipe followed by an input and `=>` starts the next contract arm.
+    /// Delimited types may contain their own arrows and pipes; those do not
+    /// terminate the lookahead. A multi-case input is parenthesized when it
+    /// follows a sum result, so a bare pipe remains a sum separator unless
+    /// its following input reaches `=>` before another bare pipe.
+    fn at_type_match_arm(&self) -> bool {
+        if !self.at(&Kind::Pipe) {
+            return false;
+        }
+        let mut closers = Vec::new();
+        for token in self.toks.iter().skip(self.pos + 1) {
+            match &token.tracked {
+                Kind::LeftParen => closers.push(0),
+                Kind::LeftBrace => closers.push(1),
+                Kind::LeftBracket => closers.push(2),
+                Kind::Match => closers.push(3),
+                Kind::RightParen | Kind::RightBrace | Kind::RightBracket | Kind::End => {
+                    let closer = match token.tracked {
+                        Kind::RightParen => 0,
+                        Kind::RightBrace => 1,
+                        Kind::RightBracket => 2,
+                        _ => 3,
+                    };
+                    if closers.pop() != Some(closer) {
+                        return false;
+                    }
+                }
+                Kind::FatArrow if closers.is_empty() => return true,
+                Kind::Pipe | Kind::Comma | Kind::Semicolon | Kind::Equal if closers.is_empty() => {
+                    return false;
+                }
+                _ => {}
+            }
+        }
+        false
+    }
+
+    fn match_type(&mut self) -> Option<Type> {
+        let open = self.advance().expect("the caller peeked `match`");
+        let outer = self.type_match_result;
+        let result = (|| {
+            let mut arms = Vec::new();
+            while !self.at(&Kind::End) {
+                self.eat(&Kind::Pipe)?;
+                self.type_match_result = false;
+                let from = self.type_expr()?;
+                self.eat(&Kind::FatArrow)?;
+                self.type_match_result = true;
+                let to = self.type_expr()?;
+                arms.push((from, to));
+            }
+            let close = self.eat_with_context(
+                &Kind::End,
+                None,
+                Some(Related {
+                    span: open.span,
+                    kind: RelatedKind::Construct("match type"),
+                }),
+            )?;
+            Some(open.span.merge(close.span).track(TypeKind::Match(arms)))
+        })();
+        self.type_match_result = outer;
+        result
     }
 
     fn at_fixed_spread(&self) -> bool {

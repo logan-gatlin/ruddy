@@ -23,6 +23,9 @@
 (annotation type: (identifier) @type)
 (function_type from: (identifier) @type)
 (function_type to: (identifier) @type)
+(match_type_arm from: (identifier) @type)
+(match_type_arm to: (identifier) @type)
+(structural_capture type: (identifier) @type)
 (type_application head: (identifier) @type)
 (type_application argument: (identifier) @type)
 (parenthesized_type (identifier) @type)
@@ -50,6 +53,9 @@
 (annotation type: (path name: (identifier) @type))
 (function_type from: (path name: (identifier) @type))
 (function_type to: (path name: (identifier) @type))
+(match_type_arm from: (path name: (identifier) @type))
+(match_type_arm to: (path name: (identifier) @type))
+(structural_capture type: (path name: (identifier) @type))
 (type_application head: (path name: (identifier) @type))
 (type_application argument: (path name: (identifier) @type))
 (parenthesized_type (path name: (identifier) @type))
@@ -138,6 +144,9 @@
 (struct_type_field name: (numeric_field) @property)
 (struct_pattern_field name: (numeric_field) @property)
 (absent_field name: (numeric_field) @property)
+(structural_field name: [(identifier) (numeric_field)] @property)
+(structural_field_pattern name: [(identifier) (numeric_field)] @property)
+(structural_projection field: [(identifier) (numeric_field)] @property)
 
 ; ── literals ─────────────────────────────────────────────────────────────────
 
@@ -154,6 +163,9 @@
 (struct_pattern_field name: (string) @property)
 (absent_field name: (string) @property)
 (projection field: (string) @property)
+(structural_field name: (string) @property)
+(structural_field_pattern name: (string) @property)
+(structural_projection field: (string) @property)
 
 ; ── keywords ─────────────────────────────────────────────────────────────────
 
@@ -194,6 +206,7 @@
 (clause_or "or" @keyword.operator)
 (clause_and "and" @keyword.operator)
 (clause_not "not" @keyword.operator)
+(structural_capture "capture" @keyword)
 
 ; ── the wildcard and the hole ────────────────────────────────────────────────
 

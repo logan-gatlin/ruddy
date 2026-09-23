@@ -130,6 +130,8 @@ module.exports = grammar({
     [$.absent_effect],
     [$.effect_alias],
     [$.sum_case],
+    [$._sum_cases],
+    [$.match_type_arm, $._sum_cases],
     [$._type_application, $.type_application],
   ],
 
@@ -917,7 +919,84 @@ module.exports = grammar({
       optional(field('clause', $.where_clause)),
     ),
 
-    _type: $ => choice($.hidden_type, $.function_type, $._type_sum),
+    _type: $ => choice($.structural_contract_type, $.hidden_type, $.function_type, $._type_sum),
+
+    structural_contract_type: $ => prec.right(seq(
+      'fn', choice(
+        seq(repeat(field('parameter', $.type_variable)), '=>',
+          field('body', $._structural_expression)),
+        repeat1(seq('|', $.structural_match_arm)),
+      ),
+      optional(field('effects', $.effect_row)),
+    )),
+
+    _structural_expression: $ => choice(
+      $.structural_application,
+      $.structural_projection,
+      $._structural_atom,
+    ),
+
+    structural_application: $ => prec.left(PREC.application, seq(
+      field('function', $._structural_expression),
+      field('argument', $._structural_atom),
+    )),
+
+    structural_projection: $ => prec.left(PREC.projection, seq(
+      field('base', $._structural_expression), '.',
+      field('field', choice(fieldLabel($), $.tag)),
+    )),
+
+    _structural_atom: $ => choice(
+      $.type_variable, $.identifier, $.path, $.hole, $.unit,
+      $.structural_capture, $.structural_record, $.structural_tuple,
+      $.structural_tag, $.structural_match, $.structural_then,
+      $.parenthesized_structural_expression,
+    ),
+
+    structural_capture: $ => seq('capture', '(', field('type', $._type), ')'),
+
+    parenthesized_structural_expression: $ => seq('(', $._structural_expression, ')'),
+
+    structural_tuple: $ => seq('(', $._structural_expression, ',', optional(seq(
+      $._structural_expression, repeat(seq(',', $._structural_expression)), optional(','),
+    )), ')'),
+
+    structural_record: $ => seq('{', optional(seq(
+      choice($.structural_field, $.structural_spread),
+      repeat(seq(',', choice($.structural_field, $.structural_spread))), optional(','),
+    )), '}'),
+
+    structural_field: $ => seq(field('name', fieldLabel($)), ':', field('value', $._structural_expression)),
+    structural_spread: $ => seq('..', $._structural_expression),
+    structural_tag: $ => prec.right(PREC.tag, seq($.tag, optional($._structural_atom))),
+
+    structural_match: $ => seq(
+      'match', $._structural_expression, 'with',
+      repeat(seq('|', $.structural_match_arm)), 'end',
+    ),
+    structural_match_arm: $ => seq($._structural_pattern, '=>', $._structural_expression),
+    _structural_pattern: $ => choice(
+      $.wildcard, $.type_variable, $.unit, $.structural_record_pattern,
+      $.structural_tuple_pattern, $.structural_tag_pattern,
+      $.parenthesized_structural_pattern,
+    ),
+    structural_record_pattern: $ => seq('{', optional(seq(
+      choice($.structural_field_pattern, '..'),
+      repeat(seq(',', choice($.structural_field_pattern, '..'))), optional(','),
+    )), '}'),
+    structural_field_pattern: $ => seq(field('name', fieldLabel($)), ':', field('pattern', $._structural_pattern)),
+    structural_tuple_pattern: $ => seq('(', $._structural_pattern, ',', optional(seq(
+      choice($._structural_pattern, '..'),
+      repeat(seq(',', choice($._structural_pattern, '..'))), optional(','),
+    )), ')'),
+    structural_tag_pattern: $ => prec.right(seq($.tag, optional($._structural_pattern))),
+    parenthesized_structural_pattern: $ => seq('(', $._structural_pattern, ')'),
+    structural_then: $ => seq(
+      'do', repeat1(seq(
+        choice(seq('let', $.type_variable), '_'), '=', $._structural_expression, optional(';'),
+      )),
+      'return', $._structural_expression, 'end',
+    ),
 
     /**
      * `hide 'a => <type>` — a hidden type. The body extends as far right as
@@ -967,10 +1046,10 @@ module.exports = grammar({
     // Right-associative, so a sum written as an operation's signature takes
     // every `|` after it — `effect E = op : #A | #B` declares one operation
     // returning a two-case sum, exactly as `Parser::type_sum` reads it.
-    _sum_cases: $ => prec.right(seq(
+    _sum_cases: $ => seq(
       choice($.sum_case, $.absent_case),
       optional(seq('|', $._sum_body)),
-    )),
+    ),
 
     /** `#Some (when 'a) T` — a case a value may be, carrying this when it is. */
     sum_case: $ => seq(
@@ -1030,6 +1109,7 @@ module.exports = grammar({
     )),
 
     _type_atom: $ => choice(
+      $.match_type,
       $.boolean,
       $.identifier,
       $.path,
@@ -1041,6 +1121,35 @@ module.exports = grammar({
       $.mut_type,
       $.tuple_type,
       $.parenthesized_type,
+    ),
+
+    /** A structural function contract, with one input/result pair per arm. */
+    match_type: $ => seq(
+      'match',
+      repeat(seq('|', $.match_type_arm)),
+      'end',
+    ),
+
+    match_type_arm: $ => prec.right(seq(
+      field('from', $._match_type_input),
+      '=>',
+      field('to', $._type),
+    )),
+
+    // Prefer finishing an earlier result sum over growing the next input sum:
+    // `#A => #B | #C | #D => #E` returns B or C, then has a D arm.
+    // Parentheses still express a multi-case input without that ambiguity.
+    _match_type_input: $ => choice(
+      $.structural_contract_type, $.hidden_type, $.function_type,
+      $.effect_type, $._type_application,
+      alias($._match_input_sum, $.sum_type),
+    ),
+
+    _match_input_sum: $ => choice(
+      $.sum_case,
+      $.absent_case,
+      seq('|', optional($._sum_body)),
+      prec.dynamic(-1, seq(choice($.sum_case, $.absent_case), '|', $._sum_body)),
     ),
 
     /** `{ x: Nat, y when 'a: Nat, \z, ..'r }`, with an optional trailing comma. */

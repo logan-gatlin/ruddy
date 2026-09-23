@@ -7,9 +7,11 @@
 //! malformed input. Use [`try_parse`] at trust boundaries. This is an internal
 //! v2 format, not a compatibility promise.
 
+mod contracts;
 mod regions;
+mod sharing;
 
-use std::{collections::HashMap, error::Error, fmt};
+use std::{collections::HashMap, error::Error, fmt, sync::Arc};
 
 use indexmap::IndexMap;
 
@@ -731,8 +733,10 @@ pub struct Scheme {
 
 /// A normalized semantic type. Structural fields are representable only by
 /// the `Struct` constructor.
-#[derive(Debug)]
 pub enum Type {
+    /// An acyclic, package-free node shared within one type root. Sharing has
+    /// no semantic meaning; package owners still count their occurrences.
+    Shared(Arc<Type>),
     Presence(Presence),
     Nat,
     Int,
@@ -742,6 +746,10 @@ pub enum Type {
     Bool,
     ForeignValue,
     Arrow(Box<Type>, Box<Type>, Row),
+    Contract {
+        fallback: Box<Type>,
+        contract: Contract,
+    },
     Package(Box<Type>),
     /// `hide 'a => T`, with the occurrences of its variable inside the body
     /// as [`Type::HiddenVar`]s naming the same binder.
@@ -772,6 +780,58 @@ pub enum Type {
     },
     Undecided,
 }
+
+impl Type {
+    pub(crate) fn unshared(&self) -> &Self {
+        let mut value = self;
+        while let Self::Shared(inner) = value {
+            value = inner;
+        }
+        value
+    }
+}
+
+impl fmt::Debug for Type {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        text::type_debug(self, f)
+    }
+}
+
+/// A finite structural contract, with its type operands in the enclosing
+/// scheme's quantifier space. The expression graph contains no compiler IDs.
+#[derive(Debug, Clone)]
+pub struct Contract {
+    pub parameters: usize,
+    pub body: Arc<crate::contracts::Expr>,
+    pub captures: Vec<Type>,
+    pub arguments: Vec<Type>,
+    pub effect_sink: Option<Box<Type>>,
+}
+
+impl Contract {
+    pub(crate) fn type_operands(&self) -> impl DoubleEndedIterator<Item = &Type> {
+        self.captures
+            .iter()
+            .chain(&self.arguments)
+            .chain(self.effect_sink.as_deref())
+    }
+
+    pub(crate) fn annotation_cases(&self) -> Option<Vec<(&Type, &Type)>> {
+        contracts::annotation_cases(self)
+    }
+}
+
+impl PartialEq for Contract {
+    fn eq(&self, other: &Self) -> bool {
+        self.parameters == other.parameters
+            && crate::contracts::Expr::same_structure(&self.body, &other.body)
+            && self.captures == other.captures
+            && self.arguments == other.arguments
+            && self.effect_sink == other.effect_sink
+    }
+}
+
+impl Eq for Contract {}
 
 /// A normalized sum or effect row.
 #[derive(Debug)]
@@ -841,97 +901,128 @@ enum SemanticPair<'a> {
 
 fn semantic_eq(root: SemanticPair<'_>) -> bool {
     let mut pending = vec![root];
+    let mut compared = std::collections::HashSet::new();
     while let Some(pair) = pending.pop() {
         match pair {
-            SemanticPair::Type(left, right) => match (left, right) {
-                (Type::Fixed(left), Type::Fixed(right)) if left == right => {}
-                (Type::Nat, Type::Nat)
-                | (Type::Int, Type::Int)
-                | (Type::Real, Type::Real)
-                | (Type::String, Type::String)
-                | (Type::Bool, Type::Bool)
-                | (Type::ForeignValue, Type::ForeignValue)
-                | (Type::Undecided, Type::Undecided) => {}
-                (Type::Presence(left), Type::Presence(right)) if left == right => {}
-                (Type::Var(left), Type::Var(right)) | (Type::Bound(left), Type::Bound(right))
-                    if left == right => {}
-                (
-                    Type::Rigid {
-                        id: left_id,
-                        name: left_name,
-                    },
-                    Type::Rigid {
-                        id: right_id,
-                        name: right_name,
-                    },
-                ) if left_id == right_id && left_name == right_name => {}
-                (
-                    Type::Arrow(left_from, left_to, left_effects),
-                    Type::Arrow(right_from, right_to, right_effects),
-                ) => {
-                    pending.push(SemanticPair::Row(left_effects, right_effects));
-                    pending.push(SemanticPair::Type(left_to, right_to));
-                    pending.push(SemanticPair::Type(left_from, right_from));
+            SemanticPair::Type(left, right) => {
+                let (left, right) = (left.unshared(), right.unshared());
+                if !compared.insert((left as *const Type, right as *const Type)) {
+                    continue;
                 }
-                (Type::Package(left), Type::Package(right)) => {
-                    pending.push(SemanticPair::Type(left, right));
+                match (left, right) {
+                    (Type::Fixed(left), Type::Fixed(right)) if left == right => {}
+                    (Type::Nat, Type::Nat)
+                    | (Type::Int, Type::Int)
+                    | (Type::Real, Type::Real)
+                    | (Type::String, Type::String)
+                    | (Type::Bool, Type::Bool)
+                    | (Type::ForeignValue, Type::ForeignValue)
+                    | (Type::Undecided, Type::Undecided) => {}
+                    (Type::Presence(left), Type::Presence(right)) if left == right => {}
+                    (Type::Var(left), Type::Var(right))
+                    | (Type::Bound(left), Type::Bound(right))
+                        if left == right => {}
+                    (
+                        Type::Rigid {
+                            id: left_id,
+                            name: left_name,
+                        },
+                        Type::Rigid {
+                            id: right_id,
+                            name: right_name,
+                        },
+                    ) if left_id == right_id && left_name == right_name => {}
+                    (
+                        Type::Arrow(left_from, left_to, left_effects),
+                        Type::Arrow(right_from, right_to, right_effects),
+                    ) => {
+                        pending.push(SemanticPair::Row(left_effects, right_effects));
+                        pending.push(SemanticPair::Type(left_to, right_to));
+                        pending.push(SemanticPair::Type(left_from, right_from));
+                    }
+                    (Type::Package(left), Type::Package(right)) => {
+                        pending.push(SemanticPair::Type(left, right));
+                    }
+                    (
+                        Type::Contract {
+                            fallback: left,
+                            contract: a,
+                        },
+                        Type::Contract {
+                            fallback: right,
+                            contract: b,
+                        },
+                    ) if a.parameters == b.parameters
+                        && crate::contracts::Expr::same_structure(&a.body, &b.body)
+                        && a.captures.len() == b.captures.len()
+                        && a.arguments.len() == b.arguments.len()
+                        && a.effect_sink.is_some() == b.effect_sink.is_some() =>
+                    {
+                        pending.push(SemanticPair::Type(left, right));
+                        pending.extend(
+                            a.type_operands()
+                                .zip(b.type_operands())
+                                .map(|(left, right)| SemanticPair::Type(left, right)),
+                        );
+                    }
+                    (
+                        Type::Hidden {
+                            binder: left_binder,
+                            name: left_name,
+                            body: left,
+                        },
+                        Type::Hidden {
+                            binder: right_binder,
+                            name: right_name,
+                            body: right,
+                        },
+                    ) if left_binder == right_binder && left_name == right_name => {
+                        pending.push(SemanticPair::Type(left, right));
+                    }
+                    (
+                        Type::HiddenVar {
+                            binder: left_binder,
+                            name: left_name,
+                        },
+                        Type::HiddenVar {
+                            binder: right_binder,
+                            name: right_name,
+                        },
+                    ) if left_binder == right_binder && left_name == right_name => {}
+                    (Type::Mut(a, b), Type::Mut(c, d)) => {
+                        pending.push(SemanticPair::Type(a, c));
+                        pending.push(SemanticPair::Type(b, d));
+                    }
+                    (Type::Array(left), Type::Array(right))
+                    | (Type::Mirror(left), Type::Mirror(right))
+                    | (Type::TypeInfo(left), Type::TypeInfo(right)) => {
+                        pending.push(SemanticPair::Type(left, right));
+                    }
+                    (Type::Struct(left), Type::Struct(right))
+                    | (Type::Sum(left), Type::Sum(right)) => {
+                        pending.push(SemanticPair::Row(left, right));
+                    }
+                    (
+                        Type::Named {
+                            name: left_name,
+                            args: left_args,
+                        },
+                        Type::Named {
+                            name: right_name,
+                            args: right_args,
+                        },
+                    ) if left_name == right_name && left_args.len() == right_args.len() => {
+                        pending.extend(
+                            left_args
+                                .iter()
+                                .zip(right_args)
+                                .rev()
+                                .map(|(left, right)| SemanticPair::Type(left, right)),
+                        );
+                    }
+                    _ => return false,
                 }
-                (
-                    Type::Hidden {
-                        binder: left_binder,
-                        name: left_name,
-                        body: left,
-                    },
-                    Type::Hidden {
-                        binder: right_binder,
-                        name: right_name,
-                        body: right,
-                    },
-                ) if left_binder == right_binder && left_name == right_name => {
-                    pending.push(SemanticPair::Type(left, right));
-                }
-                (
-                    Type::HiddenVar {
-                        binder: left_binder,
-                        name: left_name,
-                    },
-                    Type::HiddenVar {
-                        binder: right_binder,
-                        name: right_name,
-                    },
-                ) if left_binder == right_binder && left_name == right_name => {}
-                (Type::Mut(a, b), Type::Mut(c, d)) => {
-                    pending.push(SemanticPair::Type(a, c));
-                    pending.push(SemanticPair::Type(b, d));
-                }
-                (Type::Array(left), Type::Array(right))
-                | (Type::Mirror(left), Type::Mirror(right))
-                | (Type::TypeInfo(left), Type::TypeInfo(right)) => {
-                    pending.push(SemanticPair::Type(left, right));
-                }
-                (Type::Struct(left), Type::Struct(right)) | (Type::Sum(left), Type::Sum(right)) => {
-                    pending.push(SemanticPair::Row(left, right));
-                }
-                (
-                    Type::Named {
-                        name: left_name,
-                        args: left_args,
-                    },
-                    Type::Named {
-                        name: right_name,
-                        args: right_args,
-                    },
-                ) if left_name == right_name && left_args.len() == right_args.len() => {
-                    pending.extend(
-                        left_args
-                            .iter()
-                            .zip(right_args)
-                            .rev()
-                            .map(|(left, right)| SemanticPair::Type(left, right)),
-                    );
-                }
-                _ => return false,
-            },
+            }
             SemanticPair::Row(left, right) => {
                 if left.labels.len() != right.labels.len() {
                     return false;
@@ -1029,6 +1120,7 @@ enum CloneWork<'a> {
     Semantic(SemanticRef<'a>),
     Arrow,
     Package,
+    Contract(&'a Contract),
     Hidden(u32, String),
     Array,
     Mirror,
@@ -1053,6 +1145,7 @@ fn clone_semantic(root: SemanticRef<'_>) -> (Vec<Type>, Vec<Row>) {
     while let Some(part) = work.pop() {
         match part {
             CloneWork::Semantic(SemanticRef::Type(value)) => match value {
+                Type::Shared(inner) => types.push(Type::Shared(inner.clone())),
                 Type::Nat => types.push(Type::Nat),
                 Type::Int => types.push(Type::Int),
                 Type::Fixed(kind) => types.push(Type::Fixed(*kind)),
@@ -1070,6 +1163,16 @@ fn clone_semantic(root: SemanticRef<'_>) -> (Vec<Type>, Vec<Row>) {
                 Type::Package(body) => {
                     work.push(CloneWork::Package);
                     work.push(CloneWork::Semantic(SemanticRef::Type(body)));
+                }
+                Type::Contract { fallback, contract } => {
+                    work.push(CloneWork::Contract(contract));
+                    work.extend(
+                        contract
+                            .type_operands()
+                            .rev()
+                            .map(|ty| CloneWork::Semantic(SemanticRef::Type(ty))),
+                    );
+                    work.push(CloneWork::Semantic(SemanticRef::Type(fallback)));
                 }
                 Type::Hidden { binder, name, body } => {
                     work.push(CloneWork::Hidden(*binder, name.clone()));
@@ -1161,6 +1264,25 @@ fn clone_semantic(root: SemanticRef<'_>) -> (Vec<Type>, Vec<Row>) {
             CloneWork::Package => {
                 let body = types.pop().expect("cloned package body");
                 types.push(Type::Package(Box::new(body)));
+            }
+            CloneWork::Contract(contract) => {
+                let effect_sink = contract
+                    .effect_sink
+                    .as_ref()
+                    .map(|_| Box::new(types.pop().expect("cloned contract effect sink")));
+                let arguments = types.split_off(types.len() - contract.arguments.len());
+                let captures = types.split_off(types.len() - contract.captures.len());
+                let fallback = Box::new(types.pop().expect("cloned contract fallback"));
+                types.push(Type::Contract {
+                    fallback,
+                    contract: Contract {
+                        parameters: contract.parameters,
+                        body: contract.body.clone(),
+                        captures,
+                        arguments,
+                        effect_sink,
+                    },
+                });
             }
             CloneWork::Hidden(binder, name) => {
                 let body = types.pop().expect("cloned hidden body");
@@ -1254,6 +1376,40 @@ fn empty_row() -> Row {
 
 fn drain_type(value: &mut Type, pending: &mut Vec<SemanticOwned>) {
     match value {
+        Type::Shared(inner) => {
+            if let Some(inner) = Arc::get_mut(inner) {
+                pending.push(SemanticOwned::Type(std::mem::replace(
+                    inner,
+                    Type::Undecided,
+                )));
+            } else if Arc::strong_count(inner) == 1 {
+                // Weak observers prevent get_mut, but must not turn the last
+                // strong release back into a recursive destructor chain.
+                let owned = std::mem::replace(inner, Arc::new(Type::Undecided));
+                if let Ok(value) = Arc::try_unwrap(owned) {
+                    pending.push(SemanticOwned::Type(value));
+                }
+            }
+        }
+        Type::Contract { fallback, contract } => {
+            if let Some(sink) = contract.effect_sink.take() {
+                pending.push(SemanticOwned::Type(*sink));
+            }
+            pending.push(SemanticOwned::Type(std::mem::replace(
+                fallback.as_mut(),
+                Type::Undecided,
+            )));
+            pending.extend(
+                std::mem::take(&mut contract.captures)
+                    .into_iter()
+                    .map(SemanticOwned::Type),
+            );
+            pending.extend(
+                std::mem::take(&mut contract.arguments)
+                    .into_iter()
+                    .map(SemanticOwned::Type),
+            );
+        }
         Type::Hidden { body, .. } => pending.push(SemanticOwned::Type(std::mem::replace(
             body,
             Type::Undecided,
@@ -1646,7 +1802,10 @@ pub(crate) fn test_values(
                 name: qualified(mint, *symbol),
                 scheme: {
                     let mut result = scheme(mint, ty);
-                    let body = crate::inference::unfold(inference.aliases(), ty.body());
+                    let mut body = crate::inference::unfold(inference.aliases(), ty.body());
+                    while let crate::types::Ty::Contract { fallback, .. } = &*body {
+                        body = crate::inference::unfold(inference.aliases(), fallback);
+                    }
                     result.body = self::ty(mint, &body);
                     if let (crate::types::Ty::Arrow(from, to, _), Type::Arrow(input, output, _)) =
                         (&*body, &mut result.body)
@@ -1830,7 +1989,48 @@ fn effect_id(id: &types::EffectId) -> EffectIdentity {
 /// type by its qualified name in `mint`. The same translation
 /// [`build_with_dependencies`] uses for every exported value.
 pub fn export_scheme(mint: &Mint, value: &types::Scheme) -> Scheme {
-    scheme(mint, value)
+    try_export_scheme(mint, value).expect("semantic scheme exceeds artifact export limits")
+}
+
+/// A semantic type cannot be exported within the finite portable graph budget.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExportError {
+    pub limit: usize,
+}
+
+impl fmt::Display for ExportError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "type export exceeds {} portable nodes after preserving package ownership",
+            self.limit
+        )
+    }
+}
+
+impl Error for ExportError {}
+
+pub(crate) fn check_type_export(value: &types::Ty) -> Result<(), ExportError> {
+    (sharing::Plan::new(value).cost <= sharing::LIMIT)
+        .then_some(())
+        .ok_or(ExportError {
+            limit: sharing::LIMIT,
+        })
+}
+
+pub(crate) fn check_syntax_import(value: &Type) -> Result<(), ExportError> {
+    (sharing::syntax_cost(value) <= sharing::LIMIT)
+        .then_some(())
+        .ok_or(ExportError {
+            limit: sharing::LIMIT,
+        })
+}
+
+/// Export with an explicit resource error for types whose package ownership
+/// requires more expanded occurrences than the portable graph budget permits.
+pub fn try_export_scheme(mint: &Mint, value: &types::Scheme) -> Result<Scheme, ExportError> {
+    check_type_export(value.body())?;
+    Ok(scheme(mint, value))
 }
 
 fn scheme(mint: &Mint, value: &types::Scheme) -> Scheme {
@@ -1850,9 +2050,11 @@ fn scheme(mint: &Mint, value: &types::Scheme) -> Scheme {
 fn ty(mint: &Mint, value: &types::Ty) -> Type {
     enum Work<'a> {
         Ty(&'a types::Ty),
+        Shared(usize),
         Row(&'a types::Row),
         Arrow,
         Package,
+        Contract(&'a crate::contracts::Contract),
         Hidden(u32, String),
         Array,
         Mirror,
@@ -1889,78 +2091,100 @@ fn ty(mint: &Mint, value: &types::Ty) -> Type {
         types::Rest::More(_) => None,
     };
 
+    let plan = sharing::Plan::new(value);
+    let mut shared = HashMap::new();
     let mut work = vec![Work::Ty(value)];
     let mut tys = Vec::new();
     let mut rows = Vec::new();
     while let Some(part) = work.pop() {
         match part {
-            Work::Ty(value) => match value {
-                types::Ty::Nat => tys.push(Type::Nat),
-                types::Ty::Int => tys.push(Type::Int),
-                types::Ty::Fixed(kind) => tys.push(Type::Fixed(*kind)),
-                types::Ty::Real => tys.push(Type::Real),
-                types::Ty::String => tys.push(Type::String),
-                types::Ty::Bool => tys.push(Type::Bool),
-                types::Ty::Presence(p) => tys.push(Type::Presence(presence(p))),
-                types::Ty::ForeignValue => tys.push(Type::ForeignValue),
-                types::Ty::Arrow(from, to, effects) => {
-                    work.push(Work::Arrow);
-                    work.push(Work::Row(effects));
-                    work.push(Work::Ty(to));
-                    work.push(Work::Ty(from));
+            Work::Ty(value) => {
+                let key = value as *const types::Ty as usize;
+                if plan.shared.contains(&key) {
+                    if let Some(value) = shared.get(&key) {
+                        tys.push(Type::Shared(Arc::clone(value)));
+                        continue;
+                    }
+                    work.push(Work::Shared(key));
                 }
-                types::Ty::Package(body) => {
-                    work.push(Work::Package);
-                    work.push(Work::Ty(body));
+                match value {
+                    types::Ty::Nat => tys.push(Type::Nat),
+                    types::Ty::Int => tys.push(Type::Int),
+                    types::Ty::Fixed(kind) => tys.push(Type::Fixed(*kind)),
+                    types::Ty::Real => tys.push(Type::Real),
+                    types::Ty::String => tys.push(Type::String),
+                    types::Ty::Bool => tys.push(Type::Bool),
+                    types::Ty::Presence(p) => tys.push(Type::Presence(presence(p))),
+                    types::Ty::ForeignValue => tys.push(Type::ForeignValue),
+                    types::Ty::Arrow(from, to, effects) => {
+                        work.push(Work::Arrow);
+                        work.push(Work::Row(effects));
+                        work.push(Work::Ty(to));
+                        work.push(Work::Ty(from));
+                    }
+                    types::Ty::Package(body) => {
+                        work.push(Work::Package);
+                        work.push(Work::Ty(body));
+                    }
+                    types::Ty::Contract { fallback, contract } => {
+                        work.push(Work::Contract(contract));
+                        work.extend(contract.type_operands().rev().map(|ty| Work::Ty(ty)));
+                        work.push(Work::Ty(fallback));
+                    }
+                    types::Ty::Hidden { binder, name, body } => {
+                        work.push(Work::Hidden(*binder, name.to_string()));
+                        work.push(Work::Ty(body));
+                    }
+                    types::Ty::HiddenVar { binder, name } => tys.push(Type::HiddenVar {
+                        binder: *binder,
+                        name: name.to_string(),
+                    }),
+                    types::Ty::Array(element) => {
+                        work.push(Work::Array);
+                        work.push(Work::Ty(element));
+                    }
+                    types::Ty::Mirror(element) => {
+                        work.push(Work::Mirror);
+                        work.push(Work::Ty(element));
+                    }
+                    types::Ty::TypeInfo(element) => {
+                        work.push(Work::TypeInfo);
+                        work.push(Work::Ty(element));
+                    }
+                    types::Ty::Mut(region, element) => {
+                        work.push(Work::Mut);
+                        work.push(Work::Ty(element));
+                        work.push(Work::Ty(region));
+                    }
+                    types::Ty::Struct(row) => {
+                        work.push(Work::Struct);
+                        work.push(Work::Row(row));
+                    }
+                    types::Ty::Sum(row) => {
+                        work.push(Work::Sum);
+                        work.push(Work::Row(row));
+                    }
+                    types::Ty::Var(value) => tys.push(Type::Var(*value)),
+                    types::Ty::Bound(value) => tys.push(Type::Bound(*value)),
+                    types::Ty::Rigid { id, name } => tys.push(Type::Rigid {
+                        id: *id,
+                        name: name.to_string(),
+                    }),
+                    types::Ty::Named { symbol, args, .. } => {
+                        work.push(Work::Named {
+                            name: qualified(mint, *symbol),
+                            count: args.len(),
+                        });
+                        work.extend(args.iter().rev().map(|arg| Work::Ty(arg)));
+                    }
+                    types::Ty::Undecided => tys.push(Type::Undecided),
                 }
-                types::Ty::Hidden { binder, name, body } => {
-                    work.push(Work::Hidden(*binder, name.to_string()));
-                    work.push(Work::Ty(body));
-                }
-                types::Ty::HiddenVar { binder, name } => tys.push(Type::HiddenVar {
-                    binder: *binder,
-                    name: name.to_string(),
-                }),
-                types::Ty::Array(element) => {
-                    work.push(Work::Array);
-                    work.push(Work::Ty(element));
-                }
-                types::Ty::Mirror(element) => {
-                    work.push(Work::Mirror);
-                    work.push(Work::Ty(element));
-                }
-                types::Ty::TypeInfo(element) => {
-                    work.push(Work::TypeInfo);
-                    work.push(Work::Ty(element));
-                }
-                types::Ty::Mut(region, element) => {
-                    work.push(Work::Mut);
-                    work.push(Work::Ty(element));
-                    work.push(Work::Ty(region));
-                }
-                types::Ty::Struct(row) => {
-                    work.push(Work::Struct);
-                    work.push(Work::Row(row));
-                }
-                types::Ty::Sum(row) => {
-                    work.push(Work::Sum);
-                    work.push(Work::Row(row));
-                }
-                types::Ty::Var(value) => tys.push(Type::Var(*value)),
-                types::Ty::Bound(value) => tys.push(Type::Bound(*value)),
-                types::Ty::Rigid { id, name } => tys.push(Type::Rigid {
-                    id: *id,
-                    name: name.to_string(),
-                }),
-                types::Ty::Named { symbol, args, .. } => {
-                    work.push(Work::Named {
-                        name: qualified(mint, *symbol),
-                        count: args.len(),
-                    });
-                    work.extend(args.iter().rev().map(|arg| Work::Ty(arg)));
-                }
-                types::Ty::Undecided => tys.push(Type::Undecided),
-            },
+            }
+            Work::Shared(key) => {
+                let value = Arc::new(tys.pop().expect("shared artifact type"));
+                shared.insert(key, value.clone());
+                tys.push(Type::Shared(value));
+            }
             Work::Row(value) => {
                 let labels = value
                     .labels
@@ -1988,6 +2212,25 @@ fn ty(mint: &Mint, value: &types::Ty) -> Type {
             Work::Package => {
                 let body = tys.pop().expect("artifact package body");
                 tys.push(Type::Package(Box::new(body)));
+            }
+            Work::Contract(contract) => {
+                let effect_sink = contract
+                    .effect_sink
+                    .as_ref()
+                    .map(|_| Box::new(tys.pop().expect("contract effect sink")));
+                let arguments = tys.split_off(tys.len() - contract.arguments.len());
+                let captures = tys.split_off(tys.len() - contract.captures.len());
+                let fallback = Box::new(tys.pop().expect("artifact contract fallback"));
+                tys.push(Type::Contract {
+                    fallback,
+                    contract: Contract {
+                        parameters: contract.parameters,
+                        body: contract.body.clone(),
+                        captures,
+                        arguments,
+                        effect_sink,
+                    },
+                });
             }
             Work::Hidden(binder, name) => {
                 let body = tys.pop().expect("hidden body");
@@ -2815,6 +3058,17 @@ pub mod text {
         L(parts)
     }
     fn ty(value: &Type) -> S {
+        ty_with_limit(value, None)
+    }
+
+    pub(super) fn type_debug(value: &Type, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &ty_with_limit(value, Some(16_384)) {
+            S::Raw(text) => f.write_str(text),
+            _ => unreachable!("type encoder produces flat canonical syntax"),
+        }
+    }
+
+    fn ty_with_limit(value: &Type, limit: Option<usize>) -> S {
         enum Work<'a> {
             Ty(&'a Type),
             Row(&'a Row),
@@ -2827,8 +3081,13 @@ pub mod text {
         }
 
         let mut out = String::new();
+        let mut shared = HashMap::new();
         let mut work = vec![Work::Ty(value)];
         while let Some(part) = work.pop() {
+            if limit.is_some_and(|limit| out.len() >= limit) {
+                out.push_str(" … [type debug truncated]");
+                break;
+            }
             match part {
                 Work::Text(text) => out.push_str(text),
                 Work::Owned(text) => out.push_str(&text),
@@ -2837,6 +3096,18 @@ pub mod text {
                     out.push_str("(ty ");
                     work.push(Work::Text(")"));
                     match value {
+                        Type::Shared(inner) => {
+                            let key = Arc::as_ptr(inner);
+                            if let Some(index) = shared.get(&key) {
+                                out.push_str(&format!("(ref {index})"));
+                            } else {
+                                let index = shared.len();
+                                shared.insert(key, index);
+                                out.push_str(&format!("(shared {index} "));
+                                work.push(Work::Text(")"));
+                                work.push(Work::Ty(inner));
+                            }
+                        }
                         Type::Nat => work.push(Work::Text("nat")),
                         Type::Int => work.push(Work::Text("int")),
                         Type::Fixed(kind) => work.push(Work::Text(kind.suffix())),
@@ -2868,6 +3139,30 @@ pub mod text {
                             out.push_str("(package ");
                             work.push(Work::Text(")"));
                             work.push(Work::Ty(body));
+                        }
+                        Type::Contract { fallback, contract } => {
+                            out.push_str("(contract ");
+                            out.push_str(&contract.parameters.to_string());
+                            out.push(' ');
+                            out.push_str(&quoted(&contracts::encode(&contract.body)));
+                            out.push_str(" (captures");
+                            work.push(Work::Text(")"));
+                            work.push(Work::Ty(fallback));
+                            work.push(Work::Text(") "));
+                            if let Some(sink) = &contract.effect_sink {
+                                work.push(Work::Ty(sink));
+                                work.push(Work::Text(" "));
+                            }
+                            work.push(Work::Text(") (effect-sink"));
+                            for argument in contract.arguments.iter().rev() {
+                                work.push(Work::Ty(argument));
+                                work.push(Work::Text(" "));
+                            }
+                            work.push(Work::Text(") (arguments"));
+                            for capture in contract.captures.iter().rev() {
+                                work.push(Work::Ty(capture));
+                                work.push(Work::Text(" "));
+                            }
                         }
                         Type::Hidden { binder, name, body } => {
                             out.push_str("(hidden ");
@@ -3901,34 +4196,48 @@ pub mod text {
                 Row(&'a Row),
             }
             let mut parts = vec![Part::Ty(root)];
+            let mut seen = std::collections::HashSet::new();
             while let Some(part) = parts.pop() {
                 match part {
-                    Part::Ty(ty) => match ty {
-                        Type::Bound(index) => {
-                            if *index < presences || *index >= count {
-                                self.fail("type bound is outside the type quantifier space");
+                    Part::Ty(ty) => {
+                        let ty = ty.unshared();
+                        if !seen.insert(ty as *const Type) {
+                            continue;
+                        }
+                        match ty {
+                            Type::Bound(index) => {
+                                if *index < presences || *index >= count {
+                                    self.fail("type bound is outside the type quantifier space");
+                                }
                             }
+                            Type::Contract { fallback, contract } => {
+                                if let Err(message) = contracts::validate(contract) {
+                                    self.fail(message);
+                                }
+                                parts.push(Part::Ty(fallback));
+                                parts.extend(contract.type_operands().map(Part::Ty));
+                            }
+                            Type::Package(inner)
+                            | Type::Array(inner)
+                            | Type::Mirror(inner)
+                            | Type::TypeInfo(inner)
+                            | Type::Hidden { body: inner, .. } => parts.push(Part::Ty(inner)),
+                            Type::Mut(region, element) => {
+                                parts.push(Part::Ty(region));
+                                parts.push(Part::Ty(element));
+                            }
+                            Type::Arrow(from, to, row) => {
+                                parts.push(Part::Row(row));
+                                parts.push(Part::Ty(to));
+                                parts.push(Part::Ty(from));
+                            }
+                            Type::Struct(row) | Type::Sum(row) => parts.push(Part::Row(row)),
+                            Type::Named { args, .. } => {
+                                parts.extend(args.iter().rev().map(Part::Ty));
+                            }
+                            _ => {}
                         }
-                        Type::Package(inner)
-                        | Type::Array(inner)
-                        | Type::Mirror(inner)
-                        | Type::TypeInfo(inner)
-                        | Type::Hidden { body: inner, .. } => parts.push(Part::Ty(inner)),
-                        Type::Mut(region, element) => {
-                            parts.push(Part::Ty(region));
-                            parts.push(Part::Ty(element));
-                        }
-                        Type::Arrow(from, to, row) => {
-                            parts.push(Part::Row(row));
-                            parts.push(Part::Ty(to));
-                            parts.push(Part::Ty(from));
-                        }
-                        Type::Struct(row) | Type::Sum(row) => parts.push(Part::Row(row)),
-                        Type::Named { args, .. } => {
-                            parts.extend(args.iter().rev().map(Part::Ty));
-                        }
-                        _ => {}
-                    },
+                    }
                     Part::Row(row) => {
                         if let Rest::Bound(index) = row.rest
                             && (index < presences || index >= count)
@@ -4107,59 +4416,77 @@ pub mod text {
                 Row(&'a Row, Option<u32>),
             }
             let mut parts = vec![Part::Ty(&body, None)];
+            let mut seen = std::collections::HashSet::new();
             while let Some(part) = parts.pop() {
                 match part {
-                    Part::Ty(ty, owner) => match ty {
-                        Type::Presence(Presence::Bound(index)) => {
-                            if !is_presence(*index) {
-                                self.fail(
+                    Part::Ty(ty, owner) => {
+                        let ty = ty.unshared();
+                        if !seen.insert((ty as *const Type, owner)) {
+                            continue;
+                        }
+                        match ty {
+                            Type::Presence(Presence::Bound(index)) => {
+                                if !is_presence(*index) {
+                                    self.fail(
                                     "presence argument is outside the presence quantifier space",
                                 );
-                            }
-                            if existentials.contains(index) {
-                                if let Some(owner) = owner {
-                                    if slot_owners
-                                        .insert(*index, owner)
-                                        .is_some_and(|before| before != owner)
-                                    {
-                                        self.fail("existential presence crosses package owners");
+                                }
+                                if existentials.contains(index) {
+                                    if let Some(owner) = owner {
+                                        if slot_owners
+                                            .insert(*index, owner)
+                                            .is_some_and(|before| before != owner)
+                                        {
+                                            self.fail(
+                                                "existential presence crosses package owners",
+                                            );
+                                        }
+                                    } else {
+                                        self.fail("existential presence occurs outside a package");
                                     }
-                                } else {
-                                    self.fail("existential presence occurs outside a package");
                                 }
                             }
-                        }
-                        Type::Bound(index) => {
-                            if !is_type(*index) {
-                                self.fail("type bound is outside the type quantifier space");
+                            Type::Bound(index) => {
+                                if !is_type(*index) {
+                                    self.fail("type bound is outside the type quantifier space");
+                                }
                             }
+                            Type::Package(inner) => {
+                                let here = package_count;
+                                package_count += 1;
+                                parts.push(Part::Ty(inner, Some(here)));
+                            }
+                            Type::Hidden { body, .. } => parts.push(Part::Ty(body, owner)),
+                            Type::Contract { fallback, contract } => {
+                                if let Err(message) = contracts::validate(contract) {
+                                    self.fail(message);
+                                }
+                                parts.extend(
+                                    contract.type_operands().rev().map(|ty| Part::Ty(ty, owner)),
+                                );
+                                parts.push(Part::Ty(fallback, owner));
+                            }
+                            Type::Arrow(from, to, row) => {
+                                parts.push(Part::Row(row, owner));
+                                parts.push(Part::Ty(to, owner));
+                                parts.push(Part::Ty(from, owner));
+                            }
+                            Type::Mut(region, element) => {
+                                parts.push(Part::Ty(region, owner));
+                                parts.push(Part::Ty(element, owner));
+                            }
+                            Type::Array(inner) | Type::Mirror(inner) | Type::TypeInfo(inner) => {
+                                parts.push(Part::Ty(inner, owner))
+                            }
+                            Type::Struct(row) | Type::Sum(row) => {
+                                parts.push(Part::Row(row, owner));
+                            }
+                            Type::Named { args, .. } => {
+                                parts.extend(args.iter().rev().map(|ty| Part::Ty(ty, owner)))
+                            }
+                            _ => {}
                         }
-                        Type::Package(inner) => {
-                            let here = package_count;
-                            package_count += 1;
-                            parts.push(Part::Ty(inner, Some(here)));
-                        }
-                        Type::Hidden { body, .. } => parts.push(Part::Ty(body, owner)),
-                        Type::Arrow(from, to, row) => {
-                            parts.push(Part::Row(row, owner));
-                            parts.push(Part::Ty(to, owner));
-                            parts.push(Part::Ty(from, owner));
-                        }
-                        Type::Mut(region, element) => {
-                            parts.push(Part::Ty(region, owner));
-                            parts.push(Part::Ty(element, owner));
-                        }
-                        Type::Array(inner) | Type::Mirror(inner) | Type::TypeInfo(inner) => {
-                            parts.push(Part::Ty(inner, owner))
-                        }
-                        Type::Struct(row) | Type::Sum(row) => {
-                            parts.push(Part::Row(row, owner));
-                        }
-                        Type::Named { args, .. } => {
-                            parts.extend(args.iter().rev().map(|ty| Part::Ty(ty, owner)))
-                        }
-                        _ => {}
-                    },
+                    }
                     Part::Row(row, owner) => {
                         if let Rest::Bound(index) = row.rest
                             && (!is_type(index))
@@ -4292,11 +4619,19 @@ pub mod text {
         fn read_ty(&self, value: S) -> Type {
             enum Task {
                 Ty(S),
+                BuildShared(u32),
                 Row(S),
                 Rest(S),
                 Field(S),
                 BuildArrow,
                 BuildPackage,
+                BuildContract {
+                    parameters: usize,
+                    body: Arc<crate::contracts::Expr>,
+                    captures: usize,
+                    arguments: usize,
+                    effect_sink: bool,
+                },
                 BuildHidden(u32, String),
                 BuildMirror,
                 BuildTypeInfo,
@@ -4304,12 +4639,19 @@ pub mod text {
                 BuildMut,
                 BuildStruct,
                 BuildSum,
-                BuildNamed { name: String, count: usize },
-                BuildRow { labels: Vec<String> },
+                BuildNamed {
+                    name: String,
+                    count: usize,
+                },
+                BuildRow {
+                    labels: Vec<String>,
+                },
                 BuildMore,
                 BuildField(Presence),
             }
             let mut tasks = vec![Task::Ty(value)];
+            let mut shared = HashMap::<u32, Arc<Type>>::new();
+            let mut declared = std::collections::HashSet::new();
             let (mut tys, mut rows, mut rests, mut fields_out) =
                 (Vec::new(), Vec::new(), Vec::new(), Vec::new());
             while let Some(task) = tasks.pop() {
@@ -4339,6 +4681,26 @@ pub mod text {
                             L(values) => {
                                 let mut values = std::mem::take(values);
                                 match self.atom(self.take(&mut values)).as_str() {
+                                    "shared" => {
+                                        let mut values = self.exact(values, 2, "shared");
+                                        let index = self.number(self.take(&mut values));
+                                        if !declared.insert(index) {
+                                            self.fail("duplicate shared type definition");
+                                        }
+                                        tasks.push(Task::BuildShared(index));
+                                        tasks.push(Task::Ty(self.take(&mut values)));
+                                    }
+                                    "ref" => {
+                                        let index =
+                                            self.number(self.exact(values, 1, "ref").remove(0));
+                                        tys.push(match shared.get(&index) {
+                                            Some(value) => Type::Shared(value.clone()),
+                                            None => self.invalid(
+                                                "unknown or forward shared type reference",
+                                                Type::Undecided,
+                                            ),
+                                        });
+                                    }
                                     "arrow" => {
                                         let mut values = self.exact(values, 3, "arrow");
                                         let from = self.take(&mut values);
@@ -4353,6 +4715,39 @@ pub mod text {
                                         let body = self.exact(values, 1, "package").remove(0);
                                         tasks.push(Task::BuildPackage);
                                         tasks.push(Task::Ty(body));
+                                    }
+                                    "contract" => {
+                                        let mut values = self.exact(values, 6, "contract");
+                                        let parameters: usize = self.number(self.take(&mut values));
+                                        let encoded = self.string(self.take(&mut values));
+                                        let body =
+                                            contracts::decode(&encoded).unwrap_or_else(|message| {
+                                                self.invalid(
+                                                    message,
+                                                    Arc::new(crate::contracts::Expr::Input(0)),
+                                                )
+                                            });
+                                        let captures =
+                                            self.many(self.take(&mut values), "captures");
+                                        let arguments =
+                                            self.many(self.take(&mut values), "arguments");
+                                        let mut effect_sink =
+                                            self.many(self.take(&mut values), "effect-sink");
+                                        if effect_sink.len() > 1 {
+                                            self.fail("contract has more than one effect sink");
+                                        }
+                                        let fallback = self.take(&mut values);
+                                        tasks.push(Task::BuildContract {
+                                            parameters,
+                                            body,
+                                            captures: captures.len(),
+                                            arguments: arguments.len(),
+                                            effect_sink: !effect_sink.is_empty(),
+                                        });
+                                        tasks.push(Task::Ty(fallback));
+                                        tasks.extend(effect_sink.drain(..).map(Task::Ty));
+                                        tasks.extend(arguments.into_iter().rev().map(Task::Ty));
+                                        tasks.extend(captures.into_iter().rev().map(Task::Ty));
                                     }
                                     "hidden" => {
                                         let mut values = self.exact(values, 3, "hidden");
@@ -4492,6 +4887,20 @@ pub mod text {
                         let ty = tys.pop().expect("field type");
                         fields_out.push(RowField { presence, ty });
                     }
+                    Task::BuildShared(index) => {
+                        let value = tys.pop().expect("shared type body");
+                        let value = if sharing::contains_unshared_package(&value) {
+                            self.invalid(
+                                "shared type definitions cannot contain package owners",
+                                Type::Undecided,
+                            )
+                        } else {
+                            value
+                        };
+                        let value = Arc::new(value);
+                        shared.insert(index, value.clone());
+                        tys.push(Type::Shared(value));
+                    }
                     Task::BuildArrow => {
                         let effects = rows.pop().expect("effects");
                         let to = tys.pop().expect("to");
@@ -4501,6 +4910,30 @@ pub mod text {
                     Task::BuildPackage => {
                         let body = tys.pop().expect("package body");
                         tys.push(Type::Package(Box::new(body)));
+                    }
+                    Task::BuildContract {
+                        parameters,
+                        body,
+                        captures,
+                        arguments,
+                        effect_sink,
+                    } => {
+                        let fallback = Box::new(tys.pop().expect("contract fallback"));
+                        let effect_sink =
+                            effect_sink.then(|| Box::new(tys.pop().expect("contract effect sink")));
+                        let arguments = tys.split_off(tys.len() - arguments);
+                        let captures = tys.split_off(tys.len() - captures);
+                        let contract = Contract {
+                            parameters,
+                            body,
+                            captures,
+                            arguments,
+                            effect_sink,
+                        };
+                        if let Err(message) = contracts::validate(&contract) {
+                            self.fail(message);
+                        }
+                        tys.push(Type::Contract { fallback, contract });
                     }
                     Task::BuildHidden(binder, name) => {
                         let body = tys.pop().expect("hidden body");

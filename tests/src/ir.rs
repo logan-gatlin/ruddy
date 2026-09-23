@@ -12916,12 +12916,14 @@ fn deeply_nested_imported_semantics_are_preserved_on_a_small_stack() {
 
             // Importing alone only clamps the tree. Naming the value also
             // instantiates, substitutes, reads, and solves the deep formula.
+            // The explicit ordinary boundary keeps this test about importing
+            // deep interfaces, independently of finite structural capture limits.
             let parsed = parse::parse(
                 lex(
                     "let answer = dep::deep_formula\n\
                      let typed = dep::deep_type\n\
                      let ignore = fn value => 0n\n\
-                     let guarded = fn choice => match choice with\n\
+                     let guarded: _ -> Nat = fn choice => match choice with\n\
                      | {left, ..} => ignore dep::deep_type\n\
                      | {right, ..} => 0n end\n\
                      let bad : Nat = dep::deep_type",
@@ -12949,7 +12951,24 @@ fn deeply_nested_imported_semantics_are_preserved_on_a_small_stack() {
             let source_map = out.source;
             let program = out.program;
             let inferred = inference::infer(&mint, &program, inference::Trace::Complete);
-            assert_eq!(inferred.errors().len(), 1);
+            assert_eq!(
+                inferred.errors().len(),
+                1,
+                "{:?}",
+                inferred
+                    .errors()
+                    .iter()
+                    .map(|error| {
+                        let detail = match &error.kind {
+                            inference::ErrorKind::StructuralContract { message } => {
+                                message.as_str()
+                            }
+                            _ => "",
+                        };
+                        (error.kind.code(), mint.name(error.at.definition), detail)
+                    })
+                    .collect::<Vec<_>>()
+            );
             assert_eq!(inferred.errors()[0].kind.code(), "type-mismatch");
             let guarded_step = inferred
                 .diagnostics()

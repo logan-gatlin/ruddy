@@ -2257,3 +2257,142 @@ fn using_aliases_execute_without_becoming_javascript_exports() {
         "assert.equal(app.answer, 42); assert.equal(app.local, 42); assert.deepEqual(Object.keys(app).sort(), ['answer', 'local']);",
     );
 }
+
+#[test]
+fn structural_host_exports_check_and_run_concrete_inferred_contracts() {
+    execute_reification(
+        "let boxed = fn number => do let checked: Nat = number return {value: checked} end",
+        "assert.equal(app.boxed(7).value, 7); assert.throws(() => app.boxed('bad'), /Nat/);",
+    );
+    execute_reification(
+        "@private let get = fn row => match row with | {value, ..} => row.value end\n\
+         let get_nat: {value: Nat} -> Nat = get",
+        "assert.equal(app.get_nat({value: 7}), 7); assert.throws(() => app.get_nat({}), /value/);",
+    );
+}
+
+#[test]
+fn structural_host_exports_reject_correlated_optional_inputs() {
+    let artifact = compiled(
+        "let inspect = fn row => match row with\n\
+         | {value, other} => do let checked: Nat = value let _: Nat = other return checked end\n\
+         | {} => 0n end",
+    );
+    let mut body = &artifact.header().values[0].scheme.body;
+    while let artifact::Type::Shared(inner) = body {
+        body = inner;
+    }
+    assert!(matches!(body, artifact::Type::Contract { .. }));
+    let Err(error) = js::generate(&artifact) else {
+        panic!("native optional fields cannot impose a pairwise presence relation");
+    };
+    assert!(
+        matches!(
+            error,
+            js::Error::Export { .. } | js::Error::ExportType { .. }
+        ),
+        "{error}"
+    );
+}
+
+#[test]
+fn structural_host_exports_do_not_trust_optional_input_fallbacks() {
+    use ruddy::artifact::{Formula, Presence, Rest, Row, RowField, Type};
+    use ruddy::reification::interface::{Interface, Node};
+
+    fn insert_presence_slot(interface: &mut Interface) {
+        assert!(interface.construction.is_empty());
+        for node in &mut interface.nodes {
+            if let Node::Parameter(parameter) = node {
+                *parameter += 1;
+            }
+            if let Node::Arrow { requirements, .. } = node {
+                *requirements = std::mem::take(requirements)
+                    .into_iter()
+                    .map(|mut requirement| {
+                        requirement.parameter += 1;
+                        requirement
+                    })
+                    .collect();
+            }
+        }
+        for port in &mut interface.ports {
+            *port = std::mem::take(port)
+                .into_iter()
+                .map(|parameter| parameter + 1)
+                .collect();
+        }
+    }
+
+    let mut portable =
+        compiled("let get: fn | {value: 'field} => capture (Nat) = fn | {value: _} => 0n")
+            .to_unchecked();
+    let scheme = &mut portable.header.values[0].scheme;
+    scheme.count = 2;
+    scheme.presences = 1;
+    scheme.existentials.clear();
+    scheme.formula = Formula::True;
+    scheme
+        .representations
+        .iter_mut()
+        .for_each(|slot| *slot += 1);
+    if let Some(callable) = &mut scheme.callable {
+        insert_presence_slot(callable);
+    }
+    let mut body = &mut scheme.body;
+    while let Type::Shared(inner) = body {
+        body = std::sync::Arc::make_mut(inner);
+    }
+    let Type::Contract { fallback, .. } = body else {
+        panic!("an exact structural getter")
+    };
+    **fallback = Type::Arrow(
+        Box::new(Type::Struct(Row {
+            labels: vec![(
+                "value".into(),
+                RowField {
+                    presence: Presence::Bound(0),
+                    ty: Type::Nat,
+                },
+            )],
+            rest: Rest::Closed,
+        })),
+        Box::new(Type::Nat),
+        Row {
+            labels: Vec::new(),
+            rest: Rest::Closed,
+        },
+    );
+    portable.lir.globals[0].type_interface = scheme.callable.clone();
+    let portable = portable
+        .validate()
+        .expect("a representation witness does not itself prove a contract");
+    let Err(error) = js::generate(&portable) else {
+        panic!("the host could otherwise call get({{}})");
+    };
+    assert!(
+        matches!(error, js::Error::Export { .. }),
+        "the generated ordinary contract must reject the value: {error}"
+    );
+    assert!(error.to_string().contains("get"), "{error}");
+}
+
+#[test]
+fn structural_host_exports_normalize_checked_tagged_results() {
+    let source = "type Error = {message: String}\n\
+        type Result 'a = #Some 'a | #Error Error\n\
+        @private let read: String -> Result [Nat8] = fn path => #Some [42n8]\n\
+        @private let write: String -> [Nat8] -> Result () = fn path bytes => #Some ()\n\
+        let copy = fn source destination => match read source with\n\
+        | #Some bytes => write destination bytes | #Error error => #Error error end";
+    let artifact = compiled(source);
+    let mut body = &artifact.header().values[0].scheme.body;
+    while let artifact::Type::Shared(inner) = body {
+        body = inner;
+    }
+    assert!(matches!(body, artifact::Type::Contract { .. }));
+    compiled(&format!(
+        "{source}\nlet checked: String -> String -> Result () = copy"
+    ));
+    js::generate(&artifact).expect("a checked tagged result has a native shape");
+}

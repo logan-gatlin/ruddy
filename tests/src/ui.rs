@@ -154,6 +154,9 @@ fn inference_error_kinds(span: Anchor) -> Vec<TypeError> {
         TypeError::RuntimeTypeInformation {
             message: "runtime type information is unavailable for this type".into(),
         },
+        TypeError::StructuralContract {
+            message: "no structural branch covers this argument".into(),
+        },
     ]
 }
 
@@ -681,7 +684,7 @@ fn every_inference_error_exposes_a_complete_structured_diagnostic() {
     let use_span = map.record(Symbol::GENERATED, 0, Span::generated(4, 5));
     let declared = map.record(Symbol::GENERATED, 0, Span::generated(1, 2));
     let kinds = inference_error_kinds(declared);
-    assert_eq!(kinds.len(), 25);
+    assert_eq!(kinds.len(), 26);
 
     for kind in kinds {
         let diagnostic = inference::Error::new(use_span, kind).diagnostic(&map);
@@ -1163,7 +1166,7 @@ fn pivots_name_repeated_inputs_branches_and_anonymous_shared_values_once() {
 fn conditional_match_diagnostics_link_only_conflicting_branch_results() {
     for (source, contributors) in [
         (
-            "let bad = fn value => match value with | #A => 1n | #B => {} | #C => 2n end",
+            "let bad: _ -> _ = fn value => match value with | #A => 1n | #B => {} | #C => 2n end",
             ["1n", "{}"],
         ),
         (
@@ -1171,11 +1174,11 @@ fn conditional_match_diagnostics_link_only_conflicting_branch_results() {
             ["1n", "{}"],
         ),
         (
-            "let bad = fn value => match value with | #A => { y: 1n } | #B => { x: 2n } | #C => { x: false } end",
+            "let bad: _ -> _ = fn value => match value with | #A => { y: 1n } | #B => { x: 2n } | #C => { x: false } end",
             ["{ x: 2n }", "{ x: false }"],
         ),
         (
-            "let shared = 1n\nlet bad = fn value => match value with | #A => { y: shared } | #B => { x: shared } | #C => { x: false } end",
+            "let shared = 1n\nlet bad: _ -> _ = fn value => match value with | #A => { y: shared } | #B => { x: shared } | #C => { x: false } end",
             ["{ x: shared }", "{ x: false }"],
         ),
     ] {
@@ -2305,6 +2308,10 @@ fn inference_source_corpus_matches_abridged_structured_goldens() {
         (
             "runtime-type-information",
             include_str!("../diagnostics/inference/runtime-type-information.rud"),
+        ),
+        (
+            "structural-contract",
+            include_str!("../diagnostics/inference/structural-contract.rud"),
         ),
         (
             "repeated-calls",

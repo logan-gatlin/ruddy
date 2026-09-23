@@ -814,6 +814,30 @@ fn effects_node(ids: &mut Ids, effects: &EffectRow) -> Node {
 fn type_node(ids: &mut Ids, ty: &Type) -> Node {
     let node = Node::new(ids.next(), "", print::ast::ty(&ty.tracked).to_string()).at(ty.span);
     match &ty.tracked {
+        TypeKind::Structural {
+            captures,
+            effect_sink,
+            ..
+        } => Node {
+            label: "Structural contract".into(),
+            ..node
+        }
+        .children(
+            captures
+                .iter()
+                .chain(effect_sink.iter().map(|ty| ty.as_ref()))
+                .map(|ty| type_node(ids, ty)),
+        ),
+        TypeKind::Match(arms) => Node {
+            label: "Match type".into(),
+            ..node
+        }
+        .children(arms.iter().map(|(from, to)| {
+            Node::new(ids.next(), "Arm", String::new())
+                .at(from.span.merge(to.span))
+                .child(type_node(ids, from))
+                .child(type_node(ids, to))
+        })),
         // A row written where a type goes, shown as the row it is: the same
         // node an arrow's own row gets, so the two read alike on the page.
         TypeKind::Effects(effects) => effects_node(ids, effects),
